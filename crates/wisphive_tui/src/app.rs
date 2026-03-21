@@ -14,6 +14,8 @@ pub enum ViewMode {
     Detail,
     /// History browser showing resolved decisions from the audit log.
     History,
+    /// Full-screen detail view for a single history entry.
+    HistoryDetail,
 }
 
 /// Which panel currently has focus.
@@ -70,6 +72,12 @@ pub struct App {
     pub history_index: usize,
     /// Agent ID filter for history view. None = all agents.
     pub history_agent_filter: Option<String>,
+    /// Whether the user is in history search input mode.
+    pub history_search_mode: bool,
+    /// Buffer for history search input.
+    pub history_search_buffer: String,
+    /// Active search query (applied filter).
+    pub history_search_query: Option<String>,
 }
 
 /// Aggregated project status for the dashboard.
@@ -99,6 +107,9 @@ impl App {
             history: Vec::new(),
             history_index: 0,
             history_agent_filter: None,
+            history_search_mode: false,
+            history_search_buffer: String::new(),
+            history_search_query: None,
         }
     }
 
@@ -209,6 +220,28 @@ impl App {
         self.history.clear();
         self.history_index = 0;
         self.history_agent_filter = None;
+        self.history_search_query = None;
+        self.history_search_mode = false;
+        self.history_search_buffer.clear();
+    }
+
+    /// Enter the history detail view for the currently selected history entry.
+    pub fn enter_history_detail_view(&mut self) {
+        if self.history.get(self.history_index).is_some() {
+            self.detail_scroll = 0;
+            self.view_mode = ViewMode::HistoryDetail;
+        }
+    }
+
+    /// Leave the history detail view and return to the history list.
+    pub fn exit_history_detail_view(&mut self) {
+        self.view_mode = ViewMode::History;
+        self.detail_scroll = 0;
+    }
+
+    /// Get the currently selected history entry.
+    pub fn selected_history_entry(&self) -> Option<&HistoryEntry> {
+        self.history.get(self.history_index)
     }
 
     /// Move selection up in the history list.

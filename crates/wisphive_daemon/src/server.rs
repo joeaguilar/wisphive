@@ -57,8 +57,22 @@ impl Server {
         let listener = UnixListener::bind(&self.config.socket_path)?;
         info!(path = %self.config.socket_path.display(), "listening");
 
+        let mut reap_interval = tokio::time::interval(Duration::from_secs(5));
+        reap_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
+                // Periodically reap exited agent processes
+                _ = reap_interval.tick() => {
+                    let mut pr = self.process_registry.lock().await;
+                    let exited = pr.reap_exited().await;
+                    for (agent_id, exit_code) in exited {
+                        let _ = self.tui_tx.send(ServerMessage::AgentExited {
+                            agent_id,
+                            exit_code,
+                        });
+                    }
+                }
                 accept = listener.accept() => {
                     match accept {
                         Ok((stream, _addr)) => {
@@ -225,9 +239,27 @@ async fn handle_hook(
             let resp = encode(&ServerMessage::DecisionResponse { id, decision })?;
             writer.write_all(resp.as_bytes()).await?;
         }
+        ClientMessage::ToolResult(result) => {
+            // Fire-and-forget: attach result to matching decision_log entry
+            match state_db
+                .attach_tool_result(&result.agent_id, &result.tool_name, &result.tool_result)
+                .await
+            {
+                Ok(Some(id)) => {
+                    info!(%id, tool = %result.tool_name, agent = %result.agent_id, "tool result attached");
+                }
+                Ok(None) => {
+                    warn!(tool = %result.tool_name, agent = %result.agent_id,
+                          "tool result received but no matching decision found");
+                }
+                Err(e) => {
+                    warn!("failed to store tool result: {e}");
+                }
+            }
+        }
         _ => {
             let err = encode(&ServerMessage::Error {
-                message: "expected DecisionRequest from hook".into(),
+                message: "expected DecisionRequest or ToolResult from hook".into(),
             })?;
             writer.write_all(err.as_bytes()).await?;
         }
@@ -336,6 +368,20 @@ async fn handle_tui(
                                     Err(e) => {
                                         let resp = encode(&ServerMessage::Error {
                                             message: format!("history query failed: {e}"),
+                                        })?;
+                                        writer.write_all(resp.as_bytes()).await?;
+                                    }
+                                }
+                            }
+                            ClientMessage::SearchHistory(ref search) => {
+                                match state_db.search_history(search).await {
+                                    Ok(entries) => {
+                                        let resp = encode(&ServerMessage::HistoryResponse { entries })?;
+                                        writer.write_all(resp.as_bytes()).await?;
+                                    }
+                                    Err(e) => {
+                                        let resp = encode(&ServerMessage::Error {
+                                            message: format!("search failed: {e}"),
                                         })?;
                                         writer.write_all(resp.as_bytes()).await?;
                                     }

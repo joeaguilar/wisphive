@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::types::{AgentInfo, Decision, DecisionFilter, DecisionRequest, HistoryEntry, ManagedAgent, SpawnAgentRequest};
+use crate::types::{AgentInfo, Decision, DecisionFilter, DecisionRequest, HistoryEntry, HistorySearch, ManagedAgent, SpawnAgentRequest, ToolResult};
 
 /// Identifies the type of client connecting to the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +63,14 @@ pub enum ClientMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         limit: Option<u32>,
     },
+
+    /// Hook reports a tool execution result (fire-and-forget, PostToolUse).
+    #[serde(rename = "tool_result")]
+    ToolResult(ToolResult),
+
+    /// Search decision history with rich filters.
+    #[serde(rename = "search_history")]
+    SearchHistory(HistorySearch),
 }
 
 /// Messages sent from the daemon to clients.

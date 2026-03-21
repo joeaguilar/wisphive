@@ -38,6 +38,12 @@ enum Command {
         action: AgentAction,
     },
 
+    /// Browse and search the audit history
+    History {
+        #[command(subcommand)]
+        action: HistoryAction,
+    },
+
     /// Check setup and diagnose issues
     Doctor {
         /// Project directory to check (defaults to current directory)
@@ -83,6 +89,33 @@ enum AgentAction {
 }
 
 #[derive(Subcommand)]
+enum HistoryAction {
+    /// Search history for file paths, tool names, or other text
+    Search {
+        /// Search query (matches file paths, commands, tool names)
+        query: String,
+        /// Filter by agent ID
+        #[arg(long)]
+        agent_id: Option<String>,
+        /// Filter by tool name
+        #[arg(long)]
+        tool: Option<String>,
+        /// Maximum results
+        #[arg(long, default_value = "50")]
+        limit: u32,
+    },
+    /// Show recent history entries
+    Recent {
+        /// Maximum results
+        #[arg(long, default_value = "20")]
+        limit: u32,
+        /// Filter by agent ID
+        #[arg(long)]
+        agent_id: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum HookAction {
     /// Install Wisphive hooks into a project's .claude/settings.json
     Install {
@@ -124,6 +157,24 @@ fn main() -> anyhow::Result<()> {
             HookAction::Uninstall { project, all } => commands::hooks::uninstall(project, all),
             HookAction::Status => commands::hooks::status(),
         },
+
+        // History commands (need tokio runtime for socket communication)
+        Command::History { action } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                match action {
+                    HistoryAction::Search {
+                        query,
+                        agent_id,
+                        tool,
+                        limit,
+                    } => commands::history::search(query, agent_id, tool, limit).await,
+                    HistoryAction::Recent { limit, agent_id } => {
+                        commands::history::recent(limit, agent_id).await
+                    }
+                }
+            })
+        }
 
         // Agent commands (need tokio runtime for socket communication)
         Command::Agent { action } => {

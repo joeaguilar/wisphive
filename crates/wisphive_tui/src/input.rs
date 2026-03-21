@@ -21,6 +21,8 @@ pub enum InputAction {
     SpawnAgent { project: PathBuf, prompt: String },
     /// Request history from the daemon (optional agent_id filter).
     QueryHistory { agent_id: Option<String> },
+    /// Search history with a query string.
+    SearchHistory { search: wisphive_protocol::HistorySearch },
     /// Quit the application.
     Quit,
 }
@@ -40,6 +42,7 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
     match app.view_mode {
         ViewMode::Detail => return handle_detail_input(app, key),
         ViewMode::History => return handle_history_input(app, key),
+        ViewMode::HistoryDetail => return handle_history_detail_input(app, key),
         ViewMode::Dashboard => {}
     }
 
@@ -275,11 +278,17 @@ fn handle_modal_input(app: &mut App, key: KeyEvent) -> InputAction {
 
 /// Handle input in the history view.
 fn handle_history_input(app: &mut App, key: KeyEvent) -> InputAction {
+    // If in search input mode, handle text input
+    if app.history_search_mode {
+        return handle_history_search_input(app, key);
+    }
+
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => {
+        KeyCode::Esc => {
             app.exit_history_view();
             InputAction::None
         }
+        KeyCode::Char('q') => InputAction::Quit,
         KeyCode::Char('j') | KeyCode::Down => {
             app.history_down();
             InputAction::None
@@ -287,6 +296,25 @@ fn handle_history_input(app: &mut App, key: KeyEvent) -> InputAction {
         KeyCode::Char('k') | KeyCode::Up => {
             app.history_up();
             InputAction::None
+        }
+        // Open detail view for selected history entry
+        KeyCode::Enter => {
+            app.enter_history_detail_view();
+            InputAction::None
+        }
+        // Start search mode
+        KeyCode::Char('/') => {
+            app.history_search_mode = true;
+            app.history_search_buffer.clear();
+            InputAction::None
+        }
+        // Clear search
+        KeyCode::Char('C') => {
+            app.history_search_query = None;
+            app.enter_history_view(app.history_agent_filter.clone());
+            InputAction::QueryHistory {
+                agent_id: app.history_agent_filter.clone(),
+            }
         }
         // Filter history to selected entry's agent
         KeyCode::Char('f') => {
@@ -304,6 +332,70 @@ fn handle_history_input(app: &mut App, key: KeyEvent) -> InputAction {
             app.enter_history_view(None);
             InputAction::QueryHistory { agent_id: None }
         }
+        _ => InputAction::None,
+    }
+}
+
+fn handle_history_search_input(app: &mut App, key: KeyEvent) -> InputAction {
+    match key.code {
+        KeyCode::Enter => {
+            app.history_search_mode = false;
+            if app.history_search_buffer.is_empty() {
+                app.history_search_query = None;
+                return InputAction::QueryHistory {
+                    agent_id: app.history_agent_filter.clone(),
+                };
+            }
+            let query = app.history_search_buffer.clone();
+            app.history_search_query = Some(query.clone());
+            InputAction::SearchHistory {
+                search: wisphive_protocol::HistorySearch {
+                    query: Some(query),
+                    agent_id: app.history_agent_filter.clone(),
+                    ..Default::default()
+                },
+            }
+        }
+        KeyCode::Esc => {
+            app.history_search_mode = false;
+            app.history_search_buffer.clear();
+            InputAction::None
+        }
+        KeyCode::Backspace => {
+            app.history_search_buffer.pop();
+            InputAction::None
+        }
+        KeyCode::Char(c) => {
+            app.history_search_buffer.push(c);
+            InputAction::None
+        }
+        _ => InputAction::None,
+    }
+}
+
+fn handle_history_detail_input(app: &mut App, key: KeyEvent) -> InputAction {
+    match key.code {
+        KeyCode::Esc => {
+            app.exit_history_detail_view();
+            InputAction::None
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.detail_scroll = app.detail_scroll.saturating_add(1);
+            InputAction::None
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.detail_scroll = app.detail_scroll.saturating_sub(1);
+            InputAction::None
+        }
+        KeyCode::PageDown | KeyCode::Char(' ') => {
+            app.detail_scroll = app.detail_scroll.saturating_add(20);
+            InputAction::None
+        }
+        KeyCode::PageUp => {
+            app.detail_scroll = app.detail_scroll.saturating_sub(20);
+            InputAction::None
+        }
+        KeyCode::Char('q') | KeyCode::Char('Q') => InputAction::Quit,
         _ => InputAction::None,
     }
 }

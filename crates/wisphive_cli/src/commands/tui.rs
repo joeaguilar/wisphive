@@ -141,6 +141,10 @@ async fn run_loop(
                                 limit: Some(200),
                             }).await?;
                         }
+                        InputAction::SearchHistory { search } => {
+                            tracing::info!(?search.query, "searching history");
+                            conn.send(&ClientMessage::SearchHistory(search)).await?;
+                        }
                         InputAction::None => {}
                     }
                 }
@@ -171,6 +175,12 @@ async fn run_loop(
                     }
                     Some(ServerMessage::AgentDisconnected { ref agent_id }) => {
                         tracing::info!(agent = %agent_id, "agent disconnected");
+                        app.agents.retain(|a| a.agent_id != *agent_id);
+                        app.rebuild_projects();
+                    }
+                    Some(ServerMessage::AgentExited { ref agent_id, exit_code }) => {
+                        tracing::info!(agent = %agent_id, ?exit_code, "managed agent exited");
+                        // Remove from agents list if present
                         app.agents.retain(|a| a.agent_id != *agent_id);
                         app.rebuild_projects();
                     }
