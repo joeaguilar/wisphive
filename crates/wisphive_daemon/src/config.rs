@@ -16,18 +16,41 @@ pub struct DaemonConfig {
     pub log_dir: PathBuf,
     /// Maximum time a hook can block waiting for a decision (seconds).
     pub hook_timeout_secs: u64,
+    /// Whether to send desktop notifications for pending decisions.
+    pub notifications_enabled: bool,
+}
+
+/// User-editable config loaded from ~/.wisphive/config.json.
+#[derive(serde::Deserialize, serde::Serialize, Default)]
+pub struct UserConfig {
+    #[serde(default = "default_true")]
+    pub notifications: bool,
+    #[serde(default = "default_timeout")]
+    pub hook_timeout_secs: Option<u64>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_timeout() -> Option<u64> {
+    None
 }
 
 impl DaemonConfig {
     /// Create config rooted at the given home directory.
+    ///
+    /// Loads user overrides from `<home_dir>/config.json` if present.
     pub fn new(home_dir: PathBuf) -> Self {
+        let user = Self::load_user_config(&home_dir);
         Self {
             socket_path: home_dir.join("wisphive.sock"),
             pid_path: home_dir.join("wisphive.pid"),
             db_path: home_dir.join("wisphive.db"),
             mode_path: home_dir.join("mode"),
             log_dir: home_dir.join("logs"),
-            hook_timeout_secs: 3600,
+            hook_timeout_secs: user.hook_timeout_secs.unwrap_or(3600),
+            notifications_enabled: user.notifications,
             home_dir,
         }
     }
@@ -43,6 +66,19 @@ impl DaemonConfig {
         std::fs::create_dir_all(&self.home_dir)?;
         std::fs::create_dir_all(&self.log_dir)?;
         Ok(())
+    }
+
+    /// Path to the user config file.
+    pub fn config_json_path(&self) -> PathBuf {
+        self.home_dir.join("config.json")
+    }
+
+    fn load_user_config(home_dir: &Path) -> UserConfig {
+        let path = home_dir.join("config.json");
+        match std::fs::read_to_string(&path) {
+            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+            Err(_) => UserConfig::default(),
+        }
     }
 }
 
