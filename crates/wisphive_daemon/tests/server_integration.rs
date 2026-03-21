@@ -83,6 +83,29 @@ async fn connect_as_tui(
     (lines, writer)
 }
 
+/// Read TUI broadcast messages until we find one matching the predicate.
+/// Skips AgentConnected/AgentDisconnected events that the server now emits.
+async fn next_tui_msg<F>(
+    lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    predicate: F,
+) -> ServerMessage
+where
+    F: Fn(&ServerMessage) -> bool,
+{
+    loop {
+        let line = tokio::time::timeout(Duration::from_secs(2), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let msg: ServerMessage = decode(&line).unwrap();
+        if predicate(&msg) {
+            return msg;
+        }
+        // Skip other broadcast messages (AgentConnected, AgentDisconnected, etc.)
+    }
+}
+
 fn make_decision_request(tool_name: &str) -> DecisionRequest {
     DecisionRequest {
         id: uuid::Uuid::new_v4(),
@@ -216,13 +239,11 @@ async fn hook_sends_request_tui_approves_hook_gets_response() {
     let msg = encode(&ClientMessage::DecisionRequest(req)).unwrap();
     hook_writer.write_all(msg.as_bytes()).await.unwrap();
 
-    // TUI should receive the new decision
-    let tui_msg_line = tokio::time::timeout(Duration::from_secs(2), tui_lines.next_line())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    let tui_msg: ServerMessage = decode(&tui_msg_line).unwrap();
+    // TUI should receive the new decision (skip AgentConnected)
+    let tui_msg = next_tui_msg(&mut tui_lines, |m| {
+        matches!(m, ServerMessage::NewDecision(_))
+    })
+    .await;
     match tui_msg {
         ServerMessage::NewDecision(r) => {
             assert_eq!(r.id, req_id);
@@ -267,12 +288,11 @@ async fn hook_sends_request_tui_denies_hook_gets_deny() {
     let msg = encode(&ClientMessage::DecisionRequest(req)).unwrap();
     hook_writer.write_all(msg.as_bytes()).await.unwrap();
 
-    // TUI receives new decision
-    let _ = tokio::time::timeout(Duration::from_secs(2), tui_lines.next_line())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    // TUI receives new decision (skip AgentConnected)
+    let _ = next_tui_msg(&mut tui_lines, |m| {
+        matches!(m, ServerMessage::NewDecision(_))
+    })
+    .await;
 
     // TUI denies
     let deny = encode(&ClientMessage::Deny { id: req_id }).unwrap();
@@ -309,22 +329,21 @@ async fn tui_receives_decision_resolved_after_approve() {
     let msg = encode(&ClientMessage::DecisionRequest(req)).unwrap();
     hook_writer.write_all(msg.as_bytes()).await.unwrap();
 
-    // TUI receives NewDecision
-    let _ = tokio::time::timeout(Duration::from_secs(2), tui_lines.next_line())
-        .await
-        .unwrap();
+    // TUI receives NewDecision (skip AgentConnected)
+    let _ = next_tui_msg(&mut tui_lines, |m| {
+        matches!(m, ServerMessage::NewDecision(_))
+    })
+    .await;
 
     // TUI approves
     let approve = encode(&ClientMessage::Approve { id: req_id }).unwrap();
     tui_writer.write_all(approve.as_bytes()).await.unwrap();
 
-    // TUI should also receive DecisionResolved
-    let resolved_line = tokio::time::timeout(Duration::from_secs(2), tui_lines.next_line())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    let resolved: ServerMessage = decode(&resolved_line).unwrap();
+    // TUI should also receive DecisionResolved (skip AgentDisconnected)
+    let resolved = next_tui_msg(&mut tui_lines, |m| {
+        matches!(m, ServerMessage::DecisionResolved { .. })
+    })
+    .await;
     match resolved {
         ServerMessage::DecisionResolved { id, decision } => {
             assert_eq!(id, req_id);
@@ -359,13 +378,15 @@ async fn multiple_hooks_queued_then_resolved_individually() {
     let msg2 = encode(&ClientMessage::DecisionRequest(req2)).unwrap();
     hook2_writer.write_all(msg2.as_bytes()).await.unwrap();
 
-    // TUI receives both NewDecision events
-    let _ = tokio::time::timeout(Duration::from_secs(2), tui_lines.next_line())
-        .await
-        .unwrap();
-    let _ = tokio::time::timeout(Duration::from_secs(2), tui_lines.next_line())
-        .await
-        .unwrap();
+    // TUI receives both NewDecision events (skip AgentConnected)
+    let _ = next_tui_msg(&mut tui_lines, |m| {
+        matches!(m, ServerMessage::NewDecision(_))
+    })
+    .await;
+    let _ = next_tui_msg(&mut tui_lines, |m| {
+        matches!(m, ServerMessage::NewDecision(_))
+    })
+    .await;
 
     // Approve hook 2 first (out of order)
     let approve2 = encode(&ClientMessage::Approve { id: id2 }).unwrap();
@@ -428,11 +449,12 @@ async fn approve_all_resolves_all_pending_hooks() {
         writer.write_all(msg.as_bytes()).await.unwrap();
     }
 
-    // Wait for all 3 NewDecision events on TUI
+    // Wait for all 3 NewDecision events on TUI (skip AgentConnected)
     for _ in 0..3 {
-        let _ = tokio::time::timeout(Duration::from_secs(2), tui_lines.next_line())
-            .await
-            .unwrap();
+        let _ = next_tui_msg(&mut tui_lines, |m| {
+            matches!(m, ServerMessage::NewDecision(_))
+        })
+        .await;
     }
 
     // TUI sends ApproveAll
