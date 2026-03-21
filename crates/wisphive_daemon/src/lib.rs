@@ -7,4 +7,4 @@ pub mod server;
 pub mod shutdown;
 pub mod state;
 
-pub use config::DaemonConfig;
+pub use config::{DaemonConfig, UserConfig};

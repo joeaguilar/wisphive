@@ -82,8 +82,9 @@ impl Server {
                             let tui_tx = self.tui_tx.clone();
                             let state_db = self.state_db.clone();
                             let timeout = self.config.hook_timeout_secs;
+                            let notifications = self.config.notifications_enabled;
                             tokio::spawn(async move {
-                                if let Err(e) = handle_connection(stream, queue, process_registry, agent_registry, tui_tx, state_db, timeout).await {
+                                if let Err(e) = handle_connection(stream, queue, process_registry, agent_registry, tui_tx, state_db, timeout, notifications).await {
                                     warn!("connection error: {e}");
                                 }
                             });
@@ -125,6 +126,7 @@ async fn handle_connection(
     tui_tx: broadcast::Sender<ServerMessage>,
     state_db: Arc<StateDb>,
     hook_timeout_secs: u64,
+    notifications_enabled: bool,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -154,7 +156,7 @@ async fn handle_connection(
 
             match client {
                 ClientType::Hook => {
-                    handle_hook(lines, writer, queue, agent_registry, tui_tx.clone(), state_db, hook_timeout_secs).await
+                    handle_hook(lines, writer, queue, agent_registry, tui_tx.clone(), state_db, hook_timeout_secs, notifications_enabled).await
                 }
                 ClientType::Tui => {
                     handle_tui(lines, writer, queue, process_registry, state_db, tui_tx).await
@@ -180,6 +182,7 @@ async fn handle_hook(
     tui_tx: broadcast::Sender<ServerMessage>,
     state_db: Arc<StateDb>,
     timeout_secs: u64,
+    notifications_enabled: bool,
 ) -> Result<()> {
     let line = lines
         .next_line()
@@ -204,7 +207,9 @@ async fn handle_hook(
             state_db.persist_pending(&req).await?;
 
             // Send passive notification so user knows to check the TUI
-            crate::notify::notify_decision(&req);
+            if notifications_enabled {
+                crate::notify::notify_decision(&req);
+            }
 
             // Enqueue and get receiver
             let rx = {

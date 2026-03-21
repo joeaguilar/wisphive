@@ -44,11 +44,35 @@ enum Command {
         action: HistoryAction,
     },
 
+    /// View or change daemon configuration
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+
     /// Check setup and diagnose issues
     Doctor {
         /// Project directory to check (defaults to current directory)
         #[arg(long)]
         project: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Show all config values
+    List,
+    /// Get a config value
+    Get {
+        /// Config key (e.g. "notifications")
+        key: String,
+    },
+    /// Set a config value
+    Set {
+        /// Config key (e.g. "notifications")
+        key: String,
+        /// Value to set (e.g. "false")
+        value: String,
     },
 }
 
@@ -148,6 +172,11 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         // Daemon-independent commands (no tokio runtime needed)
+        Command::Config { action } => match action {
+            ConfigAction::List => commands::config::list(),
+            ConfigAction::Get { key } => commands::config::get(&key),
+            ConfigAction::Set { key, value } => commands::config::set(&key, &value),
+        },
         Command::Doctor { project } => commands::doctor::run(project),
         Command::EmergencyOff => commands::hooks::emergency_off(),
         Command::Hooks { action } => match action {
