@@ -10,6 +10,26 @@ use wisphive_protocol::{
 
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Tools that are always safe to auto-approve (read-only, no side effects).
+/// These never hit the daemon — the hook exits 0 immediately.
+const DEFAULT_AUTO_APPROVE: &[&str] = &[
+    "Read",
+    "Glob",
+    "Grep",
+    "LS",
+    "WebSearch",
+    "WebFetch",
+    "NotebookRead",
+    "Agent",
+    "Skill",
+    "TaskCreate",
+    "TaskUpdate",
+    "TaskGet",
+    "TaskList",
+    "TodoRead",
+    "ToolSearch",
+];
+
 fn main() {
     // Any failure = exit 0 (allow). Wisphive is fail-open.
     let code = match run() {
@@ -24,9 +44,10 @@ fn main() {
 
 fn run() -> Result<Decision, Box<dyn std::error::Error>> {
     let home = home_dir();
+    let wisphive_dir = home.join(".wisphive");
 
     // Layer 1: Mode file check
-    let mode_path = home.join(".wisphive").join("mode");
+    let mode_path = wisphive_dir.join("mode");
     let mode = std::fs::read_to_string(&mode_path).unwrap_or_else(|_| "off".into());
     if mode.trim() != "active" {
         return Ok(Decision::Approve);
@@ -36,15 +57,6 @@ fn run() -> Result<Decision, Box<dyn std::error::Error>> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
 
-    // Parse the hook event — Claude Code sends JSON with tool info:
-    // {
-    //   "session_id": "abc123",
-    //   "cwd": "/project",
-    //   "hook_event_name": "PreToolUse",
-    //   "tool_name": "Bash",
-    //   "tool_input": {"command": "cargo build"},
-    //   "tool_use_id": "toolu_..."
-    // }
     let hook_event: serde_json::Value = serde_json::from_str(&input)?;
 
     let tool_name = hook_event
@@ -53,13 +65,17 @@ fn run() -> Result<Decision, Box<dyn std::error::Error>> {
         .unwrap_or("unknown")
         .to_string();
 
+    // Layer 3: Auto-approve safe tools before contacting daemon.
+    // Check user overrides first (~/.wisphive/auto-approve.json), fall back to defaults.
+    if is_auto_approved(&tool_name, &wisphive_dir) {
+        return Ok(Decision::Approve);
+    }
+
     let tool_input = hook_event
         .get("tool_input")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
 
-    // Use session_id from Claude Code as agent_id (stable per session),
-    // fall back to WISPHIVE_AGENT_ID env var, then PID.
     let agent_id = hook_event
         .get("session_id")
         .and_then(|v| v.as_str())
@@ -67,8 +83,6 @@ fn run() -> Result<Decision, Box<dyn std::error::Error>> {
         .or_else(|| std::env::var("WISPHIVE_AGENT_ID").ok())
         .unwrap_or_else(|| format!("cc-{}", process::id()));
 
-    // Use CLAUDE_PROJECT_DIR env var (set by Claude Code), fall back to
-    // cwd from hook event, then std::env::current_dir.
     let project = std::env::var("CLAUDE_PROJECT_DIR")
         .map(PathBuf::from)
         .or_else(|_| {
@@ -90,8 +104,8 @@ fn run() -> Result<Decision, Box<dyn std::error::Error>> {
         timestamp: chrono::Utc::now(),
     };
 
-    // Layer 3: Connect to daemon socket (fails instantly if daemon is dead)
-    let socket_path = home.join(".wisphive").join("wisphive.sock");
+    // Layer 4: Connect to daemon socket (fails instantly if daemon is dead)
+    let socket_path = wisphive_dir.join("wisphive.sock");
     let stream = UnixStream::connect(&socket_path)?;
     stream.set_read_timeout(Some(SOCKET_TIMEOUT))?;
     stream.set_write_timeout(Some(SOCKET_TIMEOUT))?;
@@ -115,7 +129,6 @@ fn run() -> Result<Decision, Box<dyn std::error::Error>> {
     writer.write_all(req_msg.as_bytes())?;
 
     // Block for response — daemon controls timeout (up to 1 hour).
-    // Remove the short read timeout so we don't time out before the human decides.
     writer.set_read_timeout(None)?;
 
     let mut response_line = String::new();
@@ -125,8 +138,38 @@ fn run() -> Result<Decision, Box<dyn std::error::Error>> {
 
     match response {
         ServerMessage::DecisionResponse { decision, .. } => Ok(decision),
-        _ => Ok(Decision::Approve), // Unexpected response = allow
+        _ => Ok(Decision::Approve),
     }
+}
+
+/// Check if a tool is auto-approved.
+///
+/// Reads ~/.wisphive/auto-approve.json if it exists:
+/// ```json
+/// {
+///   "auto_approve": ["Read", "Glob", "Grep", "Bash"],
+///   "always_queue": ["Write", "Edit"]
+/// }
+/// ```
+///
+/// If the file doesn't exist, uses DEFAULT_AUTO_APPROVE.
+fn is_auto_approved(tool_name: &str, wisphive_dir: &std::path::Path) -> bool {
+    let config_path = wisphive_dir.join("auto-approve.json");
+
+    if config_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&config_path) {
+            if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(arr) = config.get("auto_approve").and_then(|v| v.as_array()) {
+                    return arr
+                        .iter()
+                        .any(|v| v.as_str().is_some_and(|s| s == tool_name));
+                }
+            }
+        }
+        // Config exists but is broken — fall through to defaults
+    }
+
+    DEFAULT_AUTO_APPROVE.iter().any(|&safe| safe == tool_name)
 }
 
 fn home_dir() -> PathBuf {
