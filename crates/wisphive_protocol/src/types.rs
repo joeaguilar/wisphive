@@ -78,6 +78,20 @@ pub struct ManagedAgent {
     pub started_at: DateTime<Utc>,
 }
 
+/// A resolved decision from the audit log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub id: Uuid,
+    pub agent_id: String,
+    pub agent_type: AgentType,
+    pub project: PathBuf,
+    pub tool_name: String,
+    pub tool_input: serde_json::Value,
+    pub decision: Decision,
+    pub requested_at: DateTime<Utc>,
+    pub resolved_at: DateTime<Utc>,
+}
+
 /// Filter criteria for batch operations on the decision queue.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DecisionFilter {

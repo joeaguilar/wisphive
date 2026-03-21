@@ -134,6 +134,13 @@ async fn run_loop(
                             };
                             conn.send(&ClientMessage::SpawnAgent(req)).await?;
                         }
+                        InputAction::QueryHistory { agent_id } => {
+                            tracing::info!(?agent_id, "querying history");
+                            conn.send(&ClientMessage::QueryHistory {
+                                agent_id,
+                                limit: Some(200),
+                            }).await?;
+                        }
                         InputAction::None => {}
                     }
                 }
@@ -166,6 +173,11 @@ async fn run_loop(
                         tracing::info!(agent = %agent_id, "agent disconnected");
                         app.agents.retain(|a| a.agent_id != *agent_id);
                         app.rebuild_projects();
+                    }
+                    Some(ServerMessage::HistoryResponse { entries }) => {
+                        tracing::info!(count = entries.len(), "received history");
+                        app.history = entries;
+                        app.history_index = 0;
                     }
                     Some(_) => {}
                     None => {

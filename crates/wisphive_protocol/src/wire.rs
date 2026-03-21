@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::types::{AgentInfo, Decision, DecisionFilter, DecisionRequest, ManagedAgent, SpawnAgentRequest};
+use crate::types::{AgentInfo, Decision, DecisionFilter, DecisionRequest, HistoryEntry, ManagedAgent, SpawnAgentRequest};
 
 /// Identifies the type of client connecting to the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +52,17 @@ pub enum ClientMessage {
     /// Stop a daemon-managed agent process.
     #[serde(rename = "stop_agent")]
     StopAgent { agent_id: String },
+
+    /// Query decision history from the audit log.
+    #[serde(rename = "query_history")]
+    QueryHistory {
+        /// Filter by agent ID. None = all agents.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        /// Maximum number of entries to return (default 200).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
 }
 
 /// Messages sent from the daemon to clients.
@@ -100,6 +111,10 @@ pub enum ServerMessage {
     /// Response to ListAgents request.
     #[serde(rename = "agent_list")]
     AgentList { agents: Vec<ManagedAgent> },
+
+    /// Response to QueryHistory request.
+    #[serde(rename = "history_response")]
+    HistoryResponse { entries: Vec<HistoryEntry> },
 
     /// Error message.
     #[serde(rename = "error")]
