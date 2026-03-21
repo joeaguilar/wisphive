@@ -859,17 +859,26 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(bar, area);
 }
 
+/// Return the tail of `s` that fits in `max_width` chars, keeping the cursor end visible.
+fn visible_tail(s: &str, max_width: usize) -> &str {
+    if s.len() <= max_width {
+        s
+    } else {
+        &s[s.len() - max_width..]
+    }
+}
+
 fn draw_modal(frame: &mut Frame, modal: &Modal) {
     let area = frame.area();
 
     // Text/edit input modals are taller
     let has_input = modal.text_input.is_some() || modal.edit_input.is_some() || modal.spawn.is_some();
     let modal_height = if has_input {
-        10.min(area.height.saturating_sub(4))
+        12.min(area.height.saturating_sub(4))
     } else {
         7.min(area.height.saturating_sub(4))
     };
-    let modal_width = 60.min(area.width.saturating_sub(4));
+    let modal_width = 80.min(area.width.saturating_sub(4));
 
     let x = (area.width.saturating_sub(modal_width)) / 2;
     let y = (area.height.saturating_sub(modal_height)) / 2;
@@ -888,21 +897,26 @@ fn draw_modal(frame: &mut Frame, modal: &Modal) {
         Style::default().fg(Color::White),
     ))];
 
+    // Available width for input text: modal inner width minus "> " prefix and "_" cursor
+    let input_max_width = modal_width.saturating_sub(6) as usize; // 2 border + 2 "> " + 1 "_" + 1 pad
+
     if let Some(ref text_input) = modal.text_input {
         lines.push(Line::from(""));
+        let visible = visible_tail(&text_input.buffer, input_max_width);
         lines.push(Line::from(vec![
             Span::styled("> ", Style::default().fg(Color::Cyan)),
             Span::styled(
-                format!("{}_", text_input.buffer),
+                format!("{visible}_"),
                 Style::default().fg(Color::Yellow),
             ),
         ]));
     } else if let Some(ref edit_input) = modal.edit_input {
         lines.push(Line::from(""));
+        let visible = visible_tail(&edit_input.buffer, input_max_width);
         lines.push(Line::from(vec![
             Span::styled("> ", Style::default().fg(Color::Cyan)),
             Span::styled(
-                format!("{}_", edit_input.buffer),
+                format!("{visible}_"),
                 Style::default().fg(Color::Yellow),
             ),
         ]));
