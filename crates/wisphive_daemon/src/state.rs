@@ -403,6 +403,47 @@ impl StateDb {
             .collect())
     }
 
+    /// Query distinct projects from decision_log with aggregated stats.
+    pub async fn query_projects(&self) -> Result<Vec<wisphive_protocol::ProjectSummary>> {
+        let rows: Vec<(String, String, String, i64, i64, i64, i64)> = sqlx::query_as(
+            "SELECT project,
+                    MIN(requested_at) as first_seen,
+                    MAX(resolved_at) as last_seen,
+                    COUNT(*) as total_calls,
+                    SUM(CASE WHEN decision = '\"approve\"' THEN 1 ELSE 0 END) as approved,
+                    SUM(CASE WHEN decision = '\"deny\"' THEN 1 ELSE 0 END) as denied,
+                    COUNT(DISTINCT agent_id) as agent_count
+             FROM decision_log
+             GROUP BY project
+             ORDER BY last_seen DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(
+                |(project, first_seen, last_seen, total, approved, denied, agent_count)| {
+                    Some(wisphive_protocol::ProjectSummary {
+                        project: std::path::PathBuf::from(project),
+                        first_seen: chrono::DateTime::parse_from_rfc3339(&first_seen)
+                            .ok()?
+                            .with_timezone(&chrono::Utc),
+                        last_seen: chrono::DateTime::parse_from_rfc3339(&last_seen)
+                            .ok()?
+                            .with_timezone(&chrono::Utc),
+                        total_calls: total as u32,
+                        approved: approved as u32,
+                        denied: denied as u32,
+                        agent_count: agent_count as u32,
+                        pending_count: 0,
+                        has_live_agents: false,
+                    })
+                },
+            )
+            .collect())
+    }
+
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }

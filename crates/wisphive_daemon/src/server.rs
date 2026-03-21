@@ -544,6 +544,70 @@ async fn handle_tui(
                                     }
                                 }
                             }
+                            ClientMessage::QueryProjects => {
+                                match state_db.query_projects().await {
+                                    Ok(mut projects) => {
+                                        // Enrich with live agent presence
+                                        let live_agents = {
+                                            let reg = agent_registry.lock().await;
+                                            reg.snapshot()
+                                        };
+                                        let mut live_projects: std::collections::HashSet<std::path::PathBuf> =
+                                            std::collections::HashSet::new();
+                                        for agent in &live_agents {
+                                            live_projects.insert(agent.project.clone());
+                                        }
+
+                                        // Pending counts per project
+                                        let pending_counts: std::collections::HashMap<std::path::PathBuf, u32> = {
+                                            let q = queue.lock().await;
+                                            let snapshot = q.snapshot();
+                                            let mut counts = std::collections::HashMap::new();
+                                            for req in &snapshot {
+                                                *counts.entry(req.project.clone()).or_insert(0) += 1;
+                                            }
+                                            counts
+                                        };
+
+                                        for project in &mut projects {
+                                            project.has_live_agents = live_projects.contains(&project.project);
+                                            project.pending_count = pending_counts.get(&project.project).copied().unwrap_or(0);
+                                        }
+
+                                        // Add projects with live agents but no history
+                                        for agent in &live_agents {
+                                            if !projects.iter().any(|p| p.project == agent.project) {
+                                                projects.push(wisphive_protocol::ProjectSummary {
+                                                    project: agent.project.clone(),
+                                                    first_seen: agent.started_at,
+                                                    last_seen: agent.started_at,
+                                                    total_calls: 0,
+                                                    approved: 0,
+                                                    denied: 0,
+                                                    agent_count: 1,
+                                                    pending_count: pending_counts.get(&agent.project).copied().unwrap_or(0),
+                                                    has_live_agents: true,
+                                                });
+                                            }
+                                        }
+
+                                        projects.sort_by(|a, b| {
+                                            let a_key = (a.has_live_agents && a.pending_count > 0, a.has_live_agents, a.last_seen);
+                                            let b_key = (b.has_live_agents && b.pending_count > 0, b.has_live_agents, b.last_seen);
+                                            b_key.partial_cmp(&a_key).unwrap_or(std::cmp::Ordering::Equal)
+                                        });
+
+                                        let resp = encode(&ServerMessage::ProjectsResponse { projects })?;
+                                        writer.write_all(resp.as_bytes()).await?;
+                                    }
+                                    Err(e) => {
+                                        let resp = encode(&ServerMessage::Error {
+                                            message: format!("projects query failed: {e}"),
+                                        })?;
+                                        writer.write_all(resp.as_bytes()).await?;
+                                    }
+                                }
+                            }
                             ClientMessage::StopAgent { ref agent_id } => {
                                 let mut pr = process_registry.lock().await;
                                 match pr.stop_agent(agent_id).await {
