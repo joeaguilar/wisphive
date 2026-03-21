@@ -156,6 +156,9 @@ async fn handle_hook(
             // Persist for crash recovery
             state_db.persist_pending(&req).await?;
 
+            // Send macOS notification
+            crate::notify::notify_decision(&req);
+
             // Enqueue and get receiver
             let rx = {
                 let mut q = queue.lock().await;
