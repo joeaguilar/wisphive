@@ -35,6 +35,12 @@ pub enum InputAction {
     ApproveWithContext { id: uuid::Uuid, context: String },
     /// Defer to agent's native permission prompt.
     AskDefer(uuid::Uuid),
+    /// Request session summaries from the daemon.
+    QuerySessions,
+    /// Request the timeline for a specific session.
+    QuerySessionTimeline { agent_id: String },
+    /// Request a specific page of session timeline.
+    QuerySessionTimelinePage { agent_id: String, page: usize },
     /// Quit the application.
     Quit,
 }
@@ -56,6 +62,8 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
         ViewMode::History => return handle_history_input(app, key),
         ViewMode::HistoryDetail => return handle_history_detail_input(app, key),
         ViewMode::Config => return handle_config_input(app, key),
+        ViewMode::Sessions => return handle_sessions_input(app, key),
+        ViewMode::SessionTimeline => return handle_session_timeline_input(app, key),
         ViewMode::Dashboard => {}
     }
 
@@ -85,6 +93,11 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
         KeyCode::Char('h') => {
             app.enter_history_view(None);
             return InputAction::QueryHistory { agent_id: None };
+        }
+        // Open sessions view
+        KeyCode::Char('s') => {
+            app.enter_sessions_view();
+            return InputAction::QuerySessions;
         }
         // Open config view
         KeyCode::Char('c') => {
@@ -699,6 +712,82 @@ fn handle_config_input(app: &mut App, key: KeyEvent) -> InputAction {
             InputAction::None
         }
         KeyCode::Char('Q') => InputAction::Quit,
+        _ => InputAction::None,
+    }
+}
+
+fn handle_sessions_input(app: &mut App, key: KeyEvent) -> InputAction {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.exit_sessions_view();
+            InputAction::None
+        }
+        KeyCode::Char('Q') => InputAction::Quit,
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.sessions_down();
+            InputAction::None
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.sessions_up();
+            InputAction::None
+        }
+        KeyCode::Enter => {
+            if let Some(session) = app.selected_session() {
+                let agent_id = session.agent_id.clone();
+                app.enter_session_timeline_view(agent_id.clone());
+                InputAction::QuerySessionTimeline { agent_id }
+            } else {
+                InputAction::None
+            }
+        }
+        KeyCode::Char('r') => InputAction::QuerySessions,
+        _ => InputAction::None,
+    }
+}
+
+fn handle_session_timeline_input(app: &mut App, key: KeyEvent) -> InputAction {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.exit_session_timeline_view();
+            InputAction::None
+        }
+        KeyCode::Char('Q') => InputAction::Quit,
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.session_timeline_down();
+            InputAction::None
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.session_timeline_up();
+            InputAction::None
+        }
+        KeyCode::Enter => {
+            app.enter_timeline_detail_view();
+            InputAction::None
+        }
+        KeyCode::Char('[') | KeyCode::Char('H') => {
+            if app.session_timeline_page > 0 {
+                app.session_timeline_page -= 1;
+                app.session_timeline_index = 0;
+                let agent_id = app.session_timeline_agent_id.clone().unwrap_or_default();
+                return InputAction::QuerySessionTimelinePage {
+                    agent_id,
+                    page: app.session_timeline_page,
+                };
+            }
+            InputAction::None
+        }
+        KeyCode::Char(']') | KeyCode::Char('L') => {
+            if app.session_timeline_has_more {
+                app.session_timeline_page += 1;
+                app.session_timeline_index = 0;
+                let agent_id = app.session_timeline_agent_id.clone().unwrap_or_default();
+                return InputAction::QuerySessionTimelinePage {
+                    agent_id,
+                    page: app.session_timeline_page,
+                };
+            }
+            InputAction::None
+        }
         _ => InputAction::None,
     }
 }

@@ -162,6 +162,26 @@ async fn run_loop(
                             tracing::info!(?search.query, "searching history");
                             conn.send(&ClientMessage::SearchHistory(search)).await?;
                         }
+                        InputAction::QuerySessions => {
+                            tracing::info!("querying sessions");
+                            conn.send(&ClientMessage::QuerySessions).await?;
+                        }
+                        InputAction::QuerySessionTimeline { agent_id } => {
+                            tracing::info!(%agent_id, "querying session timeline");
+                            app.session_timeline_page = 0;
+                            conn.send(&ClientMessage::QueryHistory {
+                                agent_id: Some(agent_id),
+                                limit: Some(HISTORY_PAGE_SIZE + 1),
+                            }).await?;
+                        }
+                        InputAction::QuerySessionTimelinePage { agent_id, page } => {
+                            tracing::info!(%agent_id, page, "querying session timeline page");
+                            let offset = page as u32 * HISTORY_PAGE_SIZE;
+                            conn.send(&ClientMessage::QueryHistory {
+                                agent_id: Some(agent_id),
+                                limit: Some(offset + HISTORY_PAGE_SIZE + 1),
+                            }).await?;
+                        }
                         InputAction::DenyWithMessage { id, message } => {
                             tracing::info!(%id, %message, "denied with message");
                             conn.send(&ClientMessage::Deny { id, message: Some(message) }).await?;
@@ -250,15 +270,30 @@ async fn run_loop(
                         app.rebuild_projects();
                     }
                     Some(ServerMessage::HistoryResponse { entries }) => {
-                        tracing::info!(count = entries.len(), page = app.history_page, "received history");
-                        // We request PAGE_SIZE+1 to detect if there are more pages
+                        tracing::info!(count = entries.len(), "received history");
                         let page_size = HISTORY_PAGE_SIZE as usize;
-                        let offset = app.history_page * page_size;
-                        // Skip entries from previous pages, take up to page_size
-                        let page_entries: Vec<_> = entries.into_iter().skip(offset).collect();
-                        app.history_has_more = page_entries.len() > page_size;
-                        app.history = page_entries.into_iter().take(page_size).collect();
-                        app.history_index = 0;
+
+                        match app.view_mode {
+                            wisphive_tui::app::ViewMode::SessionTimeline => {
+                                let offset = app.session_timeline_page * page_size;
+                                let page_entries: Vec<_> = entries.into_iter().skip(offset).collect();
+                                app.session_timeline_has_more = page_entries.len() > page_size;
+                                app.session_timeline = page_entries.into_iter().take(page_size).collect();
+                                app.session_timeline_index = 0;
+                            }
+                            _ => {
+                                let offset = app.history_page * page_size;
+                                let page_entries: Vec<_> = entries.into_iter().skip(offset).collect();
+                                app.history_has_more = page_entries.len() > page_size;
+                                app.history = page_entries.into_iter().take(page_size).collect();
+                                app.history_index = 0;
+                            }
+                        }
+                    }
+                    Some(ServerMessage::SessionsResponse { sessions }) => {
+                        tracing::info!(count = sessions.len(), "received sessions");
+                        app.sessions = sessions;
+                        app.sessions_index = 0;
                     }
                     Some(_) => {}
                     None => {

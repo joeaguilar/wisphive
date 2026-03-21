@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use std::path::PathBuf;
 
-use crate::types::{AgentInfo, AgentType, Decision, DecisionFilter, DecisionRequest, HistoryEntry, HistorySearch, ManagedAgent, SpawnAgentRequest, ToolResult};
+use crate::types::{AgentInfo, AgentType, Decision, DecisionFilter, DecisionRequest, HistoryEntry, HistorySearch, ManagedAgent, SessionSummary, SpawnAgentRequest, ToolResult};
 
 /// Identifies the type of client connecting to the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +92,10 @@ pub enum ClientMessage {
     #[serde(rename = "search_history")]
     SearchHistory(HistorySearch),
 
+    /// Query session summaries (live + historical).
+    #[serde(rename = "query_sessions")]
+    QuerySessions,
+
     /// Hook registers an agent session (fire-and-forget, no response expected).
     #[serde(rename = "agent_register")]
     AgentRegister {
@@ -160,6 +164,10 @@ pub enum ServerMessage {
     /// Response to QueryHistory request.
     #[serde(rename = "history_response")]
     HistoryResponse { entries: Vec<HistoryEntry> },
+
+    /// Response to QuerySessions: list of session summaries.
+    #[serde(rename = "sessions_response")]
+    SessionsResponse { sessions: Vec<SessionSummary> },
 
     /// Full snapshot of currently registered agents, sent to TUI on connect.
     #[serde(rename = "agents_snapshot")]

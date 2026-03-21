@@ -110,6 +110,23 @@ impl From<Decision> for RichDecision {
     }
 }
 
+/// Aggregated stats for one agent session (identified by agent_id).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub agent_id: String,
+    pub agent_type: AgentType,
+    pub project: PathBuf,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    pub total_calls: u32,
+    pub approved: u32,
+    pub denied: u32,
+    /// Whether this session is currently connected (live agent).
+    pub is_live: bool,
+    /// Number of currently pending decisions for this session.
+    pub pending_count: u32,
+}
+
 /// Request to spawn a new AI agent process.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnAgentRequest {
@@ -178,6 +195,21 @@ pub struct HistoryEntry {
     /// Tool execution result (captured by PostToolUse hook). None for old/denied entries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_result: Option<serde_json::Value>,
+}
+
+/// Content-aware rule for a specific tool.
+///
+/// When a tool would be auto-approved, `deny_patterns` can block specific inputs
+/// (sending them to the TUI). When a tool is NOT auto-approved, `allow_patterns`
+/// can auto-approve specific inputs. Patterns are case-insensitive substrings
+/// matched against the tool input (the `command` field for Bash, or the full
+/// JSON-serialized input for other tools).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ToolRule {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_patterns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_patterns: Vec<String>,
 }
 
 /// Auto-approve permission levels. Higher levels include all tools from lower levels.

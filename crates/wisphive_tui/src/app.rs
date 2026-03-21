@@ -31,6 +31,10 @@ pub enum ViewMode {
     HistoryDetail,
     /// Configuration panel.
     Config,
+    /// Session list browser.
+    Sessions,
+    /// Timeline for a single session.
+    SessionTimeline,
 }
 
 /// Which panel currently has focus.
@@ -109,6 +113,20 @@ pub struct App {
     pub config_add: Vec<String>,
     /// Tools removed as overrides.
     pub config_remove: Vec<String>,
+    /// Session summaries (live + historical).
+    pub sessions: Vec<wisphive_protocol::SessionSummary>,
+    /// Currently selected index in the sessions list.
+    pub sessions_index: usize,
+    /// Agent ID of the session timeline being viewed.
+    pub session_timeline_agent_id: Option<String>,
+    /// Timeline entries for the current session.
+    pub session_timeline: Vec<HistoryEntry>,
+    /// Currently selected index in the session timeline.
+    pub session_timeline_index: usize,
+    /// Current page of the session timeline.
+    pub session_timeline_page: usize,
+    /// Whether there are more timeline pages.
+    pub session_timeline_has_more: bool,
 }
 
 /// Aggregated project status for the dashboard.
@@ -149,6 +167,13 @@ impl App {
             config_index: 0,
             config_add: Vec::new(),
             config_remove: Vec::new(),
+            sessions: Vec::new(),
+            sessions_index: 0,
+            session_timeline_agent_id: None,
+            session_timeline: Vec::new(),
+            session_timeline_index: 0,
+            session_timeline_page: 0,
+            session_timeline_has_more: false,
         }
     }
 
@@ -404,6 +429,75 @@ impl App {
         match std::fs::read_to_string(&path) {
             Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
             Err(_) => ConfigSnapshot::default(),
+        }
+    }
+
+    // ── Session view helpers ──
+
+    pub fn enter_sessions_view(&mut self) {
+        self.sessions_index = 0;
+        self.push_view(ViewMode::Sessions);
+    }
+
+    pub fn exit_sessions_view(&mut self) {
+        self.sessions.clear();
+        self.sessions_index = 0;
+        self.navigate_back();
+    }
+
+    pub fn enter_session_timeline_view(&mut self, agent_id: String) {
+        self.session_timeline_agent_id = Some(agent_id);
+        self.session_timeline_index = 0;
+        self.session_timeline_page = 0;
+        self.session_timeline_has_more = false;
+        self.push_view(ViewMode::SessionTimeline);
+    }
+
+    pub fn exit_session_timeline_view(&mut self) {
+        self.session_timeline.clear();
+        self.session_timeline_index = 0;
+        self.session_timeline_page = 0;
+        self.session_timeline_has_more = false;
+        self.session_timeline_agent_id = None;
+        self.navigate_back();
+    }
+
+    pub fn sessions_up(&mut self) {
+        if self.sessions_index > 0 {
+            self.sessions_index -= 1;
+        }
+    }
+
+    pub fn sessions_down(&mut self) {
+        let len = self.sessions.len();
+        if len > 0 && self.sessions_index < len - 1 {
+            self.sessions_index += 1;
+        }
+    }
+
+    pub fn selected_session(&self) -> Option<&wisphive_protocol::SessionSummary> {
+        self.sessions.get(self.sessions_index)
+    }
+
+    pub fn session_timeline_up(&mut self) {
+        if self.session_timeline_index > 0 {
+            self.session_timeline_index -= 1;
+        }
+    }
+
+    pub fn session_timeline_down(&mut self) {
+        let len = self.session_timeline.len();
+        if len > 0 && self.session_timeline_index < len - 1 {
+            self.session_timeline_index += 1;
+        }
+    }
+
+    pub fn enter_timeline_detail_view(&mut self) {
+        if self.session_timeline.get(self.session_timeline_index).is_some() {
+            self.history = self.session_timeline.clone();
+            self.history_index = self.session_timeline_index;
+            self.detail_scroll = 0;
+            self.push_view(ViewMode::HistoryDetail);
         }
     }
 

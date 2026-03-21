@@ -466,6 +466,69 @@ async fn handle_tui(
                                     }
                                 }
                             }
+                            ClientMessage::QuerySessions => {
+                                match state_db.query_sessions().await {
+                                    Ok(mut sessions) => {
+                                        // Enrich with live status
+                                        let live_agents = {
+                                            let reg = agent_registry.lock().await;
+                                            reg.snapshot()
+                                        };
+                                        let live_ids: std::collections::HashSet<String> =
+                                            live_agents.iter().map(|a| a.agent_id.clone()).collect();
+
+                                        // Pending counts from queue
+                                        let pending_counts: std::collections::HashMap<String, u32> = {
+                                            let q = queue.lock().await;
+                                            let snapshot = q.snapshot();
+                                            let mut counts = std::collections::HashMap::new();
+                                            for req in &snapshot {
+                                                *counts.entry(req.agent_id.clone()).or_insert(0) += 1;
+                                            }
+                                            counts
+                                        };
+
+                                        for session in &mut sessions {
+                                            session.is_live = live_ids.contains(&session.agent_id);
+                                            session.pending_count = pending_counts.get(&session.agent_id).copied().unwrap_or(0);
+                                        }
+
+                                        // Add live agents with no history yet
+                                        for agent in &live_agents {
+                                            if !sessions.iter().any(|s| s.agent_id == agent.agent_id) {
+                                                sessions.push(wisphive_protocol::SessionSummary {
+                                                    agent_id: agent.agent_id.clone(),
+                                                    agent_type: agent.agent_type.clone(),
+                                                    project: agent.project.clone(),
+                                                    first_seen: agent.started_at,
+                                                    last_seen: agent.started_at,
+                                                    total_calls: 0,
+                                                    approved: 0,
+                                                    denied: 0,
+                                                    is_live: true,
+                                                    pending_count: pending_counts.get(&agent.agent_id).copied().unwrap_or(0),
+                                                });
+                                            }
+                                        }
+
+                                        // Sort: live+pending first, then live, then by last_seen DESC
+                                        sessions.sort_by(|a, b| {
+                                            let a_key = (a.is_live && a.pending_count > 0, a.is_live, a.last_seen);
+                                            let b_key = (b.is_live && b.pending_count > 0, b.is_live, b.last_seen);
+                                            b_key.partial_cmp(&a_key).unwrap_or(std::cmp::Ordering::Equal)
+                                        });
+
+                                        let resp = encode(&ServerMessage::SessionsResponse { sessions })?;
+                                        writer.write_all(resp.as_bytes()).await?;
+                                    }
+                                    Err(e) => {
+                                        let resp = encode(&ServerMessage::Error {
+                                            message: format!("sessions query failed: {e}"),
+                                        })?;
+                                        writer.write_all(resp.as_bytes()).await?;
+                                    }
+                                }
+                            }
                             ClientMessage::StopAgent { ref agent_id } => {
                                 let mut pr = process_registry.lock().await;
                                 match pr.stop_agent(agent_id).await {
