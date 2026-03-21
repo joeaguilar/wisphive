@@ -67,6 +67,19 @@ pub fn install(project: Option<PathBuf>, _all: bool) -> Result<()> {
     // Add PermissionRequest hook for permission management
     add_hook_entry(&mut settings, "PermissionRequest", &hook_command);
 
+    // Add hooks for all other blocking event types
+    for event in &[
+        "Elicitation",
+        "UserPromptSubmit",
+        "Stop",
+        "SubagentStop",
+        "ConfigChange",
+        "TeammateIdle",
+        "TaskCompleted",
+    ] {
+        add_hook_entry(&mut settings, event, &hook_command);
+    }
+
     // Add permissions so Claude Code auto-allows tools wisphive gates
     // (eliminates double-prompt — wisphive becomes the sole gatekeeper)
     add_wisphive_permissions(&mut settings);
@@ -100,10 +113,14 @@ pub fn uninstall(project: Option<PathBuf>, _all: bool) -> Result<()> {
 
     let hook_command = hook_binary_path();
 
-    // Remove Wisphive entries from each hook type
-    remove_hook_entries(&mut settings, "PreToolUse", &hook_command);
-    remove_hook_entries(&mut settings, "PostToolUse", &hook_command);
-    remove_hook_entries(&mut settings, "PermissionRequest", &hook_command);
+    // Remove Wisphive entries from all hook types
+    for event in &[
+        "PreToolUse", "PostToolUse", "PermissionRequest",
+        "Elicitation", "UserPromptSubmit", "Stop", "SubagentStop",
+        "ConfigChange", "TeammateIdle", "TaskCompleted",
+    ] {
+        remove_hook_entries(&mut settings, event, &hook_command);
+    }
 
     // Remove wisphive-managed permissions (preserves user-added ones)
     remove_wisphive_permissions(&mut settings);

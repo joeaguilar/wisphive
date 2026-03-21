@@ -16,10 +16,15 @@ pub fn notify_decision(req: &DecisionRequest) {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".into());
 
-    let title = if req.permission_suggestions.is_some() {
-        format!("Wisphive: {} permission request", req.tool_name)
-    } else {
-        format!("Wisphive: {} needs approval", req.tool_name)
+    let title = match req.hook_event_name {
+        wisphive_protocol::HookEventType::PermissionRequest => format!("Wisphive: {} permission request", req.tool_name),
+        wisphive_protocol::HookEventType::Elicitation => "Wisphive: MCP input needed".into(),
+        wisphive_protocol::HookEventType::Stop | wisphive_protocol::HookEventType::SubagentStop => "Wisphive: agent wants to stop".into(),
+        wisphive_protocol::HookEventType::UserPromptSubmit => "Wisphive: prompt review".into(),
+        wisphive_protocol::HookEventType::ConfigChange => "Wisphive: config change review".into(),
+        wisphive_protocol::HookEventType::TeammateIdle => "Wisphive: teammate idle".into(),
+        wisphive_protocol::HookEventType::TaskCompleted => "Wisphive: task completed".into(),
+        _ => format!("Wisphive: {} needs approval", req.tool_name),
     };
     let body = format!(
         "{}\n\nProject: {} ({})",

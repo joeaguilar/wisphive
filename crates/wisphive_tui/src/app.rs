@@ -352,11 +352,11 @@ impl App {
         self.queue.iter().find(|r| r.id == id)
     }
 
-    /// Check if the current detail request is a PermissionRequest.
-    pub fn detail_is_permission_request(&self) -> bool {
+    /// Get the hook event type of the current detail request.
+    pub fn detail_event_type(&self) -> wisphive_protocol::HookEventType {
         self.detail_request()
-            .and_then(|r| r.permission_suggestions.as_ref())
-            .is_some()
+            .map(|r| r.hook_event_name)
+            .unwrap_or_default()
     }
 
     /// Enter the history view.

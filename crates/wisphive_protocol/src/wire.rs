@@ -248,8 +248,10 @@ mod tests {
             tool_name: "Bash".into(),
             tool_input: serde_json::json!({"command": "cargo build"}),
             timestamp: chrono::Utc::now(),
+            hook_event_name: Default::default(),
             tool_use_id: None,
             permission_suggestions: None,
+            event_data: None,
         };
         let msg = ClientMessage::DecisionRequest(req);
         let encoded = encode(&msg).unwrap();
@@ -272,8 +274,10 @@ mod tests {
             tool_name: "Bash".into(),
             tool_input: serde_json::Value::Null,
             timestamp: chrono::Utc::now(),
+            hook_event_name: Default::default(),
             tool_use_id: None,
             permission_suggestions: None,
+            event_data: None,
         };
 
         let filter = DecisionFilter {

@@ -31,7 +31,16 @@ pub fn format_queue_item(req: &DecisionRequest) -> String {
         format!("{}h", age / 3600)
     };
 
-    let prefix = if req.permission_suggestions.is_some() { "P " } else { "  " };
+    let prefix = match req.hook_event_name {
+        wisphive_protocol::HookEventType::PermissionRequest => "P ",
+        wisphive_protocol::HookEventType::Elicitation => "E ",
+        wisphive_protocol::HookEventType::Stop | wisphive_protocol::HookEventType::SubagentStop => "S ",
+        wisphive_protocol::HookEventType::UserPromptSubmit => "U ",
+        wisphive_protocol::HookEventType::ConfigChange => "C ",
+        wisphive_protocol::HookEventType::TeammateIdle => "T ",
+        wisphive_protocol::HookEventType::TaskCompleted => "D ",
+        _ => "  ",
+    };
 
     format!(
         "{}[{}] {:<12} {:<8} {}  {:>5}",

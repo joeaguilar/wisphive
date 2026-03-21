@@ -79,6 +79,16 @@ impl StateDb {
             .await
             .ok();
 
+        // Add hook_event_name columns (idempotent)
+        sqlx::query("ALTER TABLE pending_decisions ADD COLUMN hook_event_name TEXT DEFAULT 'PreToolUse'")
+            .execute(&self.pool)
+            .await
+            .ok();
+        sqlx::query("ALTER TABLE decision_log ADD COLUMN hook_event_name TEXT DEFAULT 'PreToolUse'")
+            .execute(&self.pool)
+            .await
+            .ok();
+
         // Indexes for PostToolUse correlation and history queries
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_decision_log_agent_tool_resolved

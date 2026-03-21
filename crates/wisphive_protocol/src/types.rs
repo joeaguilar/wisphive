@@ -62,7 +62,82 @@ pub struct PermissionSuggestion {
     pub mode: Option<String>,
 }
 
-/// A decision the human needs to make about a tool call.
+/// The type of Claude Code hook event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum HookEventType {
+    PreToolUse,
+    PostToolUse,
+    PermissionRequest,
+    Elicitation,
+    ElicitationResult,
+    UserPromptSubmit,
+    Stop,
+    SubagentStop,
+    ConfigChange,
+    TeammateIdle,
+    TaskCompleted,
+    WorktreeCreate,
+    SessionStart,
+    SessionEnd,
+    Notification,
+    #[serde(other)]
+    Unknown,
+}
+
+impl Default for HookEventType {
+    fn default() -> Self {
+        Self::PreToolUse
+    }
+}
+
+impl std::fmt::Display for HookEventType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PreToolUse => write!(f, "PreToolUse"),
+            Self::PostToolUse => write!(f, "PostToolUse"),
+            Self::PermissionRequest => write!(f, "PermissionRequest"),
+            Self::Elicitation => write!(f, "Elicitation"),
+            Self::ElicitationResult => write!(f, "ElicitationResult"),
+            Self::UserPromptSubmit => write!(f, "UserPromptSubmit"),
+            Self::Stop => write!(f, "Stop"),
+            Self::SubagentStop => write!(f, "SubagentStop"),
+            Self::ConfigChange => write!(f, "ConfigChange"),
+            Self::TeammateIdle => write!(f, "TeammateIdle"),
+            Self::TaskCompleted => write!(f, "TaskCompleted"),
+            Self::WorktreeCreate => write!(f, "WorktreeCreate"),
+            Self::SessionStart => write!(f, "SessionStart"),
+            Self::SessionEnd => write!(f, "SessionEnd"),
+            Self::Notification => write!(f, "Notification"),
+            Self::Unknown => write!(f, "Unknown"),
+        }
+    }
+}
+
+impl std::str::FromStr for HookEventType {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, ()> {
+        match s {
+            "PreToolUse" => Ok(Self::PreToolUse),
+            "PostToolUse" => Ok(Self::PostToolUse),
+            "PermissionRequest" => Ok(Self::PermissionRequest),
+            "Elicitation" => Ok(Self::Elicitation),
+            "ElicitationResult" => Ok(Self::ElicitationResult),
+            "UserPromptSubmit" => Ok(Self::UserPromptSubmit),
+            "Stop" => Ok(Self::Stop),
+            "SubagentStop" => Ok(Self::SubagentStop),
+            "ConfigChange" => Ok(Self::ConfigChange),
+            "TeammateIdle" => Ok(Self::TeammateIdle),
+            "TaskCompleted" => Ok(Self::TaskCompleted),
+            "WorktreeCreate" => Ok(Self::WorktreeCreate),
+            "SessionStart" => Ok(Self::SessionStart),
+            "SessionEnd" => Ok(Self::SessionEnd),
+            "Notification" => Ok(Self::Notification),
+            _ => Ok(Self::Unknown),
+        }
+    }
+}
+
+/// A decision the human needs to make about a tool call or hook event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecisionRequest {
     pub id: Uuid,
@@ -72,13 +147,18 @@ pub struct DecisionRequest {
     pub tool_name: String,
     pub tool_input: serde_json::Value,
     pub timestamp: DateTime<Utc>,
+    /// The Claude Code hook event type. Defaults to PreToolUse for backward compat.
+    #[serde(default)]
+    pub hook_event_name: HookEventType,
     /// Claude Code's unique tool call ID for pre/post correlation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_use_id: Option<String>,
     /// Permission suggestions from Claude Code's PermissionRequest event.
-    /// Present only for PermissionRequest hooks (not PreToolUse).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_suggestions: Option<Vec<PermissionSuggestion>>,
+    /// Event-specific data (e.g., Elicitation schema, Stop reason, prompt text).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_data: Option<serde_json::Value>,
 }
 
 /// The human's decision on a tool call.
