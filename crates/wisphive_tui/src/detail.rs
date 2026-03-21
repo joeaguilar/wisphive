@@ -37,6 +37,11 @@ pub fn render_detail_lines(req: &DecisionRequest) -> Vec<Line<'static>> {
         }
     }
 
+    // PermissionRequest already renders its own action hints inline
+    if req.hook_event_name != HookEventType::PermissionRequest {
+        push_action_hints(&mut lines, req.hook_event_name);
+    }
+
     lines
 }
 
@@ -395,6 +400,60 @@ fn push_permission_detail(
         "  Press a number to select, N to deny, M to deny with message",
         Style::default().fg(Color::DarkGray),
     )));
+}
+
+fn push_action_hints(lines: &mut Vec<Line<'static>>, event_type: wisphive_protocol::HookEventType) {
+    use wisphive_protocol::HookEventType;
+
+    lines.push(Line::from(""));
+    push_section_label(lines, "Actions");
+    lines.push(Line::from(""));
+
+    let hint_style = Style::default().fg(Color::DarkGray);
+    let key_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+
+    let actions: Vec<(&str, &str)> = match event_type {
+        HookEventType::Stop | HookEventType::SubagentStop => vec![
+            ("C", "continue working"),
+            ("M", "continue with feedback"),
+            ("S", "let agent stop"),
+        ],
+        HookEventType::UserPromptSubmit | HookEventType::ConfigChange => vec![
+            ("A", "allow"),
+            ("B", "block"),
+            ("M", "block with message"),
+        ],
+        HookEventType::Elicitation => vec![
+            ("A", "accept"),
+            ("D", "decline"),
+            ("C", "cancel"),
+        ],
+        HookEventType::TeammateIdle => vec![
+            ("C", "continue with feedback"),
+            ("S", "stop teammate"),
+        ],
+        HookEventType::TaskCompleted => vec![
+            ("A", "accept"),
+            ("R", "reject with feedback"),
+        ],
+        _ => vec![
+            ("Y", "approve"),
+            ("N", "deny"),
+            ("M", "deny with message"),
+            ("!", "always allow"),
+            ("E", "edit input"),
+            ("C", "add context"),
+            ("?", "defer to native prompt"),
+        ],
+    };
+
+    for (key, desc) in &actions {
+        lines.push(Line::from(vec![
+            Span::styled("  ", hint_style),
+            Span::styled(format!("[{key}]"), key_style),
+            Span::styled(format!(" {desc}"), hint_style),
+        ]));
+    }
 }
 
 // --- Helpers ---
