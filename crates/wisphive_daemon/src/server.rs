@@ -156,7 +156,7 @@ async fn handle_hook(
             // Persist for crash recovery
             state_db.persist_pending(&req).await?;
 
-            // Send macOS notification
+            // Send passive notification so user knows to check the TUI
             crate::notify::notify_decision(&req);
 
             // Enqueue and get receiver
