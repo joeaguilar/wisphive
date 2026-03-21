@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use std::path::PathBuf;
 
-use crate::types::{AgentInfo, AgentType, Decision, DecisionFilter, DecisionRequest, HistoryEntry, HistorySearch, ManagedAgent, SessionSummary, SpawnAgentRequest, ToolResult};
+use crate::types::{AgentInfo, AgentType, Decision, DecisionFilter, DecisionRequest, HistoryEntry, HistorySearch, ManagedAgent, PermissionSuggestion, SessionSummary, SpawnAgentRequest, ToolResult};
 
 /// Identifies the type of client connecting to the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +103,16 @@ pub enum ClientMessage {
         agent_type: AgentType,
         project: PathBuf,
     },
+
+    /// TUI approves a PermissionRequest with a specific suggestion selected.
+    #[serde(rename = "approve_permission")]
+    ApprovePermission {
+        id: Uuid,
+        /// Index into the DecisionRequest's permission_suggestions array.
+        suggestion_index: usize,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        message: Option<String>,
+    },
 }
 
 /// Messages sent from the daemon to clients.
@@ -124,6 +134,9 @@ pub enum ServerMessage {
         updated_input: Option<serde_json::Value>,
         #[serde(skip_serializing_if = "Option::is_none", default)]
         additional_context: Option<String>,
+        /// Selected permission suggestion (PermissionRequest responses only).
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        selected_permission: Option<PermissionSuggestion>,
     },
 
     /// Full queue snapshot sent to TUI on connect.
@@ -227,6 +240,7 @@ mod tests {
             tool_name: "Bash".into(),
             tool_input: serde_json::json!({"command": "cargo build"}),
             timestamp: chrono::Utc::now(),
+            permission_suggestions: None,
         };
         let msg = ClientMessage::DecisionRequest(req);
         let encoded = encode(&msg).unwrap();
@@ -249,6 +263,7 @@ mod tests {
             tool_name: "Bash".into(),
             tool_input: serde_json::Value::Null,
             timestamp: chrono::Utc::now(),
+            permission_suggestions: None,
         };
 
         let filter = DecisionFilter {

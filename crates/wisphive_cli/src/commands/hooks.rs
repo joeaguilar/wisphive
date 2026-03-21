@@ -64,6 +64,9 @@ pub fn install(project: Option<PathBuf>, _all: bool) -> Result<()> {
     // Add PostToolUse hook for audit trail (captures tool results)
     add_hook_entry(&mut settings, "PostToolUse", &hook_command);
 
+    // Add PermissionRequest hook for permission management
+    add_hook_entry(&mut settings, "PermissionRequest", &hook_command);
+
     // Add permissions so Claude Code auto-allows tools wisphive gates
     // (eliminates double-prompt — wisphive becomes the sole gatekeeper)
     add_wisphive_permissions(&mut settings);
@@ -100,6 +103,7 @@ pub fn uninstall(project: Option<PathBuf>, _all: bool) -> Result<()> {
     // Remove Wisphive entries from each hook type
     remove_hook_entries(&mut settings, "PreToolUse", &hook_command);
     remove_hook_entries(&mut settings, "PostToolUse", &hook_command);
+    remove_hook_entries(&mut settings, "PermissionRequest", &hook_command);
 
     // Remove wisphive-managed permissions (preserves user-added ones)
     remove_wisphive_permissions(&mut settings);

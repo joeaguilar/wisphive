@@ -57,6 +57,16 @@ impl StateDb {
             .await
             .ok();
 
+        // Add permission columns (idempotent)
+        sqlx::query("ALTER TABLE pending_decisions ADD COLUMN permission_suggestions TEXT")
+            .execute(&self.pool)
+            .await
+            .ok();
+        sqlx::query("ALTER TABLE decision_log ADD COLUMN selected_permission TEXT")
+            .execute(&self.pool)
+            .await
+            .ok();
+
         // Indexes for PostToolUse correlation and history queries
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_decision_log_agent_tool_resolved

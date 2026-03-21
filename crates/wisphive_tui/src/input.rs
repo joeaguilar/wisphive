@@ -41,6 +41,8 @@ pub enum InputAction {
     QuerySessionTimeline { agent_id: String },
     /// Request a specific page of session timeline.
     QuerySessionTimelinePage { agent_id: String, page: usize },
+    /// Approve a PermissionRequest with a specific suggestion selected.
+    ApprovePermission { id: uuid::Uuid, suggestion_index: usize },
     /// Quit the application.
     Quit,
 }
@@ -200,9 +202,30 @@ fn handle_queue_input(app: &mut App, key: KeyEvent) -> InputAction {
 }
 
 fn handle_detail_input(app: &mut App, key: KeyEvent) -> InputAction {
+    let is_permission = app.detail_is_permission_request();
+
     match key.code {
-        // Approve
-        KeyCode::Char('y') | KeyCode::Char('Y') => {
+        // Number keys select a permission suggestion (PermissionRequest only)
+        KeyCode::Char(c @ '1'..='9') if is_permission => {
+            if let Some(req) = app.detail_request() {
+                let idx = (c as usize) - ('1' as usize);
+                let valid = req
+                    .permission_suggestions
+                    .as_ref()
+                    .map_or(false, |s| idx < s.len());
+                if valid {
+                    let id = req.id;
+                    app.exit_detail_view();
+                    return InputAction::ApprovePermission {
+                        id,
+                        suggestion_index: idx,
+                    };
+                }
+            }
+            InputAction::None
+        }
+        // Approve (non-permission only)
+        KeyCode::Char('y') | KeyCode::Char('Y') if !is_permission => {
             if let Some(req) = app.detail_request() {
                 let id = req.id;
                 app.exit_detail_view();
@@ -211,7 +234,7 @@ fn handle_detail_input(app: &mut App, key: KeyEvent) -> InputAction {
             app.exit_detail_view();
             InputAction::None
         }
-        // Deny (simple)
+        // Deny (simple) — works for both
         KeyCode::Char('n') | KeyCode::Char('N') => {
             if let Some(req) = app.detail_request() {
                 let id = req.id;
@@ -221,35 +244,35 @@ fn handle_detail_input(app: &mut App, key: KeyEvent) -> InputAction {
             app.exit_detail_view();
             InputAction::None
         }
-        // Deny with message
+        // Deny with message — works for both
         KeyCode::Char('m') | KeyCode::Char('M') => {
             if let Some(req) = app.detail_request() {
                 app.modal = Some(Modal::deny_with_message(req.id));
             }
             InputAction::None
         }
-        // Always allow this tool
-        KeyCode::Char('!') => {
+        // Always allow this tool (non-permission only)
+        KeyCode::Char('!') if !is_permission => {
             if let Some(req) = app.detail_request() {
                 app.modal = Some(Modal::confirm_always_allow(req.id, &req.tool_name));
             }
             InputAction::None
         }
-        // Edit input before approving
-        KeyCode::Char('e') | KeyCode::Char('E') => {
+        // Edit input before approving (non-permission only)
+        KeyCode::Char('e') | KeyCode::Char('E') if !is_permission => {
             if let Some(req) = app.detail_request() {
                 app.modal = Some(Modal::edit_input(req.id, &req.tool_input));
             }
             InputAction::None
         }
-        // Approve with additional context
-        KeyCode::Char('c') | KeyCode::Char('C') => {
+        // Approve with additional context (non-permission only)
+        KeyCode::Char('c') | KeyCode::Char('C') if !is_permission => {
             if let Some(req) = app.detail_request() {
                 app.modal = Some(Modal::approve_with_context(req.id));
             }
             InputAction::None
         }
-        // Ask/defer to native prompt
+        // Ask/defer to native prompt — works for both
         KeyCode::Char('?') => {
             if let Some(req) = app.detail_request() {
                 app.modal = Some(Modal::confirm_ask_defer(req.id));

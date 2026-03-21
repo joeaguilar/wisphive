@@ -123,6 +123,7 @@ fn make_decision_request(tool_name: &str) -> DecisionRequest {
         tool_name: tool_name.into(),
         tool_input: serde_json::json!({"command": "cargo test"}),
         timestamp: chrono::Utc::now(),
+        permission_suggestions: None,
     }
 }
 

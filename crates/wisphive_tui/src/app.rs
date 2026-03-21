@@ -344,6 +344,13 @@ impl App {
         self.queue.iter().find(|r| r.id == id)
     }
 
+    /// Check if the current detail request is a PermissionRequest.
+    pub fn detail_is_permission_request(&self) -> bool {
+        self.detail_request()
+            .and_then(|r| r.permission_suggestions.as_ref())
+            .is_some()
+    }
+
     /// Enter the history view.
     pub fn enter_history_view(&mut self, agent_id: Option<String>) {
         self.history_agent_filter = agent_id;
