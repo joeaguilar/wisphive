@@ -180,6 +180,89 @@ pub struct HistoryEntry {
     pub tool_result: Option<serde_json::Value>,
 }
 
+/// Auto-approve permission levels. Higher levels include all tools from lower levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AutoApproveLevel {
+    /// Nothing auto-approved. Every tool goes through the TUI.
+    Off,
+    /// Read-only + orchestration tools (default).
+    Read,
+    /// Level 1 + file modifications (Edit, Write, NotebookEdit).
+    Write,
+    /// Level 2 + shell execution (Bash).
+    Execute,
+    /// Everything auto-approved. TUI is monitoring-only.
+    All,
+}
+
+impl AutoApproveLevel {
+    /// Tools added at this specific tier (not cumulative).
+    fn tier_tools(&self) -> &'static [&'static str] {
+        match self {
+            Self::Off => &[],
+            Self::Read => &[
+                "Read", "Glob", "Grep", "LS", "WebSearch", "WebFetch",
+                "NotebookRead", "Agent", "Skill", "TaskCreate", "TaskUpdate",
+                "TaskGet", "TaskList", "TodoRead", "ToolSearch",
+            ],
+            Self::Write => &["Edit", "Write", "NotebookEdit"],
+            Self::Execute => &["Bash"],
+            Self::All => &[], // All covers everything, checked separately
+        }
+    }
+
+    /// Check if this level auto-approves the given tool.
+    pub fn includes(&self, tool_name: &str) -> bool {
+        if *self == Self::All {
+            return true;
+        }
+        // Check all tiers at or below this level
+        for level in &[Self::Off, Self::Read, Self::Write, Self::Execute] {
+            if *level > *self {
+                break;
+            }
+            if level.tier_tools().iter().any(|&t| t == tool_name) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+impl Default for AutoApproveLevel {
+    fn default() -> Self {
+        Self::Read
+    }
+}
+
+impl std::fmt::Display for AutoApproveLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Off => write!(f, "off"),
+            Self::Read => write!(f, "read"),
+            Self::Write => write!(f, "write"),
+            Self::Execute => write!(f, "execute"),
+            Self::All => write!(f, "all"),
+        }
+    }
+}
+
+impl std::str::FromStr for AutoApproveLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "off" | "0" => Ok(Self::Off),
+            "read" | "1" => Ok(Self::Read),
+            "write" | "2" => Ok(Self::Write),
+            "execute" | "exec" | "3" => Ok(Self::Execute),
+            "all" | "4" => Ok(Self::All),
+            _ => Err(format!("unknown level: {s}. Valid: off, read, write, execute, all")),
+        }
+    }
+}
+
 /// Filter criteria for batch operations on the decision queue.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DecisionFilter {

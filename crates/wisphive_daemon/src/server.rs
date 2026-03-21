@@ -62,7 +62,7 @@ impl Server {
 
         loop {
             tokio::select! {
-                // Periodically reap exited agent processes
+                // Periodically reap exited agent processes and inactive agents
                 _ = reap_interval.tick() => {
                     let mut pr = self.process_registry.lock().await;
                     let exited = pr.reap_exited().await;
@@ -71,6 +71,19 @@ impl Server {
                             agent_id,
                             exit_code,
                         });
+                    }
+                    drop(pr);
+
+                    // Reap agents inactive beyond timeout
+                    let agent_timeout = Duration::from_secs(self.config.agent_timeout_secs);
+                    let mut reg = self.agent_registry.lock().await;
+                    let reaped = reg.reap_inactive(agent_timeout);
+                    drop(reg);
+                    for agent_id in reaped {
+                        // Clean up session marker file
+                        let marker = self.config.home_dir.join("sessions").join(&agent_id);
+                        let _ = std::fs::remove_file(marker);
+                        let _ = self.tui_tx.send(ServerMessage::AgentDisconnected { agent_id });
                     }
                 }
                 accept = listener.accept() => {
@@ -159,7 +172,7 @@ async fn handle_connection(
                     handle_hook(lines, writer, queue, agent_registry, tui_tx.clone(), state_db, hook_timeout_secs, notifications_enabled).await
                 }
                 ClientType::Tui => {
-                    handle_tui(lines, writer, queue, process_registry, state_db, tui_tx).await
+                    handle_tui(lines, writer, queue, process_registry, agent_registry, state_db, tui_tx).await
                 }
             }
         }
@@ -201,12 +214,14 @@ async fn handle_hook(
                 .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
                 .join(".wisphive");
 
-            // Register agent and broadcast to TUI clients
-            let agent_info = {
+            // Register agent and broadcast to TUI clients (only if new)
+            let (agent_info, is_new) = {
                 let mut reg = agent_registry.lock().await;
                 reg.register(agent_id.clone(), req.agent_type.clone(), req.project.clone())
             };
-            let _ = tui_tx.send(ServerMessage::AgentConnected(agent_info));
+            if is_new {
+                let _ = tui_tx.send(ServerMessage::AgentConnected(agent_info));
+            }
 
             // Persist for crash recovery
             state_db.persist_pending(&req).await?;
@@ -247,12 +262,11 @@ async fn handle_hook(
                 state_db.resolve_pending(id, rich.decision).await?;
             }
 
-            // Deregister agent and broadcast to TUI clients
+            // Touch last_seen (agent stays registered, reaped on inactivity)
             {
                 let mut reg = agent_registry.lock().await;
-                reg.deregister(&agent_id);
+                reg.touch(&agent_id);
             }
-            let _ = tui_tx.send(ServerMessage::AgentDisconnected { agent_id });
 
             // Send rich response to hook
             let resp = encode(&ServerMessage::DecisionResponse {
@@ -265,6 +279,11 @@ async fn handle_hook(
             writer.write_all(resp.as_bytes()).await?;
         }
         ClientMessage::ToolResult(result) => {
+            // Touch last_seen for the agent
+            {
+                let mut reg = agent_registry.lock().await;
+                reg.touch(&result.agent_id);
+            }
             // Fire-and-forget: attach result to matching decision_log entry
             match state_db
                 .attach_tool_result(&result.agent_id, &result.tool_name, &result.tool_result)
@@ -282,9 +301,19 @@ async fn handle_hook(
                 }
             }
         }
+        ClientMessage::AgentRegister { agent_id, agent_type, project } => {
+            // Fire-and-forget registration (no response)
+            let (info, is_new) = {
+                let mut reg = agent_registry.lock().await;
+                reg.register(agent_id, agent_type, project)
+            };
+            if is_new {
+                let _ = tui_tx.send(ServerMessage::AgentConnected(info));
+            }
+        }
         _ => {
             let err = encode(&ServerMessage::Error {
-                message: "expected DecisionRequest or ToolResult from hook".into(),
+                message: "expected DecisionRequest, ToolResult, or AgentRegister from hook".into(),
             })?;
             writer.write_all(err.as_bytes()).await?;
         }
@@ -299,9 +328,18 @@ async fn handle_tui(
     mut writer: tokio::net::unix::OwnedWriteHalf,
     queue: Arc<Mutex<DecisionQueue>>,
     process_registry: Arc<Mutex<ProcessRegistry>>,
+    agent_registry: Arc<Mutex<AgentRegistry>>,
     state_db: Arc<StateDb>,
     tui_tx: broadcast::Sender<ServerMessage>,
 ) -> Result<()> {
+    // Send agents snapshot
+    let agents_snap = {
+        let reg = agent_registry.lock().await;
+        reg.snapshot()
+    };
+    let agents_msg = encode(&ServerMessage::AgentsSnapshot { agents: agents_snap })?;
+    writer.write_all(agents_msg.as_bytes()).await?;
+
     // Send initial queue snapshot
     let snapshot = {
         let q = queue.lock().await;

@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::types::{AgentInfo, Decision, DecisionFilter, DecisionRequest, HistoryEntry, HistorySearch, ManagedAgent, SpawnAgentRequest, ToolResult};
+use std::path::PathBuf;
+
+use crate::types::{AgentInfo, AgentType, Decision, DecisionFilter, DecisionRequest, HistoryEntry, HistorySearch, ManagedAgent, SpawnAgentRequest, ToolResult};
 
 /// Identifies the type of client connecting to the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +91,14 @@ pub enum ClientMessage {
     /// Search decision history with rich filters.
     #[serde(rename = "search_history")]
     SearchHistory(HistorySearch),
+
+    /// Hook registers an agent session (fire-and-forget, no response expected).
+    #[serde(rename = "agent_register")]
+    AgentRegister {
+        agent_id: String,
+        agent_type: AgentType,
+        project: PathBuf,
+    },
 }
 
 /// Messages sent from the daemon to clients.
@@ -150,6 +160,10 @@ pub enum ServerMessage {
     /// Response to QueryHistory request.
     #[serde(rename = "history_response")]
     HistoryResponse { entries: Vec<HistoryEntry> },
+
+    /// Full snapshot of currently registered agents, sent to TUI on connect.
+    #[serde(rename = "agents_snapshot")]
+    AgentsSnapshot { agents: Vec<AgentInfo> },
 
     /// Error message.
     #[serde(rename = "error")]

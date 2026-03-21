@@ -18,6 +18,8 @@ pub struct DaemonConfig {
     pub hook_timeout_secs: u64,
     /// Whether to send desktop notifications for pending decisions.
     pub notifications_enabled: bool,
+    /// Seconds of inactivity before an agent is reaped from the registry.
+    pub agent_timeout_secs: u64,
 }
 
 /// User-editable config loaded from ~/.wisphive/config.json.
@@ -25,17 +27,25 @@ pub struct DaemonConfig {
 pub struct UserConfig {
     #[serde(default = "default_true")]
     pub notifications: bool,
-    #[serde(default = "default_timeout")]
+    #[serde(default)]
     pub hook_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub agent_timeout_secs: Option<u64>,
+    /// Auto-approve permission level.
+    #[serde(default)]
+    pub auto_approve_level: Option<wisphive_protocol::AutoApproveLevel>,
+    /// Extra tools to auto-approve on top of the level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_approve_add: Option<Vec<String>>,
+    /// Tools to exclude from auto-approve despite the level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_approve_remove: Option<Vec<String>>,
 }
 
 fn default_true() -> bool {
     true
 }
 
-fn default_timeout() -> Option<u64> {
-    None
-}
 
 impl DaemonConfig {
     /// Create config rooted at the given home directory.
@@ -51,6 +61,7 @@ impl DaemonConfig {
             log_dir: home_dir.join("logs"),
             hook_timeout_secs: user.hook_timeout_secs.unwrap_or(3600),
             notifications_enabled: user.notifications,
+            agent_timeout_secs: user.agent_timeout_secs.unwrap_or(300),
             home_dir,
         }
     }

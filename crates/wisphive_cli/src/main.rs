@@ -74,6 +74,34 @@ enum ConfigAction {
         /// Value to set (e.g. "false")
         value: String,
     },
+    /// Manage the auto-approve tool list
+    AutoApprove {
+        #[command(subcommand)]
+        action: AutoApproveAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum AutoApproveAction {
+    /// Show current level, included tools, and overrides
+    Status,
+    /// Set the auto-approve permission level (off, read, write, execute, all)
+    Level {
+        /// Permission level
+        level: String,
+    },
+    /// Add a tool to auto-approve (override on top of level)
+    Add {
+        /// Tool name (e.g. "Bash")
+        tool: String,
+    },
+    /// Remove a tool from auto-approve (queue it despite level)
+    Remove {
+        /// Tool name (e.g. "WebFetch")
+        tool: String,
+    },
+    /// Reset to defaults (level: read, no overrides)
+    Reset,
 }
 
 #[derive(Subcommand)]
@@ -176,6 +204,13 @@ fn main() -> anyhow::Result<()> {
             ConfigAction::List => commands::config::list(),
             ConfigAction::Get { key } => commands::config::get(&key),
             ConfigAction::Set { key, value } => commands::config::set(&key, &value),
+            ConfigAction::AutoApprove { action } => match action {
+                AutoApproveAction::Status => commands::config::auto_approve_status(),
+                AutoApproveAction::Level { level } => commands::config::auto_approve_level(&level),
+                AutoApproveAction::Add { tool } => commands::config::auto_approve_add(&tool),
+                AutoApproveAction::Remove { tool } => commands::config::auto_approve_remove(&tool),
+                AutoApproveAction::Reset => commands::config::auto_approve_reset(),
+            },
         },
         Command::Doctor { project } => commands::doctor::run(project),
         Command::EmergencyOff => commands::hooks::emergency_off(),
