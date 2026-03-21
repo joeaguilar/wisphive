@@ -1,4 +1,5 @@
 pub mod config;
+pub mod notify;
 pub mod queue;
 pub mod registry;
 pub mod server;
