@@ -1,9 +1,22 @@
 use std::path::PathBuf;
 
 use uuid::Uuid;
-use wisphive_protocol::{AgentInfo, DecisionRequest, HistoryEntry};
+use wisphive_protocol::{AgentInfo, AutoApproveLevel, DecisionRequest, HistoryEntry};
+
+use serde::Deserialize;
 
 use crate::modal::Modal;
+
+/// Minimal config snapshot for reading auto-approve settings from config.json.
+#[derive(Deserialize, Default)]
+pub struct ConfigSnapshot {
+    #[serde(default)]
+    pub auto_approve_level: Option<AutoApproveLevel>,
+    #[serde(default)]
+    pub auto_approve_add: Option<Vec<String>>,
+    #[serde(default)]
+    pub auto_approve_remove: Option<Vec<String>>,
+}
 
 /// Which screen the TUI is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +29,8 @@ pub enum ViewMode {
     History,
     /// Full-screen detail view for a single history entry.
     HistoryDetail,
+    /// Configuration panel.
+    Config,
 }
 
 /// Which panel currently has focus.
@@ -86,6 +101,14 @@ pub struct App {
     pub history_page: usize,
     /// Whether there are more history pages available.
     pub history_has_more: bool,
+    /// Current auto-approve level in config view.
+    pub config_level: AutoApproveLevel,
+    /// Current config selection index (0=level, 1+=tools for add/remove).
+    pub config_index: usize,
+    /// Tools added as overrides.
+    pub config_add: Vec<String>,
+    /// Tools removed as overrides.
+    pub config_remove: Vec<String>,
 }
 
 /// Aggregated project status for the dashboard.
@@ -122,6 +145,10 @@ impl App {
             view_forward_stack: Vec::new(),
             history_page: 0,
             history_has_more: false,
+            config_level: AutoApproveLevel::default(),
+            config_index: 0,
+            config_add: Vec::new(),
+            config_remove: Vec::new(),
         }
     }
 
@@ -303,6 +330,80 @@ impl App {
         let len = self.history.len();
         if len > 0 && self.history_index < len - 1 {
             self.history_index += 1;
+        }
+    }
+
+    /// Enter the config view, loading current settings from disk.
+    pub fn enter_config_view(&mut self) {
+        let config = Self::load_user_config();
+        self.config_level = config.auto_approve_level.unwrap_or_default();
+        self.config_add = config.auto_approve_add.unwrap_or_default();
+        self.config_remove = config.auto_approve_remove.unwrap_or_default();
+        self.config_index = 0;
+        self.push_view(ViewMode::Config);
+    }
+
+    /// Leave the config view.
+    pub fn exit_config_view(&mut self) {
+        self.navigate_back();
+    }
+
+    /// Save current config state to disk.
+    pub fn save_config(&self) {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let path = std::path::PathBuf::from(home)
+            .join(".wisphive")
+            .join("config.json");
+
+        let mut config = match std::fs::read_to_string(&path) {
+            Ok(content) => serde_json::from_str::<serde_json::Value>(&content)
+                .unwrap_or(serde_json::json!({})),
+            Err(_) => serde_json::json!({}),
+        };
+
+        let obj = config.as_object_mut().unwrap();
+        obj.insert(
+            "auto_approve_level".into(),
+            serde_json::Value::String(self.config_level.to_string()),
+        );
+        if self.config_add.is_empty() {
+            obj.remove("auto_approve_add");
+        } else {
+            obj.insert(
+                "auto_approve_add".into(),
+                serde_json::Value::Array(
+                    self.config_add.iter().map(|s| serde_json::Value::String(s.clone())).collect(),
+                ),
+            );
+        }
+        if self.config_remove.is_empty() {
+            obj.remove("auto_approve_remove");
+        } else {
+            obj.insert(
+                "auto_approve_remove".into(),
+                serde_json::Value::Array(
+                    self.config_remove
+                        .iter()
+                        .map(|s| serde_json::Value::String(s.clone()))
+                        .collect(),
+                ),
+            );
+        }
+
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap_or_default());
+    }
+
+    fn load_user_config() -> ConfigSnapshot {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let path = std::path::PathBuf::from(home)
+            .join(".wisphive")
+            .join("config.json");
+        match std::fs::read_to_string(&path) {
+            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+            Err(_) => ConfigSnapshot::default(),
         }
     }
 

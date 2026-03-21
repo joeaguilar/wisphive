@@ -15,6 +15,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         ViewMode::Detail => draw_detail_view(frame, app),
         ViewMode::History => draw_history_view(frame, app),
         ViewMode::HistoryDetail => draw_history_detail_view(frame, app),
+        ViewMode::Config => draw_config_view(frame, app),
         ViewMode::Dashboard => draw_dashboard(frame, app),
     }
 }
@@ -247,6 +248,93 @@ fn draw_history_detail_view(frame: &mut Frame, app: &App) {
     frame.render_widget(bar, chunks[1]);
 }
 
+fn draw_config_view(frame: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+
+    const ALL_TOOLS: &[&str] = &[
+        "Read", "Glob", "Grep", "LS", "WebSearch", "WebFetch",
+        "NotebookRead", "Agent", "Skill", "TaskCreate", "TaskUpdate",
+        "TaskGet", "TaskList", "TodoRead", "ToolSearch",
+        "Edit", "Write", "NotebookEdit", "Bash",
+    ];
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Level selector row
+    let level_style = if app.config_index == 0 {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let arrow = if app.config_index == 0 { ">" } else { " " };
+    lines.push(Line::from(vec![
+        Span::styled(format!("{arrow} Level: "), Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("◀ {} ▶", app.config_level), level_style),
+        Span::styled("  (use ←/→ to change)", Style::default().fg(Color::DarkGray)),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Tools (Space/Enter to toggle):",
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    for (i, tool) in ALL_TOOLS.iter().enumerate() {
+        let row_idx = i + 1;
+        let in_level = app.config_level.includes(tool);
+        let in_add = app.config_add.iter().any(|t| t == tool);
+        let in_remove = app.config_remove.iter().any(|t| t == tool);
+
+        let (approved, status, color) = if in_remove {
+            (false, "QUEUED (override)", Color::Red)
+        } else if in_add {
+            (true, "AUTO (override)", Color::Green)
+        } else if in_level {
+            (true, "AUTO (level)", Color::DarkGray)
+        } else {
+            (false, "QUEUED", Color::DarkGray)
+        };
+
+        let checkbox = if approved { "[x]" } else { "[ ]" };
+        let selected = app.config_index == row_idx;
+        let name_style = if selected {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let arrow = if selected { ">" } else { " " };
+
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {arrow} {checkbox} "), Style::default().fg(if approved { Color::Green } else { Color::Red })),
+            Span::styled(format!("{:<16}", tool), name_style),
+            Span::styled(status.to_string(), Style::default().fg(color)),
+        ]));
+    }
+
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" Auto-Approve Config "),
+        )
+        .scroll((0, 0));
+
+    frame.render_widget(paragraph, chunks[0]);
+
+    let bar = Paragraph::new(Line::from(Span::styled(
+        " [j/k]navigate [←/→]change level [Space/Enter]toggle tool [Esc]back — changes apply immediately ",
+        Style::default().fg(Color::White).bg(Color::DarkGray),
+    )));
+    frame.render_widget(bar, chunks[1]);
+}
+
 fn draw_queue_panel(frame: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == FocusPanel::Queue;
     let border_style = if focused {
@@ -352,7 +440,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             "disconnected"
         };
         format!(
-            " [y]approve [Enter/a/d]review [A]pprove-all [D]eny-all [h]istory [/]filter [Tab]cycle [q]back [Q]uit | {} ",
+            " [y]approve [Enter/a/d]review [A]pprove-all [D]eny-all [h]istory [c]onfig [/]filter [Tab]cycle [q]back [Q]uit | {} ",
             conn
         )
     };
