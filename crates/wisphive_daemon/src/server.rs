@@ -143,7 +143,7 @@ async fn handle_connection(
                     handle_hook(lines, writer, queue, agent_registry, tui_tx.clone(), state_db, hook_timeout_secs).await
                 }
                 ClientType::Tui => {
-                    handle_tui(lines, writer, queue, process_registry, tui_tx).await
+                    handle_tui(lines, writer, queue, process_registry, state_db, tui_tx).await
                 }
             }
         }
@@ -242,6 +242,7 @@ async fn handle_tui(
     mut writer: tokio::net::unix::OwnedWriteHalf,
     queue: Arc<Mutex<DecisionQueue>>,
     process_registry: Arc<Mutex<ProcessRegistry>>,
+    state_db: Arc<StateDb>,
     tui_tx: broadcast::Sender<ServerMessage>,
 ) -> Result<()> {
     // Send initial queue snapshot
@@ -324,6 +325,21 @@ async fn handle_tui(
                                 let agents = pr.list();
                                 let resp = encode(&ServerMessage::AgentList { agents })?;
                                 writer.write_all(resp.as_bytes()).await?;
+                            }
+                            ClientMessage::QueryHistory { ref agent_id, limit } => {
+                                let limit = limit.unwrap_or(200);
+                                match state_db.query_history(agent_id.as_deref(), limit).await {
+                                    Ok(entries) => {
+                                        let resp = encode(&ServerMessage::HistoryResponse { entries })?;
+                                        writer.write_all(resp.as_bytes()).await?;
+                                    }
+                                    Err(e) => {
+                                        let resp = encode(&ServerMessage::Error {
+                                            message: format!("history query failed: {e}"),
+                                        })?;
+                                        writer.write_all(resp.as_bytes()).await?;
+                                    }
+                                }
                             }
                             ClientMessage::StopAgent { ref agent_id } => {
                                 let mut pr = process_registry.lock().await;

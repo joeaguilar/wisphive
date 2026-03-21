@@ -1,9 +1,20 @@
 use std::path::PathBuf;
 
 use uuid::Uuid;
-use wisphive_protocol::{AgentInfo, DecisionRequest};
+use wisphive_protocol::{AgentInfo, DecisionRequest, HistoryEntry};
 
 use crate::modal::Modal;
+
+/// Which screen the TUI is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    /// Normal dashboard: queue, agents, projects panels.
+    Dashboard,
+    /// Full-screen detail view for a single decision request.
+    Detail,
+    /// History browser showing resolved decisions from the audit log.
+    History,
+}
 
 /// Which panel currently has focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +58,18 @@ pub struct App {
     pub filter_input_mode: bool,
     /// Buffer for filter input.
     pub filter_buffer: String,
+    /// Current view mode (dashboard, detail, or history).
+    pub view_mode: ViewMode,
+    /// Scroll offset for the detail view content area.
+    pub detail_scroll: usize,
+    /// The UUID of the decision being viewed in detail.
+    pub detail_request_id: Option<Uuid>,
+    /// Decision history from the audit log.
+    pub history: Vec<HistoryEntry>,
+    /// Currently selected index in the history list.
+    pub history_index: usize,
+    /// Agent ID filter for history view. None = all agents.
+    pub history_agent_filter: Option<String>,
 }
 
 /// Aggregated project status for the dashboard.
@@ -70,6 +93,12 @@ impl App {
             connected: false,
             filter_input_mode: false,
             filter_buffer: String::new(),
+            view_mode: ViewMode::Dashboard,
+            detail_scroll: 0,
+            detail_request_id: None,
+            history: Vec::new(),
+            history_index: 0,
+            history_agent_filter: None,
         }
     }
 
@@ -145,8 +174,63 @@ impl App {
         self.projects.sort_by(|a, b| a.path.cmp(&b.path));
     }
 
+    /// Enter the detail view for the currently selected queue item.
+    pub fn enter_detail_view(&mut self) {
+        if let Some(req) = self.selected_request() {
+            self.detail_request_id = Some(req.id);
+            self.detail_scroll = 0;
+            self.view_mode = ViewMode::Detail;
+        }
+    }
+
+    /// Leave the detail view and return to the dashboard.
+    pub fn exit_detail_view(&mut self) {
+        self.view_mode = ViewMode::Dashboard;
+        self.detail_request_id = None;
+        self.detail_scroll = 0;
+    }
+
+    /// Get the decision request currently being viewed in detail.
+    pub fn detail_request(&self) -> Option<&DecisionRequest> {
+        let id = self.detail_request_id?;
+        self.queue.iter().find(|r| r.id == id)
+    }
+
+    /// Enter the history view.
+    pub fn enter_history_view(&mut self, agent_id: Option<String>) {
+        self.history_agent_filter = agent_id;
+        self.history_index = 0;
+        self.view_mode = ViewMode::History;
+    }
+
+    /// Leave the history view and return to the dashboard.
+    pub fn exit_history_view(&mut self) {
+        self.view_mode = ViewMode::Dashboard;
+        self.history.clear();
+        self.history_index = 0;
+        self.history_agent_filter = None;
+    }
+
+    /// Move selection up in the history list.
+    pub fn history_up(&mut self) {
+        if self.history_index > 0 {
+            self.history_index -= 1;
+        }
+    }
+
+    /// Move selection down in the history list.
+    pub fn history_down(&mut self) {
+        let len = self.history.len();
+        if len > 0 && self.history_index < len - 1 {
+            self.history_index += 1;
+        }
+    }
+
     /// Remove a decision from the queue by ID.
     pub fn remove_decision(&mut self, id: Uuid) {
+        if self.detail_request_id == Some(id) {
+            self.exit_detail_view();
+        }
         self.queue.retain(|r| r.id != id);
         let len = self.filtered_queue().len();
         if self.queue_index >= len && len > 0 {

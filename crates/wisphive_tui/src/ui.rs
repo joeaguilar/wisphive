@@ -4,12 +4,21 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 
-use crate::app::{App, FocusPanel};
+use crate::app::{App, FocusPanel, ViewMode};
+use crate::detail;
 use crate::modal::Modal;
 use crate::panels;
 
 /// Render the entire TUI.
 pub fn draw(frame: &mut Frame, app: &App) {
+    match app.view_mode {
+        ViewMode::Detail => draw_detail_view(frame, app),
+        ViewMode::History => draw_history_view(frame, app),
+        ViewMode::Dashboard => draw_dashboard(frame, app),
+    }
+}
+
+fn draw_dashboard(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -34,6 +43,137 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if let Some(ref modal) = app.modal {
         draw_modal(frame, modal);
     }
+}
+
+fn draw_detail_view(frame: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),    // Detail content (scrollable)
+            Constraint::Length(1), // Status bar
+        ])
+        .split(frame.area());
+
+    if let Some(req) = app.detail_request() {
+        let lines = detail::render_detail_lines(req);
+        let total_lines = lines.len();
+        let visible_height = chunks[0].height.saturating_sub(2) as usize;
+
+        let paragraph = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(format!(" Review: {} ", req.tool_name)),
+            )
+            .scroll((app.detail_scroll as u16, 0));
+
+        frame.render_widget(paragraph, chunks[0]);
+
+        let scroll_info = if total_lines > visible_height {
+            let max_scroll = total_lines.saturating_sub(visible_height);
+            let pos = app.detail_scroll.min(max_scroll) + 1;
+            format!(" [{}/{}]", pos, max_scroll + 1)
+        } else {
+            String::new()
+        };
+
+        let bar_text = format!(
+            " [Y]approve [N]deny [Esc]back [j/k]scroll{}",
+            scroll_info
+        );
+        let bar = Paragraph::new(Line::from(Span::styled(
+            bar_text,
+            Style::default().fg(Color::White).bg(Color::DarkGray),
+        )));
+        frame.render_widget(bar, chunks[1]);
+    } else {
+        let msg = Paragraph::new("Decision was resolved. Press Esc to return.")
+            .block(Block::default().borders(Borders::ALL));
+        frame.render_widget(msg, chunks[0]);
+    }
+}
+
+fn draw_history_view(frame: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),    // History list
+            Constraint::Length(1), // Status bar
+        ])
+        .split(frame.area());
+
+    let title = match &app.history_agent_filter {
+        Some(agent) => format!(" History — agent: {} ({} entries) ", agent, app.history.len()),
+        None => format!(" History — all agents ({} entries) ", app.history.len()),
+    };
+
+    let items: Vec<ListItem> = app
+        .history
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let decision_str = match entry.decision {
+                wisphive_protocol::Decision::Approve => "APPROVED",
+                wisphive_protocol::Decision::Deny => "DENIED  ",
+            };
+            let decision_color = match entry.decision {
+                wisphive_protocol::Decision::Approve => Color::Green,
+                wisphive_protocol::Decision::Deny => Color::Red,
+            };
+
+            let project_name = entry
+                .project
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| entry.project.to_string_lossy().to_string());
+
+            let time_str = entry.resolved_at.format("%m-%d %H:%M:%S").to_string();
+
+            let line = Line::from(vec![
+                Span::styled(
+                    format!("{decision_str} "),
+                    Style::default().fg(decision_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{:<12} ", project_name),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(
+                    format!("{:<8} ", entry.tool_name),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(
+                    format!("{} ", entry.agent_id),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(time_str, Style::default().fg(Color::DarkGray)),
+            ]);
+
+            let style = if i == app.history_index {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            ListItem::new(line).style(style)
+        })
+        .collect();
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(title),
+    );
+
+    frame.render_widget(list, chunks[0]);
+
+    let bar_text = " [j/k]navigate [f]filter-agent [F]clear-filter [Esc]back [q]quit ";
+    let bar = Paragraph::new(Line::from(Span::styled(
+        bar_text,
+        Style::default().fg(Color::White).bg(Color::DarkGray),
+    )));
+    frame.render_widget(bar, chunks[1]);
 }
 
 fn draw_queue_panel(frame: &mut Frame, app: &App, area: Rect) {
@@ -141,7 +281,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             "disconnected"
         };
         format!(
-            " [y]approve [a]pprove… [d]eny… [A]ll-approve [D]all-deny [/]filter [Tab]cycle [q]uit | {} ",
+            " [Y]approve [Enter/a/d]review [A]pprove-all [D]eny-all [h]istory [/]filter [Tab]cycle [q]uit | {} ",
             conn
         )
     };

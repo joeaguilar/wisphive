@@ -2,7 +2,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
 use std::path::PathBuf;
 
-use crate::app::{App, FocusPanel};
+use crate::app::{App, FocusPanel, ViewMode};
 use crate::modal::{Modal, ModalAction, SpawnField};
 
 /// Action the main loop should take after processing input.
@@ -19,6 +19,8 @@ pub enum InputAction {
     DenyAll,
     /// Spawn a new agent with the given project and prompt.
     SpawnAgent { project: PathBuf, prompt: String },
+    /// Request history from the daemon (optional agent_id filter).
+    QueryHistory { agent_id: Option<String> },
     /// Quit the application.
     Quit,
 }
@@ -34,6 +36,13 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
         return handle_modal_input(app, key);
     }
 
+    // Route based on view mode
+    match app.view_mode {
+        ViewMode::Detail => return handle_detail_input(app, key),
+        ViewMode::History => return handle_history_input(app, key),
+        ViewMode::Dashboard => {}
+    }
+
     // If in filter input mode, handle text input
     if app.filter_input_mode {
         return handle_filter_input(app, key);
@@ -44,6 +53,11 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
         KeyCode::Char('q') | KeyCode::Char('Q') => return InputAction::Quit,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             return InputAction::Quit;
+        }
+        // Open history view (global — works from any panel)
+        KeyCode::Char('h') => {
+            app.enter_history_view(None);
+            return InputAction::QueryHistory { agent_id: None };
         }
         _ => {}
     }
@@ -84,34 +98,18 @@ fn handle_queue_input(app: &mut App, key: KeyEvent) -> InputAction {
             InputAction::None
         }
 
-        // Quick approve selected (no confirmation)
-        KeyCode::Char('y') => {
+        // Quick approve selected (no detail view)
+        KeyCode::Char('Y') => {
             if let Some(req) = app.selected_request() {
                 return InputAction::Approve(req.id);
             }
             InputAction::None
         }
 
-        // Approve selected (with confirmation)
-        KeyCode::Char('a') => {
-            if let Some(req) = app.selected_request() {
-                let id = req.id;
-                app.modal = Some(Modal::confirm_approve(id, &req.tool_name, &req.agent_id));
-                InputAction::None
-            } else {
-                InputAction::None
-            }
-        }
-
-        // Deny selected
-        KeyCode::Char('d') => {
-            if let Some(req) = app.selected_request() {
-                let id = req.id;
-                app.modal = Some(Modal::confirm_deny(id, &req.tool_name, &req.agent_id));
-                InputAction::None
-            } else {
-                InputAction::None
-            }
+        // Open detail view for review (approve/deny from there)
+        KeyCode::Char('a') | KeyCode::Char('d') => {
+            app.enter_detail_view();
+            InputAction::None
         }
 
         // Approve all
@@ -146,9 +144,76 @@ fn handle_queue_input(app: &mut App, key: KeyEvent) -> InputAction {
             InputAction::None
         }
 
-        // Expand detail (future: toggle detail pane)
-        KeyCode::Enter => InputAction::None,
+        // Open detail view for the selected item
+        KeyCode::Enter => {
+            app.enter_detail_view();
+            InputAction::None
+        }
 
+        _ => InputAction::None,
+    }
+}
+
+fn handle_detail_input(app: &mut App, key: KeyEvent) -> InputAction {
+    match key.code {
+        // Approve
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            if let Some(req) = app.detail_request() {
+                let id = req.id;
+                app.exit_detail_view();
+                return InputAction::Approve(id);
+            }
+            app.exit_detail_view();
+            InputAction::None
+        }
+        // Deny
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            if let Some(req) = app.detail_request() {
+                let id = req.id;
+                app.exit_detail_view();
+                return InputAction::Deny(id);
+            }
+            app.exit_detail_view();
+            InputAction::None
+        }
+        // Back to dashboard
+        KeyCode::Esc => {
+            app.exit_detail_view();
+            InputAction::None
+        }
+        // Scroll down
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.detail_scroll = app.detail_scroll.saturating_add(1);
+            InputAction::None
+        }
+        // Scroll up
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.detail_scroll = app.detail_scroll.saturating_sub(1);
+            InputAction::None
+        }
+        // Page down
+        KeyCode::PageDown | KeyCode::Char(' ') => {
+            app.detail_scroll = app.detail_scroll.saturating_add(20);
+            InputAction::None
+        }
+        // Page up
+        KeyCode::PageUp => {
+            app.detail_scroll = app.detail_scroll.saturating_sub(20);
+            InputAction::None
+        }
+        // Jump to top
+        KeyCode::Char('g') => {
+            app.detail_scroll = 0;
+            InputAction::None
+        }
+        // Jump to bottom
+        KeyCode::Char('G') => {
+            app.detail_scroll = usize::MAX / 2;
+            InputAction::None
+        }
+        // Quit
+        KeyCode::Char('q') | KeyCode::Char('Q') => InputAction::Quit,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => InputAction::Quit,
         _ => InputAction::None,
     }
 }
@@ -192,8 +257,6 @@ fn handle_modal_input(app: &mut App, key: KeyEvent) -> InputAction {
 
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') => match modal.action {
-            ModalAction::ApproveSingle(id) => InputAction::Approve(id),
-            ModalAction::DenySingle(id) => InputAction::Deny(id),
             ModalAction::ApproveAll => InputAction::ApproveAll,
             ModalAction::DenyAll => InputAction::DenyAll,
             ModalAction::SpawnAgent => InputAction::None, // unreachable
@@ -207,6 +270,41 @@ fn handle_modal_input(app: &mut App, key: KeyEvent) -> InputAction {
             app.modal = Some(modal);
             InputAction::None
         }
+    }
+}
+
+/// Handle input in the history view.
+fn handle_history_input(app: &mut App, key: KeyEvent) -> InputAction {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.exit_history_view();
+            InputAction::None
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.history_down();
+            InputAction::None
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.history_up();
+            InputAction::None
+        }
+        // Filter history to selected entry's agent
+        KeyCode::Char('f') => {
+            if let Some(entry) = app.history.get(app.history_index) {
+                let agent_id = entry.agent_id.clone();
+                app.enter_history_view(Some(agent_id.clone()));
+                return InputAction::QueryHistory {
+                    agent_id: Some(agent_id),
+                };
+            }
+            InputAction::None
+        }
+        // Clear agent filter (show all)
+        KeyCode::Char('F') => {
+            app.enter_history_view(None);
+            InputAction::QueryHistory { agent_id: None }
+        }
+        _ => InputAction::None,
     }
 }
 

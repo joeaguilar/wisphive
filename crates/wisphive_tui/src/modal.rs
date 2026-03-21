@@ -1,11 +1,7 @@
 use std::path::PathBuf;
 
-use uuid::Uuid;
-
 /// What action the modal is confirming.
 pub enum ModalAction {
-    ApproveSingle(Uuid),
-    DenySingle(Uuid),
     ApproveAll,
     DenyAll,
     /// Spawn a new agent (resolved via SpawnModal fields).
@@ -68,28 +64,6 @@ pub struct Modal {
 }
 
 impl Modal {
-    pub fn confirm_approve(id: Uuid, tool_name: &str, agent_id: &str) -> Self {
-        Self {
-            title: "Confirm Approve".into(),
-            body: format!(
-                "Approve {tool_name} from {agent_id}?\n\n  Y = approve  |  N / Esc = cancel"
-            ),
-            action: ModalAction::ApproveSingle(id),
-            spawn: None,
-        }
-    }
-
-    pub fn confirm_deny(id: Uuid, tool_name: &str, agent_id: &str) -> Self {
-        Self {
-            title: "Confirm Deny".into(),
-            body: format!(
-                "Deny {tool_name} from {agent_id}?\nThis will block the tool call.\n\n  Y = deny  |  N / Esc = cancel"
-            ),
-            action: ModalAction::DenySingle(id),
-            spawn: None,
-        }
-    }
-
     pub fn confirm_approve_all(count: usize) -> Self {
         Self {
             title: "Confirm Approve All".into(),
