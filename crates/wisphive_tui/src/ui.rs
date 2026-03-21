@@ -16,6 +16,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
         ViewMode::History => draw_history_view(frame, app),
         ViewMode::HistoryDetail => draw_history_detail_view(frame, app),
         ViewMode::Config => draw_config_view(frame, app),
+        ViewMode::Sessions => draw_sessions_view(frame, app),
+        ViewMode::SessionTimeline => draw_session_timeline_view(frame, app),
         ViewMode::Dashboard => draw_dashboard(frame, app),
     }
 }
@@ -342,6 +344,217 @@ fn draw_config_view(frame: &mut Frame, app: &App) {
     frame.render_widget(bar, chunks[1]);
 }
 
+fn draw_sessions_view(frame: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(frame.area());
+
+    let live_count = app.sessions.iter().filter(|s| s.is_live).count();
+    let title = format!(
+        " Sessions ({} total, {} live) ",
+        app.sessions.len(),
+        live_count
+    );
+
+    let items: Vec<ListItem> = app
+        .sessions
+        .iter()
+        .enumerate()
+        .map(|(i, session)| {
+            let status = if session.is_live {
+                Span::styled("● ", Style::default().fg(Color::Green))
+            } else {
+                Span::styled("○ ", Style::default().fg(Color::DarkGray))
+            };
+
+            let project_name = session
+                .project
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| session.project.to_string_lossy().to_string());
+
+            let dur = session
+                .last_seen
+                .signed_duration_since(session.first_seen)
+                .num_seconds();
+            let dur_str = if dur < 60 {
+                format!("{dur}s")
+            } else if dur < 3600 {
+                format!("{}m", dur / 60)
+            } else {
+                format!("{}h{}m", dur / 3600, (dur % 3600) / 60)
+            };
+
+            let pending = if session.pending_count > 0 {
+                Span::styled(
+                    format!(" [{}!]", session.pending_count),
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled("", Style::default())
+            };
+
+            let line = Line::from(vec![
+                status,
+                Span::styled(
+                    format!("{:<18} ", session.agent_id),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(
+                    format!("{:<12} ", project_name),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(format!("{:>6} ", dur_str), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}calls ", session.total_calls),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(
+                    format!("{}ok ", session.approved),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::styled(
+                    format!("{}deny", session.denied),
+                    Style::default().fg(Color::Red),
+                ),
+                pending,
+            ]);
+
+            let style = if i == app.sessions_index {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            ListItem::new(line).style(style)
+        })
+        .collect();
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(title),
+    );
+    frame.render_widget(list, chunks[0]);
+
+    let bar = Paragraph::new(Line::from(Span::styled(
+        " [j/k]navigate [Enter]timeline [r]efresh [q/Esc]back [Q]uit ",
+        Style::default().fg(Color::White).bg(Color::DarkGray),
+    )));
+    frame.render_widget(bar, chunks[1]);
+}
+
+fn draw_session_timeline_view(frame: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(frame.area());
+
+    let agent_id = app
+        .session_timeline_agent_id
+        .as_deref()
+        .unwrap_or("unknown");
+    let title = format!(
+        " Session Timeline: {} ({} entries) ",
+        agent_id,
+        app.session_timeline.len()
+    );
+
+    let items: Vec<ListItem> = app
+        .session_timeline
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let decision_str = match entry.decision {
+                wisphive_protocol::Decision::Approve => "APPROVED",
+                wisphive_protocol::Decision::Deny => "DENIED  ",
+                wisphive_protocol::Decision::Ask => "DEFERRED",
+            };
+            let decision_color = match entry.decision {
+                wisphive_protocol::Decision::Approve => Color::Green,
+                wisphive_protocol::Decision::Deny => Color::Red,
+                wisphive_protocol::Decision::Ask => Color::Yellow,
+            };
+
+            let result_indicator = if entry.tool_result.is_some() {
+                Span::styled("+ ", Style::default().fg(Color::Cyan))
+            } else {
+                Span::styled("  ", Style::default())
+            };
+
+            let time_str = entry.resolved_at.format("%H:%M:%S").to_string();
+
+            let input_summary = if let Some(cmd) =
+                entry.tool_input.get("command").and_then(|v| v.as_str())
+            {
+                let s = cmd.to_string();
+                if s.len() > 40 {
+                    format!("{}...", &s[..37])
+                } else {
+                    s
+                }
+            } else if let Some(path) =
+                entry.tool_input.get("file_path").and_then(|v| v.as_str())
+            {
+                path.to_string()
+            } else {
+                String::new()
+            };
+
+            let line = Line::from(vec![
+                result_indicator,
+                Span::styled(
+                    format!("{decision_str} "),
+                    Style::default()
+                        .fg(decision_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{:<12} ", entry.tool_name),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(input_summary, Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("  {time_str}"),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]);
+
+            let style = if i == app.session_timeline_index {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            ListItem::new(line).style(style)
+        })
+        .collect();
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(title),
+    );
+    frame.render_widget(list, chunks[0]);
+
+    let page_info = if app.session_timeline_page > 0 || app.session_timeline_has_more {
+        format!(" pg {} ", app.session_timeline_page + 1)
+    } else {
+        String::new()
+    };
+    let bar = Paragraph::new(Line::from(Span::styled(
+        format!(
+            " [j/k]navigate [Enter]detail [H/[]prev [L/]]next [q/Esc]back [Q]uit{}",
+            page_info
+        ),
+        Style::default().fg(Color::White).bg(Color::DarkGray),
+    )));
+    frame.render_widget(bar, chunks[1]);
+}
+
 fn draw_queue_panel(frame: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == FocusPanel::Queue;
     let border_style = if focused {
@@ -447,7 +660,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             "disconnected"
         };
         format!(
-            " [y]approve [Enter/a/d]review [A]pprove-all [D]eny-all [h]istory [c]onfig [/]filter [Tab]cycle [q]back [Q]uit | {} ",
+            " [y]approve [Enter/a/d]review [A]ll [D]eny-all [h]istory [s]essions [c]onfig [/]filter [Tab]cycle [q]back [Q]uit | {} ",
             conn
         )
     };
