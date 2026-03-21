@@ -55,6 +55,7 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
         ViewMode::Detail => return handle_detail_input(app, key),
         ViewMode::History => return handle_history_input(app, key),
         ViewMode::HistoryDetail => return handle_history_detail_input(app, key),
+        ViewMode::Config => return handle_config_input(app, key),
         ViewMode::Dashboard => {}
     }
 
@@ -84,6 +85,11 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
         KeyCode::Char('h') => {
             app.enter_history_view(None);
             return InputAction::QueryHistory { agent_id: None };
+        }
+        // Open config view
+        KeyCode::Char('c') => {
+            app.enter_config_view();
+            return InputAction::None;
         }
         _ => {}
     }
@@ -600,6 +606,89 @@ fn handle_history_detail_input(app: &mut App, key: KeyEvent) -> InputAction {
         }
         KeyCode::Char('q') => {
             app.exit_history_detail_view();
+            InputAction::None
+        }
+        KeyCode::Char('Q') => InputAction::Quit,
+        _ => InputAction::None,
+    }
+}
+
+fn handle_config_input(app: &mut App, key: KeyEvent) -> InputAction {
+    use wisphive_protocol::AutoApproveLevel;
+
+    // All known tools for the toggle list
+    const ALL_TOOLS: &[&str] = &[
+        "Read", "Glob", "Grep", "LS", "WebSearch", "WebFetch",
+        "NotebookRead", "Agent", "Skill", "TaskCreate", "TaskUpdate",
+        "TaskGet", "TaskList", "TodoRead", "ToolSearch",
+        "Edit", "Write", "NotebookEdit", "Bash",
+    ];
+
+    match key.code {
+        // Back
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.exit_config_view();
+            InputAction::None
+        }
+        // Navigate
+        KeyCode::Char('j') | KeyCode::Down => {
+            let max = ALL_TOOLS.len(); // 0 = level row, 1..N = tool rows
+            if app.config_index < max {
+                app.config_index += 1;
+            }
+            InputAction::None
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.config_index = app.config_index.saturating_sub(1);
+            InputAction::None
+        }
+        // Cycle level (when on level row)
+        KeyCode::Left | KeyCode::Right if app.config_index == 0 => {
+            let levels = [
+                AutoApproveLevel::Off,
+                AutoApproveLevel::Read,
+                AutoApproveLevel::Write,
+                AutoApproveLevel::Execute,
+                AutoApproveLevel::All,
+            ];
+            let current = levels.iter().position(|l| *l == app.config_level).unwrap_or(1);
+            let next = if key.code == KeyCode::Right {
+                (current + 1).min(levels.len() - 1)
+            } else {
+                current.saturating_sub(1)
+            };
+            app.config_level = levels[next];
+            app.save_config();
+            InputAction::None
+        }
+        // Toggle tool override (when on a tool row)
+        KeyCode::Enter | KeyCode::Char(' ') if app.config_index > 0 => {
+            let tool_idx = app.config_index - 1;
+            if tool_idx < ALL_TOOLS.len() {
+                let tool = ALL_TOOLS[tool_idx].to_string();
+                let in_level = app.config_level.includes(&tool);
+                let in_add = app.config_add.contains(&tool);
+                let in_remove = app.config_remove.contains(&tool);
+
+                if in_level {
+                    // Tool is included by level — toggle remove override
+                    if in_remove {
+                        app.config_remove.retain(|t| *t != tool);
+                    } else {
+                        app.config_add.retain(|t| *t != tool);
+                        app.config_remove.push(tool);
+                    }
+                } else {
+                    // Tool is NOT in level — toggle add override
+                    if in_add {
+                        app.config_add.retain(|t| *t != tool);
+                    } else {
+                        app.config_remove.retain(|t| *t != tool);
+                        app.config_add.push(tool);
+                    }
+                }
+                app.save_config();
+            }
             InputAction::None
         }
         KeyCode::Char('Q') => InputAction::Quit,
