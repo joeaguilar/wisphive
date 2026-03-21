@@ -138,6 +138,22 @@ fn hook_binary_path() -> String {
 }
 
 /// Add a Wisphive hook entry to the settings JSON, avoiding duplicates.
+///
+/// Claude Code hook config format:
+/// ```json
+/// {
+///   "hooks": {
+///     "PreToolUse": [
+///       {
+///         "matcher": "",
+///         "hooks": [
+///           { "type": "command", "command": "/path/to/wisphive-hook" }
+///         ]
+///       }
+///     ]
+///   }
+/// }
+/// ```
 pub(crate) fn add_hook_entry(settings: &mut serde_json::Value, hook_type: &str, command: &str) {
     let hooks = settings["hooks"]
         .as_object_mut()
@@ -148,13 +164,8 @@ pub(crate) fn add_hook_entry(settings: &mut serde_json::Value, hook_type: &str, 
         .or_insert_with(|| serde_json::json!([]));
 
     if let Some(arr) = entries.as_array() {
-        // Check if our hook is already there
-        let already_present = arr.iter().any(|entry| {
-            entry
-                .get("command")
-                .and_then(|v| v.as_str())
-                .is_some_and(|cmd| cmd.contains("wisphive"))
-        });
+        // Check if our hook is already there (search nested hooks arrays)
+        let already_present = arr.iter().any(|rule| has_wisphive_hook(rule));
         if already_present {
             return;
         }
@@ -162,7 +173,13 @@ pub(crate) fn add_hook_entry(settings: &mut serde_json::Value, hook_type: &str, 
 
     if let Some(arr) = entries.as_array_mut() {
         arr.push(serde_json::json!({
-            "command": command
+            "matcher": "",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": command
+                }
+            ]
         }));
     }
 }
@@ -176,15 +193,27 @@ pub(crate) fn remove_hook_entries(
     if let Some(hooks) = settings.get_mut("hooks") {
         if let Some(entries) = hooks.get_mut(hook_type) {
             if let Some(arr) = entries.as_array_mut() {
-                arr.retain(|entry| {
-                    !entry
-                        .get("command")
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|cmd| cmd.contains("wisphive"))
-                });
+                arr.retain(|rule| !has_wisphive_hook(rule));
             }
         }
     }
+}
+
+/// Check if a hook rule entry contains a wisphive hook command.
+/// Handles the nested format: {"matcher": "...", "hooks": [{"type": "command", "command": "...wisphive..."}]}
+fn has_wisphive_hook(rule: &serde_json::Value) -> bool {
+    // Check nested hooks array (correct Claude Code format)
+    if let Some(hooks_arr) = rule.get("hooks").and_then(|v| v.as_array()) {
+        return hooks_arr.iter().any(|hook| {
+            hook.get("command")
+                .and_then(|v| v.as_str())
+                .is_some_and(|cmd| cmd.contains("wisphive"))
+        });
+    }
+    // Fallback: check flat format (legacy/simple)
+    rule.get("command")
+        .and_then(|v| v.as_str())
+        .is_some_and(|cmd| cmd.contains("wisphive"))
 }
 
 #[cfg(test)]
@@ -193,8 +222,6 @@ mod tests {
     use serde_json::json;
     use std::fs;
 
-    // ── Helper ──
-
     fn temp_project() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
     }
@@ -202,449 +229,338 @@ mod tests {
     fn write_settings(project: &std::path::Path, settings: &serde_json::Value) {
         let dir = project.join(".claude");
         fs::create_dir_all(&dir).unwrap();
-        let content = serde_json::to_string_pretty(settings).unwrap();
-        fs::write(dir.join("settings.json"), content).unwrap();
+        fs::write(
+            dir.join("settings.json"),
+            serde_json::to_string_pretty(settings).unwrap(),
+        )
+        .unwrap();
     }
 
     fn read_settings(project: &std::path::Path) -> serde_json::Value {
-        let path = project.join(".claude").join("settings.json");
-        let content = fs::read_to_string(path).unwrap();
+        let content = fs::read_to_string(project.join(".claude").join("settings.json")).unwrap();
         serde_json::from_str(&content).unwrap()
     }
 
-    // ════════════════════════════════════════════════════════════
-    // add_hook_entry tests
-    // ════════════════════════════════════════════════════════════
+    /// Build a Claude Code-format hook rule.
+    fn cc_rule(command: &str) -> serde_json::Value {
+        json!({"matcher": "", "hooks": [{"type": "command", "command": command}]})
+    }
+
+    // ══ add_hook_entry (writes correct nested format) ══
 
     #[test]
-    fn add_hook_entry_to_empty_settings() {
-        let mut settings = json!({"hooks": {}});
-        add_hook_entry(&mut settings, "PreToolUse", "wisphive-hook");
-
-        let entries = &settings["hooks"]["PreToolUse"];
-        assert!(entries.is_array());
-        assert_eq!(entries.as_array().unwrap().len(), 1);
-        assert_eq!(entries[0]["command"], "wisphive-hook");
+    fn add_to_empty_creates_nested_format() {
+        let mut s = json!({"hooks": {}});
+        add_hook_entry(&mut s, "PreToolUse", "wisphive-hook");
+        let rule = &s["hooks"]["PreToolUse"][0];
+        assert_eq!(rule["matcher"], "");
+        assert_eq!(rule["hooks"][0]["type"], "command");
+        assert_eq!(rule["hooks"][0]["command"], "wisphive-hook");
     }
 
     #[test]
-    fn add_hook_entry_preserves_existing_hooks() {
-        let mut settings = json!({
-            "hooks": {
-                "PreToolUse": [
-                    {"command": "some-other-hook"}
-                ]
-            }
-        });
-        add_hook_entry(&mut settings, "PreToolUse", "wisphive-hook");
-
-        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0]["command"], "some-other-hook");
-        assert_eq!(entries[1]["command"], "wisphive-hook");
+    fn add_preserves_existing_rules() {
+        let mut s = json!({"hooks": {"PreToolUse": [cc_rule("other-hook")]}});
+        add_hook_entry(&mut s, "PreToolUse", "wisphive-hook");
+        let arr = s["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["hooks"][0]["command"], "other-hook");
+        assert_eq!(arr[1]["hooks"][0]["command"], "wisphive-hook");
     }
 
     #[test]
-    fn add_hook_entry_idempotent() {
-        let mut settings = json!({"hooks": {}});
-        add_hook_entry(&mut settings, "PreToolUse", "wisphive-hook");
-        add_hook_entry(&mut settings, "PreToolUse", "wisphive-hook");
-        add_hook_entry(&mut settings, "PreToolUse", "/usr/bin/wisphive-hook");
-
-        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
-        // All contain "wisphive" so only the first should be added
-        assert_eq!(entries.len(), 1);
+    fn add_is_idempotent() {
+        let mut s = json!({"hooks": {}});
+        add_hook_entry(&mut s, "PreToolUse", "wisphive-hook");
+        add_hook_entry(&mut s, "PreToolUse", "wisphive-hook");
+        add_hook_entry(&mut s, "PreToolUse", "/usr/bin/wisphive-hook");
+        assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
     }
 
     #[test]
-    fn add_hook_entry_different_hook_types_are_independent() {
-        let mut settings = json!({"hooks": {}});
-        add_hook_entry(&mut settings, "PreToolUse", "wisphive-hook");
-        add_hook_entry(&mut settings, "PostToolUse", "wisphive-hook");
+    fn add_different_hook_types_independent() {
+        let mut s = json!({"hooks": {}});
+        add_hook_entry(&mut s, "PreToolUse", "wisphive-hook");
+        add_hook_entry(&mut s, "PostToolUse", "wisphive-hook");
+        assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+        assert_eq!(s["hooks"]["PostToolUse"].as_array().unwrap().len(), 1);
+    }
 
-        assert_eq!(settings["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+    #[test]
+    fn add_with_full_path() {
+        let mut s = json!({"hooks": {}});
+        add_hook_entry(&mut s, "PreToolUse", "/home/user/.cargo/bin/wisphive-hook");
         assert_eq!(
-            settings["hooks"]["PostToolUse"].as_array().unwrap().len(),
-            1
+            s["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "/home/user/.cargo/bin/wisphive-hook"
         );
     }
 
-    #[test]
-    fn add_hook_entry_with_path_containing_wisphive() {
-        let mut settings = json!({"hooks": {}});
-        add_hook_entry(
-            &mut settings,
-            "PreToolUse",
-            "/home/user/.cargo/bin/wisphive-hook",
-        );
-
-        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0]["command"], "/home/user/.cargo/bin/wisphive-hook");
-    }
-
-    // ════════════════════════════════════════════════════════════
-    // remove_hook_entries tests
-    // ════════════════════════════════════════════════════════════
+    // ══ remove_hook_entries (handles nested + legacy) ══
 
     #[test]
-    fn remove_hook_entries_removes_wisphive_only() {
-        let mut settings = json!({
-            "hooks": {
-                "PreToolUse": [
-                    {"command": "some-other-hook"},
-                    {"command": "wisphive-hook"},
-                    {"command": "yet-another-hook"}
-                ]
-            }
-        });
-        remove_hook_entries(&mut settings, "PreToolUse", "wisphive-hook");
-
-        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0]["command"], "some-other-hook");
-        assert_eq!(entries[1]["command"], "yet-another-hook");
+    fn remove_nested_format() {
+        let mut s = json!({"hooks": {"PreToolUse": [
+            cc_rule("other"), cc_rule("wisphive-hook"), cc_rule("another")
+        ]}});
+        remove_hook_entries(&mut s, "PreToolUse", "");
+        let arr = s["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["hooks"][0]["command"], "other");
+        assert_eq!(arr[1]["hooks"][0]["command"], "another");
     }
 
     #[test]
-    fn remove_hook_entries_handles_missing_hooks_section() {
-        let mut settings = json!({"other": "data"});
-        // Should not panic
-        remove_hook_entries(&mut settings, "PreToolUse", "wisphive-hook");
-        assert_eq!(settings, json!({"other": "data"}));
+    fn remove_legacy_flat_format() {
+        let mut s = json!({"hooks": {"PreToolUse": [
+            {"command": "other"}, {"command": "wisphive-hook"}, {"command": "another"}
+        ]}});
+        remove_hook_entries(&mut s, "PreToolUse", "");
+        let arr = s["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
     }
 
     #[test]
-    fn remove_hook_entries_handles_missing_hook_type() {
-        let mut settings = json!({"hooks": {}});
-        // Should not panic
-        remove_hook_entries(&mut settings, "PreToolUse", "wisphive-hook");
-        assert_eq!(settings, json!({"hooks": {}}));
+    fn remove_all_path_variants() {
+        let mut s = json!({"hooks": {"PreToolUse": [
+            cc_rule("wisphive-hook"),
+            cc_rule("/usr/local/bin/wisphive-hook"),
+            cc_rule("/home/u/.cargo/bin/wisphive-hook"),
+            cc_rule("other-tool")
+        ]}});
+        remove_hook_entries(&mut s, "PreToolUse", "");
+        let arr = s["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["hooks"][0]["command"], "other-tool");
     }
 
     #[test]
-    fn remove_hook_entries_handles_empty_array() {
-        let mut settings = json!({
-            "hooks": {
-                "PreToolUse": []
-            }
-        });
-        remove_hook_entries(&mut settings, "PreToolUse", "wisphive-hook");
-        assert_eq!(settings["hooks"]["PreToolUse"].as_array().unwrap().len(), 0);
+    fn remove_missing_hooks_section() {
+        let mut s = json!({"other": "data"});
+        remove_hook_entries(&mut s, "PreToolUse", "");
+        assert_eq!(s, json!({"other": "data"}));
     }
 
     #[test]
-    fn remove_hook_entries_removes_all_wisphive_variants() {
-        let mut settings = json!({
-            "hooks": {
-                "PreToolUse": [
-                    {"command": "wisphive-hook"},
-                    {"command": "/usr/local/bin/wisphive-hook"},
-                    {"command": "/home/user/.cargo/bin/wisphive-hook"},
-                    {"command": "other-tool"}
-                ]
-            }
-        });
-        remove_hook_entries(&mut settings, "PreToolUse", "");
-
-        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0]["command"], "other-tool");
+    fn remove_missing_hook_type() {
+        let mut s = json!({"hooks": {}});
+        remove_hook_entries(&mut s, "PreToolUse", "");
+        assert_eq!(s, json!({"hooks": {}}));
     }
 
     #[test]
-    fn remove_hook_entries_noop_when_no_wisphive_present() {
-        let mut settings = json!({
-            "hooks": {
-                "PreToolUse": [
-                    {"command": "tool-a"},
-                    {"command": "tool-b"}
-                ]
-            }
-        });
-        let original = settings.clone();
-        remove_hook_entries(&mut settings, "PreToolUse", "wisphive-hook");
-        assert_eq!(settings, original);
+    fn remove_empty_array() {
+        let mut s = json!({"hooks": {"PreToolUse": []}});
+        remove_hook_entries(&mut s, "PreToolUse", "");
+        assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 0);
     }
 
     #[test]
-    fn remove_hook_entries_handles_entries_without_command_field() {
-        let mut settings = json!({
-            "hooks": {
-                "PreToolUse": [
-                    {"command": "wisphive-hook"},
-                    {"not_command": "something"},
-                    {"command": "other-tool"}
-                ]
-            }
-        });
-        remove_hook_entries(&mut settings, "PreToolUse", "wisphive-hook");
-
-        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
-        // Entry without "command" is retained, wisphive is removed
-        assert_eq!(entries.len(), 2);
+    fn remove_noop_when_no_wisphive() {
+        let mut s = json!({"hooks": {"PreToolUse": [cc_rule("a"), cc_rule("b")]}});
+        let orig = s.clone();
+        remove_hook_entries(&mut s, "PreToolUse", "");
+        assert_eq!(s, orig);
     }
 
-    // ════════════════════════════════════════════════════════════
-    // install / uninstall integration tests (filesystem)
-    // ════════════════════════════════════════════════════════════
+    #[test]
+    fn remove_keeps_entries_without_command() {
+        let mut s = json!({"hooks": {"PreToolUse": [
+            cc_rule("wisphive-hook"), {"not_command": "x"}, cc_rule("other")
+        ]}});
+        remove_hook_entries(&mut s, "PreToolUse", "");
+        assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+    }
 
     #[test]
-    fn install_creates_settings_from_scratch() {
+    fn remove_non_array_graceful() {
+        let mut s = json!({"hooks": {"PreToolUse": "not-an-array"}});
+        remove_hook_entries(&mut s, "PreToolUse", "");
+        assert_eq!(s["hooks"]["PreToolUse"], "not-an-array");
+    }
+
+    // ══ has_wisphive_hook detection ══
+
+    #[test]
+    fn detect_nested() {
+        assert!(has_wisphive_hook(&cc_rule("wisphive-hook")));
+    }
+    #[test]
+    fn detect_legacy() {
+        assert!(has_wisphive_hook(&json!({"command": "wisphive-hook"})));
+    }
+    #[test]
+    fn detect_false_other() {
+        assert!(!has_wisphive_hook(&cc_rule("other-tool")));
+    }
+    #[test]
+    fn detect_false_empty() {
+        assert!(!has_wisphive_hook(&json!({})));
+    }
+    #[test]
+    fn detect_path_variants() {
+        assert!(has_wisphive_hook(&cc_rule("/usr/local/bin/wisphive-hook")));
+        assert!(has_wisphive_hook(&cc_rule("wisphive-hook --verbose")));
+    }
+
+    // ══ install / uninstall filesystem integration ══
+
+    #[test]
+    fn install_creates_from_scratch() {
         let tmp = temp_project();
-        let project = tmp.path().to_path_buf();
-
-        install(Some(project.clone()), false).unwrap();
-
-        let settings = read_settings(&project);
-        assert!(settings["hooks"]["PreToolUse"].is_array());
-        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(entries.len(), 1);
-        assert!(entries[0]["command"].as_str().unwrap().contains("wisphive"));
+        let p = tmp.path().to_path_buf();
+        install(Some(p.clone()), false).unwrap();
+        let s = read_settings(&p);
+        let rule = &s["hooks"]["PreToolUse"][0];
+        assert!(
+            rule["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("wisphive")
+        );
+        assert_eq!(rule["hooks"][0]["type"], "command");
     }
 
     #[test]
     fn install_preserves_existing_settings() {
         let tmp = temp_project();
-        let project = tmp.path().to_path_buf();
-
-        // Pre-existing settings with MCP servers and other data
-        let existing = json!({
-            "mcpServers": {
-                "myserver": {"url": "http://localhost:3000"}
-            },
-            "permissions": {
-                "allow": ["Read", "Glob"]
-            }
-        });
-        write_settings(&project, &existing);
-
-        install(Some(project.clone()), false).unwrap();
-
-        let settings = read_settings(&project);
-        // Original data preserved
-        assert_eq!(
-            settings["mcpServers"]["myserver"]["url"],
-            "http://localhost:3000"
-        );
-        assert!(settings["permissions"]["allow"].is_array());
-        // Hook added
-        assert!(settings["hooks"]["PreToolUse"].is_array());
+        let p = tmp.path().to_path_buf();
+        write_settings(&p, &json!({"mcpServers": {"s": {"url": "http://x"}}}));
+        install(Some(p.clone()), false).unwrap();
+        let s = read_settings(&p);
+        assert_eq!(s["mcpServers"]["s"]["url"], "http://x");
+        assert!(s["hooks"]["PreToolUse"].is_array());
     }
 
     #[test]
     fn install_preserves_existing_hooks() {
         let tmp = temp_project();
-        let project = tmp.path().to_path_buf();
-
-        let existing = json!({
-            "hooks": {
-                "PreToolUse": [
-                    {"command": "my-custom-linter"}
-                ],
-                "PostToolUse": [
-                    {"command": "my-logger"}
-                ]
-            }
-        });
-        write_settings(&project, &existing);
-
-        install(Some(project.clone()), false).unwrap();
-
-        let settings = read_settings(&project);
-        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(pre.len(), 2);
-        assert_eq!(pre[0]["command"], "my-custom-linter");
-        // PostToolUse untouched
-        let post = settings["hooks"]["PostToolUse"].as_array().unwrap();
-        assert_eq!(post.len(), 1);
-        assert_eq!(post[0]["command"], "my-logger");
+        let p = tmp.path().to_path_buf();
+        write_settings(
+            &p,
+            &json!({"hooks": {
+                "PreToolUse": [cc_rule("linter")],
+                "PostToolUse": [cc_rule("logger")]
+            }}),
+        );
+        install(Some(p.clone()), false).unwrap();
+        let s = read_settings(&p);
+        assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+        assert_eq!(s["hooks"]["PostToolUse"].as_array().unwrap().len(), 1);
     }
 
     #[test]
-    fn install_is_idempotent() {
+    fn install_idempotent() {
         let tmp = temp_project();
-        let project = tmp.path().to_path_buf();
-
-        install(Some(project.clone()), false).unwrap();
-        install(Some(project.clone()), false).unwrap();
-        install(Some(project.clone()), false).unwrap();
-
-        let settings = read_settings(&project);
-        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(entries.len(), 1);
+        let p = tmp.path().to_path_buf();
+        install(Some(p.clone()), false).unwrap();
+        install(Some(p.clone()), false).unwrap();
+        install(Some(p.clone()), false).unwrap();
+        assert_eq!(
+            read_settings(&p)["hooks"]["PreToolUse"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
     fn uninstall_removes_wisphive_only() {
         let tmp = temp_project();
-        let project = tmp.path().to_path_buf();
-
-        let existing = json!({
-            "hooks": {
-                "PreToolUse": [
-                    {"command": "my-custom-linter"},
-                    {"command": "wisphive-hook"}
-                ],
-                "PostToolUse": [
-                    {"command": "wisphive-hook"},
-                    {"command": "my-logger"}
-                ]
-            },
-            "mcpServers": {"keep": "this"}
-        });
-        write_settings(&project, &existing);
-
-        uninstall(Some(project.clone()), false).unwrap();
-
-        let settings = read_settings(&project);
-        // Wisphive removed from both
-        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(pre.len(), 1);
-        assert_eq!(pre[0]["command"], "my-custom-linter");
-
-        let post = settings["hooks"]["PostToolUse"].as_array().unwrap();
-        assert_eq!(post.len(), 1);
-        assert_eq!(post[0]["command"], "my-logger");
-
-        // Other settings preserved
-        assert_eq!(settings["mcpServers"]["keep"], "this");
+        let p = tmp.path().to_path_buf();
+        write_settings(
+            &p,
+            &json!({"hooks": {
+                "PreToolUse": [cc_rule("linter"), cc_rule("wisphive-hook")],
+                "PostToolUse": [cc_rule("wisphive-hook"), cc_rule("logger")]
+            }, "mcpServers": {"keep": "this"}}),
+        );
+        uninstall(Some(p.clone()), false).unwrap();
+        let s = read_settings(&p);
+        assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+        assert_eq!(s["hooks"]["PostToolUse"].as_array().unwrap().len(), 1);
+        assert_eq!(s["mcpServers"]["keep"], "this");
     }
 
     #[test]
-    fn uninstall_ok_when_no_settings_file() {
+    fn uninstall_ok_no_settings() {
         let tmp = temp_project();
-        let project = tmp.path().to_path_buf();
-        // No .claude/settings.json exists
-        let result = uninstall(Some(project), false);
-        assert!(result.is_ok());
+        assert!(uninstall(Some(tmp.path().to_path_buf()), false).is_ok());
     }
 
     #[test]
     fn install_then_uninstall_round_trip() {
         let tmp = temp_project();
-        let project = tmp.path().to_path_buf();
-
-        let original = json!({
-            "hooks": {
-                "PreToolUse": [
-                    {"command": "existing-tool"}
-                ]
-            },
-            "other": "data"
-        });
-        write_settings(&project, &original);
-
-        install(Some(project.clone()), false).unwrap();
-        // Now has wisphive + existing-tool
-        let mid = read_settings(&project);
-        assert_eq!(mid["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
-
-        uninstall(Some(project.clone()), false).unwrap();
-        // Back to just existing-tool
-        let after = read_settings(&project);
-        let entries = after["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0]["command"], "existing-tool");
-        assert_eq!(after["other"], "data");
-    }
-
-    // ════════════════════════════════════════════════════════════
-    // Mode file tests
-    // ════════════════════════════════════════════════════════════
-
-    #[test]
-    fn set_mode_creates_directory_and_file() {
-        // This test modifies ~/.wisphive/mode so we use a scoped approach
-        // by testing the internal logic with temp dirs instead.
-        let tmp = tempfile::tempdir().unwrap();
-        let mode_file = tmp.path().join("mode");
-
-        std::fs::write(&mode_file, "active").unwrap();
-        let content = std::fs::read_to_string(&mode_file).unwrap();
-        assert_eq!(content, "active");
-
-        std::fs::write(&mode_file, "off").unwrap();
-        let content = std::fs::read_to_string(&mode_file).unwrap();
-        assert_eq!(content, "off");
-    }
-
-    #[test]
-    fn mode_file_missing_defaults_to_off() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mode_file = tmp.path().join("nonexistent").join("mode");
-        let mode = std::fs::read_to_string(&mode_file).unwrap_or_else(|_| "off".into());
-        assert_eq!(mode, "off");
-    }
-
-    #[test]
-    fn mode_file_with_whitespace_is_trimmed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mode_file = tmp.path().join("mode");
-        std::fs::write(&mode_file, "  active  \n").unwrap();
-        let content = std::fs::read_to_string(&mode_file).unwrap();
-        assert_eq!(content.trim(), "active");
-    }
-
-    // ════════════════════════════════════════════════════════════
-    // Edge cases
-    // ════════════════════════════════════════════════════════════
-
-    #[test]
-    fn install_handles_settings_with_no_hooks_key() {
-        let tmp = temp_project();
-        let project = tmp.path().to_path_buf();
-
-        let existing = json!({"someKey": "someValue"});
-        write_settings(&project, &existing);
-
-        install(Some(project.clone()), false).unwrap();
-
-        let settings = read_settings(&project);
-        assert_eq!(settings["someKey"], "someValue");
-        assert!(settings["hooks"]["PreToolUse"].is_array());
-    }
-
-    #[test]
-    fn add_hook_entry_handles_command_with_args() {
-        let mut settings = json!({"hooks": {}});
-        add_hook_entry(
-            &mut settings,
-            "PreToolUse",
-            "wisphive-hook --verbose --timeout 30",
+        let p = tmp.path().to_path_buf();
+        write_settings(
+            &p,
+            &json!({"hooks": {"PreToolUse": [cc_rule("existing")]}, "other": "data"}),
         );
-
-        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(entries.len(), 1);
+        install(Some(p.clone()), false).unwrap();
         assert_eq!(
-            entries[0]["command"],
-            "wisphive-hook --verbose --timeout 30"
+            read_settings(&p)["hooks"]["PreToolUse"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        uninstall(Some(p.clone()), false).unwrap();
+        let s = read_settings(&p);
+        assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            s["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "existing"
+        );
+        assert_eq!(s["other"], "data");
+    }
+
+    #[test]
+    fn install_no_hooks_key() {
+        let tmp = temp_project();
+        let p = tmp.path().to_path_buf();
+        write_settings(&p, &json!({"someKey": "someValue"}));
+        install(Some(p.clone()), false).unwrap();
+        let s = read_settings(&p);
+        assert_eq!(s["someKey"], "someValue");
+        assert!(s["hooks"]["PreToolUse"].is_array());
+    }
+
+    #[test]
+    fn uninstall_empty_hooks() {
+        let tmp = temp_project();
+        let p = tmp.path().to_path_buf();
+        write_settings(&p, &json!({"hooks": {}}));
+        assert!(uninstall(Some(p), false).is_ok());
+    }
+
+    // ══ Mode file ══
+
+    #[test]
+    fn mode_creates_and_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("mode");
+        std::fs::write(&f, "active").unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "active");
+        std::fs::write(&f, "off").unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "off");
+    }
+
+    #[test]
+    fn mode_missing_defaults_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("nope").join("mode");
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap_or_else(|_| "off".into()),
+            "off"
         );
     }
 
     #[test]
-    fn remove_handles_non_array_hook_entries_gracefully() {
-        // If someone put a string instead of an array for a hook type
-        let mut settings = json!({
-            "hooks": {
-                "PreToolUse": "not-an-array"
-            }
-        });
-        // Should not panic — the as_array_mut() check will return None
-        remove_hook_entries(&mut settings, "PreToolUse", "wisphive-hook");
-        // Data unchanged since it wasn't an array
-        assert_eq!(settings["hooks"]["PreToolUse"], "not-an-array");
-    }
-
-    #[test]
-    fn uninstall_handles_settings_with_empty_hooks() {
-        let tmp = temp_project();
-        let project = tmp.path().to_path_buf();
-
-        let existing = json!({"hooks": {}});
-        write_settings(&project, &existing);
-
-        let result = uninstall(Some(project), false);
-        assert!(result.is_ok());
+    fn mode_whitespace_trimmed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("mode");
+        std::fs::write(&f, "  active  \n").unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap().trim(), "active");
     }
 }
