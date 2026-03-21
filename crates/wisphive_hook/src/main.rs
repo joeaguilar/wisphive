@@ -60,8 +60,8 @@ fn run() -> Result<Decision, Box<dyn std::error::Error>> {
 
     let hook_event: serde_json::Value = serde_json::from_str(&input)?;
 
-    // PostToolUse detection: presence of tool_result field means this is a post-execution report
-    if hook_event.get("tool_result").is_some() {
+    // PostToolUse detection: Claude Code sends "tool_response" for post-execution results
+    if hook_event.get("tool_response").is_some() {
         handle_post_tool_use(&hook_event, &wisphive_dir)?;
         return Ok(Decision::Approve);
     }
@@ -166,7 +166,7 @@ fn handle_post_tool_use(
         .unwrap_or(serde_json::Value::Null);
 
     let tool_result = hook_event
-        .get("tool_result")
+        .get("tool_response")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
 
