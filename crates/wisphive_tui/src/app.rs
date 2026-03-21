@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use uuid::Uuid;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use wisphive_protocol::{AgentInfo, AutoApproveLevel, DecisionRequest, HistoryEntry, ToolRule};
 
@@ -170,6 +170,8 @@ pub struct App {
     pub project_summaries: Vec<wisphive_protocol::ProjectSummary>,
     /// Currently selected index in the project explorer.
     pub project_summaries_index: usize,
+    /// Agent IDs that have been stopped (approved Stop events).
+    pub stopped_agents: HashSet<String>,
 }
 
 /// Aggregated project status for the dashboard.
@@ -224,6 +226,7 @@ impl App {
             session_timeline_has_more: false,
             project_summaries: Vec::new(),
             project_summaries_index: 0,
+            stopped_agents: HashSet::new(),
         }
     }
 
