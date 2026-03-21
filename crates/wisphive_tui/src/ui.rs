@@ -859,22 +859,16 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(bar, area);
 }
 
-/// Return the tail of `s` that fits in `max_width` chars, keeping the cursor end visible.
-fn visible_tail(s: &str, max_width: usize) -> &str {
-    if s.len() <= max_width {
-        s
-    } else {
-        &s[s.len() - max_width..]
-    }
-}
-
 fn draw_modal(frame: &mut Frame, modal: &Modal) {
     let area = frame.area();
 
-    // Text/edit input modals are taller
-    let has_input = modal.text_input.is_some() || modal.edit_input.is_some() || modal.spawn.is_some();
-    let modal_height = if has_input {
+    let has_input = modal.textarea.is_some() || modal.spawn.is_some();
+    let modal_height = if modal.spawn.is_some() {
+        // Spawn modal: body + 2 bordered TextArea fields (3 lines each)
         12.min(area.height.saturating_sub(4))
+    } else if has_input {
+        // Single TextArea field: body + bordered input (3 lines)
+        9.min(area.height.saturating_sub(4))
     } else {
         7.min(area.height.saturating_sub(4))
     };
@@ -891,57 +885,45 @@ fn draw_modal(frame: &mut Frame, modal: &Modal) {
         .border_style(Style::default().fg(Color::Yellow))
         .title(format!(" {} ", modal.title));
 
-    // Build content lines
-    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
-        modal.body.clone(),
-        Style::default().fg(Color::White),
-    ))];
+    let inner = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
 
-    // Available width for input text: modal inner width minus "> " prefix and "_" cursor
-    let input_max_width = modal_width.saturating_sub(6) as usize; // 2 border + 2 "> " + 1 "_" + 1 pad
+    if let Some(ref textarea) = modal.textarea {
+        // Body text + TextArea widget
+        use ratatui::layout::{Constraint, Layout};
+        let chunks = Layout::vertical([
+            Constraint::Length(2), // body text + blank line
+            Constraint::Min(3),   // TextArea
+        ]).split(inner);
 
-    if let Some(ref text_input) = modal.text_input {
-        lines.push(Line::from(""));
-        let visible = visible_tail(&text_input.buffer, input_max_width);
-        lines.push(Line::from(vec![
-            Span::styled("> ", Style::default().fg(Color::Cyan)),
-            Span::styled(
-                format!("{visible}_"),
-                Style::default().fg(Color::Yellow),
-            ),
-        ]));
-    } else if let Some(ref edit_input) = modal.edit_input {
-        lines.push(Line::from(""));
-        let visible = visible_tail(&edit_input.buffer, input_max_width);
-        lines.push(Line::from(vec![
-            Span::styled("> ", Style::default().fg(Color::Cyan)),
-            Span::styled(
-                format!("{visible}_"),
-                Style::default().fg(Color::Yellow),
-            ),
-        ]));
+        let body = Paragraph::new(Line::from(Span::styled(
+            modal.body.clone(),
+            Style::default().fg(Color::White),
+        )));
+        frame.render_widget(body, chunks[0]);
+        frame.render_widget(textarea, chunks[1]);
     } else if let Some(ref spawn) = modal.spawn {
-        lines.push(Line::from(""));
-        let proj_style = if spawn.active_field == crate::modal::SpawnField::Project {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        let prompt_style = if spawn.active_field == crate::modal::SpawnField::Prompt {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        lines.push(Line::from(vec![
-            Span::styled("  Project: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("{}_", spawn.project_buf), proj_style),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  Prompt:  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("{}_", spawn.prompt_buf), prompt_style),
-        ]));
-    }
+        // Body text + two TextArea fields
+        use ratatui::layout::{Constraint, Layout};
+        let chunks = Layout::vertical([
+            Constraint::Length(2), // body text + blank line
+            Constraint::Length(3), // project TextArea
+            Constraint::Min(3),   // prompt TextArea
+        ]).split(inner);
 
-    let text = Paragraph::new(lines).block(block);
-    frame.render_widget(text, modal_area);
+        let body = Paragraph::new(Line::from(Span::styled(
+            modal.body.clone(),
+            Style::default().fg(Color::White),
+        )));
+        frame.render_widget(body, chunks[0]);
+        frame.render_widget(&spawn.project, chunks[1]);
+        frame.render_widget(&spawn.prompt, chunks[2]);
+    } else {
+        // Simple Y/N confirmation — just body text
+        let body = Paragraph::new(Line::from(Span::styled(
+            modal.body.clone(),
+            Style::default().fg(Color::White),
+        )));
+        frame.render_widget(body, inner);
+    }
 }

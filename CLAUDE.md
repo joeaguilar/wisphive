@@ -86,6 +86,10 @@ All under `~/.wisphive/`:
 - `mode` — "active" or "off" (global kill switch)
 - `auto-approve.json` — List of tool names that skip daemon review
 
+## Reference Documentation
+
+- [tui-textarea reference](docs/tui-textarea-reference.md) — API reference, key bindings, and integration notes for the TUI text editing widget
+
 ## Rust Edition
 
 The workspace uses Rust **edition 2024**. Requires nightly or a recent stable toolchain that supports it.
