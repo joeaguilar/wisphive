@@ -64,11 +64,12 @@ impl Server {
                         Ok((stream, _addr)) => {
                             let queue = self.queue.clone();
                             let process_registry = self.process_registry.clone();
+                            let agent_registry = self.agent_registry.clone();
                             let tui_tx = self.tui_tx.clone();
                             let state_db = self.state_db.clone();
                             let timeout = self.config.hook_timeout_secs;
                             tokio::spawn(async move {
-                                if let Err(e) = handle_connection(stream, queue, process_registry, tui_tx, state_db, timeout).await {
+                                if let Err(e) = handle_connection(stream, queue, process_registry, agent_registry, tui_tx, state_db, timeout).await {
                                     warn!("connection error: {e}");
                                 }
                             });
@@ -106,6 +107,7 @@ async fn handle_connection(
     stream: UnixStream,
     queue: Arc<Mutex<DecisionQueue>>,
     process_registry: Arc<Mutex<ProcessRegistry>>,
+    agent_registry: Arc<Mutex<AgentRegistry>>,
     tui_tx: broadcast::Sender<ServerMessage>,
     state_db: Arc<StateDb>,
     hook_timeout_secs: u64,
@@ -138,7 +140,7 @@ async fn handle_connection(
 
             match client {
                 ClientType::Hook => {
-                    handle_hook(lines, writer, queue, state_db, hook_timeout_secs).await
+                    handle_hook(lines, writer, queue, agent_registry, tui_tx.clone(), state_db, hook_timeout_secs).await
                 }
                 ClientType::Tui => {
                     handle_tui(lines, writer, queue, process_registry, tui_tx).await
@@ -160,6 +162,8 @@ async fn handle_hook(
     mut lines: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
     mut writer: tokio::net::unix::OwnedWriteHalf,
     queue: Arc<Mutex<DecisionQueue>>,
+    agent_registry: Arc<Mutex<AgentRegistry>>,
+    tui_tx: broadcast::Sender<ServerMessage>,
     state_db: Arc<StateDb>,
     timeout_secs: u64,
 ) -> Result<()> {
@@ -173,6 +177,14 @@ async fn handle_hook(
     match msg {
         ClientMessage::DecisionRequest(req) => {
             let id = req.id;
+            let agent_id = req.agent_id.clone();
+
+            // Register agent and broadcast to TUI clients
+            let agent_info = {
+                let mut reg = agent_registry.lock().await;
+                reg.register(agent_id.clone(), req.agent_type.clone(), req.project.clone())
+            };
+            let _ = tui_tx.send(ServerMessage::AgentConnected(agent_info));
 
             // Persist for crash recovery
             state_db.persist_pending(&req).await?;
@@ -201,6 +213,13 @@ async fn handle_hook(
 
             // Log resolution
             state_db.resolve_pending(id, decision).await?;
+
+            // Deregister agent and broadcast to TUI clients
+            {
+                let mut reg = agent_registry.lock().await;
+                reg.deregister(&agent_id);
+            }
+            let _ = tui_tx.send(ServerMessage::AgentDisconnected { agent_id });
 
             // Send response to hook
             let resp = encode(&ServerMessage::DecisionResponse { id, decision })?;
