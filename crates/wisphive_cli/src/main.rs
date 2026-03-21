@@ -31,6 +31,13 @@ enum Command {
 
     /// Emergency kill switch — disables all hooks instantly
     EmergencyOff,
+
+    /// Check setup and diagnose issues
+    Doctor {
+        /// Project directory to check (defaults to current directory)
+        #[arg(long)]
+        project: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -76,6 +83,7 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         // Daemon-independent commands (no tokio runtime needed)
+        Command::Doctor { project } => commands::doctor::run(project),
         Command::EmergencyOff => commands::hooks::emergency_off(),
         Command::Hooks { action } => match action {
             HookAction::Enable => commands::hooks::set_mode("active"),
