@@ -67,7 +67,9 @@ The `wisphive-hook` binary runs as both `PreToolUse` and `PostToolUse` hook. Cla
 
 **Key capabilities**: `permissionDecision: "deny"` + `permissionDecisionReason` gives Claude feedback on why. `updatedInput` lets hooks sanitize tool input before execution. `"ask"` defers to Claude's native permission prompt. Stderr on exit 2 becomes Claude feedback.
 
-**PermissionRequest hook** (separate event): fires when Claude's permission dialog would show. Can return `updatedPermissions` with `setMode`/`addRules` to change permission mode for session or permanently. Does NOT fire in `-p` (print) mode.
+**PermissionRequest hook** (separate event): fires when Claude's permission dialog would show. Input includes `permission_suggestions` array — the dynamic options the user would see in the native dialog. Each suggestion is a permission update entry (`addRules`/`setMode`/etc) with `behavior`, `destination`, `rules`. A hook can echo any suggestion back as `updatedPermissions` in its response. Does NOT fire in `-p` (print) mode.
+
+**All Claude Code hook events** (22 total): `SessionStart`, `SessionEnd`, `InstructionsLoaded`, `UserPromptSubmit` (blocking), `PreToolUse` (blocking), `PermissionRequest` (blocking), `PostToolUse`, `PostToolUseFailure`, `Notification`, `SubagentStart`, `SubagentStop` (blocking), `Stop` (blocking), `StopFailure`, `TeammateIdle` (blocking), `TaskCompleted` (blocking), `ConfigChange` (blocking), `PreCompact`, `PostCompact`, `WorktreeCreate` (blocking), `WorktreeRemove`, `Elicitation` (blocking — MCP form/URL input), `ElicitationResult` (blocking). Wisphive currently handles: `PreToolUse`, `PostToolUse`, `PermissionRequest` (planned).
 
 ## IPC Protocol
 

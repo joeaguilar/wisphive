@@ -66,6 +66,10 @@ impl StateDb {
             .execute(&self.pool)
             .await
             .ok();
+        sqlx::query("ALTER TABLE decision_log ADD COLUMN auto_approved INTEGER DEFAULT 0")
+            .execute(&self.pool)
+            .await
+            .ok();
 
         // Indexes for PostToolUse correlation and history queries
         sqlx::query(
