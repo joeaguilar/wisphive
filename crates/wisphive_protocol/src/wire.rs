@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::types::{AgentInfo, Decision, DecisionFilter, DecisionRequest};
+use crate::types::{AgentInfo, Decision, DecisionFilter, DecisionRequest, ManagedAgent, SpawnAgentRequest};
 
 /// Identifies the type of client connecting to the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +40,18 @@ pub enum ClientMessage {
     /// TUI denies all items matching an optional filter.
     #[serde(rename = "deny_all")]
     DenyAll { filter: Option<DecisionFilter> },
+
+    /// Request the daemon to spawn a new agent process.
+    #[serde(rename = "spawn_agent")]
+    SpawnAgent(SpawnAgentRequest),
+
+    /// List all daemon-managed agent processes.
+    #[serde(rename = "list_agents")]
+    ListAgents,
+
+    /// Stop a daemon-managed agent process.
+    #[serde(rename = "stop_agent")]
+    StopAgent { agent_id: String },
 }
 
 /// Messages sent from the daemon to clients.
@@ -73,6 +85,21 @@ pub enum ServerMessage {
     /// An agent disconnected.
     #[serde(rename = "agent_disconnected")]
     AgentDisconnected { agent_id: String },
+
+    /// A managed agent process was spawned by the daemon.
+    #[serde(rename = "agent_spawned")]
+    AgentSpawned(ManagedAgent),
+
+    /// A managed agent process exited.
+    #[serde(rename = "agent_exited")]
+    AgentExited {
+        agent_id: String,
+        exit_code: Option<i32>,
+    },
+
+    /// Response to ListAgents request.
+    #[serde(rename = "agent_list")]
+    AgentList { agents: Vec<ManagedAgent> },
 
     /// Error message.
     #[serde(rename = "error")]

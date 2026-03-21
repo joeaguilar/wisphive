@@ -32,6 +32,12 @@ enum Command {
     /// Emergency kill switch — disables all hooks instantly
     EmergencyOff,
 
+    /// Manage AI agent processes
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
+
     /// Check setup and diagnose issues
     Doctor {
         /// Project directory to check (defaults to current directory)
@@ -48,6 +54,32 @@ enum DaemonAction {
     Stop,
     /// Show daemon status
     Status,
+}
+
+#[derive(Subcommand)]
+enum AgentAction {
+    /// Start an AI agent in a project directory
+    Start {
+        /// Path to the project directory (defaults to current directory)
+        #[arg(long)]
+        project: Option<std::path::PathBuf>,
+        /// Model to use (e.g. "sonnet", "opus")
+        #[arg(long)]
+        model: Option<String>,
+        /// Prompt to pass to the agent
+        #[arg(long)]
+        prompt: String,
+        /// Display name for the agent session
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List running agent processes
+    List,
+    /// Stop a running agent process
+    Stop {
+        /// Agent ID to stop
+        agent_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -92,6 +124,23 @@ fn main() -> anyhow::Result<()> {
             HookAction::Uninstall { project, all } => commands::hooks::uninstall(project, all),
             HookAction::Status => commands::hooks::status(),
         },
+
+        // Agent commands (need tokio runtime for socket communication)
+        Command::Agent { action } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                match action {
+                    AgentAction::Start {
+                        project,
+                        model,
+                        prompt,
+                        name,
+                    } => commands::agent::start(project, model, prompt, name).await,
+                    AgentAction::List => commands::agent::list().await,
+                    AgentAction::Stop { agent_id } => commands::agent::stop(agent_id).await,
+                }
+            })
+        }
 
         // Daemon-dependent commands (need tokio runtime)
         Command::Daemon { action } => {
