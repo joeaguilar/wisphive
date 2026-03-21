@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::app::{App, FocusPanel, ViewMode};
 use crate::detail;
@@ -66,6 +66,7 @@ fn draw_detail_view(frame: &mut Frame, app: &App) {
                     .border_style(Style::default().fg(Color::Cyan))
                     .title(format!(" Review: {} ", req.tool_name)),
             )
+            .wrap(Wrap { trim: false })
             .scroll((app.detail_scroll as u16, 0));
 
         frame.render_widget(paragraph, chunks[0]);
