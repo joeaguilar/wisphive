@@ -5,7 +5,7 @@ use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, broadcast};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use wisphive_protocol::{
     ClientMessage, ClientType, Decision, PROTOCOL_VERSION, RichDecision, ServerMessage, encode,
 };
@@ -56,6 +56,13 @@ impl Server {
 
         let listener = UnixListener::bind(&self.config.socket_path)?;
         info!(path = %self.config.socket_path.display(), "listening");
+
+        // Spawn event ingest task (tails events.jsonl → decision_log)
+        let events_path = self.config.home_dir.join("events.jsonl");
+        let _ingest_handle = crate::event_ingest::spawn_event_ingest(
+            events_path,
+            self.state_db.clone(),
+        );
 
         let mut reap_interval = tokio::time::interval(Duration::from_secs(5));
         reap_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -287,15 +294,21 @@ async fn handle_hook(
             }
             // Fire-and-forget: attach result to matching decision_log entry
             match state_db
-                .attach_tool_result(&result.agent_id, &result.tool_name, &result.tool_result)
+                .attach_tool_result(
+                    &result.agent_id,
+                    &result.tool_name,
+                    &result.tool_result,
+                    result.tool_use_id.as_deref(),
+                )
                 .await
             {
                 Ok(Some(id)) => {
                     info!(%id, tool = %result.tool_name, agent = %result.agent_id, "tool result attached");
                 }
                 Ok(None) => {
-                    warn!(tool = %result.tool_name, agent = %result.agent_id,
-                          "tool result received but no matching decision found");
+                    // Auto-approved events may still be in the JSONL ingest pipeline
+                    debug!(tool = %result.tool_name, agent = %result.agent_id,
+                          "tool result: no matching decision yet (may be pending ingest)");
                 }
                 Err(e) => {
                     warn!("failed to store tool result: {e}");

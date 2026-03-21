@@ -72,6 +72,9 @@ pub struct DecisionRequest {
     pub tool_name: String,
     pub tool_input: serde_json::Value,
     pub timestamp: DateTime<Utc>,
+    /// Claude Code's unique tool call ID for pre/post correlation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_use_id: Option<String>,
     /// Permission suggestions from Claude Code's PermissionRequest event.
     /// Present only for PermissionRequest hooks (not PreToolUse).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -201,6 +204,9 @@ pub struct ToolResult {
     pub tool_input: serde_json::Value,
     pub tool_result: serde_json::Value,
     pub timestamp: DateTime<Utc>,
+    /// Claude Code's unique tool call ID for pre/post correlation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_use_id: Option<String>,
 }
 
 /// Search criteria for the audit history.
@@ -235,6 +241,9 @@ pub struct HistoryEntry {
     /// Tool execution result (captured by PostToolUse hook). None for old/denied entries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_result: Option<serde_json::Value>,
+    /// Claude Code's unique tool call ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_use_id: Option<String>,
 }
 
 /// Content-aware rule for a specific tool.

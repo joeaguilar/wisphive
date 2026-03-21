@@ -70,6 +70,14 @@ impl StateDb {
             .execute(&self.pool)
             .await
             .ok();
+        sqlx::query("ALTER TABLE decision_log ADD COLUMN tool_use_id TEXT")
+            .execute(&self.pool)
+            .await
+            .ok();
+        sqlx::query("ALTER TABLE pending_decisions ADD COLUMN tool_use_id TEXT")
+            .execute(&self.pool)
+            .await
+            .ok();
 
         // Indexes for PostToolUse correlation and history queries
         sqlx::query(
@@ -86,8 +94,28 @@ impl StateDb {
         .execute(&self.pool)
         .await?;
 
-        // Enable WAL mode for crash safety
+        // Index for exact tool_use_id correlation
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_decision_log_tool_use_id
+             ON decision_log(tool_use_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Enable WAL mode and performance pragmas
         sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("PRAGMA synchronous = NORMAL")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("PRAGMA cache_size = -64000")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("PRAGMA busy_timeout = 5000")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("PRAGMA temp_store = MEMORY")
             .execute(&self.pool)
             .await?;
 
@@ -97,8 +125,8 @@ impl StateDb {
     /// Persist a pending decision for crash recovery.
     pub async fn persist_pending(&self, req: &wisphive_protocol::DecisionRequest) -> Result<()> {
         sqlx::query(
-            "INSERT OR REPLACE INTO pending_decisions (id, agent_id, agent_type, project, tool_name, tool_input, timestamp)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO pending_decisions (id, agent_id, agent_type, project, tool_name, tool_input, timestamp, tool_use_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(req.id.to_string())
         .bind(&req.agent_id)
@@ -107,6 +135,7 @@ impl StateDb {
         .bind(&req.tool_name)
         .bind(serde_json::to_string(&req.tool_input)?)
         .bind(req.timestamp.to_rfc3339())
+        .bind(&req.tool_use_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -119,18 +148,18 @@ impl StateDb {
         decision: wisphive_protocol::Decision,
     ) -> Result<()> {
         // Move from pending to log
-        let row = sqlx::query_as::<_, (String, String, String, String, String, String)>(
-            "SELECT agent_id, agent_type, project, tool_name, tool_input, timestamp
+        let row = sqlx::query_as::<_, (String, String, String, String, String, String, Option<String>)>(
+            "SELECT agent_id, agent_type, project, tool_name, tool_input, timestamp, tool_use_id
              FROM pending_decisions WHERE id = ?",
         )
         .bind(id.to_string())
         .fetch_optional(&self.pool)
         .await?;
 
-        if let Some((agent_id, agent_type, project, tool_name, tool_input, requested_at)) = row {
+        if let Some((agent_id, agent_type, project, tool_name, tool_input, requested_at, tool_use_id)) = row {
             sqlx::query(
-                "INSERT INTO decision_log (id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO decision_log (id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_use_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(id.to_string())
             .bind(agent_id)
@@ -141,6 +170,7 @@ impl StateDb {
             .bind(serde_json::to_string(&decision)?)
             .bind(requested_at)
             .bind(chrono::Utc::now().to_rfc3339())
+            .bind(tool_use_id)
             .execute(&self.pool)
             .await?;
         }
@@ -162,11 +192,11 @@ impl StateDb {
         agent_id: Option<&str>,
         limit: u32,
     ) -> Result<Vec<wisphive_protocol::HistoryEntry>> {
-        let rows: Vec<(String, String, String, String, String, String, String, String, String, Option<String>)> =
+        let rows: Vec<(String, String, String, String, String, String, String, String, String, Option<String>, Option<String>)> =
             match agent_id {
                 Some(aid) => {
                     sqlx::query_as(
-                        "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result
+                        "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id
                          FROM decision_log WHERE agent_id = ? ORDER BY resolved_at DESC LIMIT ?",
                     )
                     .bind(aid)
@@ -176,7 +206,7 @@ impl StateDb {
                 }
                 None => {
                     sqlx::query_as(
-                        "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result
+                        "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id
                          FROM decision_log ORDER BY resolved_at DESC LIMIT ?",
                     )
                     .bind(limit)
@@ -188,19 +218,42 @@ impl StateDb {
         Ok(rows_to_entries(rows))
     }
 
-    /// Attach a tool result to the most recent matching decision_log entry.
+    /// Attach a tool result to a matching decision_log entry.
     ///
-    /// Correlates by agent_id + tool_name where tool_result IS NULL,
-    /// ordered by resolved_at DESC, limited to entries within the last 10 minutes.
+    /// If `tool_use_id` is provided, does an exact match. Otherwise falls back
+    /// to fuzzy correlation by agent_id + tool_name + recency.
     pub async fn attach_tool_result(
         &self,
         agent_id: &str,
         tool_name: &str,
         tool_result: &serde_json::Value,
+        tool_use_id: Option<&str>,
     ) -> Result<Option<uuid::Uuid>> {
-        let cutoff = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
         let result_json = serde_json::to_string(tool_result)?;
 
+        // Try exact match by tool_use_id first
+        if let Some(tui) = tool_use_id {
+            let row: Option<(String,)> = sqlx::query_as(
+                "SELECT id FROM decision_log
+                 WHERE tool_use_id = ? AND tool_result IS NULL
+                 LIMIT 1",
+            )
+            .bind(tui)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            if let Some((id_str,)) = row {
+                sqlx::query("UPDATE decision_log SET tool_result = ? WHERE id = ?")
+                    .bind(&result_json)
+                    .bind(&id_str)
+                    .execute(&self.pool)
+                    .await?;
+                return Ok(id_str.parse().ok());
+            }
+        }
+
+        // Fallback: fuzzy match by agent_id + tool_name + recency
+        let cutoff = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
         let row: Option<(String,)> = sqlx::query_as(
             "SELECT id FROM decision_log
              WHERE agent_id = ? AND tool_name = ? AND tool_result IS NULL
@@ -261,12 +314,12 @@ impl StateDb {
         };
 
         let sql = format!(
-            "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result
+            "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id
              FROM decision_log WHERE {} ORDER BY resolved_at DESC LIMIT ?",
             where_clause
         );
 
-        let mut query = sqlx::query_as::<_, (String, String, String, String, String, String, String, String, String, Option<String>)>(&sql);
+        let mut query = sqlx::query_as::<_, (String, String, String, String, String, String, String, String, String, Option<String>, Option<String>)>(&sql);
         for bind in &binds {
             query = query.bind(bind);
         }
@@ -277,6 +330,38 @@ impl StateDb {
     }
 
     /// Get the underlying pool for direct queries.
+    /// Insert an auto-approved tool call directly into decision_log.
+    /// Called by the event ingest task when processing events.jsonl.
+    pub async fn log_auto_approved(
+        &self,
+        agent_id: &str,
+        agent_type: &str,
+        project: &str,
+        tool_name: &str,
+        tool_input: &str,
+        timestamp: &str,
+        tool_use_id: Option<&str>,
+    ) -> Result<()> {
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT OR IGNORE INTO decision_log
+             (id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, auto_approved, tool_use_id)
+             VALUES (?, ?, ?, ?, ?, ?, '\"approve\"', ?, ?, 1, ?)",
+        )
+        .bind(&id)
+        .bind(agent_id)
+        .bind(agent_type)
+        .bind(project)
+        .bind(tool_name)
+        .bind(tool_input)
+        .bind(timestamp)
+        .bind(timestamp)
+        .bind(tool_use_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Query distinct sessions from decision_log with aggregated stats.
     pub async fn query_sessions(&self) -> Result<Vec<wisphive_protocol::SessionSummary>> {
         let rows: Vec<(String, String, String, String, String, i64, i64, i64)> = sqlx::query_as(
@@ -325,10 +410,10 @@ impl StateDb {
 
 /// Convert raw SQL rows to HistoryEntry structs.
 fn rows_to_entries(
-    rows: Vec<(String, String, String, String, String, String, String, String, String, Option<String>)>,
+    rows: Vec<(String, String, String, String, String, String, String, String, String, Option<String>, Option<String>)>,
 ) -> Vec<wisphive_protocol::HistoryEntry> {
     rows.into_iter()
-        .filter_map(|(id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result)| {
+        .filter_map(|(id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id)| {
             Some(wisphive_protocol::HistoryEntry {
                 id: id.parse().ok()?,
                 agent_id,
@@ -340,6 +425,7 @@ fn rows_to_entries(
                 requested_at: chrono::DateTime::parse_from_rfc3339(&requested_at).ok()?.with_timezone(&chrono::Utc),
                 resolved_at: chrono::DateTime::parse_from_rfc3339(&resolved_at).ok()?.with_timezone(&chrono::Utc),
                 tool_result: tool_result.and_then(|s| serde_json::from_str(&s).ok()),
+                tool_use_id,
             })
         })
         .collect()
