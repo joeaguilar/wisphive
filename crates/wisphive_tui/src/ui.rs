@@ -83,10 +83,19 @@ fn draw_detail_view(frame: &mut Frame, app: &App) {
             String::new()
         };
 
-        let bar_text = format!(
-            " [Y]approve [N]deny [M]deny+msg [!]always [E]edit [C]context [?]defer [q/Esc]back [Q]uit{}",
-            scroll_info
-        );
+        let is_permission = req.permission_suggestions.is_some();
+        let bar_text = if is_permission {
+            let n = req.permission_suggestions.as_ref().map_or(0, |s| s.len());
+            format!(
+                " [1-{}]select [N]deny [M]deny+msg [?]defer [q/Esc]back [Q]uit{}",
+                n, scroll_info
+            )
+        } else {
+            format!(
+                " [Y]approve [N]deny [M]deny+msg [!]always [E]edit [C]context [?]defer [q/Esc]back [Q]uit{}",
+                scroll_info
+            )
+        };
         let bar = Paragraph::new(Line::from(Span::styled(
             bar_text,
             Style::default().fg(Color::White).bg(Color::DarkGray),

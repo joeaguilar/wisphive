@@ -31,8 +31,11 @@ pub fn format_queue_item(req: &DecisionRequest) -> String {
         format!("{}h", age / 3600)
     };
 
+    let prefix = if req.permission_suggestions.is_some() { "P " } else { "  " };
+
     format!(
-        "[{}] {:<12} {:<8} {}  {:>5}",
+        "{}[{}] {:<12} {:<8} {}  {:>5}",
+        prefix,
         req.agent_id,
         project_name,
         req.tool_name,

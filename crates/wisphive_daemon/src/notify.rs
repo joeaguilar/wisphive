@@ -16,7 +16,11 @@ pub fn notify_decision(req: &DecisionRequest) {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".into());
 
-    let title = format!("Wisphive: {} needs approval", req.tool_name);
+    let title = if req.permission_suggestions.is_some() {
+        format!("Wisphive: {} permission request", req.tool_name)
+    } else {
+        format!("Wisphive: {} needs approval", req.tool_name)
+    };
     let body = format!(
         "{}\n\nProject: {} ({})",
         tool_input_summary(req),

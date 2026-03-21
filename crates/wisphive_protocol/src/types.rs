@@ -32,6 +32,36 @@ pub struct AgentInfo {
     pub started_at: DateTime<Utc>,
 }
 
+/// A permission rule from Claude Code's PermissionRequest event.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermissionRule {
+    #[serde(rename = "toolName")]
+    pub tool_name: String,
+    #[serde(rename = "ruleContent")]
+    pub rule_content: String,
+}
+
+/// A permission suggestion from Claude Code's PermissionRequest event.
+///
+/// Each suggestion represents one option the user can select
+/// (e.g., "allow Bash(rm -rf node_modules) in local settings").
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermissionSuggestion {
+    /// "addRules" or "setMode"
+    #[serde(rename = "type")]
+    pub suggestion_type: String,
+    /// Rules to add (for addRules type).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<PermissionRule>,
+    /// "allow" or "deny"
+    pub behavior: String,
+    /// "localSettings", "projectSettings", or "session"
+    pub destination: String,
+    /// For setMode: the mode to set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+}
+
 /// A decision the human needs to make about a tool call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecisionRequest {
@@ -42,6 +72,10 @@ pub struct DecisionRequest {
     pub tool_name: String,
     pub tool_input: serde_json::Value,
     pub timestamp: DateTime<Utc>,
+    /// Permission suggestions from Claude Code's PermissionRequest event.
+    /// Present only for PermissionRequest hooks (not PreToolUse).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_suggestions: Option<Vec<PermissionSuggestion>>,
 }
 
 /// The human's decision on a tool call.
@@ -74,6 +108,9 @@ pub struct RichDecision {
     /// Additional context to inject into the agent's conversation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub additional_context: Option<String>,
+    /// Selected permission suggestion (PermissionRequest only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_permission: Option<PermissionSuggestion>,
 }
 
 impl RichDecision {
@@ -84,6 +121,7 @@ impl RichDecision {
             updated_input: None,
             always_allow: false,
             additional_context: None,
+            selected_permission: None,
         }
     }
 
@@ -94,6 +132,7 @@ impl RichDecision {
             updated_input: None,
             always_allow: false,
             additional_context: None,
+            selected_permission: None,
         }
     }
 }
@@ -106,6 +145,7 @@ impl From<Decision> for RichDecision {
             updated_input: None,
             always_allow: false,
             additional_context: None,
+            selected_permission: None,
         }
     }
 }

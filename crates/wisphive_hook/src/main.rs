@@ -28,11 +28,22 @@ struct HookResponse {
     message: Option<String>,
     updated_input: Option<serde_json::Value>,
     additional_context: Option<String>,
+    /// For PermissionRequest: the selected suggestion to echo back.
+    selected_permission: Option<wisphive_protocol::PermissionSuggestion>,
+    /// Whether this is a PermissionRequest response (changes output format).
+    is_permission_request: bool,
 }
 
 impl HookResponse {
     fn simple(decision: Decision) -> Self {
-        Self { decision, message: None, updated_input: None, additional_context: None }
+        Self {
+            decision,
+            message: None,
+            updated_input: None,
+            additional_context: None,
+            selected_permission: None,
+            is_permission_request: false,
+        }
     }
 }
 
@@ -47,6 +58,9 @@ fn main() {
 
 /// Format the hook response as Claude Code JSON stdout and return exit code.
 fn format_and_exit(resp: &HookResponse) -> i32 {
+    if resp.is_permission_request {
+        return format_permission_response(resp);
+    }
     match resp.decision {
         Decision::Ask => {
             // Defer to native prompt
@@ -108,6 +122,45 @@ fn format_and_exit(resp: &HookResponse) -> i32 {
     }
 }
 
+/// Format a PermissionRequest response for Claude Code.
+fn format_permission_response(resp: &HookResponse) -> i32 {
+    let mut decision_obj = serde_json::Map::new();
+
+    match resp.decision {
+        Decision::Approve => {
+            decision_obj.insert("behavior".into(), serde_json::Value::String("allow".into()));
+            if let Some(ref perm) = resp.selected_permission {
+                decision_obj.insert(
+                    "updatedPermissions".into(),
+                    serde_json::to_value(vec![perm]).unwrap_or(serde_json::json!([])),
+                );
+            }
+            if let Some(ref input) = resp.updated_input {
+                decision_obj.insert("updatedInput".into(), input.clone());
+            }
+        }
+        Decision::Deny => {
+            decision_obj.insert("behavior".into(), serde_json::Value::String("deny".into()));
+            if let Some(ref msg) = resp.message {
+                decision_obj.insert("message".into(), serde_json::Value::String(msg.clone()));
+            }
+        }
+        Decision::Ask => {
+            // Defer — don't output anything, let native prompt handle it
+            return 0;
+        }
+    }
+
+    let json = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PermissionRequest",
+            "decision": serde_json::Value::Object(decision_obj)
+        }
+    });
+    print!("{}", json);
+    0
+}
+
 fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
     let home = home_dir();
     let wisphive_dir = home.join(".wisphive");
@@ -116,7 +169,7 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
     let mode_path = wisphive_dir.join("mode");
     let mode = std::fs::read_to_string(&mode_path).unwrap_or_else(|_| "off".into());
     if mode.trim() != "active" {
-        return Ok(HookResponse { decision: Decision::Approve, message: None, updated_input: None, additional_context: None });
+        return Ok(HookResponse::simple(Decision::Approve));
     }
 
     // Layer 2: Read Claude Code hook data from stdin
@@ -130,6 +183,12 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
         handle_post_tool_use(&hook_event, &wisphive_dir)?;
         return Ok(HookResponse::simple(Decision::Approve));
     }
+
+    // PermissionRequest detection
+    let is_permission_request = hook_event
+        .get("hook_event_name")
+        .and_then(|v| v.as_str())
+        == Some("PermissionRequest");
 
     let tool_name = hook_event
         .get("tool_name")
@@ -164,10 +223,19 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
     // Layer 3: Register agent with daemon (once per session, fire-and-forget)
     register_agent_once(&agent_id, &project, &wisphive_dir);
 
-    // Layer 4: Auto-approve check using tiered levels + content-aware rules
-    if is_auto_approved(&tool_name, &tool_input, &wisphive_dir) {
+    // Layer 4: Auto-approve check — PermissionRequests always go to daemon
+    if !is_permission_request && is_auto_approved(&tool_name, &tool_input, &wisphive_dir) {
         return Ok(HookResponse::simple(Decision::Approve));
     }
+
+    // Parse permission suggestions for PermissionRequest events
+    let permission_suggestions = if is_permission_request {
+        hook_event
+            .get("permission_suggestions")
+            .and_then(|v| serde_json::from_value::<Vec<wisphive_protocol::PermissionSuggestion>>(v.clone()).ok())
+    } else {
+        None
+    };
 
     let request = DecisionRequest {
         id: uuid::Uuid::new_v4(),
@@ -177,6 +245,7 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
         tool_name,
         tool_input,
         timestamp: chrono::Utc::now(),
+        permission_suggestions,
     };
 
     // Layer 4: Connect to daemon socket (fails instantly if daemon is dead)
@@ -217,12 +286,15 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
             message,
             updated_input,
             additional_context,
+            selected_permission,
             ..
         } => Ok(HookResponse {
             decision,
             message,
             updated_input,
             additional_context,
+            selected_permission,
+            is_permission_request,
         }),
         _ => Ok(HookResponse::simple(Decision::Approve)),
     }

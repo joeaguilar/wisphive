@@ -10,14 +10,19 @@ pub fn render_detail_lines(req: &DecisionRequest) -> Vec<Line<'static>> {
     push_header(&mut lines, req);
     lines.push(Line::from(""));
 
-    match req.tool_name.to_lowercase().as_str() {
-        "bash" => push_bash_detail(&mut lines, req),
-        "edit" | "multiedit" => push_edit_detail(&mut lines, req),
-        "write" => push_write_detail(&mut lines, req),
-        "read" => push_read_detail(&mut lines, req),
-        "grep" => push_grep_detail(&mut lines, req),
-        "glob" => push_glob_detail(&mut lines, req),
-        _ => push_generic_detail(&mut lines, req),
+    // PermissionRequest: show suggestions before tool-specific detail
+    if let Some(ref suggestions) = req.permission_suggestions {
+        push_permission_detail(&mut lines, req, suggestions);
+    } else {
+        match req.tool_name.to_lowercase().as_str() {
+            "bash" => push_bash_detail(&mut lines, req),
+            "edit" | "multiedit" => push_edit_detail(&mut lines, req),
+            "write" => push_write_detail(&mut lines, req),
+            "read" => push_read_detail(&mut lines, req),
+            "grep" => push_grep_detail(&mut lines, req),
+            "glob" => push_glob_detail(&mut lines, req),
+            _ => push_generic_detail(&mut lines, req),
+        }
     }
 
     lines
@@ -246,6 +251,84 @@ pub fn render_history_detail_lines(entry: &HistoryEntry) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+fn push_permission_detail(
+    lines: &mut Vec<Line<'static>>,
+    req: &DecisionRequest,
+    suggestions: &[wisphive_protocol::PermissionSuggestion],
+) {
+    push_section_label(lines, "Permission Request");
+    lines.push(Line::from(""));
+
+    // Show tool input context
+    if let Some(cmd) = req.tool_input.get("command").and_then(|v| v.as_str()) {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "  Command: ",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(cmd.to_string(), Style::default().fg(Color::Yellow)),
+        ]));
+        lines.push(Line::from(""));
+    }
+
+    push_section_label(lines, "Available Options");
+    lines.push(Line::from(""));
+
+    for (i, suggestion) in suggestions.iter().enumerate() {
+        let rules_str = if suggestion.rules.is_empty() {
+            suggestion
+                .mode
+                .as_deref()
+                .unwrap_or(&suggestion.suggestion_type)
+                .to_string()
+        } else {
+            suggestion
+                .rules
+                .iter()
+                .map(|r| format!("{}({})", r.tool_name, r.rule_content))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        let behavior_color = if suggestion.behavior == "allow" {
+            Color::Green
+        } else {
+            Color::Red
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  [{}] ", i + 1),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{} ", suggestion.behavior.to_uppercase()),
+                Style::default()
+                    .fg(behavior_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(rules_str, Style::default().fg(Color::White)),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "      {} → {}",
+                suggestion.suggestion_type, suggestion.destination
+            ),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Press a number to select, N to deny, M to deny with message",
+        Style::default().fg(Color::DarkGray),
+    )));
 }
 
 // --- Helpers ---

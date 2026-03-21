@@ -275,6 +275,7 @@ async fn handle_hook(
                 message: rich.message,
                 updated_input: rich.updated_input,
                 additional_context: rich.additional_context,
+                selected_permission: rich.selected_permission,
             })?;
             writer.write_all(resp.as_bytes()).await?;
         }
@@ -389,6 +390,7 @@ async fn handle_tui(
                                     updated_input,
                                     always_allow,
                                     additional_context,
+                                    selected_permission: None,
                                 };
                                 let mut q = queue.lock().await;
                                 q.resolve(id, rich);
@@ -546,6 +548,27 @@ async fn handle_tui(
                                         writer.write_all(resp.as_bytes()).await?;
                                     }
                                 }
+                            }
+                            ClientMessage::ApprovePermission { id, suggestion_index, message } => {
+                                // Look up the selected suggestion from the queued request
+                                let selected = {
+                                    let q = queue.lock().await;
+                                    q.snapshot().iter()
+                                        .find(|r| r.id == id)
+                                        .and_then(|r| r.permission_suggestions.as_ref())
+                                        .and_then(|s| s.get(suggestion_index))
+                                        .cloned()
+                                };
+                                let rich = RichDecision {
+                                    decision: Decision::Approve,
+                                    message,
+                                    updated_input: None,
+                                    always_allow: false,
+                                    additional_context: None,
+                                    selected_permission: selected,
+                                };
+                                let mut q = queue.lock().await;
+                                q.resolve(id, rich);
                             }
                             _ => {
                                 warn!("unexpected message from TUI: {:?}", msg);

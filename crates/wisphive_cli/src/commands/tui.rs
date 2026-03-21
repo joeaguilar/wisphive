@@ -225,6 +225,15 @@ async fn run_loop(
                             conn.send(&ClientMessage::Ask { id }).await?;
                             app.remove_decision(id);
                         }
+                        InputAction::ApprovePermission { id, suggestion_index } => {
+                            tracing::info!(%id, suggestion_index, "approve permission");
+                            conn.send(&ClientMessage::ApprovePermission {
+                                id,
+                                suggestion_index,
+                                message: None,
+                            }).await?;
+                            app.remove_decision(id);
+                        }
                         InputAction::None => {}
                     }
                 }
