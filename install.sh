@@ -13,6 +13,13 @@ cp target/release/wisphive "$INSTALL_DIR/wisphive"
 cp target/release/wisphive-hook "$INSTALL_DIR/wisphive-hook"
 chmod +x "$INSTALL_DIR/wisphive" "$INSTALL_DIR/wisphive-hook"
 
+# Ad-hoc sign to prevent macOS Gatekeeper from killing unsigned binaries
+if command -v codesign &>/dev/null; then
+    codesign -s - -f "$INSTALL_DIR/wisphive" 2>/dev/null
+    codesign -s - -f "$INSTALL_DIR/wisphive-hook" 2>/dev/null
+    echo "Binaries signed (ad-hoc)"
+fi
+
 # Create ~/.wisphive if it doesn't exist
 mkdir -p "$HOME/.wisphive"
 
