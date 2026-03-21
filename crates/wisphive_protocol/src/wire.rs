@@ -25,13 +25,31 @@ pub enum ClientMessage {
     #[serde(rename = "decision_request")]
     DecisionRequest(DecisionRequest),
 
-    /// TUI approves a single queued decision.
+    /// TUI approves a single queued decision (with optional rich fields).
     #[serde(rename = "approve")]
-    Approve { id: Uuid },
+    Approve {
+        id: Uuid,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        message: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        updated_input: Option<serde_json::Value>,
+        #[serde(default)]
+        always_allow: bool,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        additional_context: Option<String>,
+    },
 
-    /// TUI denies a single queued decision.
+    /// TUI denies a single queued decision (with optional feedback).
     #[serde(rename = "deny")]
-    Deny { id: Uuid },
+    Deny {
+        id: Uuid,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        message: Option<String>,
+    },
+
+    /// TUI defers to the agent's native permission prompt.
+    #[serde(rename = "ask")]
+    Ask { id: Uuid },
 
     /// TUI approves all items matching an optional filter.
     #[serde(rename = "approve_all")]
@@ -81,9 +99,18 @@ pub enum ServerMessage {
     #[serde(rename = "welcome")]
     Welcome { version: u32 },
 
-    /// Response to a hook's DecisionRequest.
+    /// Response to a hook's DecisionRequest (with optional rich fields).
     #[serde(rename = "decision_response")]
-    DecisionResponse { id: Uuid, decision: Decision },
+    DecisionResponse {
+        id: Uuid,
+        decision: Decision,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        message: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        updated_input: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        additional_context: Option<String>,
+    },
 
     /// Full queue snapshot sent to TUI on connect.
     #[serde(rename = "queue_snapshot")]

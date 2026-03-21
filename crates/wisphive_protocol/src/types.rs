@@ -50,6 +50,64 @@ pub struct DecisionRequest {
 pub enum Decision {
     Approve,
     Deny,
+    /// Pass through to the agent's native permission prompt.
+    Ask,
+}
+
+/// A rich decision carrying optional feedback, input modifications, and rules.
+///
+/// Flows through the oneshot channel and wire protocol. The `Decision` enum
+/// remains binary for persistence/display; `RichDecision` is the transient payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RichDecision {
+    /// The core decision.
+    pub decision: Decision,
+    /// Feedback message for the agent (deny reason or approval guidance).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// Modified tool input to use instead of the original.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_input: Option<serde_json::Value>,
+    /// If true, add this tool to the auto-approve list for future calls.
+    #[serde(default)]
+    pub always_allow: bool,
+    /// Additional context to inject into the agent's conversation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additional_context: Option<String>,
+}
+
+impl RichDecision {
+    pub fn approve() -> Self {
+        Self {
+            decision: Decision::Approve,
+            message: None,
+            updated_input: None,
+            always_allow: false,
+            additional_context: None,
+        }
+    }
+
+    pub fn deny() -> Self {
+        Self {
+            decision: Decision::Deny,
+            message: None,
+            updated_input: None,
+            always_allow: false,
+            additional_context: None,
+        }
+    }
+}
+
+impl From<Decision> for RichDecision {
+    fn from(d: Decision) -> Self {
+        Self {
+            decision: d,
+            message: None,
+            updated_input: None,
+            always_allow: false,
+            additional_context: None,
+        }
+    }
 }
 
 /// Request to spawn a new AI agent process.

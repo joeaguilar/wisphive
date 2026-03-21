@@ -31,19 +31,93 @@ const DEFAULT_AUTO_APPROVE: &[&str] = &[
     "ToolSearch",
 ];
 
+/// Hook response to format for Claude Code.
+struct HookResponse {
+    decision: Decision,
+    message: Option<String>,
+    updated_input: Option<serde_json::Value>,
+    additional_context: Option<String>,
+}
+
+impl HookResponse {
+    fn simple(decision: Decision) -> Self {
+        Self { decision, message: None, updated_input: None, additional_context: None }
+    }
+}
+
 fn main() {
     // Any failure = exit 0 (allow). Wisphive is fail-open.
     let code = match run() {
-        Ok(Decision::Approve) => 0,
-        // Claude Code: exit 2 = block the tool call.
-        // Exit 1 is treated as a non-blocking error (tool proceeds).
-        Ok(Decision::Deny) => 2,
+        Ok(resp) => format_and_exit(&resp),
         Err(_) => 0,
     };
     process::exit(code);
 }
 
-fn run() -> Result<Decision, Box<dyn std::error::Error>> {
+/// Format the hook response as Claude Code JSON stdout and return exit code.
+fn format_and_exit(resp: &HookResponse) -> i32 {
+    match resp.decision {
+        Decision::Ask => {
+            // Defer to native prompt
+            let json = serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "ask"
+                }
+            });
+            print!("{}", json);
+            0
+        }
+        Decision::Deny => {
+            if let Some(ref msg) = resp.message {
+                // Deny with feedback via JSON (Claude sees the reason)
+                let json = serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": msg
+                    }
+                });
+                print!("{}", json);
+                0 // exit 0 because JSON controls behavior
+            } else {
+                2 // simple deny, same as before
+            }
+        }
+        Decision::Approve => {
+            let has_extras = resp.updated_input.is_some() || resp.additional_context.is_some();
+            if has_extras {
+                let mut output = serde_json::Map::new();
+                let mut hook_output = serde_json::Map::new();
+                hook_output.insert(
+                    "hookEventName".into(),
+                    serde_json::Value::String("PreToolUse".into()),
+                );
+                hook_output.insert(
+                    "permissionDecision".into(),
+                    serde_json::Value::String("allow".into()),
+                );
+                if let Some(ref input) = resp.updated_input {
+                    hook_output.insert("updatedInput".into(), input.clone());
+                }
+                output.insert(
+                    "hookSpecificOutput".into(),
+                    serde_json::Value::Object(hook_output),
+                );
+                if let Some(ref ctx) = resp.additional_context {
+                    output.insert(
+                        "additionalContext".into(),
+                        serde_json::Value::String(ctx.clone()),
+                    );
+                }
+                print!("{}", serde_json::Value::Object(output));
+            }
+            0
+        }
+    }
+}
+
+fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
     let home = home_dir();
     let wisphive_dir = home.join(".wisphive");
 
@@ -51,7 +125,7 @@ fn run() -> Result<Decision, Box<dyn std::error::Error>> {
     let mode_path = wisphive_dir.join("mode");
     let mode = std::fs::read_to_string(&mode_path).unwrap_or_else(|_| "off".into());
     if mode.trim() != "active" {
-        return Ok(Decision::Approve);
+        return Ok(HookResponse { decision: Decision::Approve, message: None, updated_input: None, additional_context: None });
     }
 
     // Layer 2: Read Claude Code hook data from stdin
@@ -63,7 +137,7 @@ fn run() -> Result<Decision, Box<dyn std::error::Error>> {
     // PostToolUse detection: Claude Code sends "tool_response" for post-execution results
     if hook_event.get("tool_response").is_some() {
         handle_post_tool_use(&hook_event, &wisphive_dir)?;
-        return Ok(Decision::Approve);
+        return Ok(HookResponse::simple(Decision::Approve));
     }
 
     let tool_name = hook_event
@@ -75,7 +149,7 @@ fn run() -> Result<Decision, Box<dyn std::error::Error>> {
     // Layer 3: Auto-approve safe tools before contacting daemon.
     // Check user overrides first (~/.wisphive/auto-approve.json), fall back to defaults.
     if is_auto_approved(&tool_name, &wisphive_dir) {
-        return Ok(Decision::Approve);
+        return Ok(HookResponse::simple(Decision::Approve));
     }
 
     let tool_input = hook_event
@@ -144,8 +218,19 @@ fn run() -> Result<Decision, Box<dyn std::error::Error>> {
     let response: ServerMessage = wisphive_protocol::decode(&response_line)?;
 
     match response {
-        ServerMessage::DecisionResponse { decision, .. } => Ok(decision),
-        _ => Ok(Decision::Approve),
+        ServerMessage::DecisionResponse {
+            decision,
+            message,
+            updated_input,
+            additional_context,
+            ..
+        } => Ok(HookResponse {
+            decision,
+            message,
+            updated_input,
+            additional_context,
+        }),
+        _ => Ok(HookResponse::simple(Decision::Approve)),
     }
 }
 

@@ -7,7 +7,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, broadcast};
 use tracing::{error, info, warn};
 use wisphive_protocol::{
-    ClientMessage, ClientType, Decision, PROTOCOL_VERSION, ServerMessage, encode,
+    ClientMessage, ClientType, Decision, PROTOCOL_VERSION, RichDecision, ServerMessage, encode,
 };
 
 use crate::config::DaemonConfig;
@@ -195,6 +195,11 @@ async fn handle_hook(
         ClientMessage::DecisionRequest(req) => {
             let id = req.id;
             let agent_id = req.agent_id.clone();
+            let req_tool_name = req.tool_name.clone();
+            let config_home = std::env::var("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+                .join(".wisphive");
 
             // Register agent and broadcast to TUI clients
             let agent_info = {
@@ -218,20 +223,29 @@ async fn handle_hook(
             };
 
             // Block until TUI responds or timeout
-            let decision = match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
-                Ok(Ok(decision)) => decision,
+            let rich = match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
+                Ok(Ok(rich)) => rich,
                 Ok(Err(_)) => {
                     warn!(%id, "decision channel dropped, defaulting to approve");
-                    Decision::Approve
+                    RichDecision::approve()
                 }
                 Err(_) => {
                     warn!(%id, "hook timed out after {timeout_secs}s, defaulting to approve");
-                    Decision::Approve
+                    RichDecision::approve()
                 }
             };
 
-            // Log resolution
-            state_db.resolve_pending(id, decision).await?;
+            // Persist auto-approve if requested
+            if rich.always_allow {
+                if let Err(e) = persist_auto_approve(&req_tool_name, &config_home) {
+                    warn!("failed to persist auto-approve: {e}");
+                }
+            }
+
+            // Log resolution (skip audit log for Ask/defer decisions)
+            if rich.decision != Decision::Ask {
+                state_db.resolve_pending(id, rich.decision).await?;
+            }
 
             // Deregister agent and broadcast to TUI clients
             {
@@ -240,8 +254,14 @@ async fn handle_hook(
             }
             let _ = tui_tx.send(ServerMessage::AgentDisconnected { agent_id });
 
-            // Send response to hook
-            let resp = encode(&ServerMessage::DecisionResponse { id, decision })?;
+            // Send rich response to hook
+            let resp = encode(&ServerMessage::DecisionResponse {
+                id,
+                decision: rich.decision,
+                message: rich.message,
+                updated_input: rich.updated_input,
+                additional_context: rich.additional_context,
+            })?;
             writer.write_all(resp.as_bytes()).await?;
         }
         ClientMessage::ToolResult(result) => {
@@ -324,13 +344,29 @@ async fn handle_tui(
                             }
                         };
                         match msg {
-                            ClientMessage::Approve { id } => {
+                            ClientMessage::Approve { id, message, updated_input, always_allow, additional_context } => {
+                                let rich = RichDecision {
+                                    decision: Decision::Approve,
+                                    message,
+                                    updated_input,
+                                    always_allow,
+                                    additional_context,
+                                };
                                 let mut q = queue.lock().await;
-                                q.resolve(id, Decision::Approve);
+                                q.resolve(id, rich);
                             }
-                            ClientMessage::Deny { id } => {
+                            ClientMessage::Deny { id, message } => {
+                                let rich = RichDecision {
+                                    decision: Decision::Deny,
+                                    message,
+                                    ..RichDecision::deny()
+                                };
                                 let mut q = queue.lock().await;
-                                q.resolve(id, Decision::Deny);
+                                q.resolve(id, rich);
+                            }
+                            ClientMessage::Ask { id } => {
+                                let mut q = queue.lock().await;
+                                q.resolve(id, RichDecision::from(Decision::Ask));
                             }
                             ClientMessage::ApproveAll { ref filter } => {
                                 let mut q = queue.lock().await;
@@ -426,5 +462,32 @@ async fn handle_tui(
     }
 
     info!("TUI client disconnected");
+    Ok(())
+}
+
+/// Add a tool to the auto-approve list in ~/.wisphive/auto-approve.json.
+fn persist_auto_approve(tool_name: &str, wisphive_dir: &std::path::Path) -> Result<()> {
+    let path = wisphive_dir.join("auto-approve.json");
+    let mut config: serde_json::Value = if path.exists() {
+        let content = std::fs::read_to_string(&path)?;
+        serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    let arr = config
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("auto-approve.json is not an object"))?
+        .entry("auto_approve")
+        .or_insert(serde_json::json!([]))
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("auto_approve is not an array"))?;
+
+    if !arr.iter().any(|v| v.as_str() == Some(tool_name)) {
+        arr.push(serde_json::Value::String(tool_name.to_string()));
+        info!(tool = tool_name, "added to auto-approve list");
+    }
+
+    std::fs::write(&path, serde_json::to_string_pretty(&config)?)?;
     Ok(())
 }

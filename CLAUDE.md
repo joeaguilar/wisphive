@@ -44,6 +44,31 @@ Six workspace crates with clear dependency flow:
 - **Passive notifications**: macOS uses `osascript display notification` (non-intrusive banner); Linux uses `notify-send`. Notifications are informational only — all tool input fields are shown so users have context when switching to the TUI to respond. Notifications do NOT resolve decisions; only the TUI does.
 - **Permissions management**: `wisphive hooks install` adds Claude Code permissions (Bash, Edit, Write, NotebookEdit) to `.claude/settings.json` so Claude Code auto-allows tools that Wisphive gates (eliminates double-prompt). `wisphive hooks uninstall` removes them.
 
+## Claude Code Hook Response Format
+
+The `wisphive-hook` binary runs as both `PreToolUse` and `PostToolUse` hook. Claude Code supports rich JSON responses on stdout (exit 0), not just exit codes.
+
+**PreToolUse stdin fields**: `session_id`, `tool_name`, `tool_use_id`, `tool_input`, `cwd`, `permission_mode`, `hook_event_name`, `transcript_path`
+
+**PostToolUse additional field**: `tool_response` (the tool's execution output — NOT `tool_result`)
+
+**Structured JSON response** (stdout, exit 0):
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "allow|deny|ask",
+    "permissionDecisionReason": "text shown to Claude",
+    "updatedInput": { "command": "sanitized version" },
+    "additionalContext": "guidance injected into Claude's context"
+  }
+}
+```
+
+**Key capabilities**: `permissionDecision: "deny"` + `permissionDecisionReason` gives Claude feedback on why. `updatedInput` lets hooks sanitize tool input before execution. `"ask"` defers to Claude's native permission prompt. Stderr on exit 2 becomes Claude feedback.
+
+**PermissionRequest hook** (separate event): fires when Claude's permission dialog would show. Can return `updatedPermissions` with `setMode`/`addRules` to change permission mode for session or permanently. Does NOT fire in `-p` (print) mode.
+
 ## IPC Protocol
 
 Unix socket at `~/.wisphive/wisphive.sock`. Newline-delimited JSON. Two client types:

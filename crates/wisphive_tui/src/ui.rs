@@ -81,7 +81,7 @@ fn draw_detail_view(frame: &mut Frame, app: &App) {
         };
 
         let bar_text = format!(
-            " [Y]approve [N]deny [Esc]back [j/k]scroll{}",
+            " [Y]approve [N]deny [M]deny+msg [!]always [E]edit [C]context [?]defer [Esc]back{}",
             scroll_info
         );
         let bar = Paragraph::new(Line::from(Span::styled(
@@ -132,10 +132,12 @@ fn draw_history_view(frame: &mut Frame, app: &App) {
             let decision_str = match entry.decision {
                 wisphive_protocol::Decision::Approve => "APPROVED",
                 wisphive_protocol::Decision::Deny => "DENIED  ",
+                wisphive_protocol::Decision::Ask => "DEFERRED",
             };
             let decision_color = match entry.decision {
                 wisphive_protocol::Decision::Approve => Color::Green,
                 wisphive_protocol::Decision::Deny => Color::Red,
+                wisphive_protocol::Decision::Ask => Color::Yellow,
             };
 
             let project_name = entry
@@ -357,15 +359,20 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_modal(frame: &mut Frame, modal: &Modal) {
     let area = frame.area();
-    let modal_width = 50.min(area.width.saturating_sub(4));
-    let modal_height = 7.min(area.height.saturating_sub(4));
+
+    // Text/edit input modals are taller
+    let has_input = modal.text_input.is_some() || modal.edit_input.is_some() || modal.spawn.is_some();
+    let modal_height = if has_input {
+        10.min(area.height.saturating_sub(4))
+    } else {
+        7.min(area.height.saturating_sub(4))
+    };
+    let modal_width = 60.min(area.width.saturating_sub(4));
 
     let x = (area.width.saturating_sub(modal_width)) / 2;
     let y = (area.height.saturating_sub(modal_height)) / 2;
 
     let modal_area = Rect::new(x, y, modal_width, modal_height);
-
-    // Clear the area behind the modal
     frame.render_widget(Clear, modal_area);
 
     let block = Block::default()
@@ -373,9 +380,52 @@ fn draw_modal(frame: &mut Frame, modal: &Modal) {
         .border_style(Style::default().fg(Color::Yellow))
         .title(format!(" {} ", modal.title));
 
-    let text = Paragraph::new(modal.body.clone())
-        .block(block)
-        .style(Style::default().fg(Color::White));
+    // Build content lines
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+        modal.body.clone(),
+        Style::default().fg(Color::White),
+    ))];
 
+    if let Some(ref text_input) = modal.text_input {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("> ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("{}_", text_input.buffer),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+    } else if let Some(ref edit_input) = modal.edit_input {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("> ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("{}_", edit_input.buffer),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+    } else if let Some(ref spawn) = modal.spawn {
+        lines.push(Line::from(""));
+        let proj_style = if spawn.active_field == crate::modal::SpawnField::Project {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let prompt_style = if spawn.active_field == crate::modal::SpawnField::Prompt {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  Project: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{}_", spawn.project_buf), proj_style),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  Prompt:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{}_", spawn.prompt_buf), prompt_style),
+        ]));
+    }
+
+    let text = Paragraph::new(lines).block(block);
     frame.render_widget(text, modal_area);
 }

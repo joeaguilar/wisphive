@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use tokio::sync::{broadcast, oneshot};
 use tracing::{info, warn};
 use uuid::Uuid;
-use wisphive_protocol::{Decision, DecisionFilter, DecisionRequest, ServerMessage};
+use wisphive_protocol::{Decision, DecisionFilter, DecisionRequest, RichDecision, ServerMessage};
 
 /// The decision queue: holds pending tool-call decisions awaiting human response.
 ///
@@ -11,7 +11,7 @@ use wisphive_protocol::{Decision, DecisionFilter, DecisionRequest, ServerMessage
 /// When the TUI approves/denies, the oneshot sender fires and the hook unblocks.
 pub struct DecisionQueue {
     /// Pending decisions awaiting human response. Maps request ID → oneshot sender.
-    pending_senders: HashMap<Uuid, oneshot::Sender<Decision>>,
+    pending_senders: HashMap<Uuid, oneshot::Sender<RichDecision>>,
     /// Ordered list of pending requests (for TUI display).
     pending_items: Vec<DecisionRequest>,
     /// Broadcast channel to push events to all connected TUI clients.
@@ -29,7 +29,7 @@ impl DecisionQueue {
 
     /// Enqueue a decision request. Returns a oneshot receiver that the hook handler
     /// should await — it will resolve when the TUI sends approve/deny.
-    pub fn enqueue(&mut self, req: DecisionRequest) -> oneshot::Receiver<Decision> {
+    pub fn enqueue(&mut self, req: DecisionRequest) -> oneshot::Receiver<RichDecision> {
         let (tx, rx) = oneshot::channel();
 
         info!(
@@ -49,20 +49,21 @@ impl DecisionQueue {
         rx
     }
 
-    /// Resolve a pending decision (approve or deny). Returns true if found.
-    pub fn resolve(&mut self, id: Uuid, decision: Decision) -> bool {
+    /// Resolve a pending decision with a rich response. Returns true if found.
+    pub fn resolve(&mut self, id: Uuid, rich: RichDecision) -> bool {
         if let Some(tx) = self.pending_senders.remove(&id) {
             self.pending_items.retain(|r| r.id != id);
 
-            info!(%id, ?decision, "decision resolved");
+            info!(%id, decision = ?rich.decision, "decision resolved");
 
-            let _ = self
-                .tui_tx
-                .send(ServerMessage::DecisionResolved { id, decision });
+            let _ = self.tui_tx.send(ServerMessage::DecisionResolved {
+                id,
+                decision: rich.decision,
+            });
 
-            // Send the decision to the waiting hook. If the hook already disconnected
+            // Send the rich decision to the waiting hook. If the hook already disconnected
             // (timed out), this just drops silently — that's fine.
-            let _ = tx.send(decision);
+            let _ = tx.send(rich);
             true
         } else {
             warn!(%id, "attempted to resolve unknown decision");
@@ -82,7 +83,7 @@ impl DecisionQueue {
 
         let count = ids.len();
         for id in ids {
-            self.resolve(id, decision);
+            self.resolve(id, RichDecision::from(decision));
         }
         count
     }
@@ -172,9 +173,9 @@ mod tests {
         let id = req.id;
         let rx = q.enqueue(req);
 
-        assert!(q.resolve(id, Decision::Approve));
+        assert!(q.resolve(id, RichDecision::approve()));
         let decision = rx.await.unwrap();
-        assert_eq!(decision, Decision::Approve);
+        assert_eq!(decision.decision, Decision::Approve);
         assert_eq!(q.len(), 0);
     }
 
@@ -185,16 +186,16 @@ mod tests {
         let id = req.id;
         let rx = q.enqueue(req);
 
-        assert!(q.resolve(id, Decision::Deny));
+        assert!(q.resolve(id, RichDecision::deny()));
         let decision = rx.await.unwrap();
-        assert_eq!(decision, Decision::Deny);
+        assert_eq!(decision.decision, Decision::Deny);
     }
 
     #[test]
     fn resolve_unknown_id_returns_false() {
         let mut q = make_queue();
         let unknown_id = Uuid::new_v4();
-        assert!(!q.resolve(unknown_id, Decision::Approve));
+        assert!(!q.resolve(unknown_id, RichDecision::approve()));
     }
 
     #[test]
@@ -207,7 +208,7 @@ mod tests {
         let _rx1 = q.enqueue(r1);
         let _rx2 = q.enqueue(r2);
 
-        q.resolve(id1, Decision::Approve);
+        q.resolve(id1, RichDecision::approve());
 
         assert_eq!(q.len(), 1);
         let snap = q.snapshot();
@@ -221,8 +222,8 @@ mod tests {
         let id = req.id;
         let _rx = q.enqueue(req);
 
-        assert!(q.resolve(id, Decision::Approve));
-        assert!(!q.resolve(id, Decision::Approve));
+        assert!(q.resolve(id, RichDecision::approve()));
+        assert!(!q.resolve(id, RichDecision::approve()));
     }
 
     #[test]
@@ -236,7 +237,7 @@ mod tests {
         drop(rx);
 
         // Should not panic — the send just silently fails
-        assert!(q.resolve(id, Decision::Approve));
+        assert!(q.resolve(id, RichDecision::approve()));
         assert_eq!(q.len(), 0);
     }
 
@@ -259,9 +260,9 @@ mod tests {
         assert_eq!(count, 3);
         assert_eq!(q.len(), 0);
 
-        assert_eq!(rx1.await.unwrap(), Decision::Approve);
-        assert_eq!(rx2.await.unwrap(), Decision::Approve);
-        assert_eq!(rx3.await.unwrap(), Decision::Approve);
+        assert_eq!(rx1.await.unwrap().decision, Decision::Approve);
+        assert_eq!(rx2.await.unwrap().decision, Decision::Approve);
+        assert_eq!(rx3.await.unwrap().decision, Decision::Approve);
     }
 
     #[tokio::test]
@@ -285,8 +286,8 @@ mod tests {
         assert_eq!(q.len(), 1); // Only Write remains
         assert_eq!(q.snapshot()[0].tool_name, "Write");
 
-        assert_eq!(rx1.await.unwrap(), Decision::Deny);
-        assert_eq!(rx3.await.unwrap(), Decision::Deny);
+        assert_eq!(rx1.await.unwrap().decision, Decision::Deny);
+        assert_eq!(rx3.await.unwrap().decision, Decision::Deny);
     }
 
     #[tokio::test]
@@ -310,8 +311,8 @@ mod tests {
         assert_eq!(q.len(), 1);
         assert_eq!(q.snapshot()[0].project, PathBuf::from("/rpg"));
 
-        assert_eq!(rx1.await.unwrap(), Decision::Approve);
-        assert_eq!(rx2.await.unwrap(), Decision::Approve);
+        assert_eq!(rx1.await.unwrap().decision, Decision::Approve);
+        assert_eq!(rx2.await.unwrap().decision, Decision::Approve);
     }
 
     #[test]
@@ -373,7 +374,7 @@ mod tests {
         // Skip the NewDecision broadcast
         let _ = rx.try_recv();
 
-        q.resolve(id, Decision::Deny);
+        q.resolve(id, RichDecision::deny());
 
         let msg = rx.try_recv().unwrap();
         match msg {
