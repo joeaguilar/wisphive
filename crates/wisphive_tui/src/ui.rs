@@ -258,10 +258,17 @@ fn draw_config_view(frame: &mut Frame, app: &App) {
         .split(frame.area());
 
     const ALL_TOOLS: &[&str] = &[
-        "Read", "Glob", "Grep", "LS", "WebSearch", "WebFetch",
-        "NotebookRead", "Agent", "Skill", "TaskCreate", "TaskUpdate",
-        "TaskGet", "TaskList", "TodoRead", "ToolSearch",
-        "Edit", "Write", "NotebookEdit", "Bash",
+        // Read tier
+        "Read", "Glob", "Grep", "LS", "LSP", "NotebookRead",
+        "WebSearch", "WebFetch",
+        "Agent", "Skill", "ToolSearch", "AskUserQuestion",
+        "EnterPlanMode", "ExitPlanMode", "EnterWorktree", "ExitWorktree",
+        "TaskCreate", "TaskUpdate", "TaskGet", "TaskList", "TaskOutput", "TaskStop", "TodoRead",
+        "CronList",
+        // Write tier
+        "Edit", "Write", "NotebookEdit", "CronCreate", "CronDelete",
+        // Execute tier
+        "Bash",
     ];
 
     let mut lines: Vec<Line<'static>> = Vec::new();

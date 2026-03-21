@@ -11,24 +11,15 @@ use wisphive_protocol::{
 
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Tools that are always safe to auto-approve (read-only, no side effects).
-/// These never hit the daemon — the hook exits 0 immediately.
+/// Tools that are always safe to auto-approve (read-only + orchestration).
+/// Fallback when no config.json exists. Matches the Read tier.
 const DEFAULT_AUTO_APPROVE: &[&str] = &[
-    "Read",
-    "Glob",
-    "Grep",
-    "LS",
-    "WebSearch",
-    "WebFetch",
-    "NotebookRead",
-    "Agent",
-    "Skill",
-    "TaskCreate",
-    "TaskUpdate",
-    "TaskGet",
-    "TaskList",
-    "TodoRead",
-    "ToolSearch",
+    "Read", "Glob", "Grep", "LS", "LSP", "NotebookRead",
+    "WebSearch", "WebFetch",
+    "Agent", "Skill", "ToolSearch", "AskUserQuestion",
+    "EnterPlanMode", "ExitPlanMode", "EnterWorktree", "ExitWorktree",
+    "TaskCreate", "TaskUpdate", "TaskGet", "TaskList", "TaskOutput", "TaskStop", "TodoRead",
+    "CronList",
 ];
 
 /// Hook response to format for Claude Code.
