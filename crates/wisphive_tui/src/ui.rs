@@ -859,7 +859,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             "disconnected"
         };
         format!(
-            " [y]approve [Enter/a/d]review [A]ll [D]eny-all [h]istory [s]essions [p]rojects [c]onfig [/]filter [Tab]cycle [q]back [Q]uit | {} ",
+            " [y]approve [Enter/a/d]review [A]ll [D]eny-all [n]spawn [h]istory [s]essions [p]rojects [c]onfig [/]filter [Tab]cycle [q]back [Q]uit | {} ",
             conn
         )
     };

@@ -185,6 +185,12 @@ fn handle_queue_input(app: &mut App, key: KeyEvent) -> InputAction {
             InputAction::None
         }
 
+        // Spawn a new agent
+        KeyCode::Char('n') => {
+            app.modal = Some(Modal::spawn_agent());
+            InputAction::None
+        }
+
         // Filter
         KeyCode::Char('/') => {
             app.filter_input_mode = true;
