@@ -1,5 +1,16 @@
 {
   "hooks": {
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "command": "/Users/josefaguilar/.cargo/bin/wisphive-hook",
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
     "PostToolUse": [
       {
         "hooks": [
