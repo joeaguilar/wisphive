@@ -167,6 +167,30 @@ pub fn run(project: Option<PathBuf>) -> Result<()> {
         ));
     }
 
+    // ── 6. Permissions ──
+
+    if settings_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&settings_path) {
+            if let Ok(settings) = serde_json::from_str::<serde_json::Value>(&content) {
+                let has_perms = settings
+                    .get("permissions")
+                    .and_then(|p| p.get("allow"))
+                    .and_then(|a| a.as_array())
+                    .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some("Bash(*)")));
+
+                if has_perms {
+                    eprintln!("  OK  Claude Code permissions set (no double-prompt)");
+                    ok_count += 1;
+                } else {
+                    issues.push(format!(
+                        "WARN  Claude Code permissions not set (may cause double-prompt)\n      fix: wisphive hooks install --project {}",
+                        project.display()
+                    ));
+                }
+            }
+        }
+    }
+
     // ── Summary ──
 
     eprintln!();

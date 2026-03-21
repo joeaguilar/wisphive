@@ -2,6 +2,11 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
+/// Permissions that Wisphive adds to .claude/settings.json so Claude Code
+/// auto-allows tools that Wisphive will gate via its hook.
+/// This eliminates the double-prompt — wisphive becomes the sole gatekeeper.
+const WISPHIVE_PERMISSIONS: &[&str] = &["Bash(*)", "Edit(*)", "Write(*)", "NotebookEdit(*)"];
+
 /// Get the wisphive home directory.
 fn wisphive_home() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
@@ -56,6 +61,10 @@ pub fn install(project: Option<PathBuf>, _all: bool) -> Result<()> {
     // Add PreToolUse hook if not already present
     add_hook_entry(&mut settings, "PreToolUse", &hook_command);
 
+    // Add permissions so Claude Code auto-allows tools wisphive gates
+    // (eliminates double-prompt — wisphive becomes the sole gatekeeper)
+    add_wisphive_permissions(&mut settings);
+
     // Write back
     let dir = settings_path.parent().unwrap();
     std::fs::create_dir_all(dir)?;
@@ -88,6 +97,9 @@ pub fn uninstall(project: Option<PathBuf>, _all: bool) -> Result<()> {
     // Remove Wisphive entries from each hook type
     remove_hook_entries(&mut settings, "PreToolUse", &hook_command);
     remove_hook_entries(&mut settings, "PostToolUse", &hook_command);
+
+    // Remove wisphive-managed permissions (preserves user-added ones)
+    remove_wisphive_permissions(&mut settings);
 
     let formatted = serde_json::to_string_pretty(&settings)?;
     std::fs::write(&settings_path, formatted)?;
@@ -135,6 +147,42 @@ fn hook_binary_path() -> String {
     }
     // Fallback: assume it's in PATH
     "wisphive-hook".into()
+}
+
+/// Add Wisphive-managed permissions to the settings JSON.
+/// Ensures Claude Code auto-allows tools that Wisphive gates,
+/// eliminating the double-prompt.
+fn add_wisphive_permissions(settings: &mut serde_json::Value) {
+    if settings.get("permissions").is_none() {
+        settings["permissions"] = serde_json::json!({});
+    }
+    if settings["permissions"].get("allow").is_none() {
+        settings["permissions"]["allow"] = serde_json::json!([]);
+    }
+
+    if let Some(allow_arr) = settings["permissions"]["allow"].as_array_mut() {
+        for &perm in WISPHIVE_PERMISSIONS {
+            let already_present = allow_arr
+                .iter()
+                .any(|v| v.as_str().is_some_and(|s| s == perm));
+            if !already_present {
+                allow_arr.push(serde_json::Value::String(perm.to_string()));
+            }
+        }
+    }
+}
+
+/// Remove Wisphive-managed permissions from the settings JSON.
+/// Only removes permissions from the known WISPHIVE_PERMISSIONS list.
+fn remove_wisphive_permissions(settings: &mut serde_json::Value) {
+    if let Some(permissions) = settings.get_mut("permissions") {
+        if let Some(allow_arr) = permissions.get_mut("allow").and_then(|v| v.as_array_mut()) {
+            allow_arr.retain(|v| {
+                v.as_str()
+                    .is_some_and(|s| !WISPHIVE_PERMISSIONS.iter().any(|&p| p == s))
+            });
+        }
+    }
 }
 
 /// Add a Wisphive hook entry to the settings JSON, avoiding duplicates.
@@ -532,6 +580,124 @@ mod tests {
         let p = tmp.path().to_path_buf();
         write_settings(&p, &json!({"hooks": {}}));
         assert!(uninstall(Some(p), false).is_ok());
+    }
+
+    // ══ Mode file ══
+
+    // ══ Permissions management ══
+
+    #[test]
+    fn add_permissions_to_empty_settings() {
+        let mut s = json!({});
+        add_wisphive_permissions(&mut s);
+        let allow = s["permissions"]["allow"].as_array().unwrap();
+        assert!(allow.iter().any(|v| v == "Bash(*)"));
+        assert!(allow.iter().any(|v| v == "Edit(*)"));
+        assert!(allow.iter().any(|v| v == "Write(*)"));
+        assert!(allow.iter().any(|v| v == "NotebookEdit(*)"));
+        assert_eq!(allow.len(), WISPHIVE_PERMISSIONS.len());
+    }
+
+    #[test]
+    fn add_permissions_preserves_existing() {
+        let mut s = json!({"permissions": {"allow": ["mcp__foo(*)"]}});
+        add_wisphive_permissions(&mut s);
+        let allow = s["permissions"]["allow"].as_array().unwrap();
+        assert!(allow.iter().any(|v| v == "mcp__foo(*)"));
+        assert!(allow.iter().any(|v| v == "Bash(*)"));
+        assert_eq!(allow.len(), WISPHIVE_PERMISSIONS.len() + 1);
+    }
+
+    #[test]
+    fn add_permissions_idempotent() {
+        let mut s = json!({});
+        add_wisphive_permissions(&mut s);
+        add_wisphive_permissions(&mut s);
+        add_wisphive_permissions(&mut s);
+        let allow = s["permissions"]["allow"].as_array().unwrap();
+        assert_eq!(allow.len(), WISPHIVE_PERMISSIONS.len());
+    }
+
+    #[test]
+    fn add_permissions_no_duplicates_when_user_has_same() {
+        let mut s = json!({"permissions": {"allow": ["Bash(*)"]}});
+        add_wisphive_permissions(&mut s);
+        let allow = s["permissions"]["allow"].as_array().unwrap();
+        let bash_count = allow.iter().filter(|v| v.as_str() == Some("Bash(*)")).count();
+        assert_eq!(bash_count, 1);
+        assert_eq!(allow.len(), WISPHIVE_PERMISSIONS.len());
+    }
+
+    #[test]
+    fn remove_permissions_cleans_wisphive_only() {
+        let mut s = json!({"permissions": {"allow": [
+            "Bash(*)", "Edit(*)", "Write(*)", "NotebookEdit(*)", "mcp__custom(*)"
+        ]}});
+        remove_wisphive_permissions(&mut s);
+        let allow = s["permissions"]["allow"].as_array().unwrap();
+        assert_eq!(allow.len(), 1);
+        assert_eq!(allow[0], "mcp__custom(*)");
+    }
+
+    #[test]
+    fn remove_permissions_noop_when_empty() {
+        let mut s = json!({});
+        remove_wisphive_permissions(&mut s);
+        assert!(s.get("permissions").is_none());
+    }
+
+    #[test]
+    fn remove_permissions_noop_when_no_allow() {
+        let mut s = json!({"permissions": {"deny": ["something"]}});
+        remove_wisphive_permissions(&mut s);
+        assert!(s["permissions"].get("allow").is_none());
+        assert_eq!(s["permissions"]["deny"][0], "something");
+    }
+
+    #[test]
+    fn install_adds_both_hooks_and_permissions() {
+        let tmp = temp_project();
+        let p = tmp.path().to_path_buf();
+        install(Some(p.clone()), false).unwrap();
+        let s = read_settings(&p);
+        assert!(s["hooks"]["PreToolUse"].is_array());
+        let allow = s["permissions"]["allow"].as_array().unwrap();
+        assert!(allow.iter().any(|v| v == "Bash(*)"));
+    }
+
+    #[test]
+    fn uninstall_removes_both_hooks_and_permissions() {
+        let tmp = temp_project();
+        let p = tmp.path().to_path_buf();
+        install(Some(p.clone()), false).unwrap();
+        uninstall(Some(p.clone()), false).unwrap();
+        let s = read_settings(&p);
+        let hooks = s["hooks"]["PreToolUse"].as_array().unwrap();
+        assert!(hooks.is_empty());
+        let allow = s["permissions"]["allow"].as_array().unwrap();
+        assert!(allow.is_empty());
+    }
+
+    #[test]
+    fn round_trip_preserves_user_permissions() {
+        let tmp = temp_project();
+        let p = tmp.path().to_path_buf();
+        write_settings(
+            &p,
+            &json!({
+                "permissions": {"allow": ["mcp__github(*)"]},
+                "hooks": {"PreToolUse": [cc_rule("linter")]}
+            }),
+        );
+        install(Some(p.clone()), false).unwrap();
+        uninstall(Some(p.clone()), false).unwrap();
+        let s = read_settings(&p);
+        let allow = s["permissions"]["allow"].as_array().unwrap();
+        assert_eq!(allow.len(), 1);
+        assert_eq!(allow[0], "mcp__github(*)");
+        let hooks = s["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0]["hooks"][0]["command"], "linter");
     }
 
     // ══ Mode file ══
