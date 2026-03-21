@@ -40,6 +40,9 @@ pub struct UserConfig {
     /// Tools to exclude from auto-approve despite the level.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_approve_remove: Option<Vec<String>>,
+    /// Content-aware rules per tool (deny/allow patterns on tool input).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_rules: Option<std::collections::HashMap<String, wisphive_protocol::ToolRule>>,
 }
 
 fn default_true() -> bool {
