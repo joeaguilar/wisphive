@@ -73,15 +73,8 @@ pub async fn start(
     let project = std::fs::canonicalize(&project)
         .unwrap_or_else(|_| project.clone());
 
-    // Pre-flight: check hooks are installed
-    let settings_path = project.join(".claude").join("settings.json");
-    if !settings_path.exists() {
-        eprintln!(
-            "Warning: no .claude/settings.json in {}. Run: wisphive hooks install --project {}",
-            project.display(),
-            project.display()
-        );
-    }
+    // Pre-flight checks
+    preflight_checks(&project)?;
 
     let request = SpawnAgentRequest {
         project: project.clone(),
@@ -153,6 +146,68 @@ pub async fn stop(agent_id: String) -> Result<()> {
         }
         other => {
             eprintln!("Unexpected response: {:?}", other);
+        }
+    }
+
+    Ok(())
+}
+
+/// Verify the system is ready to spawn an agent.
+fn preflight_checks(project: &PathBuf) -> Result<()> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let wisphive_dir = PathBuf::from(&home).join(".wisphive");
+
+    // 1. Check mode is active
+    let mode_path = wisphive_dir.join("mode");
+    let mode = std::fs::read_to_string(&mode_path).unwrap_or_else(|_| "off".into());
+    if mode.trim() != "active" {
+        anyhow::bail!(
+            "Wisphive hooks are not active (mode: {}).\n  fix: wisphive hooks enable",
+            mode.trim()
+        );
+    }
+
+    // 2. Check daemon is running (socket exists and PID is alive)
+    let socket_path = wisphive_dir.join("wisphive.sock");
+    if !socket_path.exists() {
+        anyhow::bail!(
+            "Daemon is not running (no socket found).\n  fix: wisphive daemon start"
+        );
+    }
+    let pid_path = wisphive_dir.join("wisphive.pid");
+    if pid_path.exists() {
+        if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
+            if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                #[cfg(unix)]
+                {
+                    let alive = unsafe { libc::kill(pid, 0) } == 0;
+                    if !alive {
+                        anyhow::bail!(
+                            "Daemon is not running (stale PID file).\n  fix: wisphive daemon start"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Check hooks are installed in the project
+    let settings_path = project.join(".claude").join("settings.json");
+    if !settings_path.exists() {
+        anyhow::bail!(
+            "No .claude/settings.json in {}.\n  fix: wisphive hooks install --project {}",
+            project.display(),
+            project.display()
+        );
+    }
+    // Verify wisphive hook is actually present
+    if let Ok(content) = std::fs::read_to_string(&settings_path) {
+        if !content.contains("wisphive") {
+            anyhow::bail!(
+                "Wisphive hooks not installed in {}.\n  fix: wisphive hooks install --project {}",
+                project.display(),
+                project.display()
+            );
         }
     }
 
