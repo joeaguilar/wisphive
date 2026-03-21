@@ -52,6 +52,32 @@ pub enum Decision {
     Deny,
 }
 
+/// Request to spawn a new AI agent process.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpawnAgentRequest {
+    /// Working directory for the agent.
+    pub project: PathBuf,
+    /// Prompt to pass to the agent.
+    pub prompt: String,
+    /// Model to use (e.g. "sonnet", "opus"). None = agent default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Human-readable session name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Metadata about a daemon-managed agent process.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedAgent {
+    pub agent_id: String,
+    pub pid: u32,
+    pub project: PathBuf,
+    pub model: Option<String>,
+    pub name: Option<String>,
+    pub started_at: DateTime<Utc>,
+}
+
 /// Filter criteria for batch operations on the decision queue.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DecisionFilter {

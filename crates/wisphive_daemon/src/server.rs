@@ -11,7 +11,9 @@ use wisphive_protocol::{
 };
 
 use crate::config::DaemonConfig;
+use crate::process_registry::ProcessRegistry;
 use crate::queue::DecisionQueue;
+use crate::registry::AgentRegistry;
 use crate::state::StateDb;
 
 /// The main daemon server. Listens on a Unix socket and dispatches
@@ -19,6 +21,8 @@ use crate::state::StateDb;
 pub struct Server {
     config: DaemonConfig,
     queue: Arc<Mutex<DecisionQueue>>,
+    process_registry: Arc<Mutex<ProcessRegistry>>,
+    agent_registry: Arc<Mutex<AgentRegistry>>,
     tui_tx: broadcast::Sender<ServerMessage>,
     state_db: Arc<StateDb>,
 }
@@ -32,10 +36,14 @@ impl Server {
 
         let db_path = config.db_path.to_string_lossy().to_string();
         let state_db = Arc::new(StateDb::open(&db_path).await?);
+        let process_registry = Arc::new(Mutex::new(ProcessRegistry::new()));
+        let agent_registry = Arc::new(Mutex::new(AgentRegistry::new()));
 
         Ok(Self {
             config,
             queue,
+            process_registry,
+            agent_registry,
             tui_tx,
             state_db,
         })
@@ -55,11 +63,12 @@ impl Server {
                     match accept {
                         Ok((stream, _addr)) => {
                             let queue = self.queue.clone();
+                            let process_registry = self.process_registry.clone();
                             let tui_tx = self.tui_tx.clone();
                             let state_db = self.state_db.clone();
                             let timeout = self.config.hook_timeout_secs;
                             tokio::spawn(async move {
-                                if let Err(e) = handle_connection(stream, queue, tui_tx, state_db, timeout).await {
+                                if let Err(e) = handle_connection(stream, queue, process_registry, tui_tx, state_db, timeout).await {
                                     warn!("connection error: {e}");
                                 }
                             });
@@ -76,6 +85,15 @@ impl Server {
             }
         }
 
+        // Shutdown managed agent processes
+        {
+            let mut pr = self.process_registry.lock().await;
+            if !pr.is_empty() {
+                info!("stopping {} managed agent(s)", pr.len());
+                pr.shutdown_all().await;
+            }
+        }
+
         // Cleanup socket
         let _ = std::fs::remove_file(&self.config.socket_path);
         info!("server stopped");
@@ -87,6 +105,7 @@ impl Server {
 async fn handle_connection(
     stream: UnixStream,
     queue: Arc<Mutex<DecisionQueue>>,
+    process_registry: Arc<Mutex<ProcessRegistry>>,
     tui_tx: broadcast::Sender<ServerMessage>,
     state_db: Arc<StateDb>,
     hook_timeout_secs: u64,
@@ -121,7 +140,9 @@ async fn handle_connection(
                 ClientType::Hook => {
                     handle_hook(lines, writer, queue, state_db, hook_timeout_secs).await
                 }
-                ClientType::Tui => handle_tui(lines, writer, queue, tui_tx).await,
+                ClientType::Tui => {
+                    handle_tui(lines, writer, queue, process_registry, tui_tx).await
+                }
             }
         }
         _ => {
@@ -201,6 +222,7 @@ async fn handle_tui(
     mut lines: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
     mut writer: tokio::net::unix::OwnedWriteHalf,
     queue: Arc<Mutex<DecisionQueue>>,
+    process_registry: Arc<Mutex<ProcessRegistry>>,
     tui_tx: broadcast::Sender<ServerMessage>,
 ) -> Result<()> {
     // Send initial queue snapshot
@@ -262,6 +284,45 @@ async fn handle_tui(
                                 let mut q = queue.lock().await;
                                 let n = q.resolve_all(filter, Decision::Deny);
                                 info!("denied {n} decisions");
+                            }
+                            ClientMessage::SpawnAgent(req) => {
+                                let mut pr = process_registry.lock().await;
+                                match pr.spawn_agent(req).await {
+                                    Ok(agent) => {
+                                        let resp = encode(&ServerMessage::AgentSpawned(agent))?;
+                                        writer.write_all(resp.as_bytes()).await?;
+                                    }
+                                    Err(e) => {
+                                        let resp = encode(&ServerMessage::Error {
+                                            message: format!("failed to spawn agent: {e}"),
+                                        })?;
+                                        writer.write_all(resp.as_bytes()).await?;
+                                    }
+                                }
+                            }
+                            ClientMessage::ListAgents => {
+                                let pr = process_registry.lock().await;
+                                let agents = pr.list();
+                                let resp = encode(&ServerMessage::AgentList { agents })?;
+                                writer.write_all(resp.as_bytes()).await?;
+                            }
+                            ClientMessage::StopAgent { ref agent_id } => {
+                                let mut pr = process_registry.lock().await;
+                                match pr.stop_agent(agent_id).await {
+                                    Ok(exit_code) => {
+                                        let resp = encode(&ServerMessage::AgentExited {
+                                            agent_id: agent_id.clone(),
+                                            exit_code,
+                                        })?;
+                                        writer.write_all(resp.as_bytes()).await?;
+                                    }
+                                    Err(e) => {
+                                        let resp = encode(&ServerMessage::Error {
+                                            message: format!("{e}"),
+                                        })?;
+                                        writer.write_all(resp.as_bytes()).await?;
+                                    }
+                                }
                             }
                             _ => {
                                 warn!("unexpected message from TUI: {:?}", msg);

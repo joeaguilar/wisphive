@@ -1,7 +1,9 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
+use std::path::PathBuf;
+
 use crate::app::{App, FocusPanel};
-use crate::modal::{Modal, ModalAction};
+use crate::modal::{Modal, ModalAction, SpawnField};
 
 /// Action the main loop should take after processing input.
 pub enum InputAction {
@@ -15,6 +17,8 @@ pub enum InputAction {
     ApproveAll,
     /// Deny all (optionally filtered).
     DenyAll,
+    /// Spawn a new agent with the given project and prompt.
+    SpawnAgent { project: PathBuf, prompt: String },
     /// Quit the application.
     Quit,
 }
@@ -48,10 +52,14 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
     match app.focus {
         FocusPanel::Queue => handle_queue_input(app, key),
         FocusPanel::Agents | FocusPanel::Projects => {
-            // Basic navigation for non-queue panels
             match key.code {
                 KeyCode::Tab => {
                     app.cycle_focus();
+                    InputAction::None
+                }
+                // Spawn a new agent
+                KeyCode::Char('n') => {
+                    app.modal = Some(Modal::spawn_agent());
                     InputAction::None
                 }
                 _ => InputAction::None,
@@ -76,7 +84,15 @@ fn handle_queue_input(app: &mut App, key: KeyEvent) -> InputAction {
             InputAction::None
         }
 
-        // Approve selected
+        // Quick approve selected (no confirmation)
+        KeyCode::Char('y') => {
+            if let Some(req) = app.selected_request() {
+                return InputAction::Approve(req.id);
+            }
+            InputAction::None
+        }
+
+        // Approve selected (with confirmation)
         KeyCode::Char('a') => {
             if let Some(req) = app.selected_request() {
                 let id = req.id;
@@ -169,12 +185,18 @@ fn handle_filter_input(app: &mut App, key: KeyEvent) -> InputAction {
 fn handle_modal_input(app: &mut App, key: KeyEvent) -> InputAction {
     let modal = app.modal.take().unwrap();
 
+    // Spawn modal has its own text-input handling
+    if modal.spawn.is_some() {
+        return handle_spawn_modal_input(app, modal, key);
+    }
+
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') => match modal.action {
             ModalAction::ApproveSingle(id) => InputAction::Approve(id),
             ModalAction::DenySingle(id) => InputAction::Deny(id),
             ModalAction::ApproveAll => InputAction::ApproveAll,
             ModalAction::DenyAll => InputAction::DenyAll,
+            ModalAction::SpawnAgent => InputAction::None, // unreachable
         },
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
             // Modal dismissed, no action
@@ -182,6 +204,56 @@ fn handle_modal_input(app: &mut App, key: KeyEvent) -> InputAction {
         }
         _ => {
             // Unknown key while modal is open — keep the modal
+            app.modal = Some(modal);
+            InputAction::None
+        }
+    }
+}
+
+fn handle_spawn_modal_input(
+    app: &mut App,
+    mut modal: Modal,
+    key: KeyEvent,
+) -> InputAction {
+    let spawn = modal.spawn.as_mut().unwrap();
+
+    match key.code {
+        KeyCode::Tab => {
+            spawn.active_field = spawn.active_field.next();
+            app.modal = Some(modal);
+            InputAction::None
+        }
+        KeyCode::Esc => {
+            // Dismiss
+            InputAction::None
+        }
+        KeyCode::Enter => {
+            let project = spawn.project_path();
+            let prompt = spawn.prompt_buf.clone();
+            if prompt.is_empty() {
+                // Don't submit with empty prompt — keep modal open
+                app.modal = Some(modal);
+                return InputAction::None;
+            }
+            InputAction::SpawnAgent { project, prompt }
+        }
+        KeyCode::Backspace => {
+            match spawn.active_field {
+                SpawnField::Project => { spawn.project_buf.pop(); }
+                SpawnField::Prompt => { spawn.prompt_buf.pop(); }
+            }
+            app.modal = Some(modal);
+            InputAction::None
+        }
+        KeyCode::Char(c) => {
+            match spawn.active_field {
+                SpawnField::Project => spawn.project_buf.push(c),
+                SpawnField::Prompt => spawn.prompt_buf.push(c),
+            }
+            app.modal = Some(modal);
+            InputAction::None
+        }
+        _ => {
             app.modal = Some(modal);
             InputAction::None
         }
