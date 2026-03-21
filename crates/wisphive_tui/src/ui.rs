@@ -91,7 +91,7 @@ fn draw_detail_view(frame: &mut Frame, app: &App) {
                 format!(" [1-{}]select [N]deny [M]deny+msg [?]defer [q/Esc]back [Q]uit{}", n, scroll_info)
             }
             HookEventType::Stop | HookEventType::SubagentStop => {
-                format!(" [C]ontinue [M]sg [S]top [q/Esc]back [Q]uit{}", scroll_info)
+                format!(" [A/Enter]accept [q/Esc]back [Q]uit{}", scroll_info)
             }
             HookEventType::UserPromptSubmit | HookEventType::ConfigChange => {
                 format!(" [A]llow [B]lock [M]block+msg [q/Esc]back [Q]uit{}", scroll_info)
@@ -794,8 +794,21 @@ fn draw_agents_panel(frame: &mut Frame, app: &App, area: Rect) {
         .agents
         .iter()
         .map(|agent| {
-            let text = format!("{} {} ●", agent.agent_id, agent.agent_type);
-            ListItem::new(Line::from(text))
+            let is_stopped = app.stopped_agents.contains(&agent.agent_id);
+            let (dot, dot_style) = if is_stopped {
+                ("■", Style::default().fg(Color::Red))
+            } else {
+                ("●", Style::default().fg(Color::Green))
+            };
+            let label = if is_stopped {
+                format!("{} {} ", agent.agent_id, agent.agent_type)
+            } else {
+                format!("{} {} ", agent.agent_id, agent.agent_type)
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(label, Style::default().fg(Color::White)),
+                Span::styled(dot.to_string(), dot_style),
+            ]))
         })
         .collect();
 

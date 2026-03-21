@@ -103,6 +103,15 @@ async fn run_loop(
                     match action {
                         InputAction::Quit => break,
                         InputAction::Approve(id) => {
+                            // Track stopped agents before removing from queue
+                            if let Some(req) = app.queue.iter().find(|r| r.id == id) {
+                                if matches!(req.hook_event_name,
+                                    wisphive_protocol::HookEventType::Stop
+                                    | wisphive_protocol::HookEventType::SubagentStop
+                                ) {
+                                    app.stopped_agents.insert(req.agent_id.clone());
+                                }
+                            }
                             tracing::info!(%id, "approved");
                             conn.send(&ClientMessage::Approve {
                                 id,
@@ -274,12 +283,13 @@ async fn run_loop(
                     Some(ServerMessage::AgentDisconnected { ref agent_id }) => {
                         tracing::info!(agent = %agent_id, "agent disconnected");
                         app.agents.retain(|a| a.agent_id != *agent_id);
+                        app.stopped_agents.remove(agent_id);
                         app.rebuild_projects();
                     }
                     Some(ServerMessage::AgentExited { ref agent_id, exit_code }) => {
                         tracing::info!(agent = %agent_id, ?exit_code, "managed agent exited");
-                        // Remove from agents list if present
                         app.agents.retain(|a| a.agent_id != *agent_id);
+                        app.stopped_agents.remove(agent_id);
                         app.rebuild_projects();
                     }
                     Some(ServerMessage::HistoryResponse { entries }) => {

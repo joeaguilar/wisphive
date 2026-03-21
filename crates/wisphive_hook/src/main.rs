@@ -334,6 +334,16 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
     // Layer 3: Register agent with daemon (once per session, fire-and-forget)
     register_agent_once(&agent_id, &project, &wisphive_dir);
 
+    // Auto-approve Stop/SubagentStop events if configured
+    if matches!(event_type, wisphive_protocol::HookEventType::Stop | wisphive_protocol::HookEventType::SubagentStop) {
+        if is_stop_auto_approved(&wisphive_dir) {
+            log_auto_approved(
+                &wisphive_dir, &tool_use_id, &agent_id, &project, &tool_name, &tool_input,
+            );
+            return Ok(HookResponse::simple(Decision::Approve));
+        }
+    }
+
     // Layer 4: Auto-approve check — PermissionRequests always go to daemon
     if !is_permission_request && is_auto_approved(&tool_name, &tool_input, &wisphive_dir) {
         log_auto_approved(
@@ -530,6 +540,16 @@ fn register_agent_once(agent_id: &str, project: &std::path::Path, wisphive_dir: 
 
         Ok(())
     })();
+}
+
+/// Check if Stop events should be auto-approved (config: `auto_approve_stop: true`).
+fn is_stop_auto_approved(wisphive_dir: &std::path::Path) -> bool {
+    let config_path = wisphive_dir.join("config.json");
+    std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .and_then(|config| config.get("auto_approve_stop")?.as_bool())
+        .unwrap_or(false)
 }
 
 /// Check if a tool is auto-approved using tiered levels + content-aware rules.
