@@ -18,7 +18,21 @@ pub async fn run() -> Result<()> {
     let config = DaemonConfig::default_location();
 
     // Connect to daemon
-    let mut conn = DaemonConnection::connect(&config.socket_path).await?;
+    let mut conn = DaemonConnection::connect(&config.socket_path)
+        .await
+        .map_err(
+            |e| match e.downcast_ref::<std::io::Error>().map(|io| io.kind()) {
+                Some(std::io::ErrorKind::NotFound) => anyhow::anyhow!(
+                    "daemon is not running. Start it first with: wisphive daemon start"
+                ),
+                Some(std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::Other) => {
+                    anyhow::anyhow!(
+                        "daemon is not running (stale socket). Start it with: wisphive daemon start"
+                    )
+                }
+                _ => e,
+            },
+        )?;
     let mut app = App::new();
     app.connected = true;
 
