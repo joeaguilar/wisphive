@@ -14,7 +14,9 @@ fn main() {
     // Any failure = exit 0 (allow). Wisphive is fail-open.
     let code = match run() {
         Ok(Decision::Approve) => 0,
-        Ok(Decision::Deny) => 1,
+        // Claude Code: exit 2 = block the tool call.
+        // Exit 1 is treated as a non-blocking error (tool proceeds).
+        Ok(Decision::Deny) => 2,
         Err(_) => 0,
     };
     process::exit(code);
@@ -34,7 +36,15 @@ fn run() -> Result<Decision, Box<dyn std::error::Error>> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
 
-    // Parse the hook event — Claude Code sends JSON with tool info
+    // Parse the hook event — Claude Code sends JSON with tool info:
+    // {
+    //   "session_id": "abc123",
+    //   "cwd": "/project",
+    //   "hook_event_name": "PreToolUse",
+    //   "tool_name": "Bash",
+    //   "tool_input": {"command": "cargo build"},
+    //   "tool_use_id": "toolu_..."
+    // }
     let hook_event: serde_json::Value = serde_json::from_str(&input)?;
 
     let tool_name = hook_event
@@ -48,12 +58,27 @@ fn run() -> Result<Decision, Box<dyn std::error::Error>> {
         .cloned()
         .unwrap_or(serde_json::Value::Null);
 
-    // Derive agent_id from environment or generate one
-    let agent_id =
-        std::env::var("WISPHIVE_AGENT_ID").unwrap_or_else(|_| format!("cc-{}", process::id()));
+    // Use session_id from Claude Code as agent_id (stable per session),
+    // fall back to WISPHIVE_AGENT_ID env var, then PID.
+    let agent_id = hook_event
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(|s| format!("cc-{}", s))
+        .or_else(|| std::env::var("WISPHIVE_AGENT_ID").ok())
+        .unwrap_or_else(|| format!("cc-{}", process::id()));
 
-    // Derive project from the current working directory
-    let project = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // Use CLAUDE_PROJECT_DIR env var (set by Claude Code), fall back to
+    // cwd from hook event, then std::env::current_dir.
+    let project = std::env::var("CLAUDE_PROJECT_DIR")
+        .map(PathBuf::from)
+        .or_else(|_| {
+            hook_event
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .map(PathBuf::from)
+                .ok_or(())
+        })
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
     let request = DecisionRequest {
         id: uuid::Uuid::new_v4(),
@@ -89,9 +114,8 @@ fn run() -> Result<Decision, Box<dyn std::error::Error>> {
     let req_msg = wisphive_protocol::encode(&ClientMessage::DecisionRequest(request))?;
     writer.write_all(req_msg.as_bytes())?;
 
-    // Block for response (daemon controls timeout on its side;
-    // we set a local read timeout as a safety net)
-    // Remove the short timeout — we trust the daemon's timeout (up to 1 hour)
+    // Block for response — daemon controls timeout (up to 1 hour).
+    // Remove the short read timeout so we don't time out before the human decides.
     writer.set_read_timeout(None)?;
 
     let mut response_line = String::new();
