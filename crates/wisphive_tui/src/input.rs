@@ -627,22 +627,16 @@ fn handle_history_detail_input(app: &mut App, key: KeyEvent) -> InputAction {
 }
 
 fn handle_config_input(app: &mut App, key: KeyEvent) -> InputAction {
-    use wisphive_protocol::AutoApproveLevel;
+    use crate::app::{ALL_TOOLS, ConfigRow};
+    use wisphive_protocol::{AutoApproveLevel, ToolRule};
 
-    // All known tools for the toggle list
-    const ALL_TOOLS: &[&str] = &[
-        // Read tier
-        "Read", "Glob", "Grep", "LS", "LSP", "NotebookRead",
-        "WebSearch", "WebFetch",
-        "Agent", "Skill", "ToolSearch", "AskUserQuestion",
-        "EnterPlanMode", "ExitPlanMode", "EnterWorktree", "ExitWorktree",
-        "TaskCreate", "TaskUpdate", "TaskGet", "TaskList", "TaskOutput", "TaskStop", "TodoRead",
-        "CronList",
-        // Write tier
-        "Edit", "Write", "NotebookEdit", "CronCreate", "CronDelete",
-        // Execute tier
-        "Bash",
-    ];
+    // If in rule input mode, handle text input
+    if app.config_rule_input_mode {
+        return handle_config_rule_input(app, key);
+    }
+
+    let rows = app.config_rows();
+    let max_idx = rows.len().saturating_sub(1);
 
     match key.code {
         // Back
@@ -652,8 +646,7 @@ fn handle_config_input(app: &mut App, key: KeyEvent) -> InputAction {
         }
         // Navigate
         KeyCode::Char('j') | KeyCode::Down => {
-            let max = ALL_TOOLS.len(); // 0 = level row, 1..N = tool rows
-            if app.config_index < max {
+            if app.config_index < max_idx {
                 app.config_index += 1;
             }
             InputAction::None
@@ -663,55 +656,131 @@ fn handle_config_input(app: &mut App, key: KeyEvent) -> InputAction {
             InputAction::None
         }
         // Cycle level (when on level row)
-        KeyCode::Left | KeyCode::Right if app.config_index == 0 => {
-            let levels = [
-                AutoApproveLevel::Off,
-                AutoApproveLevel::Read,
-                AutoApproveLevel::Write,
-                AutoApproveLevel::Execute,
-                AutoApproveLevel::All,
-            ];
-            let current = levels.iter().position(|l| *l == app.config_level).unwrap_or(1);
-            let next = if key.code == KeyCode::Right {
-                (current + 1).min(levels.len() - 1)
-            } else {
-                current.saturating_sub(1)
-            };
-            app.config_level = levels[next];
-            app.save_config();
+        KeyCode::Left | KeyCode::Right => {
+            if let Some(ConfigRow::Level) = rows.get(app.config_index) {
+                let levels = [
+                    AutoApproveLevel::Off,
+                    AutoApproveLevel::Read,
+                    AutoApproveLevel::Write,
+                    AutoApproveLevel::Execute,
+                    AutoApproveLevel::All,
+                ];
+                let current = levels.iter().position(|l| *l == app.config_level).unwrap_or(1);
+                let next = if key.code == KeyCode::Right {
+                    (current + 1).min(levels.len() - 1)
+                } else {
+                    current.saturating_sub(1)
+                };
+                app.config_level = levels[next];
+                app.save_config();
+            }
             InputAction::None
         }
         // Toggle tool override (when on a tool row)
-        KeyCode::Enter | KeyCode::Char(' ') if app.config_index > 0 => {
-            let tool_idx = app.config_index - 1;
-            if tool_idx < ALL_TOOLS.len() {
-                let tool = ALL_TOOLS[tool_idx].to_string();
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            if let Some(ConfigRow::Tool(tool_idx)) = rows.get(app.config_index) {
+                let tool = ALL_TOOLS[*tool_idx].to_string();
                 let in_level = app.config_level.includes(&tool);
                 let in_add = app.config_add.contains(&tool);
                 let in_remove = app.config_remove.contains(&tool);
 
                 if in_level {
-                    // Tool is included by level — toggle remove override
                     if in_remove {
                         app.config_remove.retain(|t| *t != tool);
                     } else {
                         app.config_add.retain(|t| *t != tool);
                         app.config_remove.push(tool);
                     }
+                } else if in_add {
+                    app.config_add.retain(|t| *t != tool);
                 } else {
-                    // Tool is NOT in level — toggle add override
-                    if in_add {
-                        app.config_add.retain(|t| *t != tool);
-                    } else {
-                        app.config_remove.retain(|t| *t != tool);
-                        app.config_add.push(tool);
+                    app.config_remove.retain(|t| *t != tool);
+                    app.config_add.push(tool);
+                }
+                app.save_config();
+            }
+            InputAction::None
+        }
+        // Add rule (+) — on a tool row, start rule input
+        KeyCode::Char('+') | KeyCode::Char('=') => {
+            if let Some(ConfigRow::Tool(tool_idx)) = rows.get(app.config_index) {
+                let tool = ALL_TOOLS[*tool_idx];
+                let in_remove = app.config_remove.iter().any(|t| t == tool);
+                let in_add = app.config_add.iter().any(|t| t == tool);
+                let in_level = app.config_level.includes(tool);
+                // Auto-determine: deny if approved, allow if not
+                let is_approved = !in_remove && (in_add || in_level);
+                app.config_rule_input_mode = true;
+                app.config_rule_buffer.clear();
+                app.config_rule_target_tool = Some(tool.to_string());
+                app.config_rule_is_deny = is_approved;
+            }
+            InputAction::None
+        }
+        // Remove rule (-) — on a rule row, delete it
+        KeyCode::Char('-') => {
+            if let Some(ConfigRow::Rule { tool_idx, rule_idx, is_deny }) = rows.get(app.config_index) {
+                let tool = ALL_TOOLS[*tool_idx].to_string();
+                let is_deny = *is_deny;
+                let rule_idx = *rule_idx;
+                let rule = app.config_tool_rules.entry(tool).or_insert_with(ToolRule::default);
+                if is_deny {
+                    if rule_idx < rule.deny_patterns.len() {
+                        rule.deny_patterns.remove(rule_idx);
                     }
+                } else if rule_idx < rule.allow_patterns.len() {
+                    rule.allow_patterns.remove(rule_idx);
+                }
+                let new_rows = app.config_rows();
+                if app.config_index >= new_rows.len() {
+                    app.config_index = new_rows.len().saturating_sub(1);
                 }
                 app.save_config();
             }
             InputAction::None
         }
         KeyCode::Char('Q') => InputAction::Quit,
+        _ => InputAction::None,
+    }
+}
+
+fn handle_config_rule_input(app: &mut App, key: KeyEvent) -> InputAction {
+    use wisphive_protocol::ToolRule;
+
+    match key.code {
+        KeyCode::Esc => {
+            app.config_rule_input_mode = false;
+            app.config_rule_buffer.clear();
+            app.config_rule_target_tool = None;
+            InputAction::None
+        }
+        KeyCode::Enter => {
+            let pattern = app.config_rule_buffer.trim().to_string();
+            if !pattern.is_empty() {
+                if let Some(tool) = app.config_rule_target_tool.take() {
+                    let rule = app.config_tool_rules.entry(tool).or_insert_with(ToolRule::default);
+                    if app.config_rule_is_deny {
+                        if !rule.deny_patterns.contains(&pattern) {
+                            rule.deny_patterns.push(pattern);
+                        }
+                    } else if !rule.allow_patterns.contains(&pattern) {
+                        rule.allow_patterns.push(pattern);
+                    }
+                    app.save_config();
+                }
+            }
+            app.config_rule_input_mode = false;
+            app.config_rule_buffer.clear();
+            InputAction::None
+        }
+        KeyCode::Backspace => {
+            app.config_rule_buffer.pop();
+            InputAction::None
+        }
+        KeyCode::Char(c) => {
+            app.config_rule_buffer.push(c);
+            InputAction::None
+        }
         _ => InputAction::None,
     }
 }

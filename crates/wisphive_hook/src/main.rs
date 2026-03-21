@@ -156,18 +156,18 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
         })
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-    // Layer 3: Register agent with daemon (once per session, fire-and-forget)
-    register_agent_once(&agent_id, &project, &wisphive_dir);
-
-    // Layer 4: Auto-approve check using tiered levels from config.json
-    if is_auto_approved(&tool_name, &wisphive_dir) {
-        return Ok(HookResponse::simple(Decision::Approve));
-    }
-
     let tool_input = hook_event
         .get("tool_input")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
+
+    // Layer 3: Register agent with daemon (once per session, fire-and-forget)
+    register_agent_once(&agent_id, &project, &wisphive_dir);
+
+    // Layer 4: Auto-approve check using tiered levels + content-aware rules
+    if is_auto_approved(&tool_name, &tool_input, &wisphive_dir) {
+        return Ok(HookResponse::simple(Decision::Approve));
+    }
 
     let request = DecisionRequest {
         id: uuid::Uuid::new_v4(),
@@ -334,38 +334,103 @@ fn register_agent_once(agent_id: &str, project: &std::path::Path, wisphive_dir: 
     })();
 }
 
-/// Check if a tool is auto-approved using tiered levels from config.json.
+/// Check if a tool is auto-approved using tiered levels + content-aware rules.
 ///
-/// Priority: config.json auto_approve_remove → auto_approve_add → level → legacy auto-approve.json → defaults.
-fn is_auto_approved(tool_name: &str, wisphive_dir: &std::path::Path) -> bool {
+/// Priority: auto_approve_remove → auto_approve_add → level → legacy → defaults.
+/// Then tool_rules override: deny_patterns block auto-approved tools,
+/// allow_patterns approve non-approved tools. Patterns are case-insensitive
+/// substrings matched against the tool input text.
+fn is_auto_approved(
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+    wisphive_dir: &std::path::Path,
+) -> bool {
     let config_path = wisphive_dir.join("config.json");
 
-    if let Ok(content) = std::fs::read_to_string(&config_path) {
-        if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
-            // Check explicit removals first
-            if let Some(arr) = config.get("auto_approve_remove").and_then(|v| v.as_array()) {
-                if arr.iter().any(|v| v.as_str() == Some(tool_name)) {
-                    return false;
-                }
-            }
+    let config: Option<serde_json::Value> = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok());
 
-            // Check explicit additions
-            if let Some(arr) = config.get("auto_approve_add").and_then(|v| v.as_array()) {
-                if arr.iter().any(|v| v.as_str() == Some(tool_name)) {
-                    return true;
-                }
+    // Determine base approval from level/add/remove
+    let base_approved = if let Some(ref config) = config {
+        // Check explicit removals first
+        if let Some(arr) = config.get("auto_approve_remove").and_then(|v| v.as_array()) {
+            if arr.iter().any(|v| v.as_str() == Some(tool_name)) {
+                false
+            } else {
+                check_base_approved(config, tool_name, wisphive_dir)
             }
+        } else {
+            check_base_approved(config, tool_name, wisphive_dir)
+        }
+    } else {
+        // No config.json — check legacy then defaults
+        legacy_auto_approved(tool_name, wisphive_dir)
+    };
 
-            // Check tiered level
-            if let Some(level_str) = config.get("auto_approve_level").and_then(|v| v.as_str()) {
-                if let Ok(level) = level_str.parse::<wisphive_protocol::AutoApproveLevel>() {
-                    return level.includes(tool_name);
+    // Apply content-aware tool_rules
+    if let Some(ref config) = config {
+        if let Some(rules) = config.get("tool_rules").and_then(|v| v.as_object()) {
+            if let Some(rule) = rules.get(tool_name) {
+                let input_text = tool_input_text(tool_name, tool_input);
+                let input_lower = input_text.to_lowercase();
+
+                if base_approved {
+                    // Check deny_patterns — any match blocks auto-approve
+                    if let Some(patterns) = rule.get("deny_patterns").and_then(|v| v.as_array()) {
+                        for p in patterns {
+                            if let Some(pat) = p.as_str() {
+                                if input_lower.contains(&pat.to_lowercase()) {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Check allow_patterns — any match auto-approves
+                    if let Some(patterns) = rule.get("allow_patterns").and_then(|v| v.as_array()) {
+                        for p in patterns {
+                            if let Some(pat) = p.as_str() {
+                                if input_lower.contains(&pat.to_lowercase()) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
-    // Fallback: legacy auto-approve.json
+    base_approved
+}
+
+/// Check base approval from explicit additions and tiered level.
+fn check_base_approved(
+    config: &serde_json::Value,
+    tool_name: &str,
+    wisphive_dir: &std::path::Path,
+) -> bool {
+    // Check explicit additions
+    if let Some(arr) = config.get("auto_approve_add").and_then(|v| v.as_array()) {
+        if arr.iter().any(|v| v.as_str() == Some(tool_name)) {
+            return true;
+        }
+    }
+
+    // Check tiered level
+    if let Some(level_str) = config.get("auto_approve_level").and_then(|v| v.as_str()) {
+        if let Ok(level) = level_str.parse::<wisphive_protocol::AutoApproveLevel>() {
+            return level.includes(tool_name);
+        }
+    }
+
+    // Fallback to legacy
+    legacy_auto_approved(tool_name, wisphive_dir)
+}
+
+/// Check legacy auto-approve.json and built-in defaults.
+fn legacy_auto_approved(tool_name: &str, wisphive_dir: &std::path::Path) -> bool {
     let legacy_path = wisphive_dir.join("auto-approve.json");
     if legacy_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&legacy_path) {
@@ -376,9 +441,18 @@ fn is_auto_approved(tool_name: &str, wisphive_dir: &std::path::Path) -> bool {
             }
         }
     }
-
-    // Final fallback: built-in defaults (level read)
     DEFAULT_AUTO_APPROVE.iter().any(|&safe| safe == tool_name)
+}
+
+/// Extract the text to match patterns against for a given tool.
+/// For Bash: the `command` field. For everything else: JSON-serialized input.
+fn tool_input_text(tool_name: &str, tool_input: &serde_json::Value) -> String {
+    if tool_name == "Bash" {
+        if let Some(cmd) = tool_input.get("command").and_then(|v| v.as_str()) {
+            return cmd.to_string();
+        }
+    }
+    serde_json::to_string(tool_input).unwrap_or_default()
 }
 
 fn home_dir() -> PathBuf {

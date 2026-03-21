@@ -1,11 +1,36 @@
 use std::path::PathBuf;
 
 use uuid::Uuid;
-use wisphive_protocol::{AgentInfo, AutoApproveLevel, DecisionRequest, HistoryEntry};
+use std::collections::HashMap;
+
+use wisphive_protocol::{AgentInfo, AutoApproveLevel, DecisionRequest, HistoryEntry, ToolRule};
 
 use serde::Deserialize;
 
 use crate::modal::Modal;
+
+/// All known tools for the config toggle list.
+pub const ALL_TOOLS: &[&str] = &[
+    // Read tier
+    "Read", "Glob", "Grep", "LS", "LSP", "NotebookRead",
+    "WebSearch", "WebFetch",
+    "Agent", "Skill", "ToolSearch", "AskUserQuestion",
+    "EnterPlanMode", "ExitPlanMode", "EnterWorktree", "ExitWorktree",
+    "TaskCreate", "TaskUpdate", "TaskGet", "TaskList", "TaskOutput", "TaskStop", "TodoRead",
+    "CronList",
+    // Write tier
+    "Edit", "Write", "NotebookEdit", "CronCreate", "CronDelete",
+    // Execute tier
+    "Bash",
+];
+
+/// A row in the config view — either the level selector, a tool, or an inline rule.
+#[derive(Debug, Clone)]
+pub enum ConfigRow {
+    Level,
+    Tool(usize),
+    Rule { tool_idx: usize, rule_idx: usize, is_deny: bool },
+}
 
 /// Minimal config snapshot for reading auto-approve settings from config.json.
 #[derive(Deserialize, Default)]
@@ -16,6 +41,8 @@ pub struct ConfigSnapshot {
     pub auto_approve_add: Option<Vec<String>>,
     #[serde(default)]
     pub auto_approve_remove: Option<Vec<String>>,
+    #[serde(default)]
+    pub tool_rules: Option<HashMap<String, ToolRule>>,
 }
 
 /// Which screen the TUI is showing.
@@ -113,6 +140,16 @@ pub struct App {
     pub config_add: Vec<String>,
     /// Tools removed as overrides.
     pub config_remove: Vec<String>,
+    /// Content-aware rules per tool.
+    pub config_tool_rules: HashMap<String, ToolRule>,
+    /// Whether the config view is in rule-input mode (typing a new pattern).
+    pub config_rule_input_mode: bool,
+    /// Buffer for rule pattern input.
+    pub config_rule_buffer: String,
+    /// Tool name the rule is being added to.
+    pub config_rule_target_tool: Option<String>,
+    /// Whether the new rule is a deny pattern (true) or allow pattern (false).
+    pub config_rule_is_deny: bool,
     /// Session summaries (live + historical).
     pub sessions: Vec<wisphive_protocol::SessionSummary>,
     /// Currently selected index in the sessions list.
@@ -167,6 +204,11 @@ impl App {
             config_index: 0,
             config_add: Vec::new(),
             config_remove: Vec::new(),
+            config_tool_rules: HashMap::new(),
+            config_rule_input_mode: false,
+            config_rule_buffer: String::new(),
+            config_rule_target_tool: None,
+            config_rule_is_deny: true,
             sessions: Vec::new(),
             sessions_index: 0,
             session_timeline_agent_id: None,
@@ -364,7 +406,11 @@ impl App {
         self.config_level = config.auto_approve_level.unwrap_or_default();
         self.config_add = config.auto_approve_add.unwrap_or_default();
         self.config_remove = config.auto_approve_remove.unwrap_or_default();
+        self.config_tool_rules = config.tool_rules.unwrap_or_default();
         self.config_index = 0;
+        self.config_rule_input_mode = false;
+        self.config_rule_buffer.clear();
+        self.config_rule_target_tool = None;
         self.push_view(ViewMode::Config);
     }
 
@@ -415,6 +461,22 @@ impl App {
             );
         }
 
+        // Persist tool_rules — remove tools with empty rules
+        let non_empty: HashMap<String, ToolRule> = self
+            .config_tool_rules
+            .iter()
+            .filter(|(_, r)| !r.deny_patterns.is_empty() || !r.allow_patterns.is_empty())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if non_empty.is_empty() {
+            obj.remove("tool_rules");
+        } else {
+            obj.insert(
+                "tool_rules".into(),
+                serde_json::to_value(&non_empty).unwrap_or(serde_json::json!({})),
+            );
+        }
+
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -430,6 +492,31 @@ impl App {
             Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
             Err(_) => ConfigSnapshot::default(),
         }
+    }
+
+    /// Build a flat list of config rows for indexing in the config view.
+    pub fn config_rows(&self) -> Vec<ConfigRow> {
+        let mut rows = vec![ConfigRow::Level];
+        for (i, tool) in ALL_TOOLS.iter().enumerate() {
+            rows.push(ConfigRow::Tool(i));
+            if let Some(rule) = self.config_tool_rules.get(*tool) {
+                for (ri, _) in rule.deny_patterns.iter().enumerate() {
+                    rows.push(ConfigRow::Rule {
+                        tool_idx: i,
+                        rule_idx: ri,
+                        is_deny: true,
+                    });
+                }
+                for (ri, _) in rule.allow_patterns.iter().enumerate() {
+                    rows.push(ConfigRow::Rule {
+                        tool_idx: i,
+                        rule_idx: ri,
+                        is_deny: false,
+                    });
+                }
+            }
+        }
+        rows
     }
 
     // ── Session view helpers ──

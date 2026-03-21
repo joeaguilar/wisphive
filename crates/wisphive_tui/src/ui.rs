@@ -251,6 +251,8 @@ fn draw_history_detail_view(frame: &mut Frame, app: &App) {
 }
 
 fn draw_config_view(frame: &mut Frame, app: &App) {
+    use crate::app::{ALL_TOOLS, ConfigRow};
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -259,70 +261,124 @@ fn draw_config_view(frame: &mut Frame, app: &App) {
         ])
         .split(frame.area());
 
-    const ALL_TOOLS: &[&str] = &[
-        // Read tier
-        "Read", "Glob", "Grep", "LS", "LSP", "NotebookRead",
-        "WebSearch", "WebFetch",
-        "Agent", "Skill", "ToolSearch", "AskUserQuestion",
-        "EnterPlanMode", "ExitPlanMode", "EnterWorktree", "ExitWorktree",
-        "TaskCreate", "TaskUpdate", "TaskGet", "TaskList", "TaskOutput", "TaskStop", "TodoRead",
-        "CronList",
-        // Write tier
-        "Edit", "Write", "NotebookEdit", "CronCreate", "CronDelete",
-        // Execute tier
-        "Bash",
-    ];
-
+    let rows = app.config_rows();
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    // Level selector row
-    let level_style = if app.config_index == 0 {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::White)
-    };
-    let arrow = if app.config_index == 0 { ">" } else { " " };
-    lines.push(Line::from(vec![
-        Span::styled(format!("{arrow} Level: "), Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("◀ {} ▶", app.config_level), level_style),
-        Span::styled("  (use ←/→ to change)", Style::default().fg(Color::DarkGray)),
-    ]));
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  Tools (Space/Enter to toggle):",
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(""));
-
-    for (i, tool) in ALL_TOOLS.iter().enumerate() {
-        let row_idx = i + 1;
-        let in_level = app.config_level.includes(tool);
-        let in_add = app.config_add.iter().any(|t| t == tool);
-        let in_remove = app.config_remove.iter().any(|t| t == tool);
-
-        let (approved, status, color) = if in_remove {
-            (false, "QUEUED (override)", Color::Red)
-        } else if in_add {
-            (true, "AUTO (override)", Color::Green)
-        } else if in_level {
-            (true, "AUTO (level)", Color::DarkGray)
-        } else {
-            (false, "QUEUED", Color::DarkGray)
-        };
-
-        let checkbox = if approved { "[x]" } else { "[ ]" };
-        let selected = app.config_index == row_idx;
-        let name_style = if selected {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
+    for (row_i, row) in rows.iter().enumerate() {
+        let selected = app.config_index == row_i;
         let arrow = if selected { ">" } else { " " };
 
+        match row {
+            ConfigRow::Level => {
+                let level_style = if selected {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{arrow} Level: "),
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("◀ {} ▶", app.config_level), level_style),
+                    Span::styled("  (use ←/→ to change)", Style::default().fg(Color::DarkGray)),
+                ]));
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "  Tools (Space/Enter toggle, + add rule, - remove rule):",
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                )));
+                lines.push(Line::from(""));
+            }
+            ConfigRow::Tool(tool_idx) => {
+                let tool = ALL_TOOLS[*tool_idx];
+                let in_level = app.config_level.includes(tool);
+                let in_add = app.config_add.iter().any(|t| t == tool);
+                let in_remove = app.config_remove.iter().any(|t| t == tool);
+
+                let (approved, status, color) = if in_remove {
+                    (false, "QUEUED (override)", Color::Red)
+                } else if in_add {
+                    (true, "AUTO (override)", Color::Green)
+                } else if in_level {
+                    (true, "AUTO (level)", Color::DarkGray)
+                } else {
+                    (false, "QUEUED", Color::DarkGray)
+                };
+
+                let has_rules = app
+                    .config_tool_rules
+                    .get(tool)
+                    .map(|r| !r.deny_patterns.is_empty() || !r.allow_patterns.is_empty())
+                    .unwrap_or(false);
+
+                let checkbox = if approved { "[x]" } else { "[ ]" };
+                let name_style = if selected {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+
+                let mut spans = vec![
+                    Span::styled(
+                        format!("  {arrow} {checkbox} "),
+                        Style::default().fg(if approved { Color::Green } else { Color::Red }),
+                    ),
+                    Span::styled(format!("{:<16}", tool), name_style),
+                    Span::styled(status.to_string(), Style::default().fg(color)),
+                ];
+                if has_rules {
+                    spans.push(Span::styled(" ⚙", Style::default().fg(Color::Cyan)));
+                }
+                lines.push(Line::from(spans));
+            }
+            ConfigRow::Rule { tool_idx, rule_idx, is_deny } => {
+                let tool = ALL_TOOLS[*tool_idx];
+                let pattern = if let Some(rule) = app.config_tool_rules.get(tool) {
+                    if *is_deny {
+                        rule.deny_patterns.get(*rule_idx).cloned().unwrap_or_default()
+                    } else {
+                        rule.allow_patterns.get(*rule_idx).cloned().unwrap_or_default()
+                    }
+                } else {
+                    String::new()
+                };
+
+                let (label, label_color) = if *is_deny {
+                    ("deny", Color::Red)
+                } else {
+                    ("allow", Color::Green)
+                };
+
+                let pat_style = if selected {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+
+                lines.push(Line::from(vec![
+                    Span::styled(format!("        {arrow} "), Style::default()),
+                    Span::styled(format!("{label}: "), Style::default().fg(label_color)),
+                    Span::styled(format!("\"{pattern}\""), pat_style),
+                ]));
+            }
+        }
+    }
+
+    // If in rule input mode, show the input line
+    if app.config_rule_input_mode {
+        let label = if app.config_rule_is_deny { "deny" } else { "allow" };
+        let tool = app.config_rule_target_tool.as_deref().unwrap_or("?");
+        lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled(format!("  {arrow} {checkbox} "), Style::default().fg(if approved { Color::Green } else { Color::Red })),
-            Span::styled(format!("{:<16}", tool), name_style),
-            Span::styled(status.to_string(), Style::default().fg(color)),
+            Span::styled(
+                format!("  Add {label} pattern for {tool}: "),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(
+                format!("{}_", app.config_rule_buffer),
+                Style::default().fg(Color::Yellow),
+            ),
         ]));
     }
 
@@ -337,8 +393,13 @@ fn draw_config_view(frame: &mut Frame, app: &App) {
 
     frame.render_widget(paragraph, chunks[0]);
 
+    let bar_text = if app.config_rule_input_mode {
+        " Type pattern, Enter to add, Esc to cancel ".to_string()
+    } else {
+        " [j/k]nav [←/→]level [Space]toggle [+]add rule [-]del rule [q]back ".to_string()
+    };
     let bar = Paragraph::new(Line::from(Span::styled(
-        " [j/k]navigate [←/→]change level [Space/Enter]toggle tool [Esc]back — changes apply immediately ",
+        bar_text,
         Style::default().fg(Color::White).bg(Color::DarkGray),
     )));
     frame.render_widget(bar, chunks[1]);
