@@ -338,7 +338,7 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
     if matches!(event_type, wisphive_protocol::HookEventType::Stop | wisphive_protocol::HookEventType::SubagentStop) {
         if is_stop_auto_approved(&wisphive_dir) {
             log_auto_approved(
-                &wisphive_dir, &tool_use_id, &agent_id, &project, &tool_name, &tool_input,
+                &wisphive_dir, &tool_use_id, &agent_id, &project, &tool_name, &tool_input, event_type,
             );
             return Ok(HookResponse::simple(Decision::Approve));
         }
@@ -347,7 +347,7 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
     // Layer 4: Auto-approve check — PermissionRequests always go to daemon
     if !is_permission_request && is_auto_approved(&tool_name, &tool_input, &wisphive_dir) {
         log_auto_approved(
-            &wisphive_dir, &tool_use_id, &agent_id, &project, &tool_name, &tool_input,
+            &wisphive_dir, &tool_use_id, &agent_id, &project, &tool_name, &tool_input, event_type,
         );
         return Ok(HookResponse::simple(Decision::Approve));
     }
@@ -671,10 +671,12 @@ fn log_auto_approved(
     project: &std::path::Path,
     tool_name: &str,
     tool_input: &serde_json::Value,
+    event_type: wisphive_protocol::HookEventType,
 ) {
     let path = wisphive_dir.join("events.jsonl");
     let entry = serde_json::json!({
         "event": "auto_approved",
+        "hook_event_name": event_type.to_string(),
         "tool_use_id": tool_use_id,
         "agent_id": agent_id,
         "agent_type": "claude_code",

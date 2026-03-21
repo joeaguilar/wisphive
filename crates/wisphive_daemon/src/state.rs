@@ -135,8 +135,8 @@ impl StateDb {
     /// Persist a pending decision for crash recovery.
     pub async fn persist_pending(&self, req: &wisphive_protocol::DecisionRequest) -> Result<()> {
         sqlx::query(
-            "INSERT OR REPLACE INTO pending_decisions (id, agent_id, agent_type, project, tool_name, tool_input, timestamp, tool_use_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO pending_decisions (id, agent_id, agent_type, project, tool_name, tool_input, timestamp, tool_use_id, hook_event_name)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(req.id.to_string())
         .bind(&req.agent_id)
@@ -146,6 +146,7 @@ impl StateDb {
         .bind(serde_json::to_string(&req.tool_input)?)
         .bind(req.timestamp.to_rfc3339())
         .bind(&req.tool_use_id)
+        .bind(req.hook_event_name.to_string())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -158,18 +159,18 @@ impl StateDb {
         decision: wisphive_protocol::Decision,
     ) -> Result<()> {
         // Move from pending to log
-        let row = sqlx::query_as::<_, (String, String, String, String, String, String, Option<String>)>(
-            "SELECT agent_id, agent_type, project, tool_name, tool_input, timestamp, tool_use_id
+        let row = sqlx::query_as::<_, (String, String, String, String, String, String, Option<String>, Option<String>)>(
+            "SELECT agent_id, agent_type, project, tool_name, tool_input, timestamp, tool_use_id, hook_event_name
              FROM pending_decisions WHERE id = ?",
         )
         .bind(id.to_string())
         .fetch_optional(&self.pool)
         .await?;
 
-        if let Some((agent_id, agent_type, project, tool_name, tool_input, requested_at, tool_use_id)) = row {
+        if let Some((agent_id, agent_type, project, tool_name, tool_input, requested_at, tool_use_id, hook_event_name)) = row {
             sqlx::query(
-                "INSERT INTO decision_log (id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_use_id)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO decision_log (id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_use_id, hook_event_name)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(id.to_string())
             .bind(agent_id)
@@ -181,6 +182,7 @@ impl StateDb {
             .bind(requested_at)
             .bind(chrono::Utc::now().to_rfc3339())
             .bind(tool_use_id)
+            .bind(hook_event_name)
             .execute(&self.pool)
             .await?;
         }
@@ -351,12 +353,13 @@ impl StateDb {
         tool_input: &str,
         timestamp: &str,
         tool_use_id: Option<&str>,
+        hook_event_name: Option<&str>,
     ) -> Result<()> {
         let id = uuid::Uuid::new_v4().to_string();
         sqlx::query(
             "INSERT OR IGNORE INTO decision_log
-             (id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, auto_approved, tool_use_id)
-             VALUES (?, ?, ?, ?, ?, ?, '\"approve\"', ?, ?, 1, ?)",
+             (id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, auto_approved, tool_use_id, hook_event_name)
+             VALUES (?, ?, ?, ?, ?, ?, '\"approve\"', ?, ?, 1, ?, ?)",
         )
         .bind(&id)
         .bind(agent_id)
@@ -367,6 +370,7 @@ impl StateDb {
         .bind(timestamp)
         .bind(timestamp)
         .bind(tool_use_id)
+        .bind(hook_event_name.unwrap_or("PreToolUse"))
         .execute(&self.pool)
         .await?;
         Ok(())

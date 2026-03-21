@@ -132,6 +132,9 @@ async fn ingest_line(line: &str, state_db: &StateDb) -> anyhow::Result<()> {
     let tool_use_id = event
         .get("tool_use_id")
         .and_then(|v| v.as_str());
+    let hook_event_name = event
+        .get("hook_event_name")
+        .and_then(|v| v.as_str());
 
     // Serialize agent_type as JSON string to match existing format
     let agent_type_json = format!("\"{}\"", agent_type);
@@ -145,6 +148,7 @@ async fn ingest_line(line: &str, state_db: &StateDb) -> anyhow::Result<()> {
             &tool_input,
             timestamp,
             tool_use_id,
+            hook_event_name,
         )
         .await?;
 
