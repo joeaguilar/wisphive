@@ -13,6 +13,8 @@ use wisphive_tui::connection::DaemonConnection;
 use wisphive_tui::input::{self, InputAction};
 use wisphive_tui::ui;
 
+const HISTORY_PAGE_SIZE: u32 = 50;
+
 /// Run the TUI client.
 pub async fn run() -> Result<()> {
     let config = DaemonConfig::default_location();
@@ -142,9 +144,18 @@ async fn run_loop(
                         }
                         InputAction::QueryHistory { agent_id } => {
                             tracing::info!(?agent_id, "querying history");
+                            app.history_page = 0;
                             conn.send(&ClientMessage::QueryHistory {
                                 agent_id,
-                                limit: Some(200),
+                                limit: Some(HISTORY_PAGE_SIZE + 1),
+                            }).await?;
+                        }
+                        InputAction::QueryHistoryPage { agent_id, page } => {
+                            tracing::info!(?agent_id, page, "querying history page");
+                            let offset = page as u32 * HISTORY_PAGE_SIZE;
+                            conn.send(&ClientMessage::QueryHistory {
+                                agent_id,
+                                limit: Some(offset + HISTORY_PAGE_SIZE + 1),
                             }).await?;
                         }
                         InputAction::SearchHistory { search } => {
@@ -239,8 +250,14 @@ async fn run_loop(
                         app.rebuild_projects();
                     }
                     Some(ServerMessage::HistoryResponse { entries }) => {
-                        tracing::info!(count = entries.len(), "received history");
-                        app.history = entries;
+                        tracing::info!(count = entries.len(), page = app.history_page, "received history");
+                        // We request PAGE_SIZE+1 to detect if there are more pages
+                        let page_size = HISTORY_PAGE_SIZE as usize;
+                        let offset = app.history_page * page_size;
+                        // Skip entries from previous pages, take up to page_size
+                        let page_entries: Vec<_> = entries.into_iter().skip(offset).collect();
+                        app.history_has_more = page_entries.len() > page_size;
+                        app.history = page_entries.into_iter().take(page_size).collect();
                         app.history_index = 0;
                     }
                     Some(_) => {}

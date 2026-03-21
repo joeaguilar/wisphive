@@ -23,6 +23,8 @@ pub enum InputAction {
     QueryHistory { agent_id: Option<String> },
     /// Search history with a query string.
     SearchHistory { search: wisphive_protocol::HistorySearch },
+    /// Request a specific page of history.
+    QueryHistoryPage { agent_id: Option<String>, page: usize },
     /// Deny with a feedback message for the agent.
     DenyWithMessage { id: uuid::Uuid, message: String },
     /// Approve and add tool to always-allow list.
@@ -63,9 +65,20 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
 
     // Global keybindings
     match key.code {
-        KeyCode::Char('q') | KeyCode::Char('Q') => return InputAction::Quit,
+        KeyCode::Char('Q') => return InputAction::Quit,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             return InputAction::Quit;
+        }
+        // Navigate back (q) / forward (e)
+        KeyCode::Char('q') => {
+            if !app.navigate_back() {
+                return InputAction::Quit; // No history = quit from dashboard
+            }
+            return InputAction::None;
+        }
+        KeyCode::Char('e') => {
+            app.navigate_forward();
+            return InputAction::None;
         }
         // Open history view (global — works from any panel)
         KeyCode::Char('h') => {
@@ -259,8 +272,12 @@ fn handle_detail_input(app: &mut App, key: KeyEvent) -> InputAction {
             app.detail_scroll = usize::MAX / 2;
             InputAction::None
         }
-        // Quit
-        KeyCode::Char('q') | KeyCode::Char('Q') => InputAction::Quit,
+        // Navigate back
+        KeyCode::Char('q') => {
+            app.exit_detail_view();
+            InputAction::None
+        }
+        KeyCode::Char('Q') => InputAction::Quit,
         _ => InputAction::None,
     }
 }
@@ -442,11 +459,11 @@ fn handle_history_input(app: &mut App, key: KeyEvent) -> InputAction {
     }
 
     match key.code {
-        KeyCode::Esc => {
+        KeyCode::Esc | KeyCode::Char('q') => {
             app.exit_history_view();
             InputAction::None
         }
-        KeyCode::Char('q') => InputAction::Quit,
+        KeyCode::Char('Q') => InputAction::Quit,
         KeyCode::Char('j') | KeyCode::Down => {
             app.history_down();
             InputAction::None
@@ -460,6 +477,30 @@ fn handle_history_input(app: &mut App, key: KeyEvent) -> InputAction {
             app.enter_history_detail_view();
             InputAction::None
         }
+        // Paginate: previous page
+        KeyCode::Char('[') | KeyCode::Char('H') => {
+            if app.history_page > 0 {
+                app.history_page -= 1;
+                app.history_index = 0;
+                return InputAction::QueryHistoryPage {
+                    agent_id: app.history_agent_filter.clone(),
+                    page: app.history_page,
+                };
+            }
+            InputAction::None
+        }
+        // Paginate: next page
+        KeyCode::Char(']') | KeyCode::Char('L') => {
+            if app.history_has_more {
+                app.history_page += 1;
+                app.history_index = 0;
+                return InputAction::QueryHistoryPage {
+                    agent_id: app.history_agent_filter.clone(),
+                    page: app.history_page,
+                };
+            }
+            InputAction::None
+        }
         // Start search mode
         KeyCode::Char('/') => {
             app.history_search_mode = true;
@@ -469,7 +510,7 @@ fn handle_history_input(app: &mut App, key: KeyEvent) -> InputAction {
         // Clear search
         KeyCode::Char('C') => {
             app.history_search_query = None;
-            app.enter_history_view(app.history_agent_filter.clone());
+            app.history_page = 0;
             InputAction::QueryHistory {
                 agent_id: app.history_agent_filter.clone(),
             }
@@ -478,7 +519,9 @@ fn handle_history_input(app: &mut App, key: KeyEvent) -> InputAction {
         KeyCode::Char('f') => {
             if let Some(entry) = app.history.get(app.history_index) {
                 let agent_id = entry.agent_id.clone();
-                app.enter_history_view(Some(agent_id.clone()));
+                app.history_agent_filter = Some(agent_id.clone());
+                app.history_page = 0;
+                app.history_index = 0;
                 return InputAction::QueryHistory {
                     agent_id: Some(agent_id),
                 };
@@ -487,7 +530,9 @@ fn handle_history_input(app: &mut App, key: KeyEvent) -> InputAction {
         }
         // Clear agent filter (show all)
         KeyCode::Char('F') => {
-            app.enter_history_view(None);
+            app.history_agent_filter = None;
+            app.history_page = 0;
+            app.history_index = 0;
             InputAction::QueryHistory { agent_id: None }
         }
         _ => InputAction::None,
@@ -553,7 +598,11 @@ fn handle_history_detail_input(app: &mut App, key: KeyEvent) -> InputAction {
             app.detail_scroll = app.detail_scroll.saturating_sub(20);
             InputAction::None
         }
-        KeyCode::Char('q') | KeyCode::Char('Q') => InputAction::Quit,
+        KeyCode::Char('q') => {
+            app.exit_history_detail_view();
+            InputAction::None
+        }
+        KeyCode::Char('Q') => InputAction::Quit,
         _ => InputAction::None,
     }
 }

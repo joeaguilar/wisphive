@@ -81,7 +81,7 @@ fn draw_detail_view(frame: &mut Frame, app: &App) {
         };
 
         let bar_text = format!(
-            " [Y]approve [N]deny [M]deny+msg [!]always [E]edit [C]context [?]defer [Esc]back{}",
+            " [Y]approve [N]deny [M]deny+msg [!]always [E]edit [C]context [?]defer [q/Esc]back [Q]uit{}",
             scroll_info
         );
         let bar = Paragraph::new(Line::from(Span::styled(
@@ -193,10 +193,18 @@ fn draw_history_view(frame: &mut Frame, app: &App) {
 
     frame.render_widget(list, chunks[0]);
 
+    let page_info = if app.history_page > 0 || app.history_has_more {
+        format!(" pg {} ", app.history_page + 1)
+    } else {
+        String::new()
+    };
     let bar_text = if app.history_search_mode {
         format!("/{}", app.history_search_buffer)
     } else {
-        " [j/k]navigate [Enter]detail [/]search [C]clear-search [f]agent [F]clear [Esc]back [q]quit ".to_string()
+        format!(
+            " [j/k]navigate [Enter]detail [/]search [H/[]prev [L/]]next [C]clear [f]agent [F]clear [q]back [Q]uit{}",
+            page_info
+        )
     };
     let bar = Paragraph::new(Line::from(Span::styled(
         bar_text,
@@ -233,7 +241,7 @@ fn draw_history_detail_view(frame: &mut Frame, app: &App) {
     }
 
     let bar = Paragraph::new(Line::from(Span::styled(
-        " [j/k]scroll [Esc]back [q]quit ",
+        " [j/k]scroll [q/Esc]back [Q]uit ",
         Style::default().fg(Color::White).bg(Color::DarkGray),
     )));
     frame.render_widget(bar, chunks[1]);
@@ -344,7 +352,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             "disconnected"
         };
         format!(
-            " [y]approve [Enter/a/d]review [A]pprove-all [D]eny-all [h]istory [/]filter [Tab]cycle [q]uit | {} ",
+            " [y]approve [Enter/a/d]review [A]pprove-all [D]eny-all [h]istory [/]filter [Tab]cycle [q]back [Q]uit | {} ",
             conn
         )
     };
