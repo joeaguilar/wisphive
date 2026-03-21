@@ -99,7 +99,7 @@ fn handle_queue_input(app: &mut App, key: KeyEvent) -> InputAction {
         }
 
         // Quick approve selected (no detail view)
-        KeyCode::Char('Y') => {
+        KeyCode::Char('y') => {
             if let Some(req) = app.selected_request() {
                 return InputAction::Approve(req.id);
             }
