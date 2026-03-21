@@ -78,6 +78,14 @@ pub struct App {
     pub history_search_buffer: String,
     /// Active search query (applied filter).
     pub history_search_query: Option<String>,
+    /// View navigation history (back stack).
+    pub view_back_stack: Vec<ViewMode>,
+    /// View navigation forward stack.
+    pub view_forward_stack: Vec<ViewMode>,
+    /// Current history page (0-indexed).
+    pub history_page: usize,
+    /// Whether there are more history pages available.
+    pub history_has_more: bool,
 }
 
 /// Aggregated project status for the dashboard.
@@ -110,6 +118,10 @@ impl App {
             history_search_mode: false,
             history_search_buffer: String::new(),
             history_search_query: None,
+            view_back_stack: Vec::new(),
+            view_forward_stack: Vec::new(),
+            history_page: 0,
+            history_has_more: false,
         }
     }
 
@@ -185,20 +197,51 @@ impl App {
         self.projects.sort_by(|a, b| a.path.cmp(&b.path));
     }
 
+    /// Push current view onto back stack and switch to a new view.
+    fn push_view(&mut self, new_view: ViewMode) {
+        self.view_back_stack.push(self.view_mode);
+        self.view_forward_stack.clear();
+        self.view_mode = new_view;
+    }
+
+    /// Navigate back to the previous view. Returns true if there was a view to go back to.
+    pub fn navigate_back(&mut self) -> bool {
+        if let Some(prev) = self.view_back_stack.pop() {
+            self.view_forward_stack.push(self.view_mode);
+            self.view_mode = prev;
+            self.detail_scroll = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Navigate forward to the next view. Returns true if there was a view to go forward to.
+    pub fn navigate_forward(&mut self) -> bool {
+        if let Some(next) = self.view_forward_stack.pop() {
+            self.view_back_stack.push(self.view_mode);
+            self.view_mode = next;
+            self.detail_scroll = 0;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Enter the detail view for the currently selected queue item.
     pub fn enter_detail_view(&mut self) {
         if let Some(req) = self.selected_request() {
             self.detail_request_id = Some(req.id);
             self.detail_scroll = 0;
-            self.view_mode = ViewMode::Detail;
+            self.push_view(ViewMode::Detail);
         }
     }
 
     /// Leave the detail view and return to the dashboard.
     pub fn exit_detail_view(&mut self) {
-        self.view_mode = ViewMode::Dashboard;
         self.detail_request_id = None;
         self.detail_scroll = 0;
+        self.navigate_back();
     }
 
     /// Get the decision request currently being viewed in detail.
@@ -211,32 +254,36 @@ impl App {
     pub fn enter_history_view(&mut self, agent_id: Option<String>) {
         self.history_agent_filter = agent_id;
         self.history_index = 0;
-        self.view_mode = ViewMode::History;
+        self.history_page = 0;
+        self.history_has_more = false;
+        self.push_view(ViewMode::History);
     }
 
     /// Leave the history view and return to the dashboard.
     pub fn exit_history_view(&mut self) {
-        self.view_mode = ViewMode::Dashboard;
         self.history.clear();
         self.history_index = 0;
+        self.history_page = 0;
+        self.history_has_more = false;
         self.history_agent_filter = None;
         self.history_search_query = None;
         self.history_search_mode = false;
         self.history_search_buffer.clear();
+        self.navigate_back();
     }
 
     /// Enter the history detail view for the currently selected history entry.
     pub fn enter_history_detail_view(&mut self) {
         if self.history.get(self.history_index).is_some() {
             self.detail_scroll = 0;
-            self.view_mode = ViewMode::HistoryDetail;
+            self.push_view(ViewMode::HistoryDetail);
         }
     }
 
     /// Leave the history detail view and return to the history list.
     pub fn exit_history_detail_view(&mut self) {
-        self.view_mode = ViewMode::History;
         self.detail_scroll = 0;
+        self.navigate_back();
     }
 
     /// Get the currently selected history entry.
