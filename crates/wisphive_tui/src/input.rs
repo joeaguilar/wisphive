@@ -618,10 +618,17 @@ fn handle_config_input(app: &mut App, key: KeyEvent) -> InputAction {
 
     // All known tools for the toggle list
     const ALL_TOOLS: &[&str] = &[
-        "Read", "Glob", "Grep", "LS", "WebSearch", "WebFetch",
-        "NotebookRead", "Agent", "Skill", "TaskCreate", "TaskUpdate",
-        "TaskGet", "TaskList", "TodoRead", "ToolSearch",
-        "Edit", "Write", "NotebookEdit", "Bash",
+        // Read tier
+        "Read", "Glob", "Grep", "LS", "LSP", "NotebookRead",
+        "WebSearch", "WebFetch",
+        "Agent", "Skill", "ToolSearch", "AskUserQuestion",
+        "EnterPlanMode", "ExitPlanMode", "EnterWorktree", "ExitWorktree",
+        "TaskCreate", "TaskUpdate", "TaskGet", "TaskList", "TaskOutput", "TaskStop", "TodoRead",
+        "CronList",
+        // Write tier
+        "Edit", "Write", "NotebookEdit", "CronCreate", "CronDelete",
+        // Execute tier
+        "Bash",
     ];
 
     match key.code {

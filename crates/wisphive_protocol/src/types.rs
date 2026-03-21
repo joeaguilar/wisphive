@@ -202,11 +202,21 @@ impl AutoApproveLevel {
         match self {
             Self::Off => &[],
             Self::Read => &[
-                "Read", "Glob", "Grep", "LS", "WebSearch", "WebFetch",
-                "NotebookRead", "Agent", "Skill", "TaskCreate", "TaskUpdate",
-                "TaskGet", "TaskList", "TodoRead", "ToolSearch",
+                // File/content reading
+                "Read", "Glob", "Grep", "LS", "LSP", "NotebookRead",
+                // Web (read-only)
+                "WebSearch", "WebFetch",
+                // Orchestration & planning
+                "Agent", "Skill", "ToolSearch", "AskUserQuestion",
+                "EnterPlanMode", "ExitPlanMode",
+                "EnterWorktree", "ExitWorktree",
+                // Task management
+                "TaskCreate", "TaskUpdate", "TaskGet", "TaskList",
+                "TaskOutput", "TaskStop", "TodoRead",
+                // Scheduling
+                "CronList",
             ],
-            Self::Write => &["Edit", "Write", "NotebookEdit"],
+            Self::Write => &["Edit", "Write", "NotebookEdit", "CronCreate", "CronDelete"],
             Self::Execute => &["Bash"],
             Self::All => &[], // All covers everything, checked separately
         }
