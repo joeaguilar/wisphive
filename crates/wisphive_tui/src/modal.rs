@@ -1,5 +1,8 @@
 use std::path::PathBuf;
 
+use ratatui::style::{Color, Style};
+use ratatui::widgets::{Block, Borders};
+use tui_textarea::TextArea;
 use uuid::Uuid;
 
 /// What action the modal is confirming.
@@ -30,65 +33,103 @@ impl SpawnField {
     }
 }
 
+/// Create a single-line TextArea with consistent styling.
+fn make_textarea(initial: &str, placeholder: &str) -> TextArea<'static> {
+    let lines = if initial.is_empty() {
+        vec![String::new()]
+    } else {
+        vec![initial.to_string()]
+    };
+    let mut ta = TextArea::new(lines);
+    ta.set_cursor_line_style(Style::default());
+    ta.set_style(Style::default().fg(Color::Yellow));
+    ta.set_cursor_style(Style::default().fg(Color::Yellow).bg(Color::DarkGray));
+    ta.set_placeholder_text(placeholder);
+    ta.set_placeholder_style(Style::default().fg(Color::DarkGray));
+    // Move cursor to end of initial text
+    ta.move_cursor(tui_textarea::CursorMove::End);
+    ta
+}
+
 /// State for the spawn-agent modal.
 pub struct SpawnModal {
-    pub project_buf: String,
-    pub prompt_buf: String,
+    pub project: TextArea<'static>,
+    pub prompt: TextArea<'static>,
     pub active_field: SpawnField,
 }
 
 impl SpawnModal {
     pub fn new() -> Self {
-        let project = std::env::current_dir()
+        let project_path = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
+        let mut project = make_textarea(&project_path, "/path/to/project");
+        project.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(" Project "),
+        );
+        let mut prompt = make_textarea("", "Enter prompt for the agent...");
+        prompt.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(" Prompt "),
+        );
         Self {
-            project_buf: project,
-            prompt_buf: String::new(),
+            project,
+            prompt,
             active_field: SpawnField::Prompt,
         }
     }
 
     pub fn project_path(&self) -> PathBuf {
-        PathBuf::from(&self.project_buf)
+        PathBuf::from(&self.project.lines()[0])
+    }
+
+    /// Replace the project field text (used when spawning from project view).
+    pub fn set_project(&mut self, path: &str) {
+        self.project = make_textarea(path, "/path/to/project");
+        self.project.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(" Project "),
+        );
+    }
+
+    pub fn active_textarea(&mut self) -> &mut TextArea<'static> {
+        match self.active_field {
+            SpawnField::Project => &mut self.project,
+            SpawnField::Prompt => &mut self.prompt,
+        }
+    }
+
+    /// Update border styles to reflect which field is active.
+    pub fn update_focus_styles(&mut self) {
+        let (proj_color, prompt_color) = match self.active_field {
+            SpawnField::Project => (Color::Yellow, Color::DarkGray),
+            SpawnField::Prompt => (Color::DarkGray, Color::Yellow),
+        };
+        self.project.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(proj_color))
+                .title(" Project "),
+        );
+        self.prompt.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(prompt_color))
+                .title(" Prompt "),
+        );
     }
 }
 
 impl Default for SpawnModal {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// State for a single-field text input modal.
-pub struct TextInputModal {
-    pub buffer: String,
-}
-
-impl TextInputModal {
-    pub fn new() -> Self {
-        Self {
-            buffer: String::new(),
-        }
-    }
-}
-
-impl Default for TextInputModal {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// State for editing tool input (pre-filled with current value).
-pub struct EditInputModal {
-    pub buffer: String,
-}
-
-impl EditInputModal {
-    pub fn new(initial: &str) -> Self {
-        Self {
-            buffer: initial.to_string(),
-        }
     }
 }
 
@@ -101,10 +142,8 @@ pub struct Modal {
     pub target_id: Option<Uuid>,
     /// State for the spawn-agent modal.
     pub spawn: Option<SpawnModal>,
-    /// State for text input modals (deny-with-message, approve-with-context).
-    pub text_input: Option<TextInputModal>,
-    /// State for the edit-input modal.
-    pub edit_input: Option<EditInputModal>,
+    /// TextArea for text input modals (deny-with-message, approve-with-context, edit-input).
+    pub textarea: Option<TextArea<'static>>,
 }
 
 impl Modal {
@@ -117,8 +156,7 @@ impl Modal {
             action: ModalAction::ApproveAll,
             target_id: None,
             spawn: None,
-            text_input: None,
-            edit_input: None,
+            textarea: None,
         }
     }
 
@@ -131,8 +169,7 @@ impl Modal {
             action: ModalAction::DenyAll,
             target_id: None,
             spawn: None,
-            text_input: None,
-            edit_input: None,
+            textarea: None,
         }
     }
 
@@ -143,8 +180,7 @@ impl Modal {
             action: ModalAction::SpawnAgent,
             target_id: None,
             spawn: Some(SpawnModal::new()),
-            text_input: None,
-            edit_input: None,
+            textarea: None,
         }
     }
 
@@ -155,8 +191,7 @@ impl Modal {
             action: ModalAction::DenyWithMessage,
             target_id: Some(id),
             spawn: None,
-            text_input: Some(TextInputModal::new()),
-            edit_input: None,
+            textarea: Some(make_textarea("", "Enter feedback...")),
         }
     }
 
@@ -167,8 +202,7 @@ impl Modal {
             action: ModalAction::ApproveWithContext,
             target_id: Some(id),
             spawn: None,
-            text_input: Some(TextInputModal::new()),
-            edit_input: None,
+            textarea: Some(make_textarea("", "Enter context...")),
         }
     }
 
@@ -185,8 +219,7 @@ impl Modal {
             action: ModalAction::EditInput,
             target_id: Some(id),
             spawn: None,
-            text_input: None,
-            edit_input: Some(EditInputModal::new(&initial)),
+            textarea: Some(make_textarea(&initial, "")),
         }
     }
 
@@ -199,8 +232,7 @@ impl Modal {
             action: ModalAction::AlwaysAllow,
             target_id: Some(id),
             spawn: None,
-            text_input: None,
-            edit_input: None,
+            textarea: None,
         }
     }
 
@@ -211,8 +243,7 @@ impl Modal {
             action: ModalAction::AskDefer,
             target_id: Some(id),
             spawn: None,
-            text_input: None,
-            edit_input: None,
+            textarea: None,
         }
     }
 }

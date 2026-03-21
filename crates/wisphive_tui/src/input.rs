@@ -3,7 +3,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use std::path::PathBuf;
 
 use crate::app::{App, FocusPanel, ViewMode};
-use crate::modal::{Modal, ModalAction, SpawnField};
+use crate::modal::{Modal, ModalAction};
 
 /// Action the main loop should take after processing input.
 pub enum InputAction {
@@ -505,14 +505,9 @@ fn handle_modal_input(app: &mut App, key: KeyEvent) -> InputAction {
         return handle_spawn_modal_input(app, modal, key);
     }
 
-    // Text input modals (deny-with-message, approve-with-context)
-    if modal.text_input.is_some() {
-        return handle_text_input_modal(app, modal, key);
-    }
-
-    // Edit input modal
-    if modal.edit_input.is_some() {
-        return handle_edit_input_modal(app, modal, key);
+    // TextArea-based input modals (deny-with-message, approve-with-context, edit-input)
+    if modal.textarea.is_some() {
+        return handle_textarea_modal(app, modal, key);
     }
 
     // Simple Y/N confirmation modals
@@ -549,20 +544,20 @@ fn handle_modal_input(app: &mut App, key: KeyEvent) -> InputAction {
     }
 }
 
-fn handle_text_input_modal(app: &mut App, mut modal: Modal, key: KeyEvent) -> InputAction {
-    let text = modal.text_input.as_mut().unwrap();
-
+fn handle_textarea_modal(app: &mut App, mut modal: Modal, key: KeyEvent) -> InputAction {
     match key.code {
-        KeyCode::Esc => InputAction::None,
+        KeyCode::Esc => InputAction::None, // dismiss modal
         KeyCode::Enter => {
-            let buf = text.buffer.clone();
+            let ta = modal.textarea.as_ref().unwrap();
+            let buf = ta.lines().join("\n");
             let target_id = modal.target_id;
-            if buf.is_empty() {
-                app.modal = Some(modal);
-                return InputAction::None;
-            }
+
             match modal.action {
                 ModalAction::DenyWithMessage => {
+                    if buf.is_empty() {
+                        app.modal = Some(modal);
+                        return InputAction::None;
+                    }
                     if let Some(id) = target_id {
                         app.exit_detail_view();
                         InputAction::DenyWithMessage { id, message: buf }
@@ -571,6 +566,10 @@ fn handle_text_input_modal(app: &mut App, mut modal: Modal, key: KeyEvent) -> In
                     }
                 }
                 ModalAction::ApproveWithContext => {
+                    if buf.is_empty() {
+                        app.modal = Some(modal);
+                        return InputAction::None;
+                    }
                     if let Some(id) = target_id {
                         app.exit_detail_view();
                         InputAction::ApproveWithContext { id, context: buf }
@@ -578,59 +577,31 @@ fn handle_text_input_modal(app: &mut App, mut modal: Modal, key: KeyEvent) -> In
                         InputAction::None
                     }
                 }
+                ModalAction::EditInput => {
+                    if let Some(id) = target_id {
+                        // Try to parse as JSON; if it looks like a bare command, wrap it
+                        let updated = if let Ok(val) = serde_json::from_str::<serde_json::Value>(&buf) {
+                            val
+                        } else {
+                            serde_json::json!({ "command": buf })
+                        };
+                        app.exit_detail_view();
+                        InputAction::ApproveWithInput { id, updated_input: updated }
+                    } else {
+                        InputAction::None
+                    }
+                }
                 _ => InputAction::None,
             }
         }
-        KeyCode::Backspace => {
-            text.buffer.pop();
-            app.modal = Some(modal);
-            InputAction::None
-        }
-        KeyCode::Char(c) => {
-            text.buffer.push(c);
-            app.modal = Some(modal);
-            InputAction::None
-        }
         _ => {
-            app.modal = Some(modal);
-            InputAction::None
-        }
-    }
-}
-
-fn handle_edit_input_modal(app: &mut App, mut modal: Modal, key: KeyEvent) -> InputAction {
-    let edit = modal.edit_input.as_mut().unwrap();
-
-    match key.code {
-        KeyCode::Esc => InputAction::None,
-        KeyCode::Enter => {
-            let buf = edit.buffer.clone();
-            let target_id = modal.target_id;
-            if let Some(id) = target_id {
-                // Try to parse as JSON; if it looks like a bare command, wrap it
-                let updated = if let Ok(val) = serde_json::from_str::<serde_json::Value>(&buf) {
-                    val
-                } else {
-                    // Treat as a Bash command string
-                    serde_json::json!({ "command": buf })
-                };
-                app.exit_detail_view();
-                InputAction::ApproveWithInput { id, updated_input: updated }
+            // Block Enter/newline insertion (Ctrl+M), delegate everything else to TextArea
+            let input: tui_textarea::Input = key.into();
+            if input.key == tui_textarea::Key::Char('m') && input.ctrl {
+                // Block Ctrl+M (Enter alias) from inserting newline
             } else {
-                InputAction::None
+                modal.textarea.as_mut().unwrap().input(input);
             }
-        }
-        KeyCode::Backspace => {
-            edit.buffer.pop();
-            app.modal = Some(modal);
-            InputAction::None
-        }
-        KeyCode::Char(c) => {
-            edit.buffer.push(c);
-            app.modal = Some(modal);
-            InputAction::None
-        }
-        _ => {
             app.modal = Some(modal);
             InputAction::None
         }
@@ -986,7 +957,7 @@ fn handle_projects_view_input(app: &mut App, key: KeyEvent) -> InputAction {
             if let Some(project) = app.selected_project_summary() {
                 let mut modal = Modal::spawn_agent();
                 if let Some(ref mut spawn) = modal.spawn {
-                    spawn.project_buf = project.project.to_string_lossy().to_string();
+                    spawn.set_project(&project.project.to_string_lossy());
                 }
                 app.modal = Some(modal);
             }
@@ -1082,8 +1053,9 @@ fn handle_spawn_modal_input(
     let spawn = modal.spawn.as_mut().unwrap();
 
     match key.code {
-        KeyCode::Tab => {
+        KeyCode::Tab | KeyCode::BackTab => {
             spawn.active_field = spawn.active_field.next();
+            spawn.update_focus_styles();
             app.modal = Some(modal);
             InputAction::None
         }
@@ -1093,31 +1065,21 @@ fn handle_spawn_modal_input(
         }
         KeyCode::Enter => {
             let project = spawn.project_path();
-            let prompt = spawn.prompt_buf.clone();
+            let prompt = spawn.prompt.lines()[0].clone();
             if prompt.is_empty() {
-                // Don't submit with empty prompt — keep modal open
                 app.modal = Some(modal);
                 return InputAction::None;
             }
             InputAction::SpawnAgent { project, prompt }
         }
-        KeyCode::Backspace => {
-            match spawn.active_field {
-                SpawnField::Project => { spawn.project_buf.pop(); }
-                SpawnField::Prompt => { spawn.prompt_buf.pop(); }
-            }
-            app.modal = Some(modal);
-            InputAction::None
-        }
-        KeyCode::Char(c) => {
-            match spawn.active_field {
-                SpawnField::Project => spawn.project_buf.push(c),
-                SpawnField::Prompt => spawn.prompt_buf.push(c),
-            }
-            app.modal = Some(modal);
-            InputAction::None
-        }
         _ => {
+            // Block Enter/newline (Ctrl+M) from inserting, delegate rest to active TextArea
+            let input: tui_textarea::Input = key.into();
+            if input.key == tui_textarea::Key::Char('m') && input.ctrl {
+                // Block Ctrl+M
+            } else {
+                spawn.active_textarea().input(input);
+            }
             app.modal = Some(modal);
             InputAction::None
         }

@@ -44,6 +44,7 @@ notify = "7"
 # TUI
 ratatui = "0.29"
 crossterm = "0.28"
+tui-textarea = { version = "0.7", default-features = false, features = ["crossterm"] }
 similar = "2"
 
 # CLI
