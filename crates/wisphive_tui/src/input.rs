@@ -331,10 +331,18 @@ fn handle_permission_request_keys(app: &mut App, key: KeyEvent) -> InputAction {
     }
 }
 
-/// Stop/SubagentStop: C=continue working (deny+reason), S=let stop (approve)
+/// Stop/SubagentStop: C=continue working (deny), M=continue+feedback, S=let stop (approve)
 fn handle_stop_keys(app: &mut App, key: KeyEvent) -> InputAction {
     match key.code {
         KeyCode::Char('c') | KeyCode::Char('C') => {
+            if let Some(req) = app.detail_request() {
+                let id = req.id;
+                app.exit_detail_view();
+                return InputAction::Deny(id);
+            }
+            InputAction::None
+        }
+        KeyCode::Char('m') | KeyCode::Char('M') => {
             if let Some(req) = app.detail_request() {
                 app.modal = Some(Modal::deny_with_message(req.id));
             }
