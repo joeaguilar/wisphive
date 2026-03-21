@@ -146,17 +146,7 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
         .unwrap_or("unknown")
         .to_string();
 
-    // Layer 3: Auto-approve safe tools before contacting daemon.
-    // Check user overrides first (~/.wisphive/auto-approve.json), fall back to defaults.
-    if is_auto_approved(&tool_name, &wisphive_dir) {
-        return Ok(HookResponse::simple(Decision::Approve));
-    }
-
-    let tool_input = hook_event
-        .get("tool_input")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-
+    // Extract agent identity early (needed for registration before auto-approve check)
     let agent_id = hook_event
         .get("session_id")
         .and_then(|v| v.as_str())
@@ -174,6 +164,19 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
                 .ok_or(())
         })
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    // Layer 3: Register agent with daemon (once per session, fire-and-forget)
+    register_agent_once(&agent_id, &project, &wisphive_dir);
+
+    // Layer 4: Auto-approve check using tiered levels from config.json
+    if is_auto_approved(&tool_name, &wisphive_dir) {
+        return Ok(HookResponse::simple(Decision::Approve));
+    }
+
+    let tool_input = hook_event
+        .get("tool_input")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
 
     let request = DecisionRequest {
         id: uuid::Uuid::new_v4(),
@@ -294,33 +297,96 @@ fn handle_post_tool_use(
     Ok(())
 }
 
-/// Check if a tool is auto-approved.
-///
-/// Reads ~/.wisphive/auto-approve.json if it exists:
-/// ```json
-/// {
-///   "auto_approve": ["Read", "Glob", "Grep", "Bash"],
-///   "always_queue": ["Write", "Edit"]
-/// }
-/// ```
-///
-/// If the file doesn't exist, uses DEFAULT_AUTO_APPROVE.
-fn is_auto_approved(tool_name: &str, wisphive_dir: &std::path::Path) -> bool {
-    let config_path = wisphive_dir.join("auto-approve.json");
+/// Register this agent session with the daemon (fire-and-forget).
+/// Uses a marker file to ensure registration only happens once per session.
+fn register_agent_once(agent_id: &str, project: &std::path::Path, wisphive_dir: &std::path::Path) {
+    // Fast path: check marker file (single stat syscall)
+    let sessions_dir = wisphive_dir.join("sessions");
+    let marker = sessions_dir.join(agent_id);
+    if marker.exists() {
+        return;
+    }
 
-    if config_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(arr) = config.get("auto_approve").and_then(|v| v.as_array()) {
-                    return arr
-                        .iter()
-                        .any(|v| v.as_str().is_some_and(|s| s == tool_name));
+    // Attempt registration — all errors are swallowed (fail-open)
+    let _ = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let socket_path = wisphive_dir.join("wisphive.sock");
+        let stream = UnixStream::connect(&socket_path)?;
+        stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut writer = stream;
+
+        // Handshake
+        let hello = wisphive_protocol::encode(&ClientMessage::Hello {
+            client: ClientType::Hook,
+            version: PROTOCOL_VERSION,
+        })?;
+        writer.write_all(hello.as_bytes())?;
+
+        let mut welcome_line = String::new();
+        reader.read_line(&mut welcome_line)?;
+
+        // Send AgentRegister (fire-and-forget)
+        let msg = wisphive_protocol::encode(&ClientMessage::AgentRegister {
+            agent_id: agent_id.to_string(),
+            agent_type: wisphive_protocol::AgentType::ClaudeCode,
+            project: project.to_path_buf(),
+        })?;
+        writer.write_all(msg.as_bytes())?;
+
+        // Create marker file
+        let _ = std::fs::create_dir_all(&sessions_dir);
+        let _ = std::fs::write(&marker, "");
+
+        Ok(())
+    })();
+}
+
+/// Check if a tool is auto-approved using tiered levels from config.json.
+///
+/// Priority: config.json auto_approve_remove → auto_approve_add → level → legacy auto-approve.json → defaults.
+fn is_auto_approved(tool_name: &str, wisphive_dir: &std::path::Path) -> bool {
+    let config_path = wisphive_dir.join("config.json");
+
+    if let Ok(content) = std::fs::read_to_string(&config_path) {
+        if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
+            // Check explicit removals first
+            if let Some(arr) = config.get("auto_approve_remove").and_then(|v| v.as_array()) {
+                if arr.iter().any(|v| v.as_str() == Some(tool_name)) {
+                    return false;
+                }
+            }
+
+            // Check explicit additions
+            if let Some(arr) = config.get("auto_approve_add").and_then(|v| v.as_array()) {
+                if arr.iter().any(|v| v.as_str() == Some(tool_name)) {
+                    return true;
+                }
+            }
+
+            // Check tiered level
+            if let Some(level_str) = config.get("auto_approve_level").and_then(|v| v.as_str()) {
+                if let Ok(level) = level_str.parse::<wisphive_protocol::AutoApproveLevel>() {
+                    return level.includes(tool_name);
                 }
             }
         }
-        // Config exists but is broken — fall through to defaults
     }
 
+    // Fallback: legacy auto-approve.json
+    let legacy_path = wisphive_dir.join("auto-approve.json");
+    if legacy_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&legacy_path) {
+            if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(arr) = config.get("auto_approve").and_then(|v| v.as_array()) {
+                    return arr.iter().any(|v| v.as_str() == Some(tool_name));
+                }
+            }
+        }
+    }
+
+    // Final fallback: built-in defaults (level read)
     DEFAULT_AUTO_APPROVE.iter().any(|&safe| safe == tool_name)
 }
 

@@ -202,6 +202,11 @@ async fn run_loop(
             // Check for daemon messages
             msg = conn.recv() => {
                 match msg? {
+                    Some(ServerMessage::AgentsSnapshot { agents }) => {
+                        tracing::info!(count = agents.len(), "received agents snapshot");
+                        app.agents = agents;
+                        app.rebuild_projects();
+                    }
                     Some(ServerMessage::QueueSnapshot { ref items }) => {
                         tracing::info!(count = items.len(), "received queue snapshot");
                         app.queue = items.clone();

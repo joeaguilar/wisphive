@@ -72,6 +72,14 @@ async fn connect_as_tui(
         other => panic!("expected Welcome, got: {:?}", other),
     }
 
+    // Read agents snapshot (sent first)
+    let agents_line = lines.next_line().await.unwrap().unwrap();
+    let agents: ServerMessage = decode(&agents_line).unwrap();
+    match agents {
+        ServerMessage::AgentsSnapshot { .. } => {}
+        other => panic!("expected AgentsSnapshot, got: {:?}", other),
+    }
+
     // Read initial queue snapshot
     let snap_line = lines.next_line().await.unwrap().unwrap();
     let snap: ServerMessage = decode(&snap_line).unwrap();
@@ -553,6 +561,9 @@ async fn tui_snapshot_reflects_pending_decisions() {
     writer.write_all(hello.as_bytes()).await.unwrap();
 
     // Welcome
+    let _ = lines.next_line().await.unwrap().unwrap();
+
+    // Agents snapshot (sent before queue snapshot)
     let _ = lines.next_line().await.unwrap().unwrap();
 
     // Queue snapshot
