@@ -11,5 +11,13 @@
         "matcher": ""
       }
     ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(*)",
+      "Edit(*)",
+      "Write(*)",
+      "NotebookEdit(*)"
+    ]
   }
 }
