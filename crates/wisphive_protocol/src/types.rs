@@ -78,6 +78,33 @@ pub struct ManagedAgent {
     pub started_at: DateTime<Utc>,
 }
 
+/// A tool execution result reported by the PostToolUse hook.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub agent_id: String,
+    pub tool_name: String,
+    pub tool_input: serde_json::Value,
+    pub tool_result: serde_json::Value,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Search criteria for the audit history.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HistorySearch {
+    /// Free-text search across tool_input, tool_result, and tool_name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    /// Filter by tool name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// Filter by agent ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Maximum results (default 200).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
 /// A resolved decision from the audit log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEntry {
@@ -90,6 +117,9 @@ pub struct HistoryEntry {
     pub decision: Decision,
     pub requested_at: DateTime<Utc>,
     pub resolved_at: DateTime<Utc>,
+    /// Tool execution result (captured by PostToolUse hook). None for old/denied entries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_result: Option<serde_json::Value>,
 }
 
 /// Filter criteria for batch operations on the decision queue.

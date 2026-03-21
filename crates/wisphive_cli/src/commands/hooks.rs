@@ -61,6 +61,9 @@ pub fn install(project: Option<PathBuf>, _all: bool) -> Result<()> {
     // Add PreToolUse hook if not already present
     add_hook_entry(&mut settings, "PreToolUse", &hook_command);
 
+    // Add PostToolUse hook for audit trail (captures tool results)
+    add_hook_entry(&mut settings, "PostToolUse", &hook_command);
+
     // Add permissions so Claude Code auto-allows tools wisphive gates
     // (eliminates double-prompt — wisphive becomes the sole gatekeeper)
     add_wisphive_permissions(&mut settings);
@@ -494,7 +497,7 @@ mod tests {
         install(Some(p.clone()), false).unwrap();
         let s = read_settings(&p);
         assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
-        assert_eq!(s["hooks"]["PostToolUse"].as_array().unwrap().len(), 1);
+        assert_eq!(s["hooks"]["PostToolUse"].as_array().unwrap().len(), 2);
     }
 
     #[test]

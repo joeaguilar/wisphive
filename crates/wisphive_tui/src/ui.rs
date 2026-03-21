@@ -14,6 +14,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match app.view_mode {
         ViewMode::Detail => draw_detail_view(frame, app),
         ViewMode::History => draw_history_view(frame, app),
+        ViewMode::HistoryDetail => draw_history_detail_view(frame, app),
         ViewMode::Dashboard => draw_dashboard(frame, app),
     }
 }
@@ -104,9 +105,23 @@ fn draw_history_view(frame: &mut Frame, app: &App) {
         ])
         .split(frame.area());
 
-    let title = match &app.history_agent_filter {
-        Some(agent) => format!(" History — agent: {} ({} entries) ", agent, app.history.len()),
-        None => format!(" History — all agents ({} entries) ", app.history.len()),
+    let title = match (&app.history_agent_filter, &app.history_search_query) {
+        (Some(agent), Some(query)) => format!(
+            " History — agent: {} search: \"{}\" ({} entries) ",
+            agent, query, app.history.len()
+        ),
+        (None, Some(query)) => format!(
+            " History — search: \"{}\" ({} entries) ",
+            query, app.history.len()
+        ),
+        (Some(agent), None) => format!(
+            " History — agent: {} ({} entries) ",
+            agent, app.history.len()
+        ),
+        (None, None) => format!(
+            " History — all agents ({} entries) ",
+            app.history.len()
+        ),
     };
 
     let items: Vec<ListItem> = app
@@ -131,7 +146,14 @@ fn draw_history_view(frame: &mut Frame, app: &App) {
 
             let time_str = entry.resolved_at.format("%m-%d %H:%M:%S").to_string();
 
+            let result_indicator = if entry.tool_result.is_some() {
+                Span::styled("+ ", Style::default().fg(Color::Cyan))
+            } else {
+                Span::styled("  ", Style::default())
+            };
+
             let line = Line::from(vec![
+                result_indicator,
                 Span::styled(
                     format!("{decision_str} "),
                     Style::default().fg(decision_color).add_modifier(Modifier::BOLD),
@@ -169,9 +191,47 @@ fn draw_history_view(frame: &mut Frame, app: &App) {
 
     frame.render_widget(list, chunks[0]);
 
-    let bar_text = " [j/k]navigate [f]filter-agent [F]clear-filter [Esc]back [q]quit ";
+    let bar_text = if app.history_search_mode {
+        format!("/{}", app.history_search_buffer)
+    } else {
+        " [j/k]navigate [Enter]detail [/]search [C]clear-search [f]agent [F]clear [Esc]back [q]quit ".to_string()
+    };
     let bar = Paragraph::new(Line::from(Span::styled(
         bar_text,
+        Style::default().fg(Color::White).bg(Color::DarkGray),
+    )));
+    frame.render_widget(bar, chunks[1]);
+}
+
+fn draw_history_detail_view(frame: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+
+    if let Some(entry) = app.selected_history_entry() {
+        let lines = detail::render_history_detail_lines(entry);
+        let paragraph = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(format!(" History Detail: {} ", entry.tool_name)),
+            )
+            .wrap(Wrap { trim: false })
+            .scroll((app.detail_scroll as u16, 0));
+        frame.render_widget(paragraph, chunks[0]);
+    } else {
+        let msg = Paragraph::new("No entry selected. Press Esc to return.")
+            .block(Block::default().borders(Borders::ALL));
+        frame.render_widget(msg, chunks[0]);
+    }
+
+    let bar = Paragraph::new(Line::from(Span::styled(
+        " [j/k]scroll [Esc]back [q]quit ",
         Style::default().fg(Color::White).bg(Color::DarkGray),
     )));
     frame.render_widget(bar, chunks[1]);

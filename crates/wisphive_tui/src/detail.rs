@@ -1,7 +1,7 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use similar::{ChangeTag, TextDiff};
-use wisphive_protocol::DecisionRequest;
+use wisphive_protocol::{DecisionRequest, HistoryEntry};
 
 /// Render the full detail content for a DecisionRequest as styled Lines.
 pub fn render_detail_lines(req: &DecisionRequest) -> Vec<Line<'static>> {
@@ -166,6 +166,84 @@ fn push_generic_detail(lines: &mut Vec<Line<'static>>, req: &DecisionRequest) {
     push_section_label(lines, "Tool Input");
     lines.push(Line::from(""));
     push_json_fallback(lines, &req.tool_input);
+}
+
+/// Render the full detail content for a HistoryEntry (including tool_result).
+pub fn render_history_detail_lines(entry: &HistoryEntry) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let label_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
+    let value_style = Style::default().fg(Color::White);
+
+    let decision_str = match entry.decision {
+        wisphive_protocol::Decision::Approve => "APPROVED",
+        wisphive_protocol::Decision::Deny => "DENIED",
+    };
+    let decision_color = match entry.decision {
+        wisphive_protocol::Decision::Approve => Color::Green,
+        wisphive_protocol::Decision::Deny => Color::Red,
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled("  Decision: ", label_style),
+        Span::styled(
+            decision_str.to_string(),
+            Style::default()
+                .fg(decision_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Agent:    ", label_style),
+        Span::styled(
+            format!("{} ({})", entry.agent_id, entry.agent_type),
+            value_style,
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Project:  ", label_style),
+        Span::styled(entry.project.to_string_lossy().to_string(), value_style),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Tool:     ", label_style),
+        Span::styled(entry.tool_name.clone(), value_style),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Requested:", label_style),
+        Span::styled(
+            format!(" {}", entry.requested_at.format("%Y-%m-%d %H:%M:%S")),
+            value_style,
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Resolved: ", label_style),
+        Span::styled(
+            format!(" {}", entry.resolved_at.format("%Y-%m-%d %H:%M:%S")),
+            value_style,
+        ),
+    ]));
+    lines.push(Line::from(""));
+
+    // Tool Input
+    push_section_label(&mut lines, "Tool Input");
+    lines.push(Line::from(""));
+    push_json_fallback(&mut lines, &entry.tool_input);
+    lines.push(Line::from(""));
+
+    // Tool Result
+    push_section_label(&mut lines, "Tool Result");
+    lines.push(Line::from(""));
+    if let Some(ref result) = entry.tool_result {
+        push_json_fallback(&mut lines, result);
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  (not captured)".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    lines
 }
 
 // --- Helpers ---

@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use wisphive_protocol::{
     ClientMessage, ClientType, Decision, DecisionRequest, PROTOCOL_VERSION, ServerMessage,
+    ToolResult,
 };
 
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(3);
@@ -58,6 +59,12 @@ fn run() -> Result<Decision, Box<dyn std::error::Error>> {
     std::io::stdin().read_to_string(&mut input)?;
 
     let hook_event: serde_json::Value = serde_json::from_str(&input)?;
+
+    // PostToolUse detection: presence of tool_result field means this is a post-execution report
+    if hook_event.get("tool_result").is_some() {
+        handle_post_tool_use(&hook_event, &wisphive_dir)?;
+        return Ok(Decision::Approve);
+    }
 
     let tool_name = hook_event
         .get("tool_name")
@@ -140,6 +147,66 @@ fn run() -> Result<Decision, Box<dyn std::error::Error>> {
         ServerMessage::DecisionResponse { decision, .. } => Ok(decision),
         _ => Ok(Decision::Approve),
     }
+}
+
+/// Handle a PostToolUse event: fire-and-forget the result to the daemon.
+fn handle_post_tool_use(
+    hook_event: &serde_json::Value,
+    wisphive_dir: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tool_name = hook_event
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let tool_input = hook_event
+        .get("tool_input")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    let tool_result = hook_event
+        .get("tool_result")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    let agent_id = hook_event
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(|s| format!("cc-{}", s))
+        .or_else(|| std::env::var("WISPHIVE_AGENT_ID").ok())
+        .unwrap_or_else(|| format!("cc-{}", std::process::id()));
+
+    let socket_path = wisphive_dir.join("wisphive.sock");
+    let stream = UnixStream::connect(&socket_path)?;
+    stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut writer = stream;
+
+    // Handshake
+    let hello = wisphive_protocol::encode(&ClientMessage::Hello {
+        client: ClientType::Hook,
+        version: PROTOCOL_VERSION,
+    })?;
+    writer.write_all(hello.as_bytes())?;
+
+    // Consume welcome
+    let mut welcome_line = String::new();
+    reader.read_line(&mut welcome_line)?;
+
+    // Send tool result (fire-and-forget)
+    let msg = wisphive_protocol::encode(&ClientMessage::ToolResult(ToolResult {
+        agent_id,
+        tool_name,
+        tool_input,
+        tool_result,
+        timestamp: chrono::Utc::now(),
+    }))?;
+    writer.write_all(msg.as_bytes())?;
+
+    Ok(())
 }
 
 /// Check if a tool is auto-approved.

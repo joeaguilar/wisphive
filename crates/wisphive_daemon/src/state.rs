@@ -51,6 +51,27 @@ impl StateDb {
         .execute(&self.pool)
         .await?;
 
+        // Add tool_result column (idempotent — ignore if already exists)
+        sqlx::query("ALTER TABLE decision_log ADD COLUMN tool_result TEXT")
+            .execute(&self.pool)
+            .await
+            .ok();
+
+        // Indexes for PostToolUse correlation and history queries
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_decision_log_agent_tool_resolved
+             ON decision_log(agent_id, tool_name, resolved_at DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_decision_log_resolved_at
+             ON decision_log(resolved_at DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Enable WAL mode for crash safety
         sqlx::query("PRAGMA journal_mode=WAL")
             .execute(&self.pool)
@@ -127,11 +148,11 @@ impl StateDb {
         agent_id: Option<&str>,
         limit: u32,
     ) -> Result<Vec<wisphive_protocol::HistoryEntry>> {
-        let rows: Vec<(String, String, String, String, String, String, String, String, String)> =
+        let rows: Vec<(String, String, String, String, String, String, String, String, String, Option<String>)> =
             match agent_id {
                 Some(aid) => {
                     sqlx::query_as(
-                        "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at
+                        "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result
                          FROM decision_log WHERE agent_id = ? ORDER BY resolved_at DESC LIMIT ?",
                     )
                     .bind(aid)
@@ -141,7 +162,7 @@ impl StateDb {
                 }
                 None => {
                     sqlx::query_as(
-                        "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at
+                        "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result
                          FROM decision_log ORDER BY resolved_at DESC LIMIT ?",
                     )
                     .bind(limit)
@@ -150,28 +171,121 @@ impl StateDb {
                 }
             };
 
-        let entries = rows
-            .into_iter()
-            .filter_map(|(id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at)| {
-                Some(wisphive_protocol::HistoryEntry {
-                    id: id.parse().ok()?,
-                    agent_id,
-                    agent_type: serde_json::from_str(&agent_type).ok()?,
-                    project: std::path::PathBuf::from(project),
-                    tool_name,
-                    tool_input: serde_json::from_str(&tool_input).unwrap_or(serde_json::Value::Null),
-                    decision: serde_json::from_str(&decision).ok()?,
-                    requested_at: chrono::DateTime::parse_from_rfc3339(&requested_at).ok()?.with_timezone(&chrono::Utc),
-                    resolved_at: chrono::DateTime::parse_from_rfc3339(&resolved_at).ok()?.with_timezone(&chrono::Utc),
-                })
-            })
-            .collect();
+        Ok(rows_to_entries(rows))
+    }
 
-        Ok(entries)
+    /// Attach a tool result to the most recent matching decision_log entry.
+    ///
+    /// Correlates by agent_id + tool_name where tool_result IS NULL,
+    /// ordered by resolved_at DESC, limited to entries within the last 10 minutes.
+    pub async fn attach_tool_result(
+        &self,
+        agent_id: &str,
+        tool_name: &str,
+        tool_result: &serde_json::Value,
+    ) -> Result<Option<uuid::Uuid>> {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+        let result_json = serde_json::to_string(tool_result)?;
+
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT id FROM decision_log
+             WHERE agent_id = ? AND tool_name = ? AND tool_result IS NULL
+             AND resolved_at > ?
+             ORDER BY resolved_at DESC LIMIT 1",
+        )
+        .bind(agent_id)
+        .bind(tool_name)
+        .bind(&cutoff)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some((id_str,)) = row {
+            sqlx::query("UPDATE decision_log SET tool_result = ? WHERE id = ?")
+                .bind(&result_json)
+                .bind(&id_str)
+                .execute(&self.pool)
+                .await?;
+            Ok(id_str.parse().ok())
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Search decision history with free-text query across tool_input, tool_result, and tool_name.
+    pub async fn search_history(
+        &self,
+        search: &wisphive_protocol::HistorySearch,
+    ) -> Result<Vec<wisphive_protocol::HistoryEntry>> {
+        let limit = search.limit.unwrap_or(200);
+
+        // Build WHERE clause dynamically
+        let mut conditions = Vec::new();
+        let mut binds: Vec<String> = Vec::new();
+
+        if let Some(ref q) = search.query {
+            conditions.push(
+                "(tool_input LIKE '%' || ? || '%' OR tool_result LIKE '%' || ? || '%' OR tool_name LIKE '%' || ? || '%')"
+                    .to_string(),
+            );
+            binds.push(q.clone());
+            binds.push(q.clone());
+            binds.push(q.clone());
+        }
+        if let Some(ref tool) = search.tool_name {
+            conditions.push("tool_name = ?".to_string());
+            binds.push(tool.clone());
+        }
+        if let Some(ref aid) = search.agent_id {
+            conditions.push("agent_id = ?".to_string());
+            binds.push(aid.clone());
+        }
+
+        let where_clause = if conditions.is_empty() {
+            "1=1".to_string()
+        } else {
+            conditions.join(" AND ")
+        };
+
+        let sql = format!(
+            "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result
+             FROM decision_log WHERE {} ORDER BY resolved_at DESC LIMIT ?",
+            where_clause
+        );
+
+        let mut query = sqlx::query_as::<_, (String, String, String, String, String, String, String, String, String, Option<String>)>(&sql);
+        for bind in &binds {
+            query = query.bind(bind);
+        }
+        query = query.bind(limit);
+
+        let rows = query.fetch_all(&self.pool).await?;
+        Ok(rows_to_entries(rows))
     }
 
     /// Get the underlying pool for direct queries.
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
+}
+
+/// Convert raw SQL rows to HistoryEntry structs.
+fn rows_to_entries(
+    rows: Vec<(String, String, String, String, String, String, String, String, String, Option<String>)>,
+) -> Vec<wisphive_protocol::HistoryEntry> {
+    rows.into_iter()
+        .filter_map(|(id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result)| {
+            Some(wisphive_protocol::HistoryEntry {
+                id: id.parse().ok()?,
+                agent_id,
+                agent_type: serde_json::from_str(&agent_type).ok()?,
+                project: std::path::PathBuf::from(project),
+                tool_name,
+                tool_input: serde_json::from_str(&tool_input).unwrap_or(serde_json::Value::Null),
+                decision: serde_json::from_str(&decision).ok()?,
+                requested_at: chrono::DateTime::parse_from_rfc3339(&requested_at).ok()?.with_timezone(&chrono::Utc),
+                resolved_at: chrono::DateTime::parse_from_rfc3339(&resolved_at).ok()?.with_timezone(&chrono::Utc),
+                tool_result: tool_result.and_then(|s| serde_json::from_str(&s).ok()),
+            })
+        })
+        .collect()
 }
