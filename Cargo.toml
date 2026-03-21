@@ -38,6 +38,9 @@ tokio = { version = "1", features = ["full"] }
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 
+# File watching
+notify = "7"
+
 # TUI
 ratatui = "0.29"
 crossterm = "0.28"

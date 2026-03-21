@@ -220,11 +220,19 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
         .cloned()
         .unwrap_or(serde_json::Value::Null);
 
+    let tool_use_id = hook_event
+        .get("tool_use_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     // Layer 3: Register agent with daemon (once per session, fire-and-forget)
     register_agent_once(&agent_id, &project, &wisphive_dir);
 
     // Layer 4: Auto-approve check — PermissionRequests always go to daemon
     if !is_permission_request && is_auto_approved(&tool_name, &tool_input, &wisphive_dir) {
+        log_auto_approved(
+            &wisphive_dir, &tool_use_id, &agent_id, &project, &tool_name, &tool_input,
+        );
         return Ok(HookResponse::simple(Decision::Approve));
     }
 
@@ -245,6 +253,7 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
         tool_name,
         tool_input,
         timestamp: chrono::Utc::now(),
+        tool_use_id: tool_use_id.clone(),
         permission_suggestions,
     };
 
@@ -328,6 +337,11 @@ fn handle_post_tool_use(
         .or_else(|| std::env::var("WISPHIVE_AGENT_ID").ok())
         .unwrap_or_else(|| format!("cc-{}", std::process::id()));
 
+    let tool_use_id = hook_event
+        .get("tool_use_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     let socket_path = wisphive_dir.join("wisphive.sock");
     let stream = UnixStream::connect(&socket_path)?;
     stream.set_write_timeout(Some(Duration::from_secs(1)))?;
@@ -354,6 +368,7 @@ fn handle_post_tool_use(
         tool_input,
         tool_result,
         timestamp: chrono::Utc::now(),
+        tool_use_id,
     }))?;
     writer.write_all(msg.as_bytes())?;
 
@@ -514,6 +529,36 @@ fn legacy_auto_approved(tool_name: &str, wisphive_dir: &std::path::Path) -> bool
         }
     }
     DEFAULT_AUTO_APPROVE.iter().any(|&safe| safe == tool_name)
+}
+
+/// Log an auto-approved tool call to events.jsonl for daemon ingestion.
+/// Uses O_APPEND for atomic writes (~0.1-1μs). All errors are swallowed (fail-open).
+fn log_auto_approved(
+    wisphive_dir: &std::path::Path,
+    tool_use_id: &Option<String>,
+    agent_id: &str,
+    project: &std::path::Path,
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+) {
+    let path = wisphive_dir.join("events.jsonl");
+    let entry = serde_json::json!({
+        "event": "auto_approved",
+        "tool_use_id": tool_use_id,
+        "agent_id": agent_id,
+        "agent_type": "claude_code",
+        "project": project,
+        "tool_name": tool_name,
+        "tool_input": tool_input,
+        "timestamp": chrono::Utc::now().to_rfc3339()
+    });
+    let mut line = serde_json::to_string(&entry).unwrap_or_default();
+    line.push('\n');
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
 }
 
 /// Extract the text to match patterns against for a given tool.

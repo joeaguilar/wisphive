@@ -240,6 +240,7 @@ mod tests {
             tool_name: "Bash".into(),
             tool_input: serde_json::json!({"command": "cargo build"}),
             timestamp: chrono::Utc::now(),
+            tool_use_id: None,
             permission_suggestions: None,
         };
         let msg = ClientMessage::DecisionRequest(req);
@@ -263,6 +264,7 @@ mod tests {
             tool_name: "Bash".into(),
             tool_input: serde_json::Value::Null,
             timestamp: chrono::Utc::now(),
+            tool_use_id: None,
             permission_suggestions: None,
         };
 

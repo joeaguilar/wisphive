@@ -119,6 +119,7 @@ mod tests {
             tool_name: tool_name.into(),
             tool_input: serde_json::json!({}),
             timestamp: chrono::Utc::now(),
+            tool_use_id: None,
             permission_suggestions: None,
         }
     }
