@@ -17,6 +17,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         ViewMode::HistoryDetail => draw_history_detail_view(frame, app),
         ViewMode::Config => draw_config_view(frame, app),
         ViewMode::Sessions => draw_sessions_view(frame, app),
+        ViewMode::ProjectsExplorer => draw_projects_explorer(frame, app),
         ViewMode::SessionTimeline => draw_session_timeline_view(frame, app),
         ViewMode::Dashboard => draw_dashboard(frame, app),
     }
@@ -414,6 +415,109 @@ fn draw_config_view(frame: &mut Frame, app: &App) {
     frame.render_widget(bar, chunks[1]);
 }
 
+fn draw_projects_explorer(frame: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(frame.area());
+
+    let live_count = app.project_summaries.iter().filter(|p| p.has_live_agents).count();
+    let title = format!(
+        " Projects ({} total, {} active) ",
+        app.project_summaries.len(),
+        live_count
+    );
+
+    let items: Vec<ListItem> = app
+        .project_summaries
+        .iter()
+        .enumerate()
+        .map(|(i, project)| {
+            let status = if project.has_live_agents {
+                Span::styled("● ", Style::default().fg(Color::Green))
+            } else {
+                Span::styled("○ ", Style::default().fg(Color::DarkGray))
+            };
+
+            let project_name = project
+                .project
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| project.project.to_string_lossy().to_string());
+
+            let dur = project
+                .last_seen
+                .signed_duration_since(project.first_seen)
+                .num_seconds();
+            let dur_str = if dur < 60 {
+                format!("{dur}s")
+            } else if dur < 3600 {
+                format!("{}m", dur / 60)
+            } else {
+                format!("{}h", dur / 3600)
+            };
+
+            let pending = if project.pending_count > 0 {
+                Span::styled(
+                    format!(" [{}!]", project.pending_count),
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled("", Style::default())
+            };
+
+            let line = Line::from(vec![
+                status,
+                Span::styled(
+                    format!("{:<20} ", project_name),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(
+                    format!("{}agents ", project.agent_count),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(format!("{:>6} ", dur_str), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}calls ", project.total_calls),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(
+                    format!("{}ok ", project.approved),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::styled(
+                    format!("{}deny", project.denied),
+                    Style::default().fg(Color::Red),
+                ),
+                pending,
+            ]);
+
+            let style = if i == app.project_summaries_index {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            ListItem::new(line).style(style)
+        })
+        .collect();
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(title),
+    );
+    frame.render_widget(list, chunks[0]);
+
+    let bar = Paragraph::new(Line::from(Span::styled(
+        " [j/k]navigate [Enter]activity [n]spawn agent [r]efresh [q/Esc]back [Q]uit ",
+        Style::default().fg(Color::White).bg(Color::DarkGray),
+    )));
+    frame.render_widget(bar, chunks[1]);
+}
+
 fn draw_sessions_view(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -730,7 +834,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             "disconnected"
         };
         format!(
-            " [y]approve [Enter/a/d]review [A]ll [D]eny-all [h]istory [s]essions [c]onfig [/]filter [Tab]cycle [q]back [Q]uit | {} ",
+            " [y]approve [Enter/a/d]review [A]ll [D]eny-all [h]istory [s]essions [p]rojects [c]onfig [/]filter [Tab]cycle [q]back [Q]uit | {} ",
             conn
         )
     };

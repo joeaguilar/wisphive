@@ -62,6 +62,8 @@ pub enum ViewMode {
     Sessions,
     /// Timeline for a single session.
     SessionTimeline,
+    /// Project explorer.
+    ProjectsExplorer,
 }
 
 /// Which panel currently has focus.
@@ -164,6 +166,10 @@ pub struct App {
     pub session_timeline_page: usize,
     /// Whether there are more timeline pages.
     pub session_timeline_has_more: bool,
+    /// Project summaries for the project explorer.
+    pub project_summaries: Vec<wisphive_protocol::ProjectSummary>,
+    /// Currently selected index in the project explorer.
+    pub project_summaries_index: usize,
 }
 
 /// Aggregated project status for the dashboard.
@@ -216,6 +222,8 @@ impl App {
             session_timeline_index: 0,
             session_timeline_page: 0,
             session_timeline_has_more: false,
+            project_summaries: Vec::new(),
+            project_summaries_index: 0,
         }
     }
 
@@ -593,6 +601,36 @@ impl App {
             self.detail_scroll = 0;
             self.push_view(ViewMode::HistoryDetail);
         }
+    }
+
+    // ── Project explorer helpers ──
+
+    pub fn enter_projects_view(&mut self) {
+        self.project_summaries_index = 0;
+        self.push_view(ViewMode::ProjectsExplorer);
+    }
+
+    pub fn exit_projects_view(&mut self) {
+        self.project_summaries.clear();
+        self.project_summaries_index = 0;
+        self.navigate_back();
+    }
+
+    pub fn projects_up(&mut self) {
+        if self.project_summaries_index > 0 {
+            self.project_summaries_index -= 1;
+        }
+    }
+
+    pub fn projects_down(&mut self) {
+        let len = self.project_summaries.len();
+        if len > 0 && self.project_summaries_index < len - 1 {
+            self.project_summaries_index += 1;
+        }
+    }
+
+    pub fn selected_project_summary(&self) -> Option<&wisphive_protocol::ProjectSummary> {
+        self.project_summaries.get(self.project_summaries_index)
     }
 
     /// Remove a decision from the queue by ID.

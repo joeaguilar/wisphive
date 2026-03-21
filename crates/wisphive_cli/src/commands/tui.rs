@@ -166,6 +166,10 @@ async fn run_loop(
                             tracing::info!("querying sessions");
                             conn.send(&ClientMessage::QuerySessions).await?;
                         }
+                        InputAction::QueryProjects => {
+                            tracing::info!("querying projects");
+                            conn.send(&ClientMessage::QueryProjects).await?;
+                        }
                         InputAction::QuerySessionTimeline { agent_id } => {
                             tracing::info!(%agent_id, "querying session timeline");
                             app.session_timeline_page = 0;
@@ -303,6 +307,11 @@ async fn run_loop(
                         tracing::info!(count = sessions.len(), "received sessions");
                         app.sessions = sessions;
                         app.sessions_index = 0;
+                    }
+                    Some(ServerMessage::ProjectsResponse { projects }) => {
+                        tracing::info!(count = projects.len(), "received projects");
+                        app.project_summaries = projects;
+                        app.project_summaries_index = 0;
                     }
                     Some(_) => {}
                     None => {

@@ -170,6 +170,20 @@ pub struct SessionSummary {
     pub pending_count: u32,
 }
 
+/// Aggregated stats for a project across all agent sessions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectSummary {
+    pub project: PathBuf,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    pub total_calls: u32,
+    pub approved: u32,
+    pub denied: u32,
+    pub agent_count: u32,
+    pub pending_count: u32,
+    pub has_live_agents: bool,
+}
+
 /// Request to spawn a new AI agent process.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnAgentRequest {

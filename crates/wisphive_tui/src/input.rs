@@ -41,6 +41,8 @@ pub enum InputAction {
     QuerySessionTimeline { agent_id: String },
     /// Request a specific page of session timeline.
     QuerySessionTimelinePage { agent_id: String, page: usize },
+    /// Request project summaries from the daemon.
+    QueryProjects,
     /// Approve a PermissionRequest with a specific suggestion selected.
     ApprovePermission { id: uuid::Uuid, suggestion_index: usize },
     /// Quit the application.
@@ -66,6 +68,7 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
         ViewMode::Config => return handle_config_input(app, key),
         ViewMode::Sessions => return handle_sessions_input(app, key),
         ViewMode::SessionTimeline => return handle_session_timeline_input(app, key),
+        ViewMode::ProjectsExplorer => return handle_projects_view_input(app, key),
         ViewMode::Dashboard => {}
     }
 
@@ -100,6 +103,11 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
         KeyCode::Char('s') => {
             app.enter_sessions_view();
             return InputAction::QuerySessions;
+        }
+        // Open projects view
+        KeyCode::Char('p') => {
+            app.enter_projects_view();
+            return InputAction::QueryProjects;
         }
         // Open config view
         KeyCode::Char('c') => {
@@ -804,6 +812,52 @@ fn handle_config_rule_input(app: &mut App, key: KeyEvent) -> InputAction {
             app.config_rule_buffer.push(c);
             InputAction::None
         }
+        _ => InputAction::None,
+    }
+}
+
+fn handle_projects_view_input(app: &mut App, key: KeyEvent) -> InputAction {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.exit_projects_view();
+            InputAction::None
+        }
+        KeyCode::Char('Q') => InputAction::Quit,
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.projects_down();
+            InputAction::None
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.projects_up();
+            InputAction::None
+        }
+        // Drill into project activity (search history by project path)
+        KeyCode::Enter => {
+            if let Some(project) = app.selected_project_summary() {
+                let project_path = project.project.to_string_lossy().to_string();
+                app.enter_history_view(None);
+                return InputAction::SearchHistory {
+                    search: wisphive_protocol::HistorySearch {
+                        query: Some(project_path),
+                        ..Default::default()
+                    },
+                };
+            }
+            InputAction::None
+        }
+        // Spawn agent in selected project
+        KeyCode::Char('n') => {
+            if let Some(project) = app.selected_project_summary() {
+                let mut modal = Modal::spawn_agent();
+                if let Some(ref mut spawn) = modal.spawn {
+                    spawn.project_buf = project.project.to_string_lossy().to_string();
+                }
+                app.modal = Some(modal);
+            }
+            InputAction::None
+        }
+        // Refresh
+        KeyCode::Char('r') => InputAction::QueryProjects,
         _ => InputAction::None,
     }
 }
