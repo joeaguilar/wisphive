@@ -117,6 +117,7 @@ fn print_entries(entries: &[wisphive_protocol::HistoryEntry]) {
         let decision = match entry.decision {
             wisphive_protocol::Decision::Approve => "APPROVED",
             wisphive_protocol::Decision::Deny => "DENIED",
+            wisphive_protocol::Decision::Ask => "DEFERRED",
         };
 
         let time_str = entry.resolved_at.format("%m-%d %H:%M:%S").to_string();

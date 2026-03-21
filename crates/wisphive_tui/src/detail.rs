@@ -179,10 +179,12 @@ pub fn render_history_detail_lines(entry: &HistoryEntry) -> Vec<Line<'static>> {
     let decision_str = match entry.decision {
         wisphive_protocol::Decision::Approve => "APPROVED",
         wisphive_protocol::Decision::Deny => "DENIED",
+        wisphive_protocol::Decision::Ask => "DEFERRED",
     };
     let decision_color = match entry.decision {
         wisphive_protocol::Decision::Approve => Color::Green,
         wisphive_protocol::Decision::Deny => Color::Red,
+        wisphive_protocol::Decision::Ask => Color::Yellow,
     };
 
     lines.push(Line::from(vec![

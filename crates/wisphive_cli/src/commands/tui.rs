@@ -102,12 +102,18 @@ async fn run_loop(
                         InputAction::Quit => break,
                         InputAction::Approve(id) => {
                             tracing::info!(%id, "approved");
-                            conn.send(&ClientMessage::Approve { id }).await?;
+                            conn.send(&ClientMessage::Approve {
+                                id,
+                                message: None,
+                                updated_input: None,
+                                always_allow: false,
+                                additional_context: None,
+                            }).await?;
                             app.remove_decision(id);
                         }
                         InputAction::Deny(id) => {
                             tracing::info!(%id, "denied");
-                            conn.send(&ClientMessage::Deny { id }).await?;
+                            conn.send(&ClientMessage::Deny { id, message: None }).await?;
                             app.remove_decision(id);
                         }
                         InputAction::ApproveAll => {
@@ -144,6 +150,49 @@ async fn run_loop(
                         InputAction::SearchHistory { search } => {
                             tracing::info!(?search.query, "searching history");
                             conn.send(&ClientMessage::SearchHistory(search)).await?;
+                        }
+                        InputAction::DenyWithMessage { id, message } => {
+                            tracing::info!(%id, %message, "denied with message");
+                            conn.send(&ClientMessage::Deny { id, message: Some(message) }).await?;
+                            app.remove_decision(id);
+                        }
+                        InputAction::AlwaysAllow(id) => {
+                            tracing::info!(%id, "always allow");
+                            conn.send(&ClientMessage::Approve {
+                                id,
+                                message: None,
+                                updated_input: None,
+                                always_allow: true,
+                                additional_context: None,
+                            }).await?;
+                            app.remove_decision(id);
+                        }
+                        InputAction::ApproveWithInput { id, updated_input } => {
+                            tracing::info!(%id, "approve with modified input");
+                            conn.send(&ClientMessage::Approve {
+                                id,
+                                message: None,
+                                updated_input: Some(updated_input),
+                                always_allow: false,
+                                additional_context: None,
+                            }).await?;
+                            app.remove_decision(id);
+                        }
+                        InputAction::ApproveWithContext { id, context } => {
+                            tracing::info!(%id, "approve with context");
+                            conn.send(&ClientMessage::Approve {
+                                id,
+                                message: None,
+                                updated_input: None,
+                                always_allow: false,
+                                additional_context: Some(context),
+                            }).await?;
+                            app.remove_decision(id);
+                        }
+                        InputAction::AskDefer(id) => {
+                            tracing::info!(%id, "defer to native prompt");
+                            conn.send(&ClientMessage::Ask { id }).await?;
+                            app.remove_decision(id);
                         }
                         InputAction::None => {}
                     }

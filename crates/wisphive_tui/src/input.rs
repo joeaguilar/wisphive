@@ -23,6 +23,16 @@ pub enum InputAction {
     QueryHistory { agent_id: Option<String> },
     /// Search history with a query string.
     SearchHistory { search: wisphive_protocol::HistorySearch },
+    /// Deny with a feedback message for the agent.
+    DenyWithMessage { id: uuid::Uuid, message: String },
+    /// Approve and add tool to always-allow list.
+    AlwaysAllow(uuid::Uuid),
+    /// Approve with modified tool input.
+    ApproveWithInput { id: uuid::Uuid, updated_input: serde_json::Value },
+    /// Approve with additional context injected into the agent.
+    ApproveWithContext { id: uuid::Uuid, context: String },
+    /// Defer to agent's native permission prompt.
+    AskDefer(uuid::Uuid),
     /// Quit the application.
     Quit,
 }
@@ -169,7 +179,7 @@ fn handle_detail_input(app: &mut App, key: KeyEvent) -> InputAction {
             app.exit_detail_view();
             InputAction::None
         }
-        // Deny
+        // Deny (simple)
         KeyCode::Char('n') | KeyCode::Char('N') => {
             if let Some(req) = app.detail_request() {
                 let id = req.id;
@@ -177,6 +187,41 @@ fn handle_detail_input(app: &mut App, key: KeyEvent) -> InputAction {
                 return InputAction::Deny(id);
             }
             app.exit_detail_view();
+            InputAction::None
+        }
+        // Deny with message
+        KeyCode::Char('m') | KeyCode::Char('M') => {
+            if let Some(req) = app.detail_request() {
+                app.modal = Some(Modal::deny_with_message(req.id));
+            }
+            InputAction::None
+        }
+        // Always allow this tool
+        KeyCode::Char('!') => {
+            if let Some(req) = app.detail_request() {
+                app.modal = Some(Modal::confirm_always_allow(req.id, &req.tool_name));
+            }
+            InputAction::None
+        }
+        // Edit input before approving
+        KeyCode::Char('e') | KeyCode::Char('E') => {
+            if let Some(req) = app.detail_request() {
+                app.modal = Some(Modal::edit_input(req.id, &req.tool_input));
+            }
+            InputAction::None
+        }
+        // Approve with additional context
+        KeyCode::Char('c') | KeyCode::Char('C') => {
+            if let Some(req) = app.detail_request() {
+                app.modal = Some(Modal::approve_with_context(req.id));
+            }
+            InputAction::None
+        }
+        // Ask/defer to native prompt
+        KeyCode::Char('?') => {
+            if let Some(req) = app.detail_request() {
+                app.modal = Some(Modal::confirm_ask_defer(req.id));
+            }
             InputAction::None
         }
         // Back to dashboard
@@ -216,7 +261,6 @@ fn handle_detail_input(app: &mut App, key: KeyEvent) -> InputAction {
         }
         // Quit
         KeyCode::Char('q') | KeyCode::Char('Q') => InputAction::Quit,
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => InputAction::Quit,
         _ => InputAction::None,
     }
 }
@@ -258,18 +302,132 @@ fn handle_modal_input(app: &mut App, key: KeyEvent) -> InputAction {
         return handle_spawn_modal_input(app, modal, key);
     }
 
+    // Text input modals (deny-with-message, approve-with-context)
+    if modal.text_input.is_some() {
+        return handle_text_input_modal(app, modal, key);
+    }
+
+    // Edit input modal
+    if modal.edit_input.is_some() {
+        return handle_edit_input_modal(app, modal, key);
+    }
+
+    // Simple Y/N confirmation modals
     match key.code {
-        KeyCode::Char('y') | KeyCode::Char('Y') => match modal.action {
-            ModalAction::ApproveAll => InputAction::ApproveAll,
-            ModalAction::DenyAll => InputAction::DenyAll,
-            ModalAction::SpawnAgent => InputAction::None, // unreachable
-        },
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-            // Modal dismissed, no action
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            let target_id = modal.target_id;
+            match modal.action {
+                ModalAction::ApproveAll => InputAction::ApproveAll,
+                ModalAction::DenyAll => InputAction::DenyAll,
+                ModalAction::AlwaysAllow => {
+                    if let Some(id) = target_id {
+                        app.exit_detail_view();
+                        InputAction::AlwaysAllow(id)
+                    } else {
+                        InputAction::None
+                    }
+                }
+                ModalAction::AskDefer => {
+                    if let Some(id) = target_id {
+                        app.exit_detail_view();
+                        InputAction::AskDefer(id)
+                    } else {
+                        InputAction::None
+                    }
+                }
+                _ => InputAction::None, // unreachable for non-confirm modals
+            }
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => InputAction::None,
+        _ => {
+            app.modal = Some(modal);
+            InputAction::None
+        }
+    }
+}
+
+fn handle_text_input_modal(app: &mut App, mut modal: Modal, key: KeyEvent) -> InputAction {
+    let text = modal.text_input.as_mut().unwrap();
+
+    match key.code {
+        KeyCode::Esc => InputAction::None,
+        KeyCode::Enter => {
+            let buf = text.buffer.clone();
+            let target_id = modal.target_id;
+            if buf.is_empty() {
+                app.modal = Some(modal);
+                return InputAction::None;
+            }
+            match modal.action {
+                ModalAction::DenyWithMessage => {
+                    if let Some(id) = target_id {
+                        app.exit_detail_view();
+                        InputAction::DenyWithMessage { id, message: buf }
+                    } else {
+                        InputAction::None
+                    }
+                }
+                ModalAction::ApproveWithContext => {
+                    if let Some(id) = target_id {
+                        app.exit_detail_view();
+                        InputAction::ApproveWithContext { id, context: buf }
+                    } else {
+                        InputAction::None
+                    }
+                }
+                _ => InputAction::None,
+            }
+        }
+        KeyCode::Backspace => {
+            text.buffer.pop();
+            app.modal = Some(modal);
+            InputAction::None
+        }
+        KeyCode::Char(c) => {
+            text.buffer.push(c);
+            app.modal = Some(modal);
             InputAction::None
         }
         _ => {
-            // Unknown key while modal is open — keep the modal
+            app.modal = Some(modal);
+            InputAction::None
+        }
+    }
+}
+
+fn handle_edit_input_modal(app: &mut App, mut modal: Modal, key: KeyEvent) -> InputAction {
+    let edit = modal.edit_input.as_mut().unwrap();
+
+    match key.code {
+        KeyCode::Esc => InputAction::None,
+        KeyCode::Enter => {
+            let buf = edit.buffer.clone();
+            let target_id = modal.target_id;
+            if let Some(id) = target_id {
+                // Try to parse as JSON; if it looks like a bare command, wrap it
+                let updated = if let Ok(val) = serde_json::from_str::<serde_json::Value>(&buf) {
+                    val
+                } else {
+                    // Treat as a Bash command string
+                    serde_json::json!({ "command": buf })
+                };
+                app.exit_detail_view();
+                InputAction::ApproveWithInput { id, updated_input: updated }
+            } else {
+                InputAction::None
+            }
+        }
+        KeyCode::Backspace => {
+            edit.buffer.pop();
+            app.modal = Some(modal);
+            InputAction::None
+        }
+        KeyCode::Char(c) => {
+            edit.buffer.push(c);
+            app.modal = Some(modal);
+            InputAction::None
+        }
+        _ => {
             app.modal = Some(modal);
             InputAction::None
         }
