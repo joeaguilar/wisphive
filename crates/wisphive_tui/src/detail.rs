@@ -10,18 +10,30 @@ pub fn render_detail_lines(req: &DecisionRequest) -> Vec<Line<'static>> {
     push_header(&mut lines, req);
     lines.push(Line::from(""));
 
-    // PermissionRequest: show suggestions before tool-specific detail
-    if let Some(ref suggestions) = req.permission_suggestions {
-        push_permission_detail(&mut lines, req, suggestions);
-    } else {
-        match req.tool_name.to_lowercase().as_str() {
-            "bash" => push_bash_detail(&mut lines, req),
-            "edit" | "multiedit" => push_edit_detail(&mut lines, req),
-            "write" => push_write_detail(&mut lines, req),
-            "read" => push_read_detail(&mut lines, req),
-            "grep" => push_grep_detail(&mut lines, req),
-            "glob" => push_glob_detail(&mut lines, req),
-            _ => push_generic_detail(&mut lines, req),
+    use wisphive_protocol::HookEventType;
+    match req.hook_event_name {
+        HookEventType::PermissionRequest => {
+            if let Some(ref suggestions) = req.permission_suggestions {
+                push_permission_detail(&mut lines, req, suggestions);
+            }
+        }
+        HookEventType::Elicitation => push_elicitation_detail(&mut lines, req),
+        HookEventType::Stop | HookEventType::SubagentStop => push_event_data_detail(&mut lines, req, "Stop Reason"),
+        HookEventType::UserPromptSubmit => push_event_data_detail(&mut lines, req, "Submitted Prompt"),
+        HookEventType::ConfigChange => push_event_data_detail(&mut lines, req, "Config Change"),
+        HookEventType::TeammateIdle => push_event_data_detail(&mut lines, req, "Teammate Status"),
+        HookEventType::TaskCompleted => push_event_data_detail(&mut lines, req, "Task Completed"),
+        _ => {
+            // PreToolUse and unknown: tool-specific rendering
+            match req.tool_name.to_lowercase().as_str() {
+                "bash" => push_bash_detail(&mut lines, req),
+                "edit" | "multiedit" => push_edit_detail(&mut lines, req),
+                "write" => push_write_detail(&mut lines, req),
+                "read" => push_read_detail(&mut lines, req),
+                "grep" => push_grep_detail(&mut lines, req),
+                "glob" => push_glob_detail(&mut lines, req),
+                _ => push_generic_detail(&mut lines, req),
+            }
         }
     }
 
@@ -171,6 +183,60 @@ fn push_generic_detail(lines: &mut Vec<Line<'static>>, req: &DecisionRequest) {
     push_section_label(lines, "Tool Input");
     lines.push(Line::from(""));
     push_json_fallback(lines, &req.tool_input);
+}
+
+fn push_elicitation_detail(lines: &mut Vec<Line<'static>>, req: &DecisionRequest) {
+    if let Some(ref data) = req.event_data {
+        if let Some(server) = data.get("mcp_server_name").and_then(|v| v.as_str()) {
+            push_field_line(lines, "MCP Server", server);
+        }
+        if let Some(mode) = data.get("mode").and_then(|v| v.as_str()) {
+            push_field_line(lines, "Mode", mode);
+        }
+        if let Some(msg) = data.get("message").and_then(|v| v.as_str()) {
+            push_field_line(lines, "Message", msg);
+        }
+        if let Some(url) = data.get("url").and_then(|v| v.as_str()) {
+            push_field_line(lines, "URL", url);
+        }
+        if let Some(schema) = data.get("requested_schema") {
+            push_section_label(lines, "Requested Schema");
+            lines.push(Line::from(""));
+            push_json_fallback(lines, schema);
+        }
+    }
+    if !req.tool_input.is_null() {
+        lines.push(Line::from(""));
+        push_section_label(lines, "Tool Input");
+        lines.push(Line::from(""));
+        push_json_fallback(lines, &req.tool_input);
+    }
+}
+
+fn push_event_data_detail(lines: &mut Vec<Line<'static>>, req: &DecisionRequest, label: &str) {
+    push_section_label(lines, label);
+    lines.push(Line::from(""));
+    if let Some(ref data) = req.event_data {
+        push_json_fallback(lines, data);
+    }
+    if !req.tool_input.is_null() {
+        lines.push(Line::from(""));
+        push_section_label(lines, "Tool Input");
+        lines.push(Line::from(""));
+        push_json_fallback(lines, &req.tool_input);
+    }
+}
+
+fn push_field_line(lines: &mut Vec<Line<'static>>, label: &str, value: &str) {
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("  {label}: "),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(value.to_string(), Style::default().fg(Color::White)),
+    ]));
 }
 
 /// Render the full detail content for a HistoryEntry (including tool_result).

@@ -1,5 +1,27 @@
 {
   "hooks": {
+    "ConfigChange": [
+      {
+        "hooks": [
+          {
+            "command": "/Users/josefaguilar/.cargo/bin/wisphive-hook",
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "Elicitation": [
+      {
+        "hooks": [
+          {
+            "command": "/Users/josefaguilar/.cargo/bin/wisphive-hook",
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
     "PermissionRequest": [
       {
         "hooks": [
@@ -23,6 +45,61 @@
       }
     ],
     "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "/Users/josefaguilar/.cargo/bin/wisphive-hook",
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": "/Users/josefaguilar/.cargo/bin/wisphive-hook",
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "command": "/Users/josefaguilar/.cargo/bin/wisphive-hook",
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "TaskCompleted": [
+      {
+        "hooks": [
+          {
+            "command": "/Users/josefaguilar/.cargo/bin/wisphive-hook",
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "TeammateIdle": [
+      {
+        "hooks": [
+          {
+            "command": "/Users/josefaguilar/.cargo/bin/wisphive-hook",
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "UserPromptSubmit": [
       {
         "hooks": [
           {

@@ -84,18 +84,30 @@ fn draw_detail_view(frame: &mut Frame, app: &App) {
             String::new()
         };
 
-        let is_permission = req.permission_suggestions.is_some();
-        let bar_text = if is_permission {
-            let n = req.permission_suggestions.as_ref().map_or(0, |s| s.len());
-            format!(
-                " [1-{}]select [N]deny [M]deny+msg [?]defer [q/Esc]back [Q]uit{}",
-                n, scroll_info
-            )
-        } else {
-            format!(
-                " [Y]approve [N]deny [M]deny+msg [!]always [E]edit [C]context [?]defer [q/Esc]back [Q]uit{}",
-                scroll_info
-            )
+        use wisphive_protocol::HookEventType;
+        let bar_text = match req.hook_event_name {
+            HookEventType::PermissionRequest => {
+                let n = req.permission_suggestions.as_ref().map_or(0, |s| s.len());
+                format!(" [1-{}]select [N]deny [M]deny+msg [?]defer [q/Esc]back [Q]uit{}", n, scroll_info)
+            }
+            HookEventType::Stop | HookEventType::SubagentStop => {
+                format!(" [C]ontinue working [S]top [q/Esc]back [Q]uit{}", scroll_info)
+            }
+            HookEventType::UserPromptSubmit | HookEventType::ConfigChange => {
+                format!(" [A]llow [B]lock [M]block+msg [q/Esc]back [Q]uit{}", scroll_info)
+            }
+            HookEventType::Elicitation => {
+                format!(" [A]ccept [D]ecline [C]ancel [q/Esc]back [Q]uit{}", scroll_info)
+            }
+            HookEventType::TeammateIdle => {
+                format!(" [C]ontinue+feedback [S]top [q/Esc]back [Q]uit{}", scroll_info)
+            }
+            HookEventType::TaskCompleted => {
+                format!(" [A]ccept [R]eject+feedback [q/Esc]back [Q]uit{}", scroll_info)
+            }
+            _ => {
+                format!(" [Y]approve [N]deny [M]deny+msg [!]always [E]edit [C]context [?]defer [q/Esc]back [Q]uit{}", scroll_info)
+            }
         };
         let bar = Paragraph::new(Line::from(Span::styled(
             bar_text,

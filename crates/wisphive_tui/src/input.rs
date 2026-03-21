@@ -210,124 +210,252 @@ fn handle_queue_input(app: &mut App, key: KeyEvent) -> InputAction {
 }
 
 fn handle_detail_input(app: &mut App, key: KeyEvent) -> InputAction {
-    let is_permission = app.detail_is_permission_request();
+    use wisphive_protocol::HookEventType;
 
+    // Common keys: scroll, back, quit
     match key.code {
-        // Number keys select a permission suggestion (PermissionRequest only)
-        KeyCode::Char(c @ '1'..='9') if is_permission => {
-            if let Some(req) = app.detail_request() {
-                let idx = (c as usize) - ('1' as usize);
-                let valid = req
-                    .permission_suggestions
-                    .as_ref()
-                    .map_or(false, |s| idx < s.len());
-                if valid {
-                    let id = req.id;
-                    app.exit_detail_view();
-                    return InputAction::ApprovePermission {
-                        id,
-                        suggestion_index: idx,
-                    };
-                }
-            }
-            InputAction::None
-        }
-        // Approve (non-permission only)
-        KeyCode::Char('y') | KeyCode::Char('Y') if !is_permission => {
+        KeyCode::Esc => { app.exit_detail_view(); return InputAction::None; }
+        KeyCode::Char('q') => { app.exit_detail_view(); return InputAction::None; }
+        KeyCode::Char('Q') => return InputAction::Quit,
+        KeyCode::Char('j') | KeyCode::Down => { app.detail_scroll = app.detail_scroll.saturating_add(1); return InputAction::None; }
+        KeyCode::Char('k') | KeyCode::Up => { app.detail_scroll = app.detail_scroll.saturating_sub(1); return InputAction::None; }
+        KeyCode::PageDown | KeyCode::Char(' ') => { app.detail_scroll = app.detail_scroll.saturating_add(20); return InputAction::None; }
+        KeyCode::PageUp => { app.detail_scroll = app.detail_scroll.saturating_sub(20); return InputAction::None; }
+        KeyCode::Char('g') => { app.detail_scroll = 0; return InputAction::None; }
+        KeyCode::Char('G') => { app.detail_scroll = usize::MAX / 2; return InputAction::None; }
+        _ => {}
+    }
+
+    // Event-specific keys
+    let event_type = app.detail_event_type();
+    match event_type {
+        HookEventType::PermissionRequest => handle_permission_request_keys(app, key),
+        HookEventType::Stop | HookEventType::SubagentStop => handle_stop_keys(app, key),
+        HookEventType::UserPromptSubmit | HookEventType::ConfigChange => handle_binary_block_keys(app, key),
+        HookEventType::Elicitation => handle_elicitation_keys(app, key),
+        HookEventType::TeammateIdle => handle_teammate_idle_keys(app, key),
+        HookEventType::TaskCompleted => handle_task_completed_keys(app, key),
+        _ => handle_pre_tool_use_keys(app, key), // PreToolUse + fallback
+    }
+}
+
+/// PreToolUse: Y=approve, N=deny, M=deny+msg, !=always, E=edit, C=context, ?=defer
+fn handle_pre_tool_use_keys(app: &mut App, key: KeyEvent) -> InputAction {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
             if let Some(req) = app.detail_request() {
                 let id = req.id;
                 app.exit_detail_view();
                 return InputAction::Approve(id);
             }
-            app.exit_detail_view();
             InputAction::None
         }
-        // Deny (simple) — works for both
         KeyCode::Char('n') | KeyCode::Char('N') => {
             if let Some(req) = app.detail_request() {
                 let id = req.id;
                 app.exit_detail_view();
                 return InputAction::Deny(id);
             }
-            app.exit_detail_view();
             InputAction::None
         }
-        // Deny with message — works for both
         KeyCode::Char('m') | KeyCode::Char('M') => {
             if let Some(req) = app.detail_request() {
                 app.modal = Some(Modal::deny_with_message(req.id));
             }
             InputAction::None
         }
-        // Always allow this tool (non-permission only)
-        KeyCode::Char('!') if !is_permission => {
+        KeyCode::Char('!') => {
             if let Some(req) = app.detail_request() {
                 app.modal = Some(Modal::confirm_always_allow(req.id, &req.tool_name));
             }
             InputAction::None
         }
-        // Edit input before approving (non-permission only)
-        KeyCode::Char('e') | KeyCode::Char('E') if !is_permission => {
+        KeyCode::Char('e') | KeyCode::Char('E') => {
             if let Some(req) = app.detail_request() {
                 app.modal = Some(Modal::edit_input(req.id, &req.tool_input));
             }
             InputAction::None
         }
-        // Approve with additional context (non-permission only)
-        KeyCode::Char('c') | KeyCode::Char('C') if !is_permission => {
+        KeyCode::Char('c') | KeyCode::Char('C') => {
             if let Some(req) = app.detail_request() {
                 app.modal = Some(Modal::approve_with_context(req.id));
             }
             InputAction::None
         }
-        // Ask/defer to native prompt — works for both
         KeyCode::Char('?') => {
             if let Some(req) = app.detail_request() {
                 app.modal = Some(Modal::confirm_ask_defer(req.id));
             }
             InputAction::None
         }
-        // Back to dashboard
-        KeyCode::Esc => {
-            app.exit_detail_view();
+        _ => InputAction::None,
+    }
+}
+
+/// PermissionRequest: 1-9=select suggestion, N=deny, M=deny+msg, ?=defer
+fn handle_permission_request_keys(app: &mut App, key: KeyEvent) -> InputAction {
+    match key.code {
+        KeyCode::Char(c @ '1'..='9') => {
+            if let Some(req) = app.detail_request() {
+                let idx = (c as usize) - ('1' as usize);
+                let valid = req.permission_suggestions.as_ref().map_or(false, |s| idx < s.len());
+                if valid {
+                    let id = req.id;
+                    app.exit_detail_view();
+                    return InputAction::ApprovePermission { id, suggestion_index: idx };
+                }
+            }
             InputAction::None
         }
-        // Scroll down
-        KeyCode::Char('j') | KeyCode::Down => {
-            app.detail_scroll = app.detail_scroll.saturating_add(1);
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            if let Some(req) = app.detail_request() {
+                let id = req.id;
+                app.exit_detail_view();
+                return InputAction::Deny(id);
+            }
             InputAction::None
         }
-        // Scroll up
-        KeyCode::Char('k') | KeyCode::Up => {
-            app.detail_scroll = app.detail_scroll.saturating_sub(1);
+        KeyCode::Char('m') | KeyCode::Char('M') => {
+            if let Some(req) = app.detail_request() {
+                app.modal = Some(Modal::deny_with_message(req.id));
+            }
             InputAction::None
         }
-        // Page down
-        KeyCode::PageDown | KeyCode::Char(' ') => {
-            app.detail_scroll = app.detail_scroll.saturating_add(20);
+        KeyCode::Char('?') => {
+            if let Some(req) = app.detail_request() {
+                app.modal = Some(Modal::confirm_ask_defer(req.id));
+            }
             InputAction::None
         }
-        // Page up
-        KeyCode::PageUp => {
-            app.detail_scroll = app.detail_scroll.saturating_sub(20);
+        _ => InputAction::None,
+    }
+}
+
+/// Stop/SubagentStop: C=continue working (deny+reason), S=let stop (approve)
+fn handle_stop_keys(app: &mut App, key: KeyEvent) -> InputAction {
+    match key.code {
+        KeyCode::Char('c') | KeyCode::Char('C') => {
+            if let Some(req) = app.detail_request() {
+                app.modal = Some(Modal::deny_with_message(req.id));
+            }
             InputAction::None
         }
-        // Jump to top
-        KeyCode::Char('g') => {
-            app.detail_scroll = 0;
+        KeyCode::Char('s') | KeyCode::Char('S') => {
+            if let Some(req) = app.detail_request() {
+                let id = req.id;
+                app.exit_detail_view();
+                return InputAction::Approve(id);
+            }
             InputAction::None
         }
-        // Jump to bottom
-        KeyCode::Char('G') => {
-            app.detail_scroll = usize::MAX / 2;
+        _ => InputAction::None,
+    }
+}
+
+/// UserPromptSubmit/ConfigChange: A=allow, B=block, M=block+reason
+fn handle_binary_block_keys(app: &mut App, key: KeyEvent) -> InputAction {
+    match key.code {
+        KeyCode::Char('a') | KeyCode::Char('A') => {
+            if let Some(req) = app.detail_request() {
+                let id = req.id;
+                app.exit_detail_view();
+                return InputAction::Approve(id);
+            }
             InputAction::None
         }
-        // Navigate back
-        KeyCode::Char('q') => {
-            app.exit_detail_view();
+        KeyCode::Char('b') | KeyCode::Char('B') => {
+            if let Some(req) = app.detail_request() {
+                let id = req.id;
+                app.exit_detail_view();
+                return InputAction::Deny(id);
+            }
             InputAction::None
         }
-        KeyCode::Char('Q') => InputAction::Quit,
+        KeyCode::Char('m') | KeyCode::Char('M') => {
+            if let Some(req) = app.detail_request() {
+                app.modal = Some(Modal::deny_with_message(req.id));
+            }
+            InputAction::None
+        }
+        _ => InputAction::None,
+    }
+}
+
+/// Elicitation: A=accept (opens edit modal for content), D=decline, C=cancel
+fn handle_elicitation_keys(app: &mut App, key: KeyEvent) -> InputAction {
+    match key.code {
+        KeyCode::Char('a') | KeyCode::Char('A') => {
+            if let Some(req) = app.detail_request() {
+                // Pre-fill with schema template if available
+                let initial = req.event_data
+                    .as_ref()
+                    .and_then(|d| d.get("requested_schema"))
+                    .map(|s| serde_json::to_string_pretty(s).unwrap_or_default())
+                    .unwrap_or_else(|| "{}".into());
+                app.modal = Some(Modal::edit_input(req.id, &serde_json::json!(initial)));
+            }
+            InputAction::None
+        }
+        KeyCode::Char('d') | KeyCode::Char('D') => {
+            if let Some(req) = app.detail_request() {
+                let id = req.id;
+                app.exit_detail_view();
+                return InputAction::Deny(id);
+            }
+            InputAction::None
+        }
+        KeyCode::Char('c') | KeyCode::Char('C') => {
+            if let Some(req) = app.detail_request() {
+                let id = req.id;
+                app.exit_detail_view();
+                return InputAction::DenyWithMessage { id, message: "cancel".into() };
+            }
+            InputAction::None
+        }
+        _ => InputAction::None,
+    }
+}
+
+/// TeammateIdle: C=continue+feedback (text modal), S=stop teammate
+fn handle_teammate_idle_keys(app: &mut App, key: KeyEvent) -> InputAction {
+    match key.code {
+        KeyCode::Char('c') | KeyCode::Char('C') => {
+            if let Some(req) = app.detail_request() {
+                // "Deny" with message = continue with feedback
+                app.modal = Some(Modal::deny_with_message(req.id));
+            }
+            InputAction::None
+        }
+        KeyCode::Char('s') | KeyCode::Char('S') => {
+            if let Some(req) = app.detail_request() {
+                let id = req.id;
+                app.exit_detail_view();
+                return InputAction::Approve(id);
+            }
+            InputAction::None
+        }
+        _ => InputAction::None,
+    }
+}
+
+/// TaskCompleted: A=accept, R=reject+feedback (text modal)
+fn handle_task_completed_keys(app: &mut App, key: KeyEvent) -> InputAction {
+    match key.code {
+        KeyCode::Char('a') | KeyCode::Char('A') => {
+            if let Some(req) = app.detail_request() {
+                let id = req.id;
+                app.exit_detail_view();
+                return InputAction::Approve(id);
+            }
+            InputAction::None
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            if let Some(req) = app.detail_request() {
+                // "Deny" with message = reject with feedback
+                app.modal = Some(Modal::deny_with_message(req.id));
+            }
+            InputAction::None
+        }
         _ => InputAction::None,
     }
 }

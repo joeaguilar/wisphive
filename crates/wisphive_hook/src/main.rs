@@ -30,8 +30,8 @@ struct HookResponse {
     additional_context: Option<String>,
     /// For PermissionRequest: the selected suggestion to echo back.
     selected_permission: Option<wisphive_protocol::PermissionSuggestion>,
-    /// Whether this is a PermissionRequest response (changes output format).
-    is_permission_request: bool,
+    /// The hook event type — determines the response JSON format.
+    event_type: wisphive_protocol::HookEventType,
 }
 
 impl HookResponse {
@@ -42,7 +42,7 @@ impl HookResponse {
             updated_input: None,
             additional_context: None,
             selected_permission: None,
-            is_permission_request: false,
+            event_type: wisphive_protocol::HookEventType::PreToolUse,
         }
     }
 }
@@ -58,8 +58,15 @@ fn main() {
 
 /// Format the hook response as Claude Code JSON stdout and return exit code.
 fn format_and_exit(resp: &HookResponse) -> i32 {
-    if resp.is_permission_request {
-        return format_permission_response(resp);
+    use wisphive_protocol::HookEventType::*;
+    match resp.event_type {
+        PermissionRequest => return format_permission_response(resp),
+        Stop | SubagentStop => return format_stop_response(resp),
+        UserPromptSubmit | ConfigChange => return format_block_response(resp),
+        Elicitation => return format_elicitation_response(resp),
+        TeammateIdle => return format_teammate_idle_response(resp),
+        TaskCompleted => return format_task_completed_response(resp),
+        _ => {} // PreToolUse and unknown fall through to existing logic
     }
     match resp.decision {
         Decision::Ask => {
@@ -161,6 +168,99 @@ fn format_permission_response(resp: &HookResponse) -> i32 {
     0
 }
 
+/// Format Stop/SubagentStop: approve = let stop (exit 0), deny = continue working.
+fn format_stop_response(resp: &HookResponse) -> i32 {
+    match resp.decision {
+        Decision::Approve => 0, // let it stop
+        Decision::Deny => {
+            let reason = resp.message.as_deref().unwrap_or("continue working");
+            let json = serde_json::json!({"decision": "block", "reason": reason});
+            print!("{}", json);
+            0
+        }
+        Decision::Ask => 0,
+    }
+}
+
+/// Format UserPromptSubmit/ConfigChange: approve = allow, deny = block.
+fn format_block_response(resp: &HookResponse) -> i32 {
+    match resp.decision {
+        Decision::Approve => 0,
+        Decision::Deny => {
+            if let Some(ref msg) = resp.message {
+                let json = serde_json::json!({"decision": "block", "reason": msg});
+                print!("{}", json);
+                0
+            } else {
+                2 // exit 2 = block
+            }
+        }
+        Decision::Ask => 0,
+    }
+}
+
+/// Format Elicitation: approve = accept with content, deny = decline/cancel.
+fn format_elicitation_response(resp: &HookResponse) -> i32 {
+    let action = match resp.decision {
+        Decision::Approve => "accept",
+        Decision::Deny => {
+            if resp.message.as_deref() == Some("cancel") {
+                "cancel"
+            } else {
+                "decline"
+            }
+        }
+        Decision::Ask => return 0,
+    };
+
+    let mut output = serde_json::Map::new();
+    let mut hook_output = serde_json::Map::new();
+    hook_output.insert("hookEventName".into(), serde_json::json!("Elicitation"));
+    hook_output.insert("action".into(), serde_json::json!(action));
+    if action == "accept" {
+        if let Some(ref input) = resp.updated_input {
+            hook_output.insert("content".into(), input.clone());
+        }
+    }
+    output.insert("hookSpecificOutput".into(), serde_json::Value::Object(hook_output));
+    print!("{}", serde_json::Value::Object(output));
+    0
+}
+
+/// Format TeammateIdle: deny = continue with feedback (exit 2 + stderr), approve = stop.
+fn format_teammate_idle_response(resp: &HookResponse) -> i32 {
+    match resp.decision {
+        Decision::Deny => {
+            // Exit 2 = teammate gets feedback and continues working
+            if let Some(ref msg) = resp.message {
+                eprint!("{}", msg);
+            }
+            2
+        }
+        Decision::Approve => {
+            // Stop the teammate
+            let json = serde_json::json!({"continue": false, "stopReason": resp.message.as_deref().unwrap_or("stopped by user")});
+            print!("{}", json);
+            0
+        }
+        Decision::Ask => 0,
+    }
+}
+
+/// Format TaskCompleted: approve = accept, deny = reject (exit 2 + stderr feedback).
+fn format_task_completed_response(resp: &HookResponse) -> i32 {
+    match resp.decision {
+        Decision::Approve => 0,
+        Decision::Deny => {
+            if let Some(ref msg) = resp.message {
+                eprint!("{}", msg);
+            }
+            2
+        }
+        Decision::Ask => 0,
+    }
+}
+
 fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
     let home = home_dir();
     let wisphive_dir = home.join(".wisphive");
@@ -178,17 +278,23 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
 
     let hook_event: serde_json::Value = serde_json::from_str(&input)?;
 
-    // PostToolUse detection: Claude Code sends "tool_response" for post-execution results
-    if hook_event.get("tool_response").is_some() {
+    // Determine event type from hook_event_name (early — needed for dispatch)
+    let event_type: wisphive_protocol::HookEventType = hook_event
+        .get("hook_event_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("PreToolUse")
+        .parse()
+        .unwrap_or_default();
+
+    // PostToolUse detection: fire-and-forget result to daemon
+    if event_type == wisphive_protocol::HookEventType::PostToolUse
+        || hook_event.get("tool_response").is_some()
+    {
         handle_post_tool_use(&hook_event, &wisphive_dir)?;
         return Ok(HookResponse::simple(Decision::Approve));
     }
 
-    // PermissionRequest detection
-    let is_permission_request = hook_event
-        .get("hook_event_name")
-        .and_then(|v| v.as_str())
-        == Some("PermissionRequest");
+    let is_permission_request = event_type == wisphive_protocol::HookEventType::PermissionRequest;
 
     let tool_name = hook_event
         .get("tool_name")
@@ -245,6 +351,9 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
         None
     };
 
+    // Extract event-specific data for non-PreToolUse events
+    let event_data = extract_event_data(event_type, &hook_event);
+
     let request = DecisionRequest {
         id: uuid::Uuid::new_v4(),
         agent_id,
@@ -253,8 +362,10 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
         tool_name,
         tool_input,
         timestamp: chrono::Utc::now(),
+        hook_event_name: event_type,
         tool_use_id: tool_use_id.clone(),
         permission_suggestions,
+        event_data,
     };
 
     // Layer 4: Connect to daemon socket (fails instantly if daemon is dead)
@@ -303,7 +414,7 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
             updated_input,
             additional_context,
             selected_permission,
-            is_permission_request,
+            event_type,
         }),
         _ => Ok(HookResponse::simple(Decision::Approve)),
     }
@@ -570,6 +681,86 @@ fn tool_input_text(tool_name: &str, tool_input: &serde_json::Value) -> String {
         }
     }
     serde_json::to_string(tool_input).unwrap_or_default()
+}
+
+/// Extract event-specific data from the hook event payload.
+fn extract_event_data(
+    event_type: wisphive_protocol::HookEventType,
+    hook_event: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    use wisphive_protocol::HookEventType::*;
+    match event_type {
+        Elicitation | ElicitationResult => {
+            let mut data = serde_json::Map::new();
+            if let Some(v) = hook_event.get("mcp_server_name") {
+                data.insert("mcp_server_name".into(), v.clone());
+            }
+            if let Some(v) = hook_event.get("message") {
+                data.insert("message".into(), v.clone());
+            }
+            if let Some(v) = hook_event.get("mode") {
+                data.insert("mode".into(), v.clone());
+            }
+            if let Some(v) = hook_event.get("requested_schema") {
+                data.insert("requested_schema".into(), v.clone());
+            }
+            if let Some(v) = hook_event.get("url") {
+                data.insert("url".into(), v.clone());
+            }
+            Some(serde_json::Value::Object(data))
+        }
+        Stop | SubagentStop => {
+            let mut data = serde_json::Map::new();
+            if let Some(v) = hook_event.get("last_assistant_message") {
+                data.insert("last_assistant_message".into(), v.clone());
+            }
+            if let Some(v) = hook_event.get("stop_hook_active") {
+                data.insert("stop_hook_active".into(), v.clone());
+            }
+            Some(serde_json::Value::Object(data))
+        }
+        UserPromptSubmit => {
+            let mut data = serde_json::Map::new();
+            if let Some(v) = hook_event.get("prompt") {
+                data.insert("prompt".into(), v.clone());
+            }
+            Some(serde_json::Value::Object(data))
+        }
+        ConfigChange => {
+            let mut data = serde_json::Map::new();
+            if let Some(v) = hook_event.get("source") {
+                data.insert("source".into(), v.clone());
+            }
+            if let Some(v) = hook_event.get("file_path") {
+                data.insert("file_path".into(), v.clone());
+            }
+            Some(serde_json::Value::Object(data))
+        }
+        TeammateIdle => {
+            let mut data = serde_json::Map::new();
+            if let Some(v) = hook_event.get("teammate_name") {
+                data.insert("teammate_name".into(), v.clone());
+            }
+            if let Some(v) = hook_event.get("team_name") {
+                data.insert("team_name".into(), v.clone());
+            }
+            Some(serde_json::Value::Object(data))
+        }
+        TaskCompleted => {
+            let mut data = serde_json::Map::new();
+            if let Some(v) = hook_event.get("task_id") {
+                data.insert("task_id".into(), v.clone());
+            }
+            if let Some(v) = hook_event.get("task_subject") {
+                data.insert("task_subject".into(), v.clone());
+            }
+            if let Some(v) = hook_event.get("task_description") {
+                data.insert("task_description".into(), v.clone());
+            }
+            Some(serde_json::Value::Object(data))
+        }
+        _ => None,
+    }
 }
 
 fn home_dir() -> PathBuf {
