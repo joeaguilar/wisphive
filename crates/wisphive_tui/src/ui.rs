@@ -91,7 +91,7 @@ fn draw_detail_view(frame: &mut Frame, app: &App) {
                 format!(" [1-{}]select [N]deny [M]deny+msg [?]defer [q/Esc]back [Q]uit{}", n, scroll_info)
             }
             HookEventType::Stop | HookEventType::SubagentStop => {
-                format!(" [C]ontinue working [S]top [q/Esc]back [Q]uit{}", scroll_info)
+                format!(" [C]ontinue [M]sg [S]top [q/Esc]back [Q]uit{}", scroll_info)
             }
             HookEventType::UserPromptSubmit | HookEventType::ConfigChange => {
                 format!(" [A]llow [B]lock [M]block+msg [q/Esc]back [Q]uit{}", scroll_info)
