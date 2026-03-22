@@ -68,6 +68,24 @@ impl Server {
         let mut reap_interval = tokio::time::interval(Duration::from_secs(5));
         reap_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // Run retention on startup
+        let archive_path = self.config.log_dir.join("decision_log.jsonl");
+        {
+            match self.state_db.archive_and_prune(
+                &archive_path,
+                self.config.retention_max_rows,
+                self.config.retention_max_age_days,
+            ).await {
+                Ok(0) => {}
+                Ok(n) => info!(n, "startup retention: archived entries"),
+                Err(e) => warn!("startup retention failed: {e}"),
+            }
+        }
+
+        let mut retention_interval = tokio::time::interval(Duration::from_secs(3600));
+        retention_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        retention_interval.tick().await; // skip immediate tick (we just ran on startup)
+
         loop {
             tokio::select! {
                 // Periodically reap exited agent processes and inactive agents
@@ -92,6 +110,18 @@ impl Server {
                         let marker = self.config.home_dir.join("sessions").join(&agent_id);
                         let _ = std::fs::remove_file(marker);
                         let _ = self.tui_tx.send(ServerMessage::AgentDisconnected { agent_id });
+                    }
+                }
+                // Periodic retention: archive + prune old decision_log entries
+                _ = retention_interval.tick() => {
+                    match self.state_db.archive_and_prune(
+                        &archive_path,
+                        self.config.retention_max_rows,
+                        self.config.retention_max_age_days,
+                    ).await {
+                        Ok(0) => {}
+                        Ok(n) => info!(n, "retention: archived entries"),
+                        Err(e) => warn!("retention failed: {e}"),
                     }
                 }
                 accept = listener.accept() => {

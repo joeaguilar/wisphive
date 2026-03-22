@@ -20,6 +20,10 @@ pub struct DaemonConfig {
     pub notifications_enabled: bool,
     /// Seconds of inactivity before an agent is reaped from the registry.
     pub agent_timeout_secs: u64,
+    /// Maximum rows to keep in decision_log (oldest archived to JSONL, then deleted).
+    pub retention_max_rows: u64,
+    /// Maximum age in days for decision_log entries (older archived and deleted).
+    pub retention_max_age_days: u64,
 }
 
 /// User-editable config loaded from ~/.wisphive/config.json.
@@ -43,6 +47,12 @@ pub struct UserConfig {
     /// Content-aware rules per tool (deny/allow patterns on tool input).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_rules: Option<std::collections::HashMap<String, wisphive_protocol::ToolRule>>,
+    /// Max rows to keep in decision_log SQLite table (default: 50000).
+    #[serde(default)]
+    pub retention_max_rows: Option<u64>,
+    /// Max age in days for decision_log entries (default: 30).
+    #[serde(default)]
+    pub retention_max_age_days: Option<u64>,
 }
 
 fn default_true() -> bool {
@@ -65,6 +75,8 @@ impl DaemonConfig {
             hook_timeout_secs: user.hook_timeout_secs.unwrap_or(3600),
             notifications_enabled: user.notifications,
             agent_timeout_secs: user.agent_timeout_secs.unwrap_or(300),
+            retention_max_rows: user.retention_max_rows.unwrap_or(50_000),
+            retention_max_age_days: user.retention_max_age_days.unwrap_or(30),
             home_dir,
         }
     }
