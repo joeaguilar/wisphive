@@ -172,7 +172,7 @@ fn format_permission_response(resp: &HookResponse) -> i32 {
 fn format_stop_response(resp: &HookResponse) -> i32 {
     match resp.decision {
         Decision::Approve => {
-            let json = serde_json::json!({"decision": "allow"});
+            let json = serde_json::json!({"decision": "approve"});
             print!("{}", json);
             0
         }
