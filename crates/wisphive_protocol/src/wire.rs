@@ -108,6 +108,10 @@ pub enum ClientMessage {
         project: PathBuf,
     },
 
+    /// Request a full reimport of events.jsonl into the history database.
+    #[serde(rename = "reimport_events")]
+    ReimportEvents,
+
     /// TUI approves a PermissionRequest with a specific suggestion selected.
     #[serde(rename = "approve_permission")]
     ApprovePermission {
@@ -193,6 +197,10 @@ pub enum ServerMessage {
     /// Full snapshot of currently registered agents, sent to TUI on connect.
     #[serde(rename = "agents_snapshot")]
     AgentsSnapshot { agents: Vec<AgentInfo> },
+
+    /// Response to ReimportEvents: how many events were imported.
+    #[serde(rename = "reimport_complete")]
+    ReimportComplete { count: u64 },
 
     /// Error message.
     #[serde(rename = "error")]
