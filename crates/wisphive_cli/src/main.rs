@@ -354,6 +354,13 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
                 .join(".wisphive");
             let socket_path = home.join("wisphive.sock");
+            if dev {
+                eprintln!("Wisphive Web (dev mode)");
+                eprintln!("  WebSocket: http://127.0.0.1:{port}/ws");
+                eprintln!("  Run `cd crates/wisphive_web/frontend && npm run dev` for the UI");
+            } else {
+                eprintln!("Wisphive Web: http://127.0.0.1:{port}");
+            }
             rt.block_on(wisphive_web::serve(socket_path, port, dev))
         }
     }
