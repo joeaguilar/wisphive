@@ -3,16 +3,21 @@ import { useWisphive } from "./hooks/useWisphive";
 import { Queue } from "./components/Queue";
 import { DetailView } from "./components/DetailView";
 import { History } from "./components/History";
+import { Sessions } from "./components/Sessions";
+import { Projects } from "./components/Projects";
 import { SpawnModal } from "./components/SpawnModal";
 import "./app.css";
 
-type View = "queue" | "history" | "sessions";
+type View = "queue" | "history" | "sessions" | "projects";
 
 function App() {
-  const { connected, queue, agents, projects, history, approve, deny, spawnAgent, queryProjects, queryHistory, searchHistory } = useWisphive();
+  const { connected, queue, agents, projects, history, sessions, approve, deny, spawnAgent, queryProjects, queryHistory, searchHistory, querySessions } = useWisphive();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [view, setView] = useState<View>("queue");
   const [showSpawn, setShowSpawn] = useState(false);
+  const [spawnDefaultProject, setSpawnDefaultProject] = useState<string | undefined>();
+  const [sessionAgent, setSessionAgent] = useState<string | null>(null);
+  const [sessionTimeline, setSessionTimeline] = useState(history);
 
   const selectedRequest = queue.find((r) => r.id === selectedId);
 
@@ -20,6 +25,11 @@ function App() {
   useEffect(() => {
     if (showSpawn) queryProjects();
   }, [showSpawn, queryProjects]);
+
+  // Keep session timeline in sync when history updates and we're viewing a timeline
+  useEffect(() => {
+    if (sessionAgent) setSessionTimeline(history);
+  }, [history, sessionAgent]);
 
   return (
     <div className="app">
@@ -36,6 +46,9 @@ function App() {
         </button>
         <button className={view === "sessions" ? "active" : ""} onClick={() => setView("sessions")}>
           Sessions
+        </button>
+        <button className={view === "projects" ? "active" : ""} onClick={() => setView("projects")}>
+          Projects
         </button>
         <button className="spawn-btn" onClick={() => setShowSpawn(true)}>
           + Spawn Agent
@@ -77,17 +90,31 @@ function App() {
           />
         )}
         {view === "sessions" && (
-          <div className="placeholder">
-            <p>Sessions view — coming soon</p>
-          </div>
+          <Sessions
+            sessions={sessions}
+            timeline={sessionTimeline}
+            selectedAgent={sessionAgent}
+            onLoad={querySessions}
+            onSelectAgent={setSessionAgent}
+            onLoadTimeline={(agentId) => queryHistory(agentId)}
+          />
+        )}
+        {view === "projects" && (
+          <Projects
+            projects={projects}
+            onLoad={queryProjects}
+            onSpawnInProject={(project) => { setSpawnDefaultProject(project); setShowSpawn(true); }}
+            onDrillDown={(project) => { searchHistory(project); setView("history"); }}
+          />
         )}
       </main>
 
       {showSpawn && (
         <SpawnModal
           projects={projects.map((p) => p.project)}
-          onSpawn={(req) => { spawnAgent(req); setShowSpawn(false); }}
-          onClose={() => setShowSpawn(false)}
+          defaultProject={spawnDefaultProject}
+          onSpawn={(req) => { spawnAgent(req); setShowSpawn(false); setSpawnDefaultProject(undefined); }}
+          onClose={() => { setShowSpawn(false); setSpawnDefaultProject(undefined); }}
         />
       )}
     </div>
