@@ -87,8 +87,20 @@ fn draw_detail_view(frame: &mut Frame, app: &App) {
         use wisphive_protocol::HookEventType;
         let bar_text = match req.hook_event_name {
             HookEventType::PermissionRequest => {
-                let n = req.permission_suggestions.as_ref().map_or(0, |s| s.len());
-                format!(" [1-{}]select [N]deny [M]deny+msg [?]defer [q/Esc]back [Q]uit{}", n, scroll_info)
+                if let Some(ref suggestions) = req.permission_suggestions {
+                    let n = suggestions.len();
+                    format!(" [1-{}]select [N]deny [M]deny+msg [?]defer [q/Esc]back [Q]uit{}", n, scroll_info)
+                } else {
+                    // AskUserQuestion: PermissionRequest without suggestions
+                    let n = req.tool_input
+                        .get("questions")
+                        .and_then(|v| v.as_array())
+                        .and_then(|qs| qs.first())
+                        .and_then(|q| q.get("options"))
+                        .and_then(|v| v.as_array())
+                        .map_or(0, |o| o.len());
+                    format!(" [1-{}]select [O]ther [D]eny [M]deny+msg [q/Esc]back [Q]uit{}", n, scroll_info)
+                }
             }
             HookEventType::Stop | HookEventType::SubagentStop => {
                 format!(" [A/Enter]accept [q/Esc]back [Q]uit{}", scroll_info)
@@ -118,6 +130,11 @@ fn draw_detail_view(frame: &mut Frame, app: &App) {
         let msg = Paragraph::new("Decision was resolved. Press Esc to return.")
             .block(Block::default().borders(Borders::ALL));
         frame.render_widget(msg, chunks[0]);
+    }
+
+    // Render modal overlay (deny-with-message, answer-question, etc.)
+    if let Some(ref modal) = app.modal {
+        draw_modal(frame, modal);
     }
 }
 

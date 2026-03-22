@@ -233,7 +233,18 @@ fn handle_detail_input(app: &mut App, key: KeyEvent) -> InputAction {
     // Event-specific keys
     let event_type = app.detail_event_type();
     match event_type {
-        HookEventType::PermissionRequest => handle_permission_request_keys(app, key),
+        HookEventType::PermissionRequest => {
+            // AskUserQuestion arrives as PermissionRequest without suggestions —
+            // use dedicated handler with number-key answer selection.
+            let has_suggestions = app.detail_request()
+                .and_then(|r| r.permission_suggestions.as_ref())
+                .map_or(false, |s| !s.is_empty());
+            if has_suggestions {
+                handle_permission_request_keys(app, key)
+            } else {
+                handle_ask_question_keys(app, key)
+            }
+        }
         HookEventType::Stop | HookEventType::SubagentStop => handle_stop_keys(app, key),
         HookEventType::UserPromptSubmit | HookEventType::ConfigChange => handle_binary_block_keys(app, key),
         HookEventType::Elicitation => handle_elicitation_keys(app, key),
@@ -333,6 +344,73 @@ fn handle_permission_request_keys(app: &mut App, key: KeyEvent) -> InputAction {
         }
         _ => InputAction::None,
     }
+}
+
+/// AskUserQuestion (PermissionRequest without suggestions):
+/// 1-9 = select an option, O = type custom response, D = deny, M = deny+msg
+fn handle_ask_question_keys(app: &mut App, key: KeyEvent) -> InputAction {
+    match key.code {
+        KeyCode::Char(c @ '1'..='9') => {
+            if let Some(req) = app.detail_request() {
+                let idx = (c as usize) - ('1' as usize);
+                let questions = req.tool_input.get("questions").and_then(|v| v.as_array());
+                if let Some(qs) = questions {
+                    if let Some(first_q) = qs.first() {
+                        let options = first_q.get("options").and_then(|v| v.as_array());
+                        let option_count = options.map_or(0, |o| o.len());
+
+                        if idx < option_count {
+                            let question_text = first_q.get("question")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let answer = options.unwrap()[idx]
+                                .get("label")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+
+                            let updated = build_ask_answer(&req.tool_input, question_text, answer);
+                            let id = req.id;
+                            app.exit_detail_view();
+                            return InputAction::ApproveWithInput { id, updated_input: updated };
+                        }
+                    }
+                }
+            }
+            InputAction::None
+        }
+        KeyCode::Char('o') | KeyCode::Char('O') => {
+            if let Some(req) = app.detail_request() {
+                app.modal = Some(Modal::answer_question(req.id));
+            }
+            InputAction::None
+        }
+        KeyCode::Char('d') | KeyCode::Char('D') => {
+            if let Some(req) = app.detail_request() {
+                let id = req.id;
+                app.exit_detail_view();
+                return InputAction::Deny(id);
+            }
+            InputAction::None
+        }
+        KeyCode::Char('m') | KeyCode::Char('M') => {
+            if let Some(req) = app.detail_request() {
+                app.modal = Some(Modal::deny_with_message(req.id));
+            }
+            InputAction::None
+        }
+        _ => InputAction::None,
+    }
+}
+
+/// Build updatedInput with the answer filled in for AskUserQuestion.
+fn build_ask_answer(tool_input: &serde_json::Value, question: &str, answer: &str) -> serde_json::Value {
+    let mut updated = tool_input.clone();
+    if let Some(obj) = updated.as_object_mut() {
+        let mut answers = serde_json::Map::new();
+        answers.insert(question.to_string(), serde_json::Value::String(answer.to_string()));
+        obj.insert("answers".into(), serde_json::Value::Object(answers));
+    }
+    updated
 }
 
 /// Stop/SubagentStop: A=accept (approve = let stop)
@@ -575,6 +653,30 @@ fn handle_textarea_modal(app: &mut App, mut modal: Modal, key: KeyEvent) -> Inpu
                         } else {
                             serde_json::json!({ "command": buf })
                         };
+                        app.exit_detail_view();
+                        InputAction::ApproveWithInput { id, updated_input: updated }
+                    } else {
+                        InputAction::None
+                    }
+                }
+                ModalAction::AnswerQuestion => {
+                    if buf.is_empty() {
+                        app.modal = Some(modal);
+                        return InputAction::None;
+                    }
+                    if let Some(id) = target_id {
+                        // Build updatedInput with the typed answer
+                        let tool_input = app.detail_request()
+                            .map(|r| r.tool_input.clone())
+                            .unwrap_or(serde_json::Value::Null);
+                        let question_text = tool_input
+                            .get("questions")
+                            .and_then(|v| v.as_array())
+                            .and_then(|qs| qs.first())
+                            .and_then(|q| q.get("question"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let updated = build_ask_answer(&tool_input, question_text, &buf);
                         app.exit_detail_view();
                         InputAction::ApproveWithInput { id, updated_input: updated }
                     } else {

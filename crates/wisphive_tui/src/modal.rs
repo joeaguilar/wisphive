@@ -15,6 +15,8 @@ pub enum ModalAction {
     EditInput,
     AlwaysAllow,
     AskDefer,
+    /// Answer an AskUserQuestion with typed text.
+    AnswerQuestion,
 }
 
 /// Active input field in the spawn agent modal.
@@ -255,6 +257,17 @@ impl Modal {
             target_id: Some(id),
             spawn: None,
             textarea: None,
+        }
+    }
+
+    pub fn answer_question(id: Uuid) -> Self {
+        Self {
+            title: "Answer Question".into(),
+            body: "Type your response (sent as the answer to Claude):".into(),
+            action: ModalAction::AnswerQuestion,
+            target_id: Some(id),
+            spawn: None,
+            textarea: Some(make_textarea("", "Type your answer...")),
         }
     }
 
