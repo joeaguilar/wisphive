@@ -2,13 +2,14 @@ import { useEffect, useState } from "react";
 import { useWisphive } from "./hooks/useWisphive";
 import { Queue } from "./components/Queue";
 import { DetailView } from "./components/DetailView";
+import { History } from "./components/History";
 import { SpawnModal } from "./components/SpawnModal";
 import "./app.css";
 
 type View = "queue" | "history" | "sessions";
 
 function App() {
-  const { connected, queue, agents, projects, approve, deny, spawnAgent, queryProjects } = useWisphive();
+  const { connected, queue, agents, projects, history, approve, deny, spawnAgent, queryProjects, queryHistory, searchHistory } = useWisphive();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [view, setView] = useState<View>("queue");
   const [showSpawn, setShowSpawn] = useState(false);
@@ -69,9 +70,11 @@ function App() {
           </div>
         )}
         {view === "history" && (
-          <div className="placeholder">
-            <p>History view — coming soon</p>
-          </div>
+          <History
+            entries={history}
+            onLoad={queryHistory}
+            onSearch={searchHistory}
+          />
         )}
         {view === "sessions" && (
           <div className="placeholder">

@@ -105,4 +105,5 @@ export type ClientMessage =
   | { type: "query_sessions" }
   | { type: "query_projects" }
   | { type: "reimport_events" }
-  | { type: "spawn_agent" } & SpawnAgentRequest;
+  | { type: "spawn_agent" } & SpawnAgentRequest
+  | { type: "search_history"; query?: string; tool_name?: string; agent_id?: string; limit?: number };
