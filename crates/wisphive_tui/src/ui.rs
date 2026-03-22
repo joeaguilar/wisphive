@@ -90,7 +90,7 @@ fn draw_detail_view(frame: &mut Frame, app: &App) {
                 if let Some(ref suggestions) = req.permission_suggestions {
                     let n = suggestions.len();
                     format!(" [1-{}]select [N]deny [M]deny+msg [?]defer [q/Esc]back [Q]uit{}", n, scroll_info)
-                } else {
+                } else if req.tool_input.get("questions").and_then(|v| v.as_array()).map_or(false, |a| !a.is_empty()) {
                     // AskUserQuestion: PermissionRequest without suggestions
                     let n = req.tool_input
                         .get("questions")
@@ -100,6 +100,9 @@ fn draw_detail_view(frame: &mut Frame, app: &App) {
                         .and_then(|v| v.as_array())
                         .map_or(0, |o| o.len());
                     format!(" [1-{}]select [O]ther [D]eny [M]deny+msg [q/Esc]back [Q]uit{}", n, scroll_info)
+                } else {
+                    // ExitPlanMode / generic PermissionRequest
+                    format!(" [A/Enter]accept [D]eny [M]deny+msg [q/Esc]back [Q]uit{}", scroll_info)
                 }
             }
             HookEventType::Stop | HookEventType::SubagentStop => {

@@ -17,6 +17,8 @@ pub fn render_detail_lines(req: &DecisionRequest) -> Vec<Line<'static>> {
                 push_permission_detail(&mut lines, req, suggestions);
             } else if has_ask_questions(&req.tool_input) {
                 push_ask_question_detail(&mut lines, req);
+            } else if has_plan_content(req) {
+                push_plan_detail(&mut lines, req);
             } else {
                 push_generic_detail(&mut lines, req);
             }
@@ -282,6 +284,34 @@ fn push_ask_question_detail(lines: &mut Vec<Line<'static>>, req: &DecisionReques
     }
 }
 
+/// Check if event_data contains plan content (ExitPlanMode).
+fn has_plan_content(req: &DecisionRequest) -> bool {
+    req.event_data
+        .as_ref()
+        .and_then(|d| d.get("plan_content"))
+        .and_then(|v| v.as_str())
+        .map_or(false, |s| !s.is_empty())
+}
+
+fn push_plan_detail(lines: &mut Vec<Line<'static>>, req: &DecisionRequest) {
+    push_section_label(lines, "Plan");
+    lines.push(Line::from(""));
+
+    if let Some(plan) = req
+        .event_data
+        .as_ref()
+        .and_then(|d| d.get("plan_content"))
+        .and_then(|v| v.as_str())
+    {
+        for line in plan.lines() {
+            lines.push(Line::from(Span::styled(
+                format!("  {line}"),
+                Style::default().fg(Color::White),
+            )));
+        }
+    }
+}
+
 fn push_generic_detail(lines: &mut Vec<Line<'static>>, req: &DecisionRequest) {
     push_section_label(lines, "Tool Input");
     lines.push(Line::from(""));
@@ -510,11 +540,14 @@ fn push_action_hints(lines: &mut Vec<Line<'static>>, event_type: wisphive_protoc
     let hint_style = Style::default().fg(Color::DarkGray);
     let key_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 
+    let is_plan = has_plan_content(req);
+
     // AskUserQuestion: either PermissionRequest without suggestions, or PreToolUse with tool_name
-    let is_ask_question = (event_type == HookEventType::PermissionRequest
-        && req.permission_suggestions.is_none())
+    let is_ask_question = !is_plan
+        && ((event_type == HookEventType::PermissionRequest
+            && req.permission_suggestions.is_none())
         || (req.tool_name.eq_ignore_ascii_case("askuserquestion")
-            && has_ask_questions(&req.tool_input));
+            && has_ask_questions(&req.tool_input)));
 
     let option_count = if is_ask_question {
         req.tool_input
@@ -538,7 +571,13 @@ fn push_action_hints(lines: &mut Vec<Line<'static>>, event_type: wisphive_protoc
         ]));
     }
 
-    let actions: Vec<(&str, &str)> = if is_ask_question {
+    let actions: Vec<(&str, &str)> = if is_plan {
+        vec![
+            ("A", "accept plan (exit plan mode)"),
+            ("D", "reject (continue planning)"),
+            ("M", "reject with feedback"),
+        ]
+    } else if is_ask_question {
         vec![
             ("O", "type custom response"),
             ("D", "deny"),
