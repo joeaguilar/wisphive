@@ -48,14 +48,24 @@ export function useWisphive() {
 
           case "new_decision": {
             const { type: _, ...req } = msg;
-            return { ...prev, queue: [...prev.queue, req as DecisionRequest] };
+            const newQueue = [...prev.queue, req as DecisionRequest];
+            // Tab title badge
+            document.title = newQueue.length > 0 ? `(${newQueue.length}) Wisphive` : "Wisphive";
+            // Browser notification if tab not focused
+            if (document.hidden && Notification.permission === "granted") {
+              new Notification(`Wisphive: ${(req as DecisionRequest).tool_name}`, {
+                body: `${(req as DecisionRequest).agent_id.slice(0, 20)} needs a decision`,
+                tag: "wisphive-decision",
+              });
+            }
+            return { ...prev, queue: newQueue };
           }
 
-          case "decision_resolved":
-            return {
-              ...prev,
-              queue: prev.queue.filter((r) => r.id !== msg.id),
-            };
+          case "decision_resolved": {
+            const filtered = prev.queue.filter((r) => r.id !== msg.id);
+            document.title = filtered.length > 0 ? `(${filtered.length}) Wisphive` : "Wisphive";
+            return { ...prev, queue: filtered };
+          }
 
           case "agents_snapshot":
             return { ...prev, agents: msg.agents };
@@ -103,7 +113,10 @@ export function useWisphive() {
     wsRef.current = ws;
 
     ws.onopen = () => {
-      console.log("WebSocket connected");
+      // Request notification permission on first connect
+      if ("Notification" in window && Notification.permission === "default") {
+        Notification.requestPermission();
+      }
     };
 
     ws.onmessage = (event) => {
