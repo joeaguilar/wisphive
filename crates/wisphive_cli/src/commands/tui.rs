@@ -7,7 +7,7 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use wisphive_daemon::DaemonConfig;
-use wisphive_protocol::{ClientMessage, ServerMessage, SpawnAgentRequest};
+use wisphive_protocol::{ClientMessage, ServerMessage};
 use wisphive_tui::app::App;
 use wisphive_tui::connection::DaemonConnection;
 use wisphive_tui::input::{self, InputAction};
@@ -141,14 +141,8 @@ async fn run_loop(
                             app.queue_index = 0;
                             app.rebuild_projects();
                         }
-                        InputAction::SpawnAgent { project, prompt } => {
-                            tracing::info!(?project, "spawning agent");
-                            let req = SpawnAgentRequest {
-                                project,
-                                prompt,
-                                model: None,
-                                name: None,
-                            };
+                        InputAction::SpawnAgent(req) => {
+                            tracing::info!(project = ?req.project, "spawning agent");
                             conn.send(&ClientMessage::SpawnAgent(req)).await?;
                         }
                         InputAction::QueryHistory { agent_id } => {

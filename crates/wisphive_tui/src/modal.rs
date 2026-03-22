@@ -22,13 +22,29 @@ pub enum ModalAction {
 pub enum SpawnField {
     Project,
     Prompt,
+    Model,
+    Reasoning,
+    MaxTurns,
 }
 
 impl SpawnField {
     pub fn next(self) -> Self {
         match self {
             Self::Project => Self::Prompt,
+            Self::Prompt => Self::Model,
+            Self::Model => Self::Reasoning,
+            Self::Reasoning => Self::MaxTurns,
+            Self::MaxTurns => Self::Project,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Project => Self::MaxTurns,
             Self::Prompt => Self::Project,
+            Self::Model => Self::Prompt,
+            Self::Reasoning => Self::Model,
+            Self::MaxTurns => Self::Reasoning,
         }
     }
 }
@@ -55,6 +71,9 @@ fn make_textarea(initial: &str, placeholder: &str) -> TextArea<'static> {
 pub struct SpawnModal {
     pub project: TextArea<'static>,
     pub prompt: TextArea<'static>,
+    pub model: TextArea<'static>,
+    pub reasoning: TextArea<'static>,
+    pub max_turns: TextArea<'static>,
     pub active_field: SpawnField,
 }
 
@@ -63,25 +82,16 @@ impl SpawnModal {
         let project_path = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
-        let mut project = make_textarea(&project_path, "/path/to/project");
-        project.set_block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(" Project "),
-        );
-        let mut prompt = make_textarea("", "Enter prompt for the agent...");
-        prompt.set_block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow))
-                .title(" Prompt "),
-        );
-        Self {
-            project,
-            prompt,
+        let mut s = Self {
+            project: make_textarea(&project_path, "/path/to/project"),
+            prompt: make_textarea("", "Enter prompt for the agent..."),
+            model: make_textarea("", "sonnet, opus (optional)"),
+            reasoning: make_textarea("", "low/med/high (optional)"),
+            max_turns: make_textarea("", "e.g. 10 (optional)"),
             active_field: SpawnField::Prompt,
-        }
+        };
+        s.apply_blocks();
+        s
     }
 
     pub fn project_path(&self) -> PathBuf {
@@ -91,39 +101,51 @@ impl SpawnModal {
     /// Replace the project field text (used when spawning from project view).
     pub fn set_project(&mut self, path: &str) {
         self.project = make_textarea(path, "/path/to/project");
-        self.project.set_block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(" Project "),
-        );
+        self.apply_blocks();
+    }
+
+    pub fn model_value(&self) -> Option<String> {
+        let val = self.model.lines()[0].trim().to_string();
+        if val.is_empty() { None } else { Some(val) }
+    }
+
+    pub fn reasoning_value(&self) -> Option<String> {
+        let val = self.reasoning.lines()[0].trim().to_string();
+        if val.is_empty() { None } else { Some(val) }
+    }
+
+    pub fn max_turns_value(&self) -> Option<u32> {
+        self.max_turns.lines()[0].trim().parse().ok()
     }
 
     pub fn active_textarea(&mut self) -> &mut TextArea<'static> {
         match self.active_field {
             SpawnField::Project => &mut self.project,
             SpawnField::Prompt => &mut self.prompt,
+            SpawnField::Model => &mut self.model,
+            SpawnField::Reasoning => &mut self.reasoning,
+            SpawnField::MaxTurns => &mut self.max_turns,
         }
     }
 
     /// Update border styles to reflect which field is active.
     pub fn update_focus_styles(&mut self) {
-        let (proj_color, prompt_color) = match self.active_field {
-            SpawnField::Project => (Color::Yellow, Color::DarkGray),
-            SpawnField::Prompt => (Color::DarkGray, Color::Yellow),
-        };
-        self.project.set_block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(proj_color))
-                .title(" Project "),
-        );
-        self.prompt.set_block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(prompt_color))
-                .title(" Prompt "),
-        );
+        self.apply_blocks();
+    }
+
+    fn apply_blocks(&mut self) {
+        let active = self.active_field;
+        let color = |f: SpawnField| if f == active { Color::Yellow } else { Color::DarkGray };
+        self.project.set_block(Block::default().borders(Borders::ALL)
+            .border_style(Style::default().fg(color(SpawnField::Project))).title(" Project "));
+        self.prompt.set_block(Block::default().borders(Borders::ALL)
+            .border_style(Style::default().fg(color(SpawnField::Prompt))).title(" Prompt "));
+        self.model.set_block(Block::default().borders(Borders::ALL)
+            .border_style(Style::default().fg(color(SpawnField::Model))).title(" Model "));
+        self.reasoning.set_block(Block::default().borders(Borders::ALL)
+            .border_style(Style::default().fg(color(SpawnField::Reasoning))).title(" Reasoning "));
+        self.max_turns.set_block(Block::default().borders(Borders::ALL)
+            .border_style(Style::default().fg(color(SpawnField::MaxTurns))).title(" Max Turns "));
     }
 }
 

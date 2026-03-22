@@ -1,7 +1,5 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
-use std::path::PathBuf;
-
 use crate::app::{App, FocusPanel, ViewMode};
 use crate::modal::{Modal, ModalAction};
 
@@ -17,8 +15,8 @@ pub enum InputAction {
     ApproveAll,
     /// Deny all (optionally filtered).
     DenyAll,
-    /// Spawn a new agent with the given project and prompt.
-    SpawnAgent { project: PathBuf, prompt: String },
+    /// Spawn a new agent.
+    SpawnAgent(wisphive_protocol::SpawnAgentRequest),
     /// Request history from the daemon (optional agent_id filter).
     QueryHistory { agent_id: Option<String> },
     /// Search history with a query string.
@@ -1045,8 +1043,14 @@ fn handle_spawn_modal_input(
     let spawn = modal.spawn.as_mut().unwrap();
 
     match key.code {
-        KeyCode::Tab | KeyCode::BackTab => {
+        KeyCode::Tab => {
             spawn.active_field = spawn.active_field.next();
+            spawn.update_focus_styles();
+            app.modal = Some(modal);
+            InputAction::None
+        }
+        KeyCode::BackTab => {
+            spawn.active_field = spawn.active_field.prev();
             spawn.update_focus_styles();
             app.modal = Some(modal);
             InputAction::None
@@ -1062,7 +1066,23 @@ fn handle_spawn_modal_input(
                 app.modal = Some(modal);
                 return InputAction::None;
             }
-            InputAction::SpawnAgent { project, prompt }
+            InputAction::SpawnAgent(wisphive_protocol::SpawnAgentRequest {
+                project,
+                prompt,
+                model: spawn.model_value(),
+                name: None,
+                reasoning: spawn.reasoning_value(),
+                max_turns: spawn.max_turns_value(),
+                permission_mode: None,
+                system_prompt: None,
+                append_system_prompt: None,
+                allowed_tools: None,
+                disallowed_tools: None,
+                continue_session: false,
+                resume: None,
+                output_format: None,
+                verbose: false,
+            })
         }
         _ => {
             // Block Enter/newline (Ctrl+M) from inserting, delegate rest to active TextArea

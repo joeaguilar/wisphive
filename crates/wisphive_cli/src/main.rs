@@ -130,6 +130,39 @@ enum AgentAction {
         /// Display name for the agent session
         #[arg(long)]
         name: Option<String>,
+        /// Reasoning effort level (low, medium, high)
+        #[arg(long)]
+        reasoning: Option<String>,
+        /// Maximum number of agentic turns
+        #[arg(long)]
+        max_turns: Option<u32>,
+        /// Permission mode (default, plan, bypassPermissions)
+        #[arg(long)]
+        permission_mode: Option<String>,
+        /// Custom system prompt (replaces default)
+        #[arg(long)]
+        system_prompt: Option<String>,
+        /// Additional system prompt (appended to default)
+        #[arg(long)]
+        append_system_prompt: Option<String>,
+        /// Restrict to specific tools (repeatable)
+        #[arg(long = "allowed-tools")]
+        allowed_tools: Option<Vec<String>>,
+        /// Block specific tools (repeatable)
+        #[arg(long = "disallowed-tools")]
+        disallowed_tools: Option<Vec<String>>,
+        /// Continue the most recent session
+        #[arg(long = "continue", conflicts_with = "resume")]
+        continue_session: bool,
+        /// Resume a specific session by ID
+        #[arg(long, conflicts_with = "continue_session")]
+        resume: Option<String>,
+        /// Output format (json, stream-json, text)
+        #[arg(long)]
+        output_format: Option<String>,
+        /// Enable verbose output
+        #[arg(long)]
+        verbose: bool,
     },
     /// List running agent processes
     List,
@@ -247,10 +280,42 @@ fn main() -> anyhow::Result<()> {
                 match action {
                     AgentAction::Start {
                         project,
-                        model,
                         prompt,
+                        model,
                         name,
-                    } => commands::agent::start(project, model, prompt, name).await,
+                        reasoning,
+                        max_turns,
+                        permission_mode,
+                        system_prompt,
+                        append_system_prompt,
+                        allowed_tools,
+                        disallowed_tools,
+                        continue_session,
+                        resume,
+                        output_format,
+                        verbose,
+                    } => {
+                        let proj = project
+                            .or_else(|| std::env::current_dir().ok())
+                            .unwrap_or_else(|| std::path::PathBuf::from("."));
+                        commands::agent::start(wisphive_protocol::SpawnAgentRequest {
+                            project: proj,
+                            prompt,
+                            model,
+                            name,
+                            reasoning,
+                            max_turns,
+                            permission_mode,
+                            system_prompt,
+                            append_system_prompt,
+                            allowed_tools,
+                            disallowed_tools,
+                            continue_session,
+                            resume,
+                            output_format,
+                            verbose,
+                        }).await
+                    }
                     AgentAction::List => commands::agent::list().await,
                     AgentAction::Stop { agent_id } => commands::agent::stop(agent_id).await,
                 }

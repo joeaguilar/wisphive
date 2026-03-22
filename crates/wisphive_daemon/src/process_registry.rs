@@ -39,15 +39,53 @@ impl ProcessRegistry {
         // Wisphive is the gatekeeper — skip Claude's own permission prompts
         cmd.arg("--dangerously-skip-permissions");
 
-        // Session tracking
-        cmd.args(["--session-id", &session_id.to_string()]);
+        // Session tracking — skip if resuming an existing session
+        if !req.continue_session && req.resume.is_none() {
+            cmd.args(["--session-id", &session_id.to_string()]);
+        }
 
         if let Some(ref model) = req.model {
             cmd.args(["--model", model]);
         }
-
         if let Some(ref name) = req.name {
             cmd.args(["--name", name]);
+        }
+        if let Some(ref reasoning) = req.reasoning {
+            cmd.args(["--reasoning", reasoning]);
+        }
+        if let Some(max_turns) = req.max_turns {
+            cmd.args(["--max-turns", &max_turns.to_string()]);
+        }
+        if let Some(ref perm_mode) = req.permission_mode {
+            cmd.args(["--permission-mode", perm_mode]);
+        }
+        if let Some(ref sys_prompt) = req.system_prompt {
+            cmd.args(["--system-prompt", sys_prompt]);
+        }
+        if let Some(ref append_prompt) = req.append_system_prompt {
+            cmd.args(["--append-system-prompt", append_prompt]);
+        }
+        if let Some(ref tools) = req.allowed_tools {
+            for tool in tools {
+                cmd.args(["--allowedTools", tool]);
+            }
+        }
+        if let Some(ref tools) = req.disallowed_tools {
+            for tool in tools {
+                cmd.args(["--disallowedTools", tool]);
+            }
+        }
+        if req.continue_session {
+            cmd.arg("--continue");
+        }
+        if let Some(ref session) = req.resume {
+            cmd.args(["--resume", session]);
+        }
+        if let Some(ref fmt) = req.output_format {
+            cmd.args(["--output-format", fmt]);
+        }
+        if req.verbose {
+            cmd.arg("--verbose");
         }
 
         // The prompt is the positional argument
@@ -78,6 +116,9 @@ impl ProcessRegistry {
             model: req.model,
             name: req.name,
             started_at: Utc::now(),
+            reasoning: req.reasoning,
+            max_turns: req.max_turns,
+            permission_mode: req.permission_mode,
         };
 
         info!(
