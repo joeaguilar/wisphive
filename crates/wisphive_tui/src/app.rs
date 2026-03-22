@@ -172,6 +172,8 @@ pub struct App {
     pub project_summaries_index: usize,
     /// Agent IDs that have been stopped (approved Stop events).
     pub stopped_agents: HashSet<String>,
+    /// Whether the detail view is showing rendered markdown preview.
+    pub markdown_preview: bool,
 }
 
 /// Aggregated project status for the dashboard.
@@ -227,6 +229,7 @@ impl App {
             project_summaries: Vec::new(),
             project_summaries_index: 0,
             stopped_agents: HashSet::new(),
+            markdown_preview: false,
         }
     }
 
