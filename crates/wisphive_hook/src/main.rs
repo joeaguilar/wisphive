@@ -348,8 +348,8 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
         }
     }
 
-    // Auto-approve UserPromptSubmit — the user already typed it, no review needed
-    if event_type == wisphive_protocol::HookEventType::UserPromptSubmit {
+    // Auto-approve UserPromptSubmit and ConfigChange — routine events that don't need review
+    if matches!(event_type, wisphive_protocol::HookEventType::UserPromptSubmit | wisphive_protocol::HookEventType::ConfigChange) {
         log_auto_approved(
             &wisphive_dir, &tool_use_id, &agent_id, &project, &tool_name, &tool_input, event_type,
         );
