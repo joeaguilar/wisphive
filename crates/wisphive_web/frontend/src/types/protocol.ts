@@ -73,15 +73,36 @@ export type ServerMessage =
   | { type: "agents_snapshot"; agents: AgentInfo[] }
   | { type: "history_response"; entries: HistoryEntry[] }
   | { type: "sessions_response"; sessions: SessionSummary[] }
+  | { type: "projects_response"; projects: ProjectSummary[] }
   | { type: "reimport_complete"; count: number }
   | { type: "error"; message: string };
 
+export interface ProjectSummary {
+  project: string;
+  first_seen: string;
+  last_seen: string;
+  total_calls: number;
+  approved: number;
+  denied: number;
+  agent_count: number;
+}
+
+export interface SpawnAgentRequest {
+  project: string;
+  prompt: string;
+  model?: string;
+  reasoning?: string;
+  max_turns?: number;
+}
+
 // Client → Server messages
 export type ClientMessage =
-  | { type: "approve"; id: string; message?: string; updated_input?: unknown; always_allow?: boolean }
+  | { type: "approve"; id: string; message?: string; updated_input?: unknown; always_allow?: boolean; additional_context?: string }
   | { type: "deny"; id: string; message?: string }
   | { type: "approve_all"; filter?: unknown }
   | { type: "deny_all"; filter?: unknown }
   | { type: "query_history"; agent_id?: string; limit?: number }
   | { type: "query_sessions" }
-  | { type: "reimport_events" };
+  | { type: "query_projects" }
+  | { type: "reimport_events" }
+  | { type: "spawn_agent" } & SpawnAgentRequest;

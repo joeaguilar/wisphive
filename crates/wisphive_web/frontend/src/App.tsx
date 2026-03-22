@@ -1,17 +1,24 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useWisphive } from "./hooks/useWisphive";
 import { Queue } from "./components/Queue";
 import { DetailView } from "./components/DetailView";
+import { SpawnModal } from "./components/SpawnModal";
 import "./app.css";
 
 type View = "queue" | "history" | "sessions";
 
 function App() {
-  const { connected, queue, agents, approve, deny } = useWisphive();
+  const { connected, queue, agents, projects, approve, deny, spawnAgent, queryProjects } = useWisphive();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [view, setView] = useState<View>("queue");
+  const [showSpawn, setShowSpawn] = useState(false);
 
   const selectedRequest = queue.find((r) => r.id === selectedId);
+
+  // Fetch projects when spawn modal opens
+  useEffect(() => {
+    if (showSpawn) queryProjects();
+  }, [showSpawn, queryProjects]);
 
   return (
     <div className="app">
@@ -28,6 +35,9 @@ function App() {
         </button>
         <button className={view === "sessions" ? "active" : ""} onClick={() => setView("sessions")}>
           Sessions
+        </button>
+        <button className="spawn-btn" onClick={() => setShowSpawn(true)}>
+          + Spawn Agent
         </button>
         <div className="sidebar-agents">
           <h3>Agents ({agents.length})</h3>
@@ -52,7 +62,7 @@ function App() {
             {selectedRequest && (
               <DetailView
                 request={selectedRequest}
-                onApprove={(id) => { approve(id); setSelectedId(null); }}
+                onApprove={(id, opts) => { approve(id, opts); setSelectedId(null); }}
                 onDeny={(id, msg) => { deny(id, msg); setSelectedId(null); }}
               />
             )}
@@ -69,6 +79,14 @@ function App() {
           </div>
         )}
       </main>
+
+      {showSpawn && (
+        <SpawnModal
+          projects={projects.map((p) => p.project)}
+          onSpawn={(req) => { spawnAgent(req); setShowSpawn(false); }}
+          onClose={() => setShowSpawn(false)}
+        />
+      )}
     </div>
   );
 }
