@@ -671,6 +671,44 @@ pre.code-block, pre.plan-content {
   margin-left: auto;
 }
 
+/* Help modal */
+.help-modal { max-width: 500px; }
+
+.help-grid {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-lg);
+}
+
+.help-section h3 {
+  color: var(--cyan);
+  font-size: var(--font-sm);
+  margin-bottom: var(--space-sm);
+  border-bottom: 1px solid var(--border);
+  padding-bottom: var(--space-xs);
+}
+
+.help-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-xs) 0;
+  color: var(--text-dim);
+  font-size: var(--font-base);
+}
+
+kbd {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 1px 6px;
+  font-family: inherit;
+  font-size: var(--font-sm);
+  color: var(--cyan);
+  min-width: 22px;
+  text-align: center;
+}
+
 /* ========== RESPONSIVE ========== */
 
 /* Tablet */

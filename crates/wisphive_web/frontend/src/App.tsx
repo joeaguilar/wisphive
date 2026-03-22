@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useWisphive } from "./hooks/useWisphive";
+import { useKeyboard } from "./hooks/useKeyboard";
 import { Queue } from "./components/Queue";
 import { DetailView } from "./components/DetailView";
 import { History } from "./components/History";
@@ -18,8 +19,56 @@ function App() {
   const [spawnDefaultProject, setSpawnDefaultProject] = useState<string | undefined>();
   const [sessionAgent, setSessionAgent] = useState<string | null>(null);
   const [sessionTimeline, setSessionTimeline] = useState(history);
+  const [showHelp, setShowHelp] = useState(false);
 
   const selectedRequest = queue.find((r) => r.id === selectedId);
+
+  // Queue index for keyboard navigation
+  const queueIndex = queue.findIndex((r) => r.id === selectedId);
+
+  const handleNext = useCallback(() => {
+    if (view === "queue" && queue.length > 0) {
+      const next = Math.min(queueIndex + 1, queue.length - 1);
+      setSelectedId(queue[next >= 0 ? next : 0].id);
+    }
+  }, [view, queue, queueIndex]);
+
+  const handlePrev = useCallback(() => {
+    if (view === "queue" && queue.length > 0) {
+      const prev = Math.max(queueIndex - 1, 0);
+      setSelectedId(queue[prev].id);
+    }
+  }, [view, queue, queueIndex]);
+
+  const keyActions = useMemo(() => ({
+    onNext: handleNext,
+    onPrev: handlePrev,
+    onApprove: () => {
+      if (selectedId && view === "queue") { approve(selectedId); setSelectedId(null); }
+    },
+    onDeny: () => {
+      if (selectedId && view === "queue") { deny(selectedId); setSelectedId(null); }
+    },
+    onBack: () => {
+      if (showHelp) { setShowHelp(false); return; }
+      if (showSpawn) { setShowSpawn(false); return; }
+      if (selectedId) { setSelectedId(null); return; }
+      if (sessionAgent) { setSessionAgent(null); return; }
+    },
+    onSelect: () => {
+      if (view === "queue" && queue.length > 0 && !selectedId) {
+        setSelectedId(queue[0].id);
+      }
+    },
+    onViewQueue: () => setView("queue"),
+    onViewHistory: () => setView("history"),
+    onViewSessions: () => setView("sessions"),
+    onViewProjects: () => setView("projects"),
+    onSpawn: () => setShowSpawn(true),
+    onHelp: () => setShowHelp((v) => !v),
+  }), [handleNext, handlePrev, selectedId, view, queue, approve, deny, showHelp, showSpawn, sessionAgent]);
+
+  useKeyboard(keyActions);
 
   // Fetch projects when spawn modal opens
   useEffect(() => {
@@ -108,6 +157,40 @@ function App() {
           />
         )}
       </main>
+
+      {showHelp && (
+        <div className="modal-overlay" onClick={() => setShowHelp(false)}>
+          <div className="modal-content help-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>Keyboard Shortcuts</h2>
+              <button className="modal-close" onClick={() => setShowHelp(false)}>×</button>
+            </div>
+            <div className="help-grid">
+              <div className="help-section">
+                <h3>Navigation</h3>
+                <div className="help-row"><kbd>j</kbd> / <kbd>↓</kbd> Next item</div>
+                <div className="help-row"><kbd>k</kbd> / <kbd>↑</kbd> Previous item</div>
+                <div className="help-row"><kbd>Enter</kbd> Select / expand</div>
+                <div className="help-row"><kbd>Esc</kbd> Back / close</div>
+              </div>
+              <div className="help-section">
+                <h3>Actions</h3>
+                <div className="help-row"><kbd>y</kbd> Approve selected</div>
+                <div className="help-row"><kbd>n</kbd> Deny selected</div>
+                <div className="help-row"><kbd>N</kbd> Spawn agent</div>
+              </div>
+              <div className="help-section">
+                <h3>Views</h3>
+                <div className="help-row"><kbd>1</kbd> Queue</div>
+                <div className="help-row"><kbd>2</kbd> History</div>
+                <div className="help-row"><kbd>3</kbd> Sessions</div>
+                <div className="help-row"><kbd>4</kbd> Projects</div>
+                <div className="help-row"><kbd>?</kbd> This help</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {showSpawn && (
         <SpawnModal
