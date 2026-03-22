@@ -348,6 +348,14 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
         }
     }
 
+    // Auto-approve UserPromptSubmit — the user already typed it, no review needed
+    if event_type == wisphive_protocol::HookEventType::UserPromptSubmit {
+        log_auto_approved(
+            &wisphive_dir, &tool_use_id, &agent_id, &project, &tool_name, &tool_input, event_type,
+        );
+        return Ok(HookResponse::simple(Decision::Approve));
+    }
+
     // Layer 4: Auto-approve check — PermissionRequests always go to daemon
     if !is_permission_request && is_auto_approved(&tool_name, &tool_input, &wisphive_dir) {
         log_auto_approved(
