@@ -362,7 +362,21 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
     };
 
     // Extract event-specific data for non-PreToolUse events
-    let event_data = extract_event_data(event_type, &hook_event);
+    let mut event_data = extract_event_data(event_type, &hook_event);
+
+    // For ExitPlanMode, extract plan content from transcript
+    if tool_name == "ExitPlanMode" {
+        if let Some(plan) = hook_event
+            .get("transcript_path")
+            .and_then(|v| v.as_str())
+            .and_then(extract_plan_from_transcript)
+        {
+            let data = event_data.get_or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if let Some(obj) = data.as_object_mut() {
+                obj.insert("plan_content".into(), serde_json::Value::String(plan));
+            }
+        }
+    }
 
     let request = DecisionRequest {
         id: uuid::Uuid::new_v4(),
@@ -783,6 +797,53 @@ fn extract_event_data(
         }
         _ => None,
     }
+}
+
+/// Read the transcript JSONL and extract the last assistant text content (the plan).
+///
+/// Reads the file backwards, looking for the most recent assistant message
+/// that contains text content. Returns the concatenated text blocks.
+fn extract_plan_from_transcript(path: &str) -> Option<String> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+
+    // Collect all lines, then iterate backwards to find the last assistant text.
+    // For typical transcripts this is fast enough; the file is small.
+    let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+
+    for line in lines.iter().rev() {
+        let entry: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // Only look at assistant messages
+        if entry.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+
+        let content = entry
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())?;
+
+        // Collect all text blocks from this message
+        let mut text_parts = Vec::new();
+        for item in content {
+            if item.get("type").and_then(|v| v.as_str()) == Some("text") {
+                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                    text_parts.push(text.to_string());
+                }
+            }
+        }
+
+        if !text_parts.is_empty() {
+            return Some(text_parts.join("\n"));
+        }
+    }
+
+    None
 }
 
 fn home_dir() -> PathBuf {

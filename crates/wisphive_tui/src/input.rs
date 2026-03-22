@@ -234,15 +234,19 @@ fn handle_detail_input(app: &mut App, key: KeyEvent) -> InputAction {
     let event_type = app.detail_event_type();
     match event_type {
         HookEventType::PermissionRequest => {
-            // AskUserQuestion arrives as PermissionRequest without suggestions —
-            // use dedicated handler with number-key answer selection.
             let has_suggestions = app.detail_request()
                 .and_then(|r| r.permission_suggestions.as_ref())
                 .map_or(false, |s| !s.is_empty());
+            let is_ask = app.detail_request()
+                .map(|r| has_ask_questions_input(&r.tool_input))
+                .unwrap_or(false);
             if has_suggestions {
                 handle_permission_request_keys(app, key)
-            } else {
+            } else if is_ask {
                 handle_ask_question_keys(app, key)
+            } else {
+                // ExitPlanMode and other PermissionRequests without suggestions
+                handle_plan_keys(app, key)
             }
         }
         HookEventType::Stop | HookEventType::SubagentStop => handle_stop_keys(app, key),
@@ -339,6 +343,44 @@ fn handle_permission_request_keys(app: &mut App, key: KeyEvent) -> InputAction {
         KeyCode::Char('?') => {
             if let Some(req) = app.detail_request() {
                 app.modal = Some(Modal::confirm_ask_defer(req.id));
+            }
+            InputAction::None
+        }
+        _ => InputAction::None,
+    }
+}
+
+/// Check if tool_input contains AskUserQuestion-style questions.
+fn has_ask_questions_input(tool_input: &serde_json::Value) -> bool {
+    tool_input
+        .get("questions")
+        .and_then(|v| v.as_array())
+        .map_or(false, |a| !a.is_empty())
+}
+
+/// ExitPlanMode / generic PermissionRequest without suggestions:
+/// A = accept (approve), D = deny (reject plan), M = deny with message
+fn handle_plan_keys(app: &mut App, key: KeyEvent) -> InputAction {
+    match key.code {
+        KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Enter => {
+            if let Some(req) = app.detail_request() {
+                let id = req.id;
+                app.exit_detail_view();
+                return InputAction::Approve(id);
+            }
+            InputAction::None
+        }
+        KeyCode::Char('d') | KeyCode::Char('D') => {
+            if let Some(req) = app.detail_request() {
+                let id = req.id;
+                app.exit_detail_view();
+                return InputAction::Deny(id);
+            }
+            InputAction::None
+        }
+        KeyCode::Char('m') | KeyCode::Char('M') => {
+            if let Some(req) = app.detail_request() {
+                app.modal = Some(Modal::deny_with_message(req.id));
             }
             InputAction::None
         }
