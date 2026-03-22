@@ -4,8 +4,10 @@ import type {
   ClientMessage,
   DecisionRequest,
   HistoryEntry,
+  ProjectSummary,
   ServerMessage,
   SessionSummary,
+  SpawnAgentRequest,
 } from "../types/protocol";
 
 export interface WisphiveState {
@@ -14,6 +16,7 @@ export interface WisphiveState {
   agents: AgentInfo[];
   history: HistoryEntry[];
   sessions: SessionSummary[];
+  projects: ProjectSummary[];
 }
 
 const WS_URL =
@@ -28,6 +31,7 @@ export function useWisphive() {
     agents: [],
     history: [],
     sessions: [],
+    projects: [],
   });
 
   const handleMessage = useCallback((data: string) => {
@@ -72,6 +76,9 @@ export function useWisphive() {
 
           case "sessions_response":
             return { ...prev, sessions: msg.sessions };
+
+          case "projects_response":
+            return { ...prev, projects: msg.projects };
 
           case "reimport_complete":
             return prev; // No-op, the subsequent history query will update
@@ -129,7 +136,7 @@ export function useWisphive() {
   }, []);
 
   const approve = useCallback(
-    (id: string, opts?: { message?: string; updated_input?: unknown }) => {
+    (id: string, opts?: { message?: string; updated_input?: unknown; always_allow?: boolean; additional_context?: string }) => {
       send({ type: "approve", id, ...opts });
     },
     [send],
@@ -154,6 +161,17 @@ export function useWisphive() {
     send({ type: "query_sessions" });
   }, [send]);
 
+  const queryProjects = useCallback(() => {
+    send({ type: "query_projects" });
+  }, [send]);
+
+  const spawnAgent = useCallback(
+    (req: SpawnAgentRequest) => {
+      send({ type: "spawn_agent", ...req });
+    },
+    [send],
+  );
+
   return {
     ...state,
     send,
@@ -161,5 +179,7 @@ export function useWisphive() {
     deny,
     queryHistory,
     querySessions,
+    queryProjects,
+    spawnAgent,
   };
 }

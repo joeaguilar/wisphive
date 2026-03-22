@@ -291,3 +291,155 @@ pre.code-block, pre.plan-content {
   text-align: center;
   padding: 60px;
 }
+
+/* Secondary buttons */
+.btn-secondary {
+  background: var(--bg-card);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  padding: 6px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+}
+
+.btn-secondary:hover { border-color: var(--cyan); color: var(--text); }
+
+.btn-cancel {
+  background: none;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  padding: 6px 16px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.btn-cancel:hover { border-color: var(--text-dim); }
+
+/* Spawn button */
+.spawn-btn {
+  background: var(--cyan) !important;
+  color: var(--bg) !important;
+  font-weight: bold;
+  margin-top: 8px;
+}
+
+.spawn-btn:hover { opacity: 0.9; }
+
+/* Modal overlay */
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal-content {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 20px;
+  min-width: 400px;
+  max-width: 600px;
+  max-height: 80vh;
+  overflow-y: auto;
+}
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+}
+
+.modal-header h2 { color: var(--cyan); font-size: 16px; }
+
+.modal-close {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 20px;
+  cursor: pointer;
+}
+
+.modal-close:hover { color: var(--text); }
+
+.modal-textarea {
+  width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px;
+  font-family: inherit;
+  font-size: 13px;
+  resize: vertical;
+  margin-bottom: 12px;
+}
+
+.modal-textarea:focus { outline: none; border-color: var(--cyan); }
+
+.modal-message {
+  color: var(--text);
+  margin-bottom: 16px;
+  line-height: 1.5;
+}
+
+.modal-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+/* Spawn form */
+.spawn-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.spawn-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.spawn-form label span {
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+}
+
+.spawn-form input,
+.spawn-form select,
+.spawn-form textarea {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-family: inherit;
+  font-size: 13px;
+}
+
+.spawn-form input:focus,
+.spawn-form select:focus,
+.spawn-form textarea:focus {
+  outline: none;
+  border-color: var(--cyan);
+}
+
+.spawn-options {
+  display: flex;
+  gap: 12px;
+}
+
+.spawn-options label { flex: 1; }
