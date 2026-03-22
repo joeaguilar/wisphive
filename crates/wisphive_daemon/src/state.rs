@@ -376,6 +376,109 @@ impl StateDb {
         Ok(())
     }
 
+    /// Archive old decision_log entries to JSONL and delete from SQLite.
+    ///
+    /// Two pruning strategies applied in order:
+    /// 1. Age: entries older than `max_age_days` are archived and deleted.
+    /// 2. Count: if rows still exceed `max_rows`, oldest are archived and deleted.
+    ///
+    /// Returns the number of rows archived.
+    pub async fn archive_and_prune(
+        &self,
+        archive_path: &std::path::Path,
+        max_rows: u64,
+        max_age_days: u64,
+    ) -> Result<u64> {
+        let mut total_archived = 0u64;
+
+        // Phase 1: Archive entries older than max_age_days
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(max_age_days as i64)).to_rfc3339();
+        let old_rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT id FROM decision_log WHERE resolved_at < ? ORDER BY resolved_at ASC",
+        )
+        .bind(&cutoff)
+        .fetch_all(&self.pool)
+        .await?;
+
+        if !old_rows.is_empty() {
+            total_archived += self.archive_rows_by_ids(&old_rows, archive_path).await?;
+        }
+
+        // Phase 2: If still over max_rows, trim oldest
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM decision_log")
+            .fetch_one(&self.pool)
+            .await?;
+
+        if count.0 as u64 > max_rows {
+            let excess = count.0 as u64 - max_rows;
+            let excess_rows: Vec<(String,)> = sqlx::query_as(
+                "SELECT id FROM decision_log ORDER BY resolved_at ASC LIMIT ?",
+            )
+            .bind(excess as i64)
+            .fetch_all(&self.pool)
+            .await?;
+
+            if !excess_rows.is_empty() {
+                total_archived += self.archive_rows_by_ids(&excess_rows, archive_path).await?;
+            }
+        }
+
+        Ok(total_archived)
+    }
+
+    /// Archive specific rows to JSONL file and delete from SQLite.
+    async fn archive_rows_by_ids(
+        &self,
+        ids: &[(String,)],
+        archive_path: &std::path::Path,
+    ) -> Result<u64> {
+        use std::io::Write;
+
+        // Fetch full rows for archiving
+        let mut archived = 0u64;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(archive_path)?;
+
+        for (id,) in ids {
+            let row: Option<(String, String, String, String, String, String, String, String, String, Option<String>, Option<String>)> =
+                sqlx::query_as(
+                    "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id
+                     FROM decision_log WHERE id = ?",
+                )
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+            if let Some((id, agent_id, _agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id)) = row {
+                let entry = serde_json::json!({
+                    "id": id,
+                    "agent_id": agent_id,
+                    "project": project,
+                    "tool_name": tool_name,
+                    "tool_input": serde_json::from_str::<serde_json::Value>(&tool_input).unwrap_or(serde_json::Value::Null),
+                    "decision": decision,
+                    "requested_at": requested_at,
+                    "resolved_at": resolved_at,
+                    "tool_result": tool_result.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                    "tool_use_id": tool_use_id,
+                });
+                let mut line = serde_json::to_string(&entry).unwrap_or_default();
+                line.push('\n');
+                file.write_all(line.as_bytes())?;
+
+                sqlx::query("DELETE FROM decision_log WHERE id = ?")
+                    .bind(&id)
+                    .execute(&self.pool)
+                    .await?;
+                archived += 1;
+            }
+        }
+
+        Ok(archived)
+    }
+
     /// Query distinct sessions from decision_log with aggregated stats.
     pub async fn query_sessions(&self) -> Result<Vec<wisphive_protocol::SessionSummary>> {
         let rows: Vec<(String, String, String, String, String, i64, i64, i64)> = sqlx::query_as(
