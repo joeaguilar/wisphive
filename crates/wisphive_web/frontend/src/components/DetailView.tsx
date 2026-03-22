@@ -10,7 +10,8 @@ interface DetailViewProps {
 const str = (v: unknown): string => (typeof v === "string" ? v : String(v ?? ""));
 
 export function DetailView({ request, onApprove, onDeny }: DetailViewProps) {
-  const { tool_name, tool_input, agent_id, project, timestamp, hook_event_name, event_data } = request;
+  const { tool_name, tool_input: rawInput, agent_id, project, timestamp, hook_event_name, event_data } = request;
+  const tool_input = rawInput ?? {};
   const planContent = typeof event_data?.plan_content === "string" ? event_data.plan_content : null;
   const command = typeof tool_input.command === "string" ? tool_input.command : null;
   const oldString = typeof tool_input.old_string === "string" ? tool_input.old_string : null;

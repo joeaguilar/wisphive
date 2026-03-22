@@ -6,7 +6,7 @@ export interface DecisionRequest {
   agent_type: string;
   project: string;
   tool_name: string;
-  tool_input: Record<string, unknown>;
+  tool_input: Record<string, unknown> | null;
   timestamp: string;
   hook_event_name: string;
   tool_use_id?: string;
