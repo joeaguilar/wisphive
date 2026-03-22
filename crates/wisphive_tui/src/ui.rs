@@ -60,7 +60,7 @@ fn draw_detail_view(frame: &mut Frame, app: &App) {
         .split(frame.area());
 
     if let Some(req) = app.detail_request() {
-        let lines = detail::render_detail_lines(req);
+        let lines = detail::render_detail_lines(req, app.markdown_preview);
         let total_lines = lines.len();
         let visible_height = chunks[0].height.saturating_sub(2) as usize;
 
@@ -124,8 +124,9 @@ fn draw_detail_view(frame: &mut Frame, app: &App) {
                 format!(" [Y]approve [N]deny [M]deny+msg [!]always [E]edit [C]context [?]defer [q/Esc]back [Q]uit{}", scroll_info)
             }
         };
+        let preview_indicator = if app.markdown_preview { " [P]raw" } else { " [P]review" };
         let bar = Paragraph::new(Line::from(Span::styled(
-            bar_text,
+            format!("{bar_text}{preview_indicator}"),
             Style::default().fg(Color::White).bg(Color::DarkGray),
         )));
         frame.render_widget(bar, chunks[1]);

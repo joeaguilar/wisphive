@@ -227,6 +227,7 @@ fn handle_detail_input(app: &mut App, key: KeyEvent) -> InputAction {
         KeyCode::PageUp => { app.detail_scroll = app.detail_scroll.saturating_sub(20); return InputAction::None; }
         KeyCode::Char('g') => { app.detail_scroll = 0; return InputAction::None; }
         KeyCode::Char('G') => { app.detail_scroll = usize::MAX / 2; return InputAction::None; }
+        KeyCode::Char('p') | KeyCode::Char('P') => { app.markdown_preview = !app.markdown_preview; return InputAction::None; }
         _ => {}
     }
 

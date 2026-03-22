@@ -19,3 +19,4 @@ tracing.workspace = true
 chrono.workspace = true
 similar.workspace = true
 tui-textarea.workspace = true
+pulldown-cmark.workspace = true

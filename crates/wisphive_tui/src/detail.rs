@@ -1,10 +1,11 @@
+use pulldown_cmark::{Event as MdEvent, Tag, TagEnd, Parser};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use similar::{ChangeTag, TextDiff};
 use wisphive_protocol::{DecisionRequest, HistoryEntry};
 
 /// Render the full detail content for a DecisionRequest as styled Lines.
-pub fn render_detail_lines(req: &DecisionRequest) -> Vec<Line<'static>> {
+pub fn render_detail_lines(req: &DecisionRequest, markdown_preview: bool) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
     push_header(&mut lines, req);
@@ -18,7 +19,7 @@ pub fn render_detail_lines(req: &DecisionRequest) -> Vec<Line<'static>> {
             } else if has_ask_questions(&req.tool_input) {
                 push_ask_question_detail(&mut lines, req);
             } else if has_plan_content(req) {
-                push_plan_detail(&mut lines, req);
+                push_plan_detail(&mut lines, req, markdown_preview);
             } else {
                 push_generic_detail(&mut lines, req);
             }
@@ -293,7 +294,7 @@ fn has_plan_content(req: &DecisionRequest) -> bool {
         .map_or(false, |s| !s.is_empty())
 }
 
-fn push_plan_detail(lines: &mut Vec<Line<'static>>, req: &DecisionRequest) {
+fn push_plan_detail(lines: &mut Vec<Line<'static>>, req: &DecisionRequest, markdown_preview: bool) {
     push_section_label(lines, "Plan");
     lines.push(Line::from(""));
 
@@ -303,11 +304,15 @@ fn push_plan_detail(lines: &mut Vec<Line<'static>>, req: &DecisionRequest) {
         .and_then(|d| d.get("plan_content"))
         .and_then(|v| v.as_str())
     {
-        for line in plan.lines() {
-            lines.push(Line::from(Span::styled(
-                format!("  {line}"),
-                Style::default().fg(Color::White),
-            )));
+        if markdown_preview {
+            push_markdown_lines(lines, plan);
+        } else {
+            for line in plan.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {line}"),
+                    Style::default().fg(Color::White),
+                )));
+            }
         }
     }
 }
@@ -696,4 +701,128 @@ fn push_diff_lines(lines: &mut Vec<Line<'static>>, old_text: &str, new_text: &st
         let text = format!("  {sign} {}", change.value().trim_end_matches('\n'));
         lines.push(Line::from(Span::styled(text, style)));
     }
+}
+
+/// Render markdown text as styled ratatui Lines.
+fn push_markdown_lines(lines: &mut Vec<Line<'static>>, text: &str) {
+    let parser = Parser::new(text);
+
+    let mut current_spans: Vec<Span<'static>> = Vec::new();
+    let mut current_style = Style::default().fg(Color::White);
+    let mut in_code_block = false;
+    let mut list_depth: usize = 0;
+    let mut style_depth: Vec<Style> = Vec::new();
+
+    for event in parser {
+        match event {
+            MdEvent::Start(tag) => match tag {
+                Tag::Heading { level, .. } => {
+                    style_depth.push(current_style);
+                    current_style = match level {
+                        pulldown_cmark::HeadingLevel::H1 => Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                        pulldown_cmark::HeadingLevel::H2 => Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                        _ => Style::default()
+                            .fg(Color::Blue)
+                            .add_modifier(Modifier::BOLD),
+                    };
+                }
+                Tag::Strong => {
+                    style_depth.push(current_style);
+                    current_style = current_style.add_modifier(Modifier::BOLD);
+                }
+                Tag::Emphasis => {
+                    style_depth.push(current_style);
+                    current_style = current_style.add_modifier(Modifier::ITALIC);
+                }
+                Tag::CodeBlock(_) => {
+                    in_code_block = true;
+                    lines.push(Line::from(""));
+                }
+                Tag::List(_) => {
+                    list_depth += 1;
+                }
+                Tag::Item => {
+                    let indent = "  ".repeat(list_depth);
+                    current_spans.push(Span::styled(
+                        format!("  {indent}• "),
+                        Style::default().fg(Color::Cyan),
+                    ));
+                }
+                Tag::Paragraph => {}
+                _ => {}
+            },
+            MdEvent::End(tag_end) => match tag_end {
+                TagEnd::Heading(_) => {
+                    current_style = style_depth.pop().unwrap_or(Style::default().fg(Color::White));
+                    flush_spans(lines, &mut current_spans);
+                    lines.push(Line::from(""));
+                }
+                TagEnd::Strong | TagEnd::Emphasis => {
+                    current_style = style_depth.pop().unwrap_or(Style::default().fg(Color::White));
+                }
+                TagEnd::CodeBlock => {
+                    in_code_block = false;
+                    lines.push(Line::from(""));
+                }
+                TagEnd::List(_) => {
+                    list_depth = list_depth.saturating_sub(1);
+                }
+                TagEnd::Item => {
+                    flush_spans(lines, &mut current_spans);
+                }
+                TagEnd::Paragraph => {
+                    flush_spans(lines, &mut current_spans);
+                    lines.push(Line::from(""));
+                }
+                _ => {}
+            },
+            MdEvent::Text(text) => {
+                if in_code_block {
+                    let code_style = Style::default().fg(Color::Yellow);
+                    for line in text.lines() {
+                        lines.push(Line::from(Span::styled(
+                            format!("    {line}"),
+                            code_style,
+                        )));
+                    }
+                } else {
+                    current_spans.push(Span::styled(
+                        text.to_string(),
+                        current_style,
+                    ));
+                }
+            }
+            MdEvent::Code(code) => {
+                current_spans.push(Span::styled(
+                    format!("`{code}`"),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            MdEvent::SoftBreak | MdEvent::HardBreak => {
+                flush_spans(lines, &mut current_spans);
+            }
+            MdEvent::Rule => {
+                lines.push(Line::from(Span::styled(
+                    "  ────────────────────────────",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            _ => {}
+        }
+    }
+    flush_spans(lines, &mut current_spans);
+}
+
+/// Flush accumulated spans into a Line, prepending indent.
+fn flush_spans(lines: &mut Vec<Line<'static>>, spans: &mut Vec<Span<'static>>) {
+    if spans.is_empty() {
+        return;
+    }
+    let mut line_spans = vec![Span::raw("  ")];
+    line_spans.append(spans);
+    lines.push(Line::from(line_spans));
 }
