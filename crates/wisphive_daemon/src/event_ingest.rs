@@ -95,8 +95,37 @@ async fn run_ingest(events_path: PathBuf, state_db: Arc<StateDb>) -> anyhow::Res
     Ok(())
 }
 
+/// Read all lines from events.jsonl and ingest them into the database.
+/// Returns the number of events successfully ingested.
+/// Uses INSERT OR IGNORE with a unique index on tool_use_id for deduplication.
+pub async fn reimport_all(events_path: &std::path::Path, state_db: &StateDb) -> anyhow::Result<u64> {
+    use tokio::io::AsyncBufReadExt;
+
+    if !events_path.exists() {
+        return Ok(0);
+    }
+
+    let file = tokio::fs::File::open(events_path).await?;
+    let reader = tokio::io::BufReader::new(file);
+    let mut lines = reader.lines();
+    let mut count = 0u64;
+
+    while let Some(line) = lines.next_line().await? {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if ingest_line(trimmed, state_db).await.is_ok() {
+            count += 1;
+        }
+    }
+
+    info!(count, "reimported events from events.jsonl");
+    Ok(count)
+}
+
 /// Parse a single JSONL line and insert into decision_log as auto-approved.
-async fn ingest_line(line: &str, state_db: &StateDb) -> anyhow::Result<()> {
+pub async fn ingest_line(line: &str, state_db: &StateDb) -> anyhow::Result<()> {
     let event: serde_json::Value = serde_json::from_str(line)?;
 
     let event_type = event.get("event").and_then(|v| v.as_str()).unwrap_or("");

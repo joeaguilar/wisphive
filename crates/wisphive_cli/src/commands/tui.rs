@@ -146,8 +146,10 @@ async fn run_loop(
                             conn.send(&ClientMessage::SpawnAgent(req)).await?;
                         }
                         InputAction::QueryHistory { agent_id } => {
-                            tracing::info!(?agent_id, "querying history");
+                            tracing::info!(?agent_id, "querying history (with reimport)");
                             app.history_page = 0;
+                            // Sync events.jsonl into DB before querying
+                            conn.send(&ClientMessage::ReimportEvents).await?;
                             conn.send(&ClientMessage::QueryHistory {
                                 agent_id,
                                 limit: Some(HISTORY_PAGE_SIZE + 1),
@@ -316,6 +318,9 @@ async fn run_loop(
                         tracing::info!(count = projects.len(), "received projects");
                         app.project_summaries = projects;
                         app.project_summaries_index = 0;
+                    }
+                    Some(ServerMessage::ReimportComplete { count }) => {
+                        tracing::info!(count, "reimport complete");
                     }
                     Some(_) => {}
                     None => {

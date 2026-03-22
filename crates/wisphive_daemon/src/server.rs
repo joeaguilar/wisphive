@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -103,8 +104,9 @@ impl Server {
                             let state_db = self.state_db.clone();
                             let timeout = self.config.hook_timeout_secs;
                             let notifications = self.config.notifications_enabled;
+                            let home_dir = self.config.home_dir.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = handle_connection(stream, queue, process_registry, agent_registry, tui_tx, state_db, timeout, notifications).await {
+                                if let Err(e) = handle_connection(stream, queue, process_registry, agent_registry, tui_tx, state_db, timeout, notifications, home_dir).await {
                                     warn!("connection error: {e}");
                                 }
                             });
@@ -147,6 +149,7 @@ async fn handle_connection(
     state_db: Arc<StateDb>,
     hook_timeout_secs: u64,
     notifications_enabled: bool,
+    home_dir: PathBuf,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -179,7 +182,7 @@ async fn handle_connection(
                     handle_hook(lines, writer, queue, agent_registry, tui_tx.clone(), state_db, hook_timeout_secs, notifications_enabled).await
                 }
                 ClientType::Tui => {
-                    handle_tui(lines, writer, queue, process_registry, agent_registry, state_db, tui_tx).await
+                    handle_tui(lines, writer, queue, process_registry, agent_registry, state_db, tui_tx, home_dir).await
                 }
             }
         }
@@ -345,6 +348,7 @@ async fn handle_tui(
     agent_registry: Arc<Mutex<AgentRegistry>>,
     state_db: Arc<StateDb>,
     tui_tx: broadcast::Sender<ServerMessage>,
+    home_dir: PathBuf,
 ) -> Result<()> {
     // Send agents snapshot
     let agents_snap = {
@@ -451,6 +455,21 @@ async fn handle_tui(
                                 let agents = pr.list();
                                 let resp = encode(&ServerMessage::AgentList { agents })?;
                                 writer.write_all(resp.as_bytes()).await?;
+                            }
+                            ClientMessage::ReimportEvents => {
+                                let events_path = home_dir.join("events.jsonl");
+                                match crate::event_ingest::reimport_all(&events_path, &state_db).await {
+                                    Ok(count) => {
+                                        let resp = encode(&ServerMessage::ReimportComplete { count })?;
+                                        writer.write_all(resp.as_bytes()).await?;
+                                    }
+                                    Err(e) => {
+                                        let resp = encode(&ServerMessage::Error {
+                                            message: format!("reimport failed: {e}"),
+                                        })?;
+                                        writer.write_all(resp.as_bytes()).await?;
+                                    }
+                                }
                             }
                             ClientMessage::QueryHistory { ref agent_id, limit } => {
                                 let limit = limit.unwrap_or(200);

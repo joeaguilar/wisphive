@@ -104,10 +104,10 @@ impl StateDb {
         .execute(&self.pool)
         .await?;
 
-        // Index for exact tool_use_id correlation
+        // Unique index on tool_use_id for deduplication (NULL values excluded)
         sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_decision_log_tool_use_id
-             ON decision_log(tool_use_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_decision_log_tool_use_id
+             ON decision_log(tool_use_id) WHERE tool_use_id IS NOT NULL",
         )
         .execute(&self.pool)
         .await?;
