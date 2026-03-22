@@ -558,14 +558,33 @@ fn register_agent_once(agent_id: &str, project: &std::path::Path, wisphive_dir: 
     })();
 }
 
-/// Check if Stop events should be auto-approved (config: `auto_approve_stop: true`).
-fn is_stop_auto_approved(wisphive_dir: &std::path::Path) -> bool {
+/// Check if an event type should be auto-approved based on config.
+///
+/// Config keys in ~/.wisphive/config.json:
+///   "auto_approve_stop": bool          (default: false)
+///   "auto_approve_user_prompt": bool   (default: true)
+///   "auto_approve_config_change": bool (default: true)
+///
+/// Set to false to send these events to the daemon for review (useful for debugging).
+fn is_event_auto_approved(
+    event_type: wisphive_protocol::HookEventType,
+    wisphive_dir: &std::path::Path,
+) -> bool {
+    use wisphive_protocol::HookEventType;
+
+    let (config_key, default) = match event_type {
+        HookEventType::Stop | HookEventType::SubagentStop => ("auto_approve_stop", false),
+        HookEventType::UserPromptSubmit => ("auto_approve_user_prompt", true),
+        HookEventType::ConfigChange => ("auto_approve_config_change", true),
+        _ => return false,
+    };
+
     let config_path = wisphive_dir.join("config.json");
     std::fs::read_to_string(&config_path)
         .ok()
         .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-        .and_then(|config| config.get("auto_approve_stop")?.as_bool())
-        .unwrap_or(false)
+        .and_then(|config| config.get(config_key)?.as_bool())
+        .unwrap_or(default)
 }
 
 /// Check if a tool is auto-approved using tiered levels + content-aware rules.
