@@ -55,7 +55,7 @@ async fn handle_ws(ws: WebSocket, socket_path: PathBuf) {
 /// - `socket_path`: path to the daemon's Unix socket
 /// - `port`: HTTP port to listen on
 /// - `dev_mode`: if true, proxy to Vite dev server instead of serving embedded assets
-pub async fn serve(socket_path: PathBuf, port: u16, dev_mode: bool) -> anyhow::Result<()> {
+pub async fn serve(socket_path: PathBuf, port: u16, dev_mode: bool, host: [u8; 4]) -> anyhow::Result<()> {
     let app = if dev_mode {
         // In dev mode, only serve the WebSocket endpoint.
         // The Vite dev server handles static assets (run `npm run dev` separately).
@@ -76,7 +76,7 @@ pub async fn serve(socket_path: PathBuf, port: u16, dev_mode: bool) -> anyhow::R
             .with_state(socket_path)
     };
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = SocketAddr::from((host, port));
     info!(%addr, dev_mode, "web server starting");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;

@@ -150,8 +150,30 @@ body {
 
 .tool-name { font-weight: bold; color: var(--cyan); }
 .event-type { color: var(--text-dim); font-size: 11px; }
+.event-prefix {
+  background: var(--border);
+  color: var(--text-dim);
+  font-size: 10px;
+  font-weight: bold;
+  padding: 1px 4px;
+  border-radius: 2px;
+  min-width: 14px;
+  text-align: center;
+}
+.project-name { color: var(--text-dim); font-size: 11px; }
 .time-ago { margin-left: auto; color: var(--text-dim); font-size: 11px; }
 .agent-id { color: var(--text-dim); font-size: 11px; }
+.queue-item-summary {
+  color: var(--text);
+  font-size: 12px;
+  margin-top: 4px;
+  padding: 4px 6px;
+  background: var(--bg);
+  border-radius: 3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
 .queue-item-actions {
   display: flex;

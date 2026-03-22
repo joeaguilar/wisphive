@@ -22,6 +22,9 @@ enum Command {
         /// HTTP port (default: 3100)
         #[arg(short, long, default_value = "3100")]
         port: u16,
+        /// Bind address (default: 127.0.0.1, use 0.0.0.0 for LAN access)
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
         /// Dev mode: only serve WebSocket, expect Vite dev server for frontend
         #[arg(long)]
         dev: bool,
@@ -347,21 +350,47 @@ fn main() -> anyhow::Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(commands::tui::run())
         }
-        Command::Web { port, dev } => {
+        Command::Web { port, host, dev } => {
             let rt = tokio::runtime::Runtime::new()?;
             let home = std::env::var("HOME")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
                 .join(".wisphive");
             let socket_path = home.join("wisphive.sock");
+
+            let host_octets: [u8; 4] = match host.as_str() {
+                "0.0.0.0" => [0, 0, 0, 0],
+                "127.0.0.1" | "localhost" => [127, 0, 0, 1],
+                other => {
+                    let parts: Vec<u8> = other.split('.').filter_map(|s| s.parse().ok()).collect();
+                    if parts.len() == 4 {
+                        [parts[0], parts[1], parts[2], parts[3]]
+                    } else {
+                        eprintln!("Invalid host address: {other}");
+                        return Ok(());
+                    }
+                }
+            };
+
             if dev {
                 eprintln!("Wisphive Web (dev mode)");
-                eprintln!("  WebSocket: http://127.0.0.1:{port}/ws");
+                eprintln!("  WebSocket: http://{host}:{port}/ws");
                 eprintln!("  Run `cd crates/wisphive_web/frontend && npm run dev` for the UI");
             } else {
-                eprintln!("Wisphive Web: http://127.0.0.1:{port}");
+                eprintln!("Wisphive Web: http://{host}:{port}");
+                if host_octets == [0, 0, 0, 0] {
+                    // Show local IP for LAN access
+                    if let Ok(output) = std::process::Command::new("ipconfig").arg("getifaddr").arg("en0").output() {
+                        if let Ok(ip) = String::from_utf8(output.stdout) {
+                            let ip = ip.trim();
+                            if !ip.is_empty() {
+                                eprintln!("  LAN:      http://{ip}:{port}");
+                            }
+                        }
+                    }
+                }
             }
-            rt.block_on(wisphive_web::serve(socket_path, port, dev))
+            rt.block_on(wisphive_web::serve(socket_path, port, dev, host_octets))
         }
     }
 }
