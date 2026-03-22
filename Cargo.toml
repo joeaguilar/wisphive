@@ -7,6 +7,7 @@ members = [
     "crates/wisphive_tui",
     "crates/wisphive_cli",
     "crates/wisphive_adapters",
+    "crates/wisphive_web",
 ]
 
 [workspace.package]
@@ -23,6 +24,7 @@ wisphive_hook = { path = "crates/wisphive_hook" }
 wisphive_tui = { path = "crates/wisphive_tui" }
 wisphive_cli = { path = "crates/wisphive_cli" }
 wisphive_adapters = { path = "crates/wisphive_adapters" }
+wisphive_web = { path = "crates/wisphive_web" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -54,6 +56,13 @@ clap = { version = "4", features = ["derive"] }
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Web
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
+mime_guess = "2"
+futures-util = "0.3"
 
 # Error handling
 thiserror = "2"

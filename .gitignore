@@ -4,3 +4,5 @@
 *.swp
 *.swo
 .DS_Store
+crates/wisphive_web/frontend/node_modules/
+crates/wisphive_web/frontend/dist/
