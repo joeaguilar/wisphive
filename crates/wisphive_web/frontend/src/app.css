@@ -593,9 +593,82 @@ pre.code-block, pre.plan-content {
 }
 
 .history-detail {
-  margin-top: 8px;
-  padding-top: 8px;
+  margin-top: var(--space-sm);
+  padding-top: var(--space-sm);
   border-top: 1px solid var(--border);
+}
+
+/* Sessions & Projects views */
+.sessions-view, .projects-view {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.sessions-toolbar {
+  display: flex;
+  gap: var(--space-sm);
+  align-items: center;
+  margin-bottom: var(--space-md);
+}
+
+.sessions-toolbar h2 {
+  color: var(--cyan);
+  font-size: var(--font-lg);
+}
+
+.sessions-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  overflow-y: auto;
+}
+
+.session-item {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-md);
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.session-item:hover { background: var(--bg-card-hover); }
+
+.session-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.status-indicator { font-size: 10px; }
+.status-indicator.live { color: var(--green); }
+.status-indicator.ended { color: var(--text-dim); }
+
+.project-name-lg {
+  font-weight: bold;
+  color: var(--text);
+}
+
+.session-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  margin-top: var(--space-xs);
+}
+
+.session-stats {
+  color: var(--text-dim);
+  font-size: var(--font-sm);
+}
+
+.badge-pending {
+  background: var(--red);
+  color: white;
+}
+
+.spawn-project-btn {
+  margin-left: auto;
 }
 
 /* ========== RESPONSIVE ========== */
