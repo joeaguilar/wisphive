@@ -559,3 +559,157 @@ pre.code-block, pre.plan-content {
   padding-top: 8px;
   border-top: 1px solid var(--border);
 }
+
+/* ========== RESPONSIVE ========== */
+
+/* Tablet: sidebar narrower */
+@media (max-width: 1024px) {
+  .sidebar { width: 160px; }
+  .queue { max-width: 300px; }
+}
+
+/* Mobile: sidebar becomes top nav, stack everything */
+@media (max-width: 768px) {
+  .app {
+    flex-direction: column;
+  }
+
+  /* Sidebar → horizontal top bar */
+  .sidebar {
+    width: 100%;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    padding: 8px 12px;
+    gap: 6px;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .sidebar-header {
+    margin-bottom: 0;
+    margin-right: auto;
+  }
+
+  .sidebar-header h1 { font-size: 14px; }
+
+  .sidebar button {
+    padding: 8px 12px;
+    font-size: 12px;
+  }
+
+  .spawn-btn { margin-top: 0 !important; }
+
+  /* Hide agents list on mobile — too much clutter */
+  .sidebar-agents { display: none; }
+
+  /* Content fills remaining space */
+  .content {
+    padding: 10px;
+    overflow: auto;
+  }
+
+  /* Queue + detail: stack vertically */
+  .queue-layout {
+    flex-direction: column;
+  }
+
+  .queue {
+    max-width: 100%;
+    min-width: 0;
+  }
+
+  .detail-view {
+    border-top: 1px solid var(--border);
+    margin-top: 8px;
+  }
+
+  /* Larger touch targets */
+  .queue-item {
+    padding: 12px;
+  }
+
+  .queue-item-actions {
+    gap: 12px;
+  }
+
+  .btn-approve, .btn-deny, .btn-secondary, .btn-cancel {
+    padding: 10px 16px;
+    font-size: 14px;
+    min-height: 44px;
+  }
+
+  .detail-actions {
+    flex-wrap: wrap;
+  }
+
+  .option-btn {
+    padding: 12px;
+    font-size: 14px;
+    min-height: 44px;
+  }
+
+  /* History toolbar stacks */
+  .history-toolbar {
+    flex-wrap: wrap;
+  }
+
+  .history-search {
+    flex-basis: 100%;
+    padding: 10px;
+    font-size: 14px;
+  }
+
+  .history-item {
+    padding: 10px;
+  }
+
+  .history-item-row {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  /* Modal fills screen on mobile */
+  .modal-content {
+    min-width: 0;
+    max-width: 95vw;
+    width: 95vw;
+    max-height: 90vh;
+  }
+
+  .modal-textarea {
+    font-size: 16px; /* prevent iOS zoom on focus */
+    padding: 12px;
+  }
+
+  .spawn-options {
+    flex-direction: column;
+  }
+
+  .spawn-form input,
+  .spawn-form select,
+  .spawn-form textarea {
+    font-size: 16px; /* prevent iOS zoom */
+    padding: 10px;
+  }
+
+  /* Code blocks scroll horizontally */
+  pre.code-block, pre.plan-content {
+    font-size: 11px;
+    max-height: 300px;
+    overflow: auto;
+  }
+
+  .detail-meta {
+    flex-direction: column;
+    gap: 4px;
+  }
+}
+
+/* Small phones */
+@media (max-width: 400px) {
+  .sidebar button { padding: 6px 8px; font-size: 11px; }
+  .sidebar-header h1 { font-size: 12px; }
+  .content { padding: 6px; }
+  .detail-header h2 { font-size: 14px; }
+}
