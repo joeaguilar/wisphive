@@ -92,8 +92,12 @@ pub struct App {
     pub queue_index: usize,
     /// Connected agents.
     pub agents: Vec<AgentInfo>,
+    /// Currently selected index in the agents panel.
+    pub agents_index: usize,
     /// Known projects (derived from agent connections).
     pub projects: Vec<ProjectStatus>,
+    /// Currently selected index in the projects panel.
+    pub projects_panel_index: usize,
     /// Which panel has focus.
     pub focus: FocusPanel,
     /// Active modal dialog (if any).
@@ -189,7 +193,9 @@ impl App {
             queue: Vec::new(),
             queue_index: 0,
             agents: Vec::new(),
+            agents_index: 0,
             projects: Vec::new(),
+            projects_panel_index: 0,
             focus: FocusPanel::Queue,
             modal: None,
             filter: None,
@@ -269,6 +275,41 @@ impl App {
         let len = self.filtered_queue().len();
         if len > 0 && self.queue_index < len - 1 {
             self.queue_index += 1;
+        }
+    }
+
+    /// Move selection up in the agents panel.
+    pub fn agents_up(&mut self) {
+        if self.agents_index > 0 {
+            self.agents_index -= 1;
+        }
+    }
+
+    /// Move selection down in the agents panel.
+    pub fn agents_down(&mut self) {
+        let len = self.agents.len();
+        if len > 0 && self.agents_index < len - 1 {
+            self.agents_index += 1;
+        }
+    }
+
+    /// Get the currently selected agent.
+    pub fn selected_agent(&self) -> Option<&AgentInfo> {
+        self.agents.get(self.agents_index)
+    }
+
+    /// Move selection up in the projects panel.
+    pub fn projects_panel_up(&mut self) {
+        if self.projects_panel_index > 0 {
+            self.projects_panel_index -= 1;
+        }
+    }
+
+    /// Move selection down in the projects panel.
+    pub fn projects_panel_down(&mut self) {
+        let len = self.projects.len();
+        if len > 0 && self.projects_panel_index < len - 1 {
+            self.projects_panel_index += 1;
         }
     }
 
