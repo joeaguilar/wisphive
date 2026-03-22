@@ -165,6 +165,13 @@ export function useWisphive() {
     send({ type: "query_projects" });
   }, [send]);
 
+  const searchHistory = useCallback(
+    (query: string) => {
+      send({ type: "search_history", query, limit: 200 });
+    },
+    [send],
+  );
+
   const spawnAgent = useCallback(
     (req: SpawnAgentRequest) => {
       send({ type: "spawn_agent", ...req });
@@ -180,6 +187,7 @@ export function useWisphive() {
     queryHistory,
     querySessions,
     queryProjects,
+    searchHistory,
     spawnAgent,
   };
 }
