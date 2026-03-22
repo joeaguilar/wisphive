@@ -523,7 +523,7 @@ fn build_ask_answer(tool_input: &serde_json::Value, question: &str, answer: &str
     updated
 }
 
-/// Stop/SubagentStop: A=accept (approve = let stop)
+/// Stop/SubagentStop: A=accept (approve = let stop), D=deny with feedback (continue working)
 fn handle_stop_keys(app: &mut App, key: KeyEvent) -> InputAction {
     match key.code {
         KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Enter => {
@@ -531,6 +531,12 @@ fn handle_stop_keys(app: &mut App, key: KeyEvent) -> InputAction {
                 let id = req.id;
                 app.exit_detail_view();
                 return InputAction::Approve(id);
+            }
+            InputAction::None
+        }
+        KeyCode::Char('d') | KeyCode::Char('D') => {
+            if let Some(req) = app.detail_request() {
+                app.modal = Some(Modal::deny_with_message(req.id));
             }
             InputAction::None
         }

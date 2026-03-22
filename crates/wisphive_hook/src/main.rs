@@ -171,7 +171,11 @@ fn format_permission_response(resp: &HookResponse) -> i32 {
 /// Format Stop/SubagentStop: approve = let stop (exit 0), deny = continue working.
 fn format_stop_response(resp: &HookResponse) -> i32 {
     match resp.decision {
-        Decision::Approve => 0, // let it stop
+        Decision::Approve => {
+            let json = serde_json::json!({"decision": "allow"});
+            print!("{}", json);
+            0
+        }
         Decision::Deny => {
             let reason = resp.message.as_deref().unwrap_or("continue working");
             let json = serde_json::json!({"decision": "block", "reason": reason});

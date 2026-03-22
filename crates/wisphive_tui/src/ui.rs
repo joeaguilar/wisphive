@@ -110,7 +110,7 @@ fn draw_detail_view(frame: &mut Frame, app: &App) {
                 }
             }
             HookEventType::Stop | HookEventType::SubagentStop => {
-                format!(" [A/Enter]accept [q/Esc]back [Q]uit{}", scroll_info)
+                format!(" [A/Enter]accept [D]deny+msg [q/Esc]back [Q]uit{}", scroll_info)
             }
             HookEventType::UserPromptSubmit | HookEventType::ConfigChange => {
                 format!(" [A]llow [B]lock [M]block+msg [q/Esc]back [Q]uit{}", scroll_info)
