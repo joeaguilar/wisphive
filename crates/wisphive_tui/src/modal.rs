@@ -17,6 +17,8 @@ pub enum ModalAction {
     AskDefer,
     /// Answer an AskUserQuestion with typed text.
     AnswerQuestion,
+    /// Pick a project from the list, then transition to SpawnAgent.
+    PickProject,
 }
 
 /// Active input field in the spawn agent modal.
@@ -157,6 +159,11 @@ impl Default for SpawnModal {
     }
 }
 
+/// State for the project picker modal.
+pub struct PickerState {
+    pub index: usize,
+}
+
 /// A confirmation or input dialog.
 pub struct Modal {
     pub title: String,
@@ -168,6 +175,8 @@ pub struct Modal {
     pub spawn: Option<SpawnModal>,
     /// TextArea for text input modals (deny-with-message, approve-with-context, edit-input).
     pub textarea: Option<TextArea<'static>>,
+    /// State for the project picker modal.
+    pub picker: Option<PickerState>,
 }
 
 impl Modal {
@@ -181,6 +190,7 @@ impl Modal {
             target_id: None,
             spawn: None,
             textarea: None,
+            picker: None,
         }
     }
 
@@ -194,6 +204,7 @@ impl Modal {
             target_id: None,
             spawn: None,
             textarea: None,
+            picker: None,
         }
     }
 
@@ -205,6 +216,7 @@ impl Modal {
             target_id: None,
             spawn: Some(SpawnModal::new()),
             textarea: None,
+            picker: None,
         }
     }
 
@@ -216,6 +228,7 @@ impl Modal {
             target_id: Some(id),
             spawn: None,
             textarea: Some(make_textarea("", "Enter feedback...")),
+            picker: None,
         }
     }
 
@@ -227,6 +240,7 @@ impl Modal {
             target_id: Some(id),
             spawn: None,
             textarea: Some(make_textarea("", "Enter context...")),
+            picker: None,
         }
     }
 
@@ -244,6 +258,7 @@ impl Modal {
             target_id: Some(id),
             spawn: None,
             textarea: Some(make_textarea(&initial, "")),
+            picker: None,
         }
     }
 
@@ -257,6 +272,7 @@ impl Modal {
             target_id: Some(id),
             spawn: None,
             textarea: None,
+            picker: None,
         }
     }
 
@@ -268,6 +284,19 @@ impl Modal {
             target_id: Some(id),
             spawn: None,
             textarea: Some(make_textarea("", "Type your answer...")),
+            picker: None,
+        }
+    }
+
+    pub fn pick_project() -> Self {
+        Self {
+            title: "Pick Project".into(),
+            body: "Select a project to spawn an agent (j/k navigate, Enter select, Esc cancel):".into(),
+            action: ModalAction::PickProject,
+            target_id: None,
+            spawn: None,
+            textarea: None,
+            picker: Some(PickerState { index: 0 }),
         }
     }
 
@@ -279,6 +308,7 @@ impl Modal {
             target_id: Some(id),
             spawn: None,
             textarea: None,
+            picker: None,
         }
     }
 }

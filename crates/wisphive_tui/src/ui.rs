@@ -46,7 +46,11 @@ fn draw_dashboard(frame: &mut Frame, app: &App) {
 
     // Draw modal on top if present
     if let Some(ref modal) = app.modal {
-        draw_modal(frame, modal);
+        if modal.picker.is_some() {
+            draw_picker_modal(frame, app);
+        } else {
+            draw_modal(frame, modal);
+        }
     }
 }
 
@@ -138,7 +142,11 @@ fn draw_detail_view(frame: &mut Frame, app: &App) {
 
     // Render modal overlay (deny-with-message, answer-question, etc.)
     if let Some(ref modal) = app.modal {
-        draw_modal(frame, modal);
+        if modal.picker.is_some() {
+            draw_picker_modal(frame, app);
+        } else {
+            draw_modal(frame, modal);
+        }
     }
 }
 
@@ -880,7 +888,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             "disconnected"
         };
         format!(
-            " [y]approve [Enter/a/d]review [A]ll [D]eny-all [n]spawn [h]istory [s]essions [p]rojects [c]onfig [/]filter [Tab]cycle [q]back [Q]uit | {} ",
+            " [y]approve [Enter/a/d]review [A]ll [D]eny-all [n]spawn [P]ick+spawn [h]istory [s]essions [p]rojects [c]onfig [/]filter [Tab]cycle [q]back [Q]uit | {} ",
             conn
         )
     };
@@ -891,6 +899,95 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     )));
 
     frame.render_widget(bar, area);
+}
+
+fn draw_picker_modal(frame: &mut Frame, app: &App) {
+    let modal = app.modal.as_ref().unwrap();
+    let picker = modal.picker.as_ref().unwrap();
+    let area = frame.area();
+
+    let project_count = app.project_summaries.len();
+    // Height: 2 (title border + body) + max 12 project rows + 2 (bottom border + status)
+    let list_height = project_count.max(1).min(12) as u16;
+    let modal_height = (list_height + 5).min(area.height.saturating_sub(4));
+    let modal_width = 70.min(area.width.saturating_sub(4));
+
+    let x = (area.width.saturating_sub(modal_width)) / 2;
+    let y = (area.height.saturating_sub(modal_height)) / 2;
+    let modal_area = Rect::new(x, y, modal_width, modal_height);
+
+    frame.render_widget(Clear, modal_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(format!(" {} ", modal.title));
+
+    let inner = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+
+    if project_count == 0 {
+        let msg = Paragraph::new(Line::from(Span::styled(
+            "No projects found. Run an agent first to register a project.",
+            Style::default().fg(Color::DarkGray),
+        )));
+        frame.render_widget(msg, inner);
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // hint line
+            Constraint::Min(1),   // project list
+        ])
+        .split(inner);
+
+    let hint = Paragraph::new(Line::from(Span::styled(
+        "j/k navigate, Enter select, Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+    frame.render_widget(hint, chunks[0]);
+
+    let items: Vec<ListItem> = app
+        .project_summaries
+        .iter()
+        .enumerate()
+        .map(|(i, project)| {
+            let indicator = if project.has_live_agents {
+                Span::styled("● ", Style::default().fg(Color::Green))
+            } else {
+                Span::styled("○ ", Style::default().fg(Color::DarkGray))
+            };
+
+            let project_name = project
+                .project
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| project.project.to_string_lossy().to_string());
+
+            let detail = format!("{}agents {}calls", project.agent_count, project.total_calls);
+
+            let line = Line::from(vec![
+                indicator,
+                Span::styled(
+                    format!("{:<20} ", project_name),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(detail, Style::default().fg(Color::DarkGray)),
+            ]);
+
+            let style = if i == picker.index {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            ListItem::new(line).style(style)
+        })
+        .collect();
+
+    let list = List::new(items);
+    frame.render_widget(list, chunks[1]);
 }
 
 fn draw_modal(frame: &mut Frame, modal: &Modal) {
