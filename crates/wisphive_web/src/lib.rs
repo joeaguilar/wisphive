@@ -11,6 +11,13 @@ use axum::routing::get;
 use rust_embed::RustEmbed;
 use tracing::info;
 
+/// Shared server state.
+#[derive(Clone)]
+struct AppState {
+    socket_path: PathBuf,
+    config_path: PathBuf,
+}
+
 /// Embedded frontend assets (built by Vite into frontend/dist/).
 #[derive(RustEmbed)]
 #[folder = "frontend/dist/"]
@@ -20,7 +27,6 @@ struct FrontendAssets;
 async fn static_handler(uri: axum::http::Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
 
-    // Try the exact path first
     if let Some(file) = FrontendAssets::get(path) {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
         (
@@ -29,7 +35,6 @@ async fn static_handler(uri: axum::http::Uri) -> Response {
         )
             .into_response()
     } else if let Some(file) = FrontendAssets::get("index.html") {
-        // SPA fallback
         Html(std::str::from_utf8(&file.data).unwrap_or("").to_string()).into_response()
     } else {
         (axum::http::StatusCode::NOT_FOUND, "not found").into_response()
@@ -39,9 +44,9 @@ async fn static_handler(uri: axum::http::Uri) -> Response {
 /// WebSocket upgrade handler — bridges browser ↔ daemon.
 async fn ws_handler(
     ws: WebSocketUpgrade,
-    axum::extract::State(socket_path): axum::extract::State<PathBuf>,
+    axum::extract::State(state): axum::extract::State<AppState>,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_ws(socket, socket_path))
+    ws.on_upgrade(move |socket| handle_ws(socket, state.socket_path))
 }
 
 async fn handle_ws(ws: WebSocket, socket_path: PathBuf) {
@@ -50,18 +55,53 @@ async fn handle_ws(ws: WebSocket, socket_path: PathBuf) {
     }
 }
 
+/// GET /api/config — read config.json
+async fn get_config(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Response {
+    match std::fs::read_to_string(&state.config_path) {
+        Ok(content) => (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            content,
+        ).into_response(),
+        Err(_) => (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            "{}".to_string(),
+        ).into_response(),
+    }
+}
+
+/// PUT /api/config — write config.json
+async fn put_config(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    body: String,
+) -> Response {
+    // Validate JSON
+    if serde_json::from_str::<serde_json::Value>(&body).is_err() {
+        return (axum::http::StatusCode::BAD_REQUEST, "invalid JSON").into_response();
+    }
+    match std::fs::write(&state.config_path, &body) {
+        Ok(_) => (axum::http::StatusCode::OK, "saved").into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("write failed: {e}"),
+        ).into_response(),
+    }
+}
+
 /// Start the web server.
-///
-/// - `socket_path`: path to the daemon's Unix socket
-/// - `port`: HTTP port to listen on
-/// - `dev_mode`: if true, proxy to Vite dev server instead of serving embedded assets
 pub async fn serve(socket_path: PathBuf, port: u16, dev_mode: bool, host: [u8; 4]) -> anyhow::Result<()> {
+    let config_path = socket_path.parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("config.json");
+
+    let state = AppState { socket_path, config_path };
+
     let app = if dev_mode {
-        // In dev mode, only serve the WebSocket endpoint.
-        // The Vite dev server handles static assets (run `npm run dev` separately).
         Router::new()
             .route("/ws", get(ws_handler))
-            .with_state(socket_path)
+            .route("/api/config", get(get_config).put(put_config))
+            .with_state(state)
             .layer(
                 tower_http::cors::CorsLayer::new()
                     .allow_origin(tower_http::cors::Any)
@@ -69,11 +109,11 @@ pub async fn serve(socket_path: PathBuf, port: u16, dev_mode: bool, host: [u8; 4
                     .allow_headers(tower_http::cors::Any),
             )
     } else {
-        // Production: serve embedded frontend + WebSocket
         Router::new()
             .route("/ws", get(ws_handler))
+            .route("/api/config", get(get_config).put(put_config))
             .fallback(get(static_handler))
-            .with_state(socket_path)
+            .with_state(state)
     };
 
     let addr = SocketAddr::from((host, port));

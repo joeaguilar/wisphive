@@ -671,6 +671,124 @@ pre.code-block, pre.plan-content {
   margin-left: auto;
 }
 
+/* Config view */
+.config-view {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+
+.config-level {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  margin-bottom: var(--space-lg);
+  padding: var(--space-md);
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.config-label {
+  color: var(--text-dim);
+  font-weight: bold;
+}
+
+.level-selector {
+  display: flex;
+  gap: var(--space-xs);
+}
+
+.level-btn {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  padding: var(--space-sm) var(--space-md);
+  border-radius: var(--radius);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: var(--font-sm);
+  min-height: var(--touch-min);
+}
+
+.level-btn.active {
+  background: var(--cyan);
+  color: var(--bg);
+  border-color: var(--cyan);
+  font-weight: bold;
+}
+
+.level-btn:hover:not(.active) { border-color: var(--cyan); }
+
+.config-tier {
+  margin-bottom: var(--space-lg);
+}
+
+.config-tier h3 {
+  color: var(--cyan);
+  font-size: var(--font-sm);
+  margin-bottom: var(--space-sm);
+  border-bottom: 1px solid var(--border);
+  padding-bottom: var(--space-xs);
+}
+
+.tool-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tool-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-sm) var(--space-md);
+  background: var(--bg-card);
+  border-radius: var(--radius);
+  cursor: pointer;
+  min-height: var(--touch-min);
+}
+
+.tool-row:hover { background: var(--bg-card-hover); }
+
+.tool-checkbox {
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  color: var(--green);
+}
+
+.tool-checkbox.checked {
+  background: rgba(76, 175, 80, 0.15);
+  border-color: var(--green);
+}
+
+.tool-name-config { color: var(--text); flex: 1; }
+
+.tool-status {
+  font-size: var(--font-sm);
+  padding: 1px 6px;
+  border-radius: 3px;
+}
+
+.status-auto { color: var(--green); background: rgba(76, 175, 80, 0.1); }
+.status-queued { color: var(--text-dim); background: rgba(136, 136, 136, 0.1); }
+
+.tool-row.override .tool-status {
+  font-weight: bold;
+}
+
+@media (max-width: 768px) {
+  .config-level { flex-direction: column; align-items: flex-start; }
+  .level-selector { flex-wrap: wrap; }
+}
+
 /* Help modal */
 .help-modal { max-width: 500px; }
 

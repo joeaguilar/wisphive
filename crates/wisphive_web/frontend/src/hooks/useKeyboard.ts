@@ -9,6 +9,7 @@ interface KeyboardActions {
   onSelect?: () => void;
   onViewQueue?: () => void;
   onViewHistory?: () => void;
+  onViewConfig?: () => void;
   onViewSessions?: () => void;
   onViewProjects?: () => void;
   onSpawn?: () => void;
@@ -69,6 +70,9 @@ export function useKeyboard(actions: KeyboardActions) {
           break;
         case "4":
           actions.onViewProjects?.();
+          break;
+        case "5":
+          actions.onViewConfig?.();
           break;
 
         // Spawn

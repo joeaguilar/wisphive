@@ -7,9 +7,10 @@ import { History } from "./components/History";
 import { Sessions } from "./components/Sessions";
 import { Projects } from "./components/Projects";
 import { SpawnModal } from "./components/SpawnModal";
+import { ConfigView } from "./components/Config";
 import "./app.css";
 
-type View = "queue" | "history" | "sessions" | "projects";
+type View = "queue" | "history" | "sessions" | "projects" | "config";
 
 function App() {
   const { connected, queue, agents, projects, history, sessions, approve, deny, spawnAgent, queryProjects, queryHistory, searchHistory, querySessions } = useWisphive();
@@ -64,6 +65,7 @@ function App() {
     onViewHistory: () => setView("history"),
     onViewSessions: () => setView("sessions"),
     onViewProjects: () => setView("projects"),
+    onViewConfig: () => setView("config"),
     onSpawn: () => setShowSpawn(true),
     onHelp: () => setShowHelp((v) => !v),
   }), [handleNext, handlePrev, selectedId, view, queue, approve, deny, showHelp, showSpawn, sessionAgent]);
@@ -98,6 +100,9 @@ function App() {
         </button>
         <button className={view === "projects" ? "active" : ""} onClick={() => setView("projects")}>
           Projects
+        </button>
+        <button className={view === "config" ? "active" : ""} onClick={() => setView("config")}>
+          Config
         </button>
         <button className="spawn-btn" onClick={() => setShowSpawn(true)}>
           + Spawn Agent
@@ -156,6 +161,7 @@ function App() {
             onDrillDown={(project) => { searchHistory(project); setView("history"); }}
           />
         )}
+        {view === "config" && <ConfigView />}
       </main>
 
       {showHelp && (
