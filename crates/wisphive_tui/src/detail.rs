@@ -592,6 +592,7 @@ fn push_action_hints(lines: &mut Vec<Line<'static>>, event_type: wisphive_protoc
         match event_type {
             HookEventType::Stop | HookEventType::SubagentStop => vec![
                 ("A/Enter", "accept (let agent stop)"),
+                ("D", "deny with feedback (continue working)"),
             ],
             HookEventType::UserPromptSubmit | HookEventType::ConfigChange => vec![
                 ("A", "allow"),
