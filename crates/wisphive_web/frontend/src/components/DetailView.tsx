@@ -11,6 +11,42 @@ interface DetailViewProps {
 // Safe string extraction from unknown values
 const str = (v: unknown): string => (typeof v === "string" ? v : String(v ?? ""));
 
+// Simple diff renderer — split old/new into lines and show unified view
+function DiffView({ oldStr, newStr }: { oldStr: string; newStr: string }) {
+  const oldLines = oldStr.split("\n");
+  const newLines = newStr.split("\n");
+  return (
+    <div className="diff-view">
+      {oldLines.map((line, i) => (
+        <div key={`old-${i}`} className="diff-line diff-remove">
+          <span className="diff-gutter">-</span>
+          <span className="diff-text">{line}</span>
+        </div>
+      ))}
+      {newLines.map((line, i) => (
+        <div key={`new-${i}`} className="diff-line diff-add">
+          <span className="diff-gutter">+</span>
+          <span className="diff-text">{line}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Simple markdown to HTML (headers, bold, code, lists)
+function renderMarkdown(text: string): string {
+  return text
+    .replace(/^### (.+)$/gm, '<h4 class="md-h3">$1</h4>')
+    .replace(/^## (.+)$/gm, '<h3 class="md-h2">$1</h3>')
+    .replace(/^# (.+)$/gm, '<h2 class="md-h1">$1</h2>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/`([^`]+)`/g, '<code class="md-code">$1</code>')
+    .replace(/^- (.+)$/gm, '<div class="md-li">• $1</div>')
+    .replace(/^(\d+)\. (.+)$/gm, '<div class="md-li">$1. $2</div>')
+    .replace(/\n\n/g, '<br/><br/>')
+    .replace(/\n/g, '<br/>');
+}
+
 export function DetailView({ request, onApprove, onDeny }: DetailViewProps) {
   const [modal, setModal] = useState<"deny-msg" | "context" | "always" | null>(null);
   const { tool_name, tool_input: rawInput, agent_id, project, timestamp, hook_event_name, event_data } = request;
@@ -80,7 +116,7 @@ export function DetailView({ request, onApprove, onDeny }: DetailViewProps) {
       {planContent && (
         <div className="detail-section">
           <h3>Plan</h3>
-          <pre className="plan-content">{planContent}</pre>
+          <div className="markdown-content" dangerouslySetInnerHTML={{ __html: renderMarkdown(planContent) }} />
         </div>
       )}
 
@@ -117,10 +153,7 @@ export function DetailView({ request, onApprove, onDeny }: DetailViewProps) {
         <div className="detail-section">
           <h3>Changes</h3>
           {filePath && <div className="file-path">{filePath}</div>}
-          <div className="diff">
-            {oldString && <pre className="diff-remove">- {oldString}</pre>}
-            {newString && <pre className="diff-add">+ {newString}</pre>}
-          </div>
+          <DiffView oldStr={oldString || ""} newStr={newString || ""} />
         </div>
       )}
 

@@ -338,18 +338,8 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
     // Layer 3: Register agent with daemon (once per session, fire-and-forget)
     register_agent_once(&agent_id, &project, &wisphive_dir);
 
-    // Auto-approve Stop/SubagentStop events if configured
-    if matches!(event_type, wisphive_protocol::HookEventType::Stop | wisphive_protocol::HookEventType::SubagentStop) {
-        if is_stop_auto_approved(&wisphive_dir) {
-            log_auto_approved(
-                &wisphive_dir, &tool_use_id, &agent_id, &project, &tool_name, &tool_input, event_type,
-            );
-            return Ok(HookResponse::simple(Decision::Approve));
-        }
-    }
-
-    // Auto-approve UserPromptSubmit and ConfigChange — routine events that don't need review
-    if matches!(event_type, wisphive_protocol::HookEventType::UserPromptSubmit | wisphive_protocol::HookEventType::ConfigChange) {
+    // Auto-approve certain event types based on config (with sensible defaults)
+    if is_event_auto_approved(event_type, &wisphive_dir) {
         log_auto_approved(
             &wisphive_dir, &tool_use_id, &agent_id, &project, &tool_name, &tool_input, event_type,
         );
