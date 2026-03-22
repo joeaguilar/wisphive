@@ -15,6 +15,10 @@ pub fn render_detail_lines(req: &DecisionRequest) -> Vec<Line<'static>> {
         HookEventType::PermissionRequest => {
             if let Some(ref suggestions) = req.permission_suggestions {
                 push_permission_detail(&mut lines, req, suggestions);
+            } else if has_ask_questions(&req.tool_input) {
+                push_ask_question_detail(&mut lines, req);
+            } else {
+                push_generic_detail(&mut lines, req);
             }
         }
         HookEventType::Elicitation => push_elicitation_detail(&mut lines, req),
@@ -32,14 +36,20 @@ pub fn render_detail_lines(req: &DecisionRequest) -> Vec<Line<'static>> {
                 "read" => push_read_detail(&mut lines, req),
                 "grep" => push_grep_detail(&mut lines, req),
                 "glob" => push_glob_detail(&mut lines, req),
+                "askuserquestion" if has_ask_questions(&req.tool_input) => {
+                    push_ask_question_detail(&mut lines, req)
+                }
                 _ => push_generic_detail(&mut lines, req),
             }
         }
     }
 
-    // PermissionRequest already renders its own action hints inline
-    if req.hook_event_name != HookEventType::PermissionRequest {
-        push_action_hints(&mut lines, req.hook_event_name);
+    // PermissionRequest with suggestions renders its own action hints inline;
+    // AskUserQuestion (PermissionRequest without suggestions) needs standard hints.
+    if req.hook_event_name != HookEventType::PermissionRequest
+        || req.permission_suggestions.is_none()
+    {
+        push_action_hints(&mut lines, req.hook_event_name, req);
     }
 
     lines
@@ -182,6 +192,94 @@ fn push_grep_detail(lines: &mut Vec<Line<'static>>, req: &DecisionRequest) {
 fn push_glob_detail(lines: &mut Vec<Line<'static>>, req: &DecisionRequest) {
     push_field_if_present(lines, &req.tool_input, "pattern", "Pattern");
     push_field_if_present(lines, &req.tool_input, "path", "Path");
+}
+
+/// Check if tool_input contains AskUserQuestion-style questions.
+fn has_ask_questions(tool_input: &serde_json::Value) -> bool {
+    tool_input
+        .get("questions")
+        .and_then(|v| v.as_array())
+        .map_or(false, |a| !a.is_empty())
+}
+
+fn push_ask_question_detail(lines: &mut Vec<Line<'static>>, req: &DecisionRequest) {
+    let questions = match req.tool_input.get("questions").and_then(|v| v.as_array()) {
+        Some(q) => q,
+        None => return,
+    };
+
+    let header_style = Style::default()
+        .fg(Color::Magenta)
+        .add_modifier(Modifier::BOLD);
+    let question_style = Style::default().fg(Color::White);
+    let option_idx_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let option_label_style = Style::default().fg(Color::Yellow);
+    let option_desc_style = Style::default().fg(Color::DarkGray);
+
+    for (qi, q) in questions.iter().enumerate() {
+        if qi > 0 {
+            lines.push(Line::from(""));
+        }
+
+        // Header tag
+        if let Some(header) = q.get("header").and_then(|v| v.as_str()) {
+            lines.push(Line::from(Span::styled(
+                format!("  [{header}]"),
+                header_style,
+            )));
+        }
+
+        // Question text
+        if let Some(question) = q.get("question").and_then(|v| v.as_str()) {
+            push_section_label(lines, "Question");
+            lines.push(Line::from(""));
+            for line in question.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {line}"),
+                    question_style,
+                )));
+            }
+        }
+
+        // Options
+        if let Some(options) = q.get("options").and_then(|v| v.as_array()) {
+            lines.push(Line::from(""));
+            push_section_label(lines, "Options");
+            lines.push(Line::from(""));
+
+            for (i, opt) in options.iter().enumerate() {
+                let label = opt.get("label").and_then(|v| v.as_str()).unwrap_or("?");
+                let desc = opt.get("description").and_then(|v| v.as_str());
+
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  [{}] ", i + 1), option_idx_style),
+                    Span::styled(label.to_string(), option_label_style),
+                ]));
+                if let Some(d) = desc {
+                    lines.push(Line::from(Span::styled(
+                        format!("      {d}"),
+                        option_desc_style,
+                    )));
+                }
+            }
+            // "Other" option — opens text input
+            lines.push(Line::from(vec![
+                Span::styled("  [O] ", option_idx_style),
+                Span::styled("Other (type response)", Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+
+        // Multi-select indicator
+        if q.get("multiSelect").and_then(|v| v.as_bool()).unwrap_or(false) {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  (multi-select enabled)",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
 }
 
 fn push_generic_detail(lines: &mut Vec<Line<'static>>, req: &DecisionRequest) {
@@ -402,7 +500,7 @@ fn push_permission_detail(
     )));
 }
 
-fn push_action_hints(lines: &mut Vec<Line<'static>>, event_type: wisphive_protocol::HookEventType) {
+fn push_action_hints(lines: &mut Vec<Line<'static>>, event_type: wisphive_protocol::HookEventType, req: &DecisionRequest) {
     use wisphive_protocol::HookEventType;
 
     lines.push(Line::from(""));
@@ -412,37 +510,73 @@ fn push_action_hints(lines: &mut Vec<Line<'static>>, event_type: wisphive_protoc
     let hint_style = Style::default().fg(Color::DarkGray);
     let key_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 
-    let actions: Vec<(&str, &str)> = match event_type {
-        HookEventType::Stop | HookEventType::SubagentStop => vec![
-            ("A/Enter", "accept (let agent stop)"),
-        ],
-        HookEventType::UserPromptSubmit | HookEventType::ConfigChange => vec![
-            ("A", "allow"),
-            ("B", "block"),
-            ("M", "block with message"),
-        ],
-        HookEventType::Elicitation => vec![
-            ("A", "accept"),
-            ("D", "decline"),
-            ("C", "cancel"),
-        ],
-        HookEventType::TeammateIdle => vec![
-            ("C", "continue with feedback"),
-            ("S", "stop teammate"),
-        ],
-        HookEventType::TaskCompleted => vec![
-            ("A", "accept"),
-            ("R", "reject with feedback"),
-        ],
-        _ => vec![
-            ("Y", "approve"),
-            ("N", "deny"),
+    // AskUserQuestion: either PermissionRequest without suggestions, or PreToolUse with tool_name
+    let is_ask_question = (event_type == HookEventType::PermissionRequest
+        && req.permission_suggestions.is_none())
+        || (req.tool_name.eq_ignore_ascii_case("askuserquestion")
+            && has_ask_questions(&req.tool_input));
+
+    let option_count = if is_ask_question {
+        req.tool_input
+            .get("questions")
+            .and_then(|v| v.as_array())
+            .and_then(|qs| qs.first())
+            .and_then(|q| q.get("options"))
+            .and_then(|v| v.as_array())
+            .map_or(0, |o| o.len())
+    } else {
+        0
+    };
+
+    // For AskUserQuestion, render the dynamic "1-N" hint first
+    if is_ask_question && option_count > 0 {
+        let key_label = format!("[1-{}]", option_count);
+        lines.push(Line::from(vec![
+            Span::styled("  ", hint_style),
+            Span::styled(key_label, key_style),
+            Span::styled(" select an option", hint_style),
+        ]));
+    }
+
+    let actions: Vec<(&str, &str)> = if is_ask_question {
+        vec![
+            ("O", "type custom response"),
+            ("D", "deny"),
             ("M", "deny with message"),
-            ("!", "always allow"),
-            ("E", "edit input"),
-            ("C", "add context"),
-            ("?", "defer to native prompt"),
-        ],
+        ]
+    } else {
+        match event_type {
+            HookEventType::Stop | HookEventType::SubagentStop => vec![
+                ("A/Enter", "accept (let agent stop)"),
+            ],
+            HookEventType::UserPromptSubmit | HookEventType::ConfigChange => vec![
+                ("A", "allow"),
+                ("B", "block"),
+                ("M", "block with message"),
+            ],
+            HookEventType::Elicitation => vec![
+                ("A", "accept"),
+                ("D", "decline"),
+                ("C", "cancel"),
+            ],
+            HookEventType::TeammateIdle => vec![
+                ("C", "continue with feedback"),
+                ("S", "stop teammate"),
+            ],
+            HookEventType::TaskCompleted => vec![
+                ("A", "accept"),
+                ("R", "reject with feedback"),
+            ],
+            _ => vec![
+                ("Y", "approve"),
+                ("N", "deny"),
+                ("M", "deny with message"),
+                ("!", "always allow"),
+                ("E", "edit input"),
+                ("C", "add context"),
+                ("?", "defer to native prompt"),
+            ],
+        }
     };
 
     for (key, desc) in &actions {
