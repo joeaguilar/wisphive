@@ -822,22 +822,25 @@ fn draw_agents_panel(frame: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = app
         .agents
         .iter()
-        .map(|agent| {
+        .enumerate()
+        .map(|(i, agent)| {
             let is_stopped = app.stopped_agents.contains(&agent.agent_id);
             let (dot, dot_style) = if is_stopped {
                 ("■", Style::default().fg(Color::Red))
             } else {
                 ("●", Style::default().fg(Color::Green))
             };
-            let label = if is_stopped {
-                format!("{} {} ", agent.agent_id, agent.agent_type)
-            } else {
-                format!("{} {} ", agent.agent_id, agent.agent_type)
-            };
-            ListItem::new(Line::from(vec![
+            let label = format!("{} {} ", agent.agent_id, agent.agent_type);
+            let line = Line::from(vec![
                 Span::styled(label, Style::default().fg(Color::White)),
                 Span::styled(dot.to_string(), dot_style),
-            ]))
+            ]);
+            let style = if i == app.agents_index && focused {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            ListItem::new(line).style(style)
         })
         .collect();
 
@@ -862,9 +865,15 @@ fn draw_projects_panel(frame: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = app
         .projects
         .iter()
-        .map(|p| {
+        .enumerate()
+        .map(|(i, p)| {
             let text = panels::format_project_status(p);
-            ListItem::new(Line::from(text))
+            let style = if i == app.projects_panel_index && focused {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(text)).style(style)
         })
         .collect();
 

@@ -123,15 +123,77 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
     // Panel-specific keybindings
     match app.focus {
         FocusPanel::Queue => handle_queue_input(app, key),
-        FocusPanel::Agents | FocusPanel::Projects => {
+        FocusPanel::Agents => {
             match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    app.agents_down();
+                    InputAction::None
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    app.agents_up();
+                    InputAction::None
+                }
+                // Enter: drill into session timeline for selected agent
+                KeyCode::Enter => {
+                    if let Some(agent) = app.selected_agent() {
+                        let agent_id = agent.agent_id.clone();
+                        app.enter_history_view(Some(agent_id.clone()));
+                        InputAction::QueryHistory { agent_id: Some(agent_id) }
+                    } else {
+                        InputAction::None
+                    }
+                }
                 KeyCode::Tab => {
                     app.cycle_focus();
                     InputAction::None
                 }
-                // Spawn a new agent
                 KeyCode::Char('n') => {
                     app.modal = Some(Modal::spawn_agent());
+                    InputAction::None
+                }
+                _ => InputAction::None,
+            }
+        }
+        FocusPanel::Projects => {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    app.projects_panel_down();
+                    InputAction::None
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    app.projects_panel_up();
+                    InputAction::None
+                }
+                // Enter: drill into history for selected project
+                KeyCode::Enter => {
+                    if let Some(project) = app.projects.get(app.projects_panel_index) {
+                        let path = project.path.to_string_lossy().to_string();
+                        app.enter_history_view(None);
+                        InputAction::SearchHistory {
+                            search: wisphive_protocol::HistorySearch {
+                                query: Some(path),
+                                ..Default::default()
+                            },
+                        }
+                    } else {
+                        InputAction::None
+                    }
+                }
+                KeyCode::Tab => {
+                    app.cycle_focus();
+                    InputAction::None
+                }
+                // Spawn agent in selected project
+                KeyCode::Char('n') => {
+                    if let Some(project) = app.projects.get(app.projects_panel_index) {
+                        let mut modal = Modal::spawn_agent();
+                        if let Some(ref mut spawn) = modal.spawn {
+                            spawn.set_project(&project.path.to_string_lossy());
+                        }
+                        app.modal = Some(modal);
+                    } else {
+                        app.modal = Some(Modal::spawn_agent());
+                    }
                     InputAction::None
                 }
                 _ => InputAction::None,
