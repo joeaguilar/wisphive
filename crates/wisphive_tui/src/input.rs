@@ -112,6 +112,11 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
             app.enter_config_view();
             return InputAction::None;
         }
+        // Project picker: quick-select a project and spawn agent
+        KeyCode::Char('P') => {
+            app.modal = Some(Modal::pick_project());
+            return InputAction::QueryProjects;
+        }
         _ => {}
     }
 
@@ -610,6 +615,11 @@ fn handle_filter_input(app: &mut App, key: KeyEvent) -> InputAction {
 
 fn handle_modal_input(app: &mut App, key: KeyEvent) -> InputAction {
     let modal = app.modal.take().unwrap();
+
+    // Project picker modal
+    if modal.picker.is_some() {
+        return handle_picker_modal_input(app, modal, key);
+    }
 
     // Spawn modal has its own text-input handling
     if modal.spawn.is_some() {
@@ -1177,6 +1187,44 @@ fn handle_session_timeline_input(app: &mut App, key: KeyEvent) -> InputAction {
             InputAction::None
         }
         _ => InputAction::None,
+    }
+}
+
+fn handle_picker_modal_input(app: &mut App, mut modal: Modal, key: KeyEvent) -> InputAction {
+    let picker = modal.picker.as_mut().unwrap();
+    let len = app.project_summaries.len();
+
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => InputAction::None, // dismiss
+        KeyCode::Char('j') | KeyCode::Down => {
+            if len > 0 && picker.index < len - 1 {
+                picker.index += 1;
+            }
+            app.modal = Some(modal);
+            InputAction::None
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            if picker.index > 0 {
+                picker.index -= 1;
+            }
+            app.modal = Some(modal);
+            InputAction::None
+        }
+        KeyCode::Enter => {
+            if let Some(project) = app.project_summaries.get(picker.index) {
+                let project_path = project.project.to_string_lossy().to_string();
+                let mut spawn_modal = Modal::spawn_agent();
+                if let Some(ref mut spawn) = spawn_modal.spawn {
+                    spawn.set_project(&project_path);
+                }
+                app.modal = Some(spawn_modal);
+            }
+            InputAction::None
+        }
+        _ => {
+            app.modal = Some(modal);
+            InputAction::None
+        }
     }
 }
 
