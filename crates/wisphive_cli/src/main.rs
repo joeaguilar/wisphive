@@ -17,6 +17,16 @@ enum Command {
     /// Launch the TUI client
     Tui,
 
+    /// Launch the Web UI server
+    Web {
+        /// HTTP port (default: 3100)
+        #[arg(short, long, default_value = "3100")]
+        port: u16,
+        /// Dev mode: only serve WebSocket, expect Vite dev server for frontend
+        #[arg(long)]
+        dev: bool,
+    },
+
     /// Daemon management
     Daemon {
         #[command(subcommand)]
@@ -336,6 +346,15 @@ fn main() -> anyhow::Result<()> {
         Command::Tui => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(commands::tui::run())
+        }
+        Command::Web { port, dev } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            let home = std::env::var("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+                .join(".wisphive");
+            let socket_path = home.join("wisphive.sock");
+            rt.block_on(wisphive_web::serve(socket_path, port, dev))
         }
     }
 }
