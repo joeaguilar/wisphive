@@ -877,8 +877,8 @@ fn draw_modal(frame: &mut Frame, modal: &Modal) {
 
     let has_input = modal.textarea.is_some() || modal.spawn.is_some();
     let modal_height = if modal.spawn.is_some() {
-        // Spawn modal: body + 2 bordered TextArea fields (3 lines each)
-        12.min(area.height.saturating_sub(4))
+        // Spawn modal: body + project + prompt + options row (3 fields)
+        15.min(area.height.saturating_sub(4))
     } else if has_input {
         // Single TextArea field: body + bordered input (3 lines)
         9.min(area.height.saturating_sub(4))
@@ -916,12 +916,13 @@ fn draw_modal(frame: &mut Frame, modal: &Modal) {
         frame.render_widget(body, chunks[0]);
         frame.render_widget(textarea, chunks[1]);
     } else if let Some(ref spawn) = modal.spawn {
-        // Body text + two TextArea fields
-        use ratatui::layout::{Constraint, Layout};
+        // Body text + project + prompt + options row (model | reasoning | max_turns)
+        use ratatui::layout::{Constraint, Direction, Layout};
         let chunks = Layout::vertical([
-            Constraint::Length(2), // body text + blank line
-            Constraint::Length(3), // project TextArea
-            Constraint::Min(3),   // prompt TextArea
+            Constraint::Length(2), // body text
+            Constraint::Length(3), // project
+            Constraint::Length(3), // prompt
+            Constraint::Min(3),   // model | reasoning | max_turns
         ]).split(inner);
 
         let body = Paragraph::new(Line::from(Span::styled(
@@ -931,6 +932,18 @@ fn draw_modal(frame: &mut Frame, modal: &Modal) {
         frame.render_widget(body, chunks[0]);
         frame.render_widget(&spawn.project, chunks[1]);
         frame.render_widget(&spawn.prompt, chunks[2]);
+
+        let options_row = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(40),
+                Constraint::Percentage(35),
+                Constraint::Percentage(25),
+            ])
+            .split(chunks[3]);
+        frame.render_widget(&spawn.model, options_row[0]);
+        frame.render_widget(&spawn.reasoning, options_row[1]);
+        frame.render_widget(&spawn.max_turns, options_row[2]);
     } else {
         // Simple Y/N confirmation — just body text
         let body = Paragraph::new(Line::from(Span::styled(

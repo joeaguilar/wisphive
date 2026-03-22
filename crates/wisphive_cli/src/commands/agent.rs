@@ -60,29 +60,14 @@ fn send_and_recv(msg: &ClientMessage) -> Result<ServerMessage> {
 }
 
 /// Start an agent process via the daemon.
-pub async fn start(
-    project: Option<PathBuf>,
-    model: Option<String>,
-    prompt: String,
-    name: Option<String>,
-) -> Result<()> {
-    let project = project
-        .or_else(|| std::env::current_dir().ok())
-        .context("could not determine project directory")?;
-
-    let project = std::fs::canonicalize(&project)
-        .unwrap_or_else(|_| project.clone());
+pub async fn start(req: SpawnAgentRequest) -> Result<()> {
+    let project = std::fs::canonicalize(&req.project)
+        .unwrap_or_else(|_| req.project.clone());
 
     // Pre-flight checks
     preflight_checks(&project)?;
 
-    let request = SpawnAgentRequest {
-        project: project.clone(),
-        prompt,
-        model: model.clone(),
-        name: name.clone(),
-    };
-
+    let request = SpawnAgentRequest { project, ..req };
     let response = send_and_recv(&ClientMessage::SpawnAgent(request))?;
 
     match response {
@@ -229,6 +214,15 @@ fn print_agent(agent: &ManagedAgent) {
     }
     if let Some(ref name) = agent.name {
         eprintln!("  Name:    {}", name);
+    }
+    if let Some(ref reasoning) = agent.reasoning {
+        eprintln!("  Reason:  {}", reasoning);
+    }
+    if let Some(max_turns) = agent.max_turns {
+        eprintln!("  Turns:   {}", max_turns);
+    }
+    if let Some(ref perm) = agent.permission_mode {
+        eprintln!("  PermMod: {}", perm);
     }
     eprintln!("  Started: {}", agent.started_at.format("%Y-%m-%d %H:%M:%S UTC"));
 }

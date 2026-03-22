@@ -277,6 +277,39 @@ pub struct SpawnAgentRequest {
     /// Human-readable session name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Reasoning effort level (e.g. "low", "medium", "high").
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reasoning: Option<String>,
+    /// Maximum number of agentic turns.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_turns: Option<u32>,
+    /// Permission mode (e.g. "default", "plan", "bypassPermissions").
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub permission_mode: Option<String>,
+    /// Custom system prompt (replaces default).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub system_prompt: Option<String>,
+    /// Additional system prompt text (appended to default).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub append_system_prompt: Option<String>,
+    /// Restrict to specific tools.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub allowed_tools: Option<Vec<String>>,
+    /// Block specific tools.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub disallowed_tools: Option<Vec<String>>,
+    /// Continue the most recent session.
+    #[serde(default)]
+    pub continue_session: bool,
+    /// Resume a specific session by ID.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub resume: Option<String>,
+    /// Output format (json, stream-json, text).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub output_format: Option<String>,
+    /// Enable verbose output.
+    #[serde(default)]
+    pub verbose: bool,
 }
 
 /// Metadata about a daemon-managed agent process.
@@ -288,6 +321,12 @@ pub struct ManagedAgent {
     pub model: Option<String>,
     pub name: Option<String>,
     pub started_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reasoning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_turns: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub permission_mode: Option<String>,
 }
 
 /// A tool execution result reported by the PostToolUse hook.
