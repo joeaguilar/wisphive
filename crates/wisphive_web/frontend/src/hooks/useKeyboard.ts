@@ -12,6 +12,7 @@ interface KeyboardActions {
   onViewConfig?: () => void;
   onViewSessions?: () => void;
   onViewProjects?: () => void;
+  onViewAgents?: () => void;
   onSpawn?: () => void;
   onHelp?: () => void;
 }
@@ -72,6 +73,9 @@ export function useKeyboard(actions: KeyboardActions) {
           actions.onViewProjects?.();
           break;
         case "5":
+          actions.onViewAgents?.();
+          break;
+        case "6":
           actions.onViewConfig?.();
           break;
 
