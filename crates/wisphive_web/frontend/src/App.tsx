@@ -6,11 +6,12 @@ import { DetailView } from "./components/DetailView";
 import { History } from "./components/History";
 import { Sessions } from "./components/Sessions";
 import { Projects } from "./components/Projects";
+import { Agents } from "./components/Agents";
 import { SpawnModal } from "./components/SpawnModal";
 import { ConfigView } from "./components/Config";
 import "./app.css";
 
-type View = "queue" | "history" | "sessions" | "projects" | "config";
+type View = "queue" | "history" | "sessions" | "projects" | "agents" | "config";
 
 function App() {
   const { connected, queue, agents, projects, history, sessions, approve, deny, spawnAgent, queryProjects, queryHistory, searchHistory, querySessions } = useWisphive();
@@ -20,6 +21,8 @@ function App() {
   const [spawnDefaultProject, setSpawnDefaultProject] = useState<string | undefined>();
   const [sessionAgent, setSessionAgent] = useState<string | null>(null);
   const [sessionTimeline, setSessionTimeline] = useState(history);
+  const [agentDrilldown, setAgentDrilldown] = useState<string | null>(null);
+  const [agentTimeline, setAgentTimeline] = useState(history);
   const [showHelp, setShowHelp] = useState(false);
 
   const selectedRequest = queue.find((r) => r.id === selectedId);
@@ -54,6 +57,7 @@ function App() {
       if (showHelp) { setShowHelp(false); return; }
       if (showSpawn) { setShowSpawn(false); return; }
       if (selectedId) { setSelectedId(null); return; }
+      if (agentDrilldown) { setAgentDrilldown(null); return; }
       if (sessionAgent) { setSessionAgent(null); return; }
     },
     onSelect: () => {
@@ -65,10 +69,11 @@ function App() {
     onViewHistory: () => setView("history"),
     onViewSessions: () => setView("sessions"),
     onViewProjects: () => setView("projects"),
+    onViewAgents: () => setView("agents"),
     onViewConfig: () => setView("config"),
     onSpawn: () => setShowSpawn(true),
     onHelp: () => setShowHelp((v) => !v),
-  }), [handleNext, handlePrev, selectedId, view, queue, approve, deny, showHelp, showSpawn, sessionAgent]);
+  }), [handleNext, handlePrev, selectedId, view, queue, approve, deny, showHelp, showSpawn, agentDrilldown, sessionAgent]);
 
   useKeyboard(keyActions);
 
@@ -81,6 +86,11 @@ function App() {
   useEffect(() => {
     if (sessionAgent) setSessionTimeline(history);
   }, [history, sessionAgent]);
+
+  // Keep agent timeline in sync
+  useEffect(() => {
+    if (agentDrilldown) setAgentTimeline(history);
+  }, [history, agentDrilldown]);
 
   return (
     <div className="app">
@@ -100,6 +110,9 @@ function App() {
         </button>
         <button className={view === "projects" ? "active" : ""} onClick={() => setView("projects")}>
           Projects
+        </button>
+        <button className={view === "agents" ? "active" : ""} onClick={() => setView("agents")}>
+          Agents {agents.length > 0 && <span className="badge">{agents.length}</span>}
         </button>
         <button className={view === "config" ? "active" : ""} onClick={() => setView("config")}>
           Config
@@ -153,6 +166,16 @@ function App() {
             onLoadTimeline={(agentId) => queryHistory(agentId)}
           />
         )}
+        {view === "agents" && (
+          <Agents
+            agents={agents}
+            timeline={agentTimeline}
+            selectedAgent={agentDrilldown}
+            onSelectAgent={setAgentDrilldown}
+            onLoadTimeline={(agentId) => queryHistory(agentId)}
+            onSpawn={() => setShowSpawn(true)}
+          />
+        )}
         {view === "projects" && (
           <Projects
             projects={projects}
@@ -191,6 +214,8 @@ function App() {
                 <div className="help-row"><kbd>2</kbd> History</div>
                 <div className="help-row"><kbd>3</kbd> Sessions</div>
                 <div className="help-row"><kbd>4</kbd> Projects</div>
+                <div className="help-row"><kbd>5</kbd> Agents</div>
+                <div className="help-row"><kbd>6</kbd> Config</div>
                 <div className="help-row"><kbd>?</kbd> This help</div>
               </div>
             </div>

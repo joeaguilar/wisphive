@@ -647,6 +647,81 @@ pre.code-block, pre.plan-content {
   border-top: 1px solid var(--border);
 }
 
+/* Agents view */
+.agents-view {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.agents-toolbar {
+  display: flex;
+  gap: var(--space-sm);
+  align-items: center;
+  margin-bottom: var(--space-md);
+}
+
+.agents-toolbar h2 {
+  color: var(--cyan);
+  font-size: var(--font-lg);
+}
+
+.spawn-btn-inline {
+  margin-left: auto;
+}
+
+.agents-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  overflow-y: auto;
+}
+
+.agent-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-md);
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.agent-card:hover { background: var(--bg-card-hover); }
+
+.agent-card-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.agent-card-id {
+  color: var(--text);
+  font-weight: bold;
+  font-size: var(--font-base);
+  word-break: break-all;
+}
+
+.agent-card-type {
+  background: var(--border);
+  color: var(--text-dim);
+  font-size: 10px;
+  font-weight: bold;
+  padding: 1px 6px;
+  border-radius: 3px;
+}
+
+.agent-card-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  margin-top: var(--space-xs);
+}
+
+.agent-card-times {
+  color: var(--text-dim);
+  font-size: var(--font-sm);
+}
+
 /* Sessions & Projects views */
 .sessions-view, .projects-view {
   height: 100%;
