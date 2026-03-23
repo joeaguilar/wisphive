@@ -169,10 +169,13 @@ function App() {
         {view === "agents" && (
           <Agents
             agents={agents}
+            queue={queue}
             timeline={agentTimeline}
             selectedAgent={agentDrilldown}
             onSelectAgent={setAgentDrilldown}
             onLoadTimeline={(agentId) => queryHistory(agentId)}
+            onApprove={(id) => approve(id)}
+            onDeny={(id) => deny(id)}
             onSpawn={() => setShowSpawn(true)}
           />
         )}
