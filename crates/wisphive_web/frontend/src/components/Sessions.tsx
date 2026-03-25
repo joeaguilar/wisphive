@@ -8,17 +8,20 @@ interface SessionsProps {
   onLoad: () => void;
   onSelectAgent: (agentId: string | null) => void;
   onLoadTimeline: (agentId: string) => void;
+  onRefreshTimeline: (agentId: string) => void;
 }
 
 function duration(first: string, last: string): string {
-  const ms = new Date(last).getTime() - new Date(first).getTime();
-  const seconds = Math.floor(ms / 1000);
+  const start = new Date(first).getTime();
+  const end = new Date(last).getTime();
+  if (isNaN(start) || isNaN(end)) return "—";
+  const seconds = Math.floor((end - start) / 1000);
   if (seconds < 60) return `${seconds}s`;
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
   return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
 }
 
-export function Sessions({ sessions, timeline, selectedAgent, onLoad, onSelectAgent, onLoadTimeline }: SessionsProps) {
+export function Sessions({ sessions, timeline, selectedAgent, onLoad, onSelectAgent, onLoadTimeline, onRefreshTimeline }: SessionsProps) {
   useEffect(() => { onLoad(); }, [onLoad]);
 
   if (selectedAgent) {
@@ -27,6 +30,9 @@ export function Sessions({ sessions, timeline, selectedAgent, onLoad, onSelectAg
         <div className="sessions-toolbar">
           <button className="btn-secondary" onClick={() => onSelectAgent(null)}>
             ← Back to sessions
+          </button>
+          <button className="btn-secondary" onClick={() => onRefreshTimeline(selectedAgent)}>
+            Refresh
           </button>
           <span className="filter-tag">Agent: {selectedAgent.slice(0, 20)}</span>
         </div>
@@ -58,6 +64,7 @@ export function Sessions({ sessions, timeline, selectedAgent, onLoad, onSelectAg
     <div className="sessions-view">
       <div className="sessions-toolbar">
         <h2>Sessions ({sessions.length})</h2>
+        <button className="btn-secondary" onClick={onLoad}>Refresh</button>
       </div>
       {sessions.length === 0 ? (
         <div className="history-empty">No sessions</div>

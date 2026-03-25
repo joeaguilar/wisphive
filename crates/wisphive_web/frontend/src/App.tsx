@@ -14,15 +14,16 @@ import "./app.css";
 type View = "queue" | "history" | "sessions" | "projects" | "agents" | "config";
 
 function App() {
-  const { connected, queue, agents, projects, history, sessions, approve, deny, spawnAgent, queryProjects, queryHistory, searchHistory, querySessions } = useWisphive();
+  const {
+    connected, queue, agents, projects, history, agentTimeline, sessionTimeline, sessions,
+    approve, deny, spawnAgent, queryProjects, queryHistory, queryAgentTimeline, querySessionTimeline, searchHistory, querySessions,
+  } = useWisphive();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [view, setView] = useState<View>("queue");
   const [showSpawn, setShowSpawn] = useState(false);
   const [spawnDefaultProject, setSpawnDefaultProject] = useState<string | undefined>();
   const [sessionAgent, setSessionAgent] = useState<string | null>(null);
-  const [sessionTimeline, setSessionTimeline] = useState(history);
   const [agentDrilldown, setAgentDrilldown] = useState<string | null>(null);
-  const [agentTimeline, setAgentTimeline] = useState(history);
   const [showHelp, setShowHelp] = useState(false);
 
   const selectedRequest = queue.find((r) => r.id === selectedId);
@@ -81,16 +82,6 @@ function App() {
   useEffect(() => {
     if (showSpawn) queryProjects();
   }, [showSpawn, queryProjects]);
-
-  // Keep session timeline in sync when history updates and we're viewing a timeline
-  useEffect(() => {
-    if (sessionAgent) setSessionTimeline(history);
-  }, [history, sessionAgent]);
-
-  // Keep agent timeline in sync
-  useEffect(() => {
-    if (agentDrilldown) setAgentTimeline(history);
-  }, [history, agentDrilldown]);
 
   return (
     <div className="app">
@@ -163,7 +154,8 @@ function App() {
             selectedAgent={sessionAgent}
             onLoad={querySessions}
             onSelectAgent={setSessionAgent}
-            onLoadTimeline={(agentId) => queryHistory(agentId)}
+            onLoadTimeline={querySessionTimeline}
+            onRefreshTimeline={querySessionTimeline}
           />
         )}
         {view === "agents" && (
@@ -173,7 +165,8 @@ function App() {
             timeline={agentTimeline}
             selectedAgent={agentDrilldown}
             onSelectAgent={setAgentDrilldown}
-            onLoadTimeline={(agentId) => queryHistory(agentId)}
+            onLoadTimeline={queryAgentTimeline}
+            onRefreshTimeline={queryAgentTimeline}
             onApprove={(id) => approve(id)}
             onDeny={(id) => deny(id)}
             onSpawn={() => setShowSpawn(true)}

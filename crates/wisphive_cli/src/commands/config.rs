@@ -88,16 +88,14 @@ pub fn list() -> Result<()> {
     );
     let level = config.auto_approve_level.unwrap_or_default();
     eprintln!("auto_approve_level = {level}");
-    if let Some(ref add) = config.auto_approve_add {
-        if !add.is_empty() {
+    if let Some(ref add) = config.auto_approve_add
+        && !add.is_empty() {
             eprintln!("auto_approve_add = {}", add.join(", "));
         }
-    }
-    if let Some(ref remove) = config.auto_approve_remove {
-        if !remove.is_empty() {
+    if let Some(ref remove) = config.auto_approve_remove
+        && !remove.is_empty() {
             eprintln!("auto_approve_remove = {}", remove.join(", "));
         }
-    }
     eprintln!("\nConfig file: {}", config_path().display());
     Ok(())
 }
@@ -119,22 +117,20 @@ pub fn auto_approve_status() -> Result<()> {
             eprintln!("  + {tool}");
         }
     }
-    if let Some(ref add) = config.auto_approve_add {
-        if !add.is_empty() {
+    if let Some(ref add) = config.auto_approve_add
+        && !add.is_empty() {
             eprintln!("\nOverrides (added):");
             for t in add {
                 eprintln!("  + {t}");
             }
         }
-    }
-    if let Some(ref remove) = config.auto_approve_remove {
-        if !remove.is_empty() {
+    if let Some(ref remove) = config.auto_approve_remove
+        && !remove.is_empty() {
             eprintln!("\nOverrides (removed — queued despite level):");
             for t in remove {
                 eprintln!("  - {t}");
             }
         }
-    }
     Ok(())
 }
 

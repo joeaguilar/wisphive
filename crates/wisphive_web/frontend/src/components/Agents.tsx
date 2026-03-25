@@ -8,14 +8,17 @@ interface AgentsProps {
   selectedAgent: string | null;
   onSelectAgent: (agentId: string | null) => void;
   onLoadTimeline: (agentId: string) => void;
+  onRefreshTimeline: (agentId: string) => void;
   onApprove: (id: string) => void;
   onDeny: (id: string) => void;
   onSpawn: () => void;
 }
 
 function duration(first: string, last: string): string {
-  const ms = new Date(last).getTime() - new Date(first).getTime();
-  const seconds = Math.floor(ms / 1000);
+  const start = new Date(first).getTime();
+  const end = new Date(last).getTime();
+  if (isNaN(start) || isNaN(end)) return "—";
+  const seconds = Math.floor((end - start) / 1000);
   if (seconds < 60) return `${seconds}s`;
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
   return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
@@ -44,7 +47,7 @@ function inputSummary(input: Record<string, unknown> | null): string {
   return "";
 }
 
-export function Agents({ agents, queue, timeline, selectedAgent, onSelectAgent, onLoadTimeline, onApprove, onDeny, onSpawn }: AgentsProps) {
+export function Agents({ agents, queue, timeline, selectedAgent, onSelectAgent, onLoadTimeline, onRefreshTimeline, onApprove, onDeny, onSpawn }: AgentsProps) {
   const [expandedEntry, setExpandedEntry] = useState<string | null>(null);
 
   // Drilldown view: agent's pending decisions + timeline
@@ -57,6 +60,9 @@ export function Agents({ agents, queue, timeline, selectedAgent, onSelectAgent, 
         <div className="agents-toolbar">
           <button className="btn-secondary" onClick={() => onSelectAgent(null)}>
             ← Back to agents
+          </button>
+          <button className="btn-secondary" onClick={() => onRefreshTimeline(selectedAgent)}>
+            Refresh
           </button>
         </div>
 

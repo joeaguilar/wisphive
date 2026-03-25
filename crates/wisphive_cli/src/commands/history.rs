@@ -68,11 +68,12 @@ pub async fn search(
         agent_id,
         tool_name: tool,
         limit: Some(limit),
+        request_id: None,
     };
 
     let response = send_and_recv(&ClientMessage::SearchHistory(search))?;
     match response {
-        ServerMessage::HistoryResponse { entries } => {
+        ServerMessage::HistoryResponse { entries, .. } => {
             if entries.is_empty() {
                 println!("No matching history entries found.");
                 return Ok(());
@@ -90,10 +91,11 @@ pub async fn recent(limit: u32, agent_id: Option<String>) -> Result<()> {
     let response = send_and_recv(&ClientMessage::QueryHistory {
         agent_id,
         limit: Some(limit),
+        request_id: None,
     })?;
 
     match response {
-        ServerMessage::HistoryResponse { entries } => {
+        ServerMessage::HistoryResponse { entries, .. } => {
             if entries.is_empty() {
                 println!("No history entries found.");
                 return Ok(());

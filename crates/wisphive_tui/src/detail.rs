@@ -202,7 +202,7 @@ fn has_ask_questions(tool_input: &serde_json::Value) -> bool {
     tool_input
         .get("questions")
         .and_then(|v| v.as_array())
-        .map_or(false, |a| !a.is_empty())
+        .is_some_and(|a| !a.is_empty())
 }
 
 fn push_ask_question_detail(lines: &mut Vec<Line<'static>>, req: &DecisionRequest) {
@@ -291,7 +291,7 @@ fn has_plan_content(req: &DecisionRequest) -> bool {
         .as_ref()
         .and_then(|d| d.get("plan_content"))
         .and_then(|v| v.as_str())
-        .map_or(false, |s| !s.is_empty())
+        .is_some_and(|s| !s.is_empty())
 }
 
 fn push_plan_detail(lines: &mut Vec<Line<'static>>, req: &DecisionRequest, markdown_preview: bool) {

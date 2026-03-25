@@ -59,6 +59,18 @@ fn default_true() -> bool {
     true
 }
 
+/// Clamp a config value to a valid range, logging a warning if clamped.
+fn clamp_config(name: &str, value: u64, min: u64, max: u64) -> u64 {
+    if value < min {
+        tracing::warn!(name, value, min, "config value below minimum, clamping");
+        min
+    } else if value > max {
+        tracing::warn!(name, value, max, "config value above maximum, clamping");
+        max
+    } else {
+        value
+    }
+}
 
 impl DaemonConfig {
     /// Create config rooted at the given home directory.
@@ -66,17 +78,23 @@ impl DaemonConfig {
     /// Loads user overrides from `<home_dir>/config.json` if present.
     pub fn new(home_dir: PathBuf) -> Self {
         let user = Self::load_user_config(&home_dir);
+
+        let hook_timeout_secs = clamp_config("hook_timeout_secs", user.hook_timeout_secs.unwrap_or(3600), 10, 86_400);
+        let agent_timeout_secs = clamp_config("agent_timeout_secs", user.agent_timeout_secs.unwrap_or(300), 10, 86_400);
+        let retention_max_rows = clamp_config("retention_max_rows", user.retention_max_rows.unwrap_or(50_000), 100, 10_000_000);
+        let retention_max_age_days = clamp_config("retention_max_age_days", user.retention_max_age_days.unwrap_or(30), 1, 3650);
+
         Self {
             socket_path: home_dir.join("wisphive.sock"),
             pid_path: home_dir.join("wisphive.pid"),
             db_path: home_dir.join("wisphive.db"),
             mode_path: home_dir.join("mode"),
             log_dir: home_dir.join("logs"),
-            hook_timeout_secs: user.hook_timeout_secs.unwrap_or(3600),
+            hook_timeout_secs,
             notifications_enabled: user.notifications,
-            agent_timeout_secs: user.agent_timeout_secs.unwrap_or(300),
-            retention_max_rows: user.retention_max_rows.unwrap_or(50_000),
-            retention_max_age_days: user.retention_max_age_days.unwrap_or(30),
+            agent_timeout_secs,
+            retention_max_rows,
+            retention_max_age_days,
             home_dir,
         }
     }
