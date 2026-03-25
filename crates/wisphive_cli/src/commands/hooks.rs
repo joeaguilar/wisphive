@@ -85,7 +85,8 @@ pub fn install(project: Option<PathBuf>, _all: bool) -> Result<()> {
     add_wisphive_permissions(&mut settings);
 
     // Write back
-    let dir = settings_path.parent().unwrap();
+    let dir = settings_path.parent()
+        .ok_or_else(|| anyhow::anyhow!("settings path has no parent directory: {}", settings_path.display()))?;
     std::fs::create_dir_all(dir)?;
     let formatted = serde_json::to_string_pretty(&settings)?;
     std::fs::write(&settings_path, formatted)?;
@@ -161,14 +162,13 @@ pub fn status() -> Result<()> {
 /// Get the path to the wisphive-hook binary.
 fn hook_binary_path() -> String {
     // Look for wisphive-hook next to the wisphive binary, or in PATH
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent() {
             let hook_path = dir.join("wisphive-hook");
             if hook_path.exists() {
                 return hook_path.to_string_lossy().to_string();
             }
         }
-    }
     // Fallback: assume it's in PATH
     "wisphive-hook".into()
 }
@@ -199,14 +199,13 @@ fn add_wisphive_permissions(settings: &mut serde_json::Value) {
 /// Remove Wisphive-managed permissions from the settings JSON.
 /// Only removes permissions from the known WISPHIVE_PERMISSIONS list.
 fn remove_wisphive_permissions(settings: &mut serde_json::Value) {
-    if let Some(permissions) = settings.get_mut("permissions") {
-        if let Some(allow_arr) = permissions.get_mut("allow").and_then(|v| v.as_array_mut()) {
+    if let Some(permissions) = settings.get_mut("permissions")
+        && let Some(allow_arr) = permissions.get_mut("allow").and_then(|v| v.as_array_mut()) {
             allow_arr.retain(|v| {
                 v.as_str()
-                    .is_some_and(|s| !WISPHIVE_PERMISSIONS.iter().any(|&p| p == s))
+                    .is_some_and(|s| !WISPHIVE_PERMISSIONS.contains(&s))
             });
         }
-    }
 }
 
 /// Add a Wisphive hook entry to the settings JSON, avoiding duplicates.
@@ -237,7 +236,7 @@ pub(crate) fn add_hook_entry(settings: &mut serde_json::Value, hook_type: &str, 
 
     if let Some(arr) = entries.as_array() {
         // Check if our hook is already there (search nested hooks arrays)
-        let already_present = arr.iter().any(|rule| has_wisphive_hook(rule));
+        let already_present = arr.iter().any(has_wisphive_hook);
         if already_present {
             return;
         }
@@ -262,13 +261,11 @@ pub(crate) fn remove_hook_entries(
     hook_type: &str,
     _command: &str,
 ) {
-    if let Some(hooks) = settings.get_mut("hooks") {
-        if let Some(entries) = hooks.get_mut(hook_type) {
-            if let Some(arr) = entries.as_array_mut() {
+    if let Some(hooks) = settings.get_mut("hooks")
+        && let Some(entries) = hooks.get_mut(hook_type)
+            && let Some(arr) = entries.as_array_mut() {
                 arr.retain(|rule| !has_wisphive_hook(rule));
             }
-        }
-    }
 }
 
 /// Check if a hook rule entry contains a wisphive hook command.

@@ -15,6 +15,10 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 authors = ["Josef Aguilar"]
+repository = "https://github.com/joeaguilar/wisphive"
+homepage = "https://github.com/joeaguilar/wisphive"
+keywords = ["ai", "agent", "control-plane", "tool-approval", "claude"]
+categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
 # Internal crates
