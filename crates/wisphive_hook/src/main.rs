@@ -221,11 +221,10 @@ fn format_elicitation_response(resp: &HookResponse) -> i32 {
     let mut hook_output = serde_json::Map::new();
     hook_output.insert("hookEventName".into(), serde_json::json!("Elicitation"));
     hook_output.insert("action".into(), serde_json::json!(action));
-    if action == "accept" {
-        if let Some(ref input) = resp.updated_input {
+    if action == "accept"
+        && let Some(ref input) = resp.updated_input {
             hook_output.insert("content".into(), input.clone());
         }
-    }
     output.insert("hookSpecificOutput".into(), serde_json::Value::Object(hook_output));
     print!("{}", serde_json::Value::Object(output));
     0
@@ -368,8 +367,8 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
     let mut event_data = extract_event_data(event_type, &hook_event);
 
     // For ExitPlanMode, extract plan content from transcript
-    if tool_name == "ExitPlanMode" {
-        if let Some(plan) = hook_event
+    if tool_name == "ExitPlanMode"
+        && let Some(plan) = hook_event
             .get("transcript_path")
             .and_then(|v| v.as_str())
             .and_then(extract_plan_from_transcript)
@@ -379,7 +378,6 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
                 obj.insert("plan_content".into(), serde_json::Value::String(plan));
             }
         }
-    }
 
     let request = DecisionRequest {
         id: uuid::Uuid::new_v4(),
@@ -623,9 +621,9 @@ fn is_auto_approved(
     };
 
     // Apply content-aware tool_rules
-    if let Some(ref config) = config {
-        if let Some(rules) = config.get("tool_rules").and_then(|v| v.as_object()) {
-            if let Some(rule) = rules.get(tool_name) {
+    if let Some(ref config) = config
+        && let Some(rules) = config.get("tool_rules").and_then(|v| v.as_object())
+            && let Some(rule) = rules.get(tool_name) {
                 let input_text = tool_input_text(tool_name, tool_input);
                 let input_lower = input_text.to_lowercase();
 
@@ -633,28 +631,24 @@ fn is_auto_approved(
                     // Check deny_patterns — any match blocks auto-approve
                     if let Some(patterns) = rule.get("deny_patterns").and_then(|v| v.as_array()) {
                         for p in patterns {
-                            if let Some(pat) = p.as_str() {
-                                if input_lower.contains(&pat.to_lowercase()) {
+                            if let Some(pat) = p.as_str()
+                                && input_lower.contains(&pat.to_lowercase()) {
                                     return false;
                                 }
-                            }
                         }
                     }
                 } else {
                     // Check allow_patterns — any match auto-approves
                     if let Some(patterns) = rule.get("allow_patterns").and_then(|v| v.as_array()) {
                         for p in patterns {
-                            if let Some(pat) = p.as_str() {
-                                if input_lower.contains(&pat.to_lowercase()) {
+                            if let Some(pat) = p.as_str()
+                                && input_lower.contains(&pat.to_lowercase()) {
                                     return true;
                                 }
-                            }
                         }
                     }
                 }
             }
-        }
-    }
 
     base_approved
 }
@@ -666,18 +660,16 @@ fn check_base_approved(
     wisphive_dir: &std::path::Path,
 ) -> bool {
     // Check explicit additions
-    if let Some(arr) = config.get("auto_approve_add").and_then(|v| v.as_array()) {
-        if arr.iter().any(|v| v.as_str() == Some(tool_name)) {
+    if let Some(arr) = config.get("auto_approve_add").and_then(|v| v.as_array())
+        && arr.iter().any(|v| v.as_str() == Some(tool_name)) {
             return true;
         }
-    }
 
     // Check tiered level
-    if let Some(level_str) = config.get("auto_approve_level").and_then(|v| v.as_str()) {
-        if let Ok(level) = level_str.parse::<wisphive_protocol::AutoApproveLevel>() {
+    if let Some(level_str) = config.get("auto_approve_level").and_then(|v| v.as_str())
+        && let Ok(level) = level_str.parse::<wisphive_protocol::AutoApproveLevel>() {
             return level.includes(tool_name);
         }
-    }
 
     // Fallback to legacy
     legacy_auto_approved(tool_name, wisphive_dir)
@@ -686,16 +678,13 @@ fn check_base_approved(
 /// Check legacy auto-approve.json and built-in defaults.
 fn legacy_auto_approved(tool_name: &str, wisphive_dir: &std::path::Path) -> bool {
     let legacy_path = wisphive_dir.join("auto-approve.json");
-    if legacy_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&legacy_path) {
-            if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(arr) = config.get("auto_approve").and_then(|v| v.as_array()) {
+    if legacy_path.exists()
+        && let Ok(content) = std::fs::read_to_string(&legacy_path)
+            && let Ok(config) = serde_json::from_str::<serde_json::Value>(&content)
+                && let Some(arr) = config.get("auto_approve").and_then(|v| v.as_array()) {
                     return arr.iter().any(|v| v.as_str() == Some(tool_name));
                 }
-            }
-        }
-    }
-    DEFAULT_AUTO_APPROVE.iter().any(|&safe| safe == tool_name)
+    DEFAULT_AUTO_APPROVE.contains(&tool_name)
 }
 
 /// Log an auto-approved tool call to events.jsonl for daemon ingestion.
@@ -733,11 +722,10 @@ fn log_auto_approved(
 /// Extract the text to match patterns against for a given tool.
 /// For Bash: the `command` field. For everything else: JSON-serialized input.
 fn tool_input_text(tool_name: &str, tool_input: &serde_json::Value) -> String {
-    if tool_name == "Bash" {
-        if let Some(cmd) = tool_input.get("command").and_then(|v| v.as_str()) {
+    if tool_name == "Bash"
+        && let Some(cmd) = tool_input.get("command").and_then(|v| v.as_str()) {
             return cmd.to_string();
         }
-    }
     serde_json::to_string(tool_input).unwrap_or_default()
 }
 
@@ -832,7 +820,7 @@ fn extract_plan_from_transcript(path: &str) -> Option<String> {
 
     // Collect all lines, then iterate backwards to find the last assistant text.
     // For typical transcripts this is fast enough; the file is small.
-    let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+    let lines: Vec<String> = reader.lines().map_while(|l| l.ok()).collect();
 
     for line in lines.iter().rev() {
         let entry: serde_json::Value = match serde_json::from_str(line) {
@@ -853,11 +841,10 @@ fn extract_plan_from_transcript(path: &str) -> Option<String> {
         // Collect all text blocks from this message
         let mut text_parts = Vec::new();
         for item in content {
-            if item.get("type").and_then(|v| v.as_str()) == Some("text") {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+            if item.get("type").and_then(|v| v.as_str()) == Some("text")
+                && let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                     text_parts.push(text.to_string());
                 }
-            }
         }
 
         if !text_parts.is_empty() {

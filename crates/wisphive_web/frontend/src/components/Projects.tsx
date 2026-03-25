@@ -9,8 +9,10 @@ interface ProjectsProps {
 }
 
 function duration(first: string, last: string): string {
-  const ms = new Date(last).getTime() - new Date(first).getTime();
-  const seconds = Math.floor(ms / 1000);
+  const start = new Date(first).getTime();
+  const end = new Date(last).getTime();
+  if (isNaN(start) || isNaN(end)) return "—";
+  const seconds = Math.floor((end - start) / 1000);
   if (seconds < 60) return `${seconds}s`;
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
   return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
@@ -23,6 +25,7 @@ export function Projects({ projects, onLoad, onSpawnInProject, onDrillDown }: Pr
     <div className="projects-view">
       <div className="sessions-toolbar">
         <h2>Projects ({projects.length})</h2>
+        <button className="btn-secondary" onClick={onLoad}>Refresh</button>
       </div>
       {projects.length === 0 ? (
         <div className="history-empty">No projects</div>

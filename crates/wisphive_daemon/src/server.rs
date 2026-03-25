@@ -17,6 +17,18 @@ use crate::queue::DecisionQueue;
 use crate::registry::AgentRegistry;
 use crate::state::StateDb;
 
+/// Shared context passed to each connection handler, replacing many individual arguments.
+struct ConnectionContext {
+    queue: Arc<Mutex<DecisionQueue>>,
+    process_registry: Arc<Mutex<ProcessRegistry>>,
+    agent_registry: Arc<Mutex<AgentRegistry>>,
+    tui_tx: broadcast::Sender<ServerMessage>,
+    state_db: Arc<StateDb>,
+    hook_timeout_secs: u64,
+    notifications_enabled: bool,
+    home_dir: PathBuf,
+}
+
 /// The main daemon server. Listens on a Unix socket and dispatches
 /// hook and TUI connections.
 pub struct Server {
@@ -127,16 +139,18 @@ impl Server {
                 accept = listener.accept() => {
                     match accept {
                         Ok((stream, _addr)) => {
-                            let queue = self.queue.clone();
-                            let process_registry = self.process_registry.clone();
-                            let agent_registry = self.agent_registry.clone();
-                            let tui_tx = self.tui_tx.clone();
-                            let state_db = self.state_db.clone();
-                            let timeout = self.config.hook_timeout_secs;
-                            let notifications = self.config.notifications_enabled;
-                            let home_dir = self.config.home_dir.clone();
+                            let ctx = Arc::new(ConnectionContext {
+                                queue: self.queue.clone(),
+                                process_registry: self.process_registry.clone(),
+                                agent_registry: self.agent_registry.clone(),
+                                tui_tx: self.tui_tx.clone(),
+                                state_db: self.state_db.clone(),
+                                hook_timeout_secs: self.config.hook_timeout_secs,
+                                notifications_enabled: self.config.notifications_enabled,
+                                home_dir: self.config.home_dir.clone(),
+                            });
                             tokio::spawn(async move {
-                                if let Err(e) = handle_connection(stream, queue, process_registry, agent_registry, tui_tx, state_db, timeout, notifications, home_dir).await {
+                                if let Err(e) = handle_connection(stream, &ctx).await {
                                     warn!("connection error: {e}");
                                 }
                             });
@@ -170,16 +184,10 @@ impl Server {
 }
 
 /// Handle a single client connection. Dispatches based on the Hello handshake.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     stream: UnixStream,
-    queue: Arc<Mutex<DecisionQueue>>,
-    process_registry: Arc<Mutex<ProcessRegistry>>,
-    agent_registry: Arc<Mutex<AgentRegistry>>,
-    tui_tx: broadcast::Sender<ServerMessage>,
-    state_db: Arc<StateDb>,
-    hook_timeout_secs: u64,
-    notifications_enabled: bool,
-    home_dir: PathBuf,
+    ctx: &ConnectionContext,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -209,10 +217,10 @@ async fn handle_connection(
 
             match client {
                 ClientType::Hook => {
-                    handle_hook(lines, writer, queue, agent_registry, tui_tx.clone(), state_db, hook_timeout_secs, notifications_enabled).await
+                    handle_hook(lines, writer, ctx).await
                 }
                 ClientType::Tui => {
-                    handle_tui(lines, writer, queue, process_registry, agent_registry, state_db, tui_tx, home_dir).await
+                    handle_tui(lines, writer, ctx).await
                 }
             }
         }
@@ -227,15 +235,11 @@ async fn handle_connection(
 }
 
 /// Handle a hook connection: receive DecisionRequest, block until resolved.
+#[allow(clippy::too_many_arguments)]
 async fn handle_hook(
     mut lines: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
     mut writer: tokio::net::unix::OwnedWriteHalf,
-    queue: Arc<Mutex<DecisionQueue>>,
-    agent_registry: Arc<Mutex<AgentRegistry>>,
-    tui_tx: broadcast::Sender<ServerMessage>,
-    state_db: Arc<StateDb>,
-    timeout_secs: u64,
-    notifications_enabled: bool,
+    ctx: &ConnectionContext,
 ) -> Result<()> {
     let line = lines
         .next_line()
@@ -256,28 +260,29 @@ async fn handle_hook(
 
             // Register agent and broadcast to TUI clients (only if new)
             let (agent_info, is_new) = {
-                let mut reg = agent_registry.lock().await;
+                let mut reg = ctx.agent_registry.lock().await;
                 reg.register(agent_id.clone(), req.agent_type.clone(), req.project.clone())
             };
             if is_new {
-                let _ = tui_tx.send(ServerMessage::AgentConnected(agent_info));
+                let _ = ctx.tui_tx.send(ServerMessage::AgentConnected(agent_info));
             }
 
             // Persist for crash recovery
-            state_db.persist_pending(&req).await?;
+            ctx.state_db.persist_pending(&req).await?;
 
             // Send passive notification so user knows to check the TUI
-            if notifications_enabled {
+            if ctx.notifications_enabled {
                 crate::notify::notify_decision(&req);
             }
 
             // Enqueue and get receiver
             let rx = {
-                let mut q = queue.lock().await;
+                let mut q = ctx.queue.lock().await;
                 q.enqueue(req)
             };
 
             // Block until TUI responds or timeout
+            let timeout_secs = ctx.hook_timeout_secs;
             let rich = match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
                 Ok(Ok(rich)) => rich,
                 Ok(Err(_)) => {
@@ -291,20 +296,19 @@ async fn handle_hook(
             };
 
             // Persist auto-approve if requested
-            if rich.always_allow {
-                if let Err(e) = persist_auto_approve(&req_tool_name, &config_home) {
+            if rich.always_allow
+                && let Err(e) = persist_auto_approve(&req_tool_name, &config_home) {
                     warn!("failed to persist auto-approve: {e}");
                 }
-            }
 
             // Log resolution (skip audit log for Ask/defer decisions)
             if rich.decision != Decision::Ask {
-                state_db.resolve_pending(id, rich.decision).await?;
+                ctx.state_db.resolve_pending(id, rich.decision).await?;
             }
 
             // Touch last_seen (agent stays registered, reaped on inactivity)
             {
-                let mut reg = agent_registry.lock().await;
+                let mut reg = ctx.agent_registry.lock().await;
                 reg.touch(&agent_id);
             }
 
@@ -322,11 +326,11 @@ async fn handle_hook(
         ClientMessage::ToolResult(result) => {
             // Touch last_seen for the agent
             {
-                let mut reg = agent_registry.lock().await;
+                let mut reg = ctx.agent_registry.lock().await;
                 reg.touch(&result.agent_id);
             }
             // Fire-and-forget: attach result to matching decision_log entry
-            match state_db
+            match ctx.state_db
                 .attach_tool_result(
                     &result.agent_id,
                     &result.tool_name,
@@ -351,11 +355,11 @@ async fn handle_hook(
         ClientMessage::AgentRegister { agent_id, agent_type, project } => {
             // Fire-and-forget registration (no response)
             let (info, is_new) = {
-                let mut reg = agent_registry.lock().await;
+                let mut reg = ctx.agent_registry.lock().await;
                 reg.register(agent_id, agent_type, project)
             };
             if is_new {
-                let _ = tui_tx.send(ServerMessage::AgentConnected(info));
+                let _ = ctx.tui_tx.send(ServerMessage::AgentConnected(info));
             }
         }
         _ => {
@@ -373,16 +377,11 @@ async fn handle_hook(
 async fn handle_tui(
     mut lines: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
     mut writer: tokio::net::unix::OwnedWriteHalf,
-    queue: Arc<Mutex<DecisionQueue>>,
-    process_registry: Arc<Mutex<ProcessRegistry>>,
-    agent_registry: Arc<Mutex<AgentRegistry>>,
-    state_db: Arc<StateDb>,
-    tui_tx: broadcast::Sender<ServerMessage>,
-    home_dir: PathBuf,
+    ctx: &ConnectionContext,
 ) -> Result<()> {
     // Send agents snapshot
     let agents_snap = {
-        let reg = agent_registry.lock().await;
+        let reg = ctx.agent_registry.lock().await;
         reg.snapshot()
     };
     let agents_msg = encode(&ServerMessage::AgentsSnapshot { agents: agents_snap })?;
@@ -390,14 +389,14 @@ async fn handle_tui(
 
     // Send initial queue snapshot
     let snapshot = {
-        let q = queue.lock().await;
+        let q = ctx.queue.lock().await;
         q.snapshot()
     };
     let snap_msg = encode(&ServerMessage::QueueSnapshot { items: snapshot })?;
     writer.write_all(snap_msg.as_bytes()).await?;
 
     // Subscribe to broadcast events for this TUI
-    let mut tui_rx = tui_tx.subscribe();
+    let mut tui_rx = ctx.tui_tx.subscribe();
 
     loop {
         tokio::select! {
@@ -439,8 +438,15 @@ async fn handle_tui(
                                     additional_context,
                                     selected_permission: None,
                                 };
-                                let mut q = queue.lock().await;
-                                q.resolve(id, rich);
+                                {
+                                    let mut q = ctx.queue.lock().await;
+                                    q.resolve(id, rich);
+                                }
+                                // Eagerly persist so subsequent history queries see this decision.
+                                // The hook handler's resolve_pending is idempotent (no-op if already done).
+                                if let Err(e) = ctx.state_db.resolve_pending(id, Decision::Approve).await {
+                                    warn!("eager persist failed for {id}: {e}");
+                                }
                             }
                             ClientMessage::Deny { id, message } => {
                                 let rich = RichDecision {
@@ -448,25 +454,45 @@ async fn handle_tui(
                                     message,
                                     ..RichDecision::deny()
                                 };
-                                let mut q = queue.lock().await;
-                                q.resolve(id, rich);
+                                {
+                                    let mut q = ctx.queue.lock().await;
+                                    q.resolve(id, rich);
+                                }
+                                if let Err(e) = ctx.state_db.resolve_pending(id, Decision::Deny).await {
+                                    warn!("eager persist failed for {id}: {e}");
+                                }
                             }
                             ClientMessage::Ask { id } => {
-                                let mut q = queue.lock().await;
+                                let mut q = ctx.queue.lock().await;
                                 q.resolve(id, RichDecision::from(Decision::Ask));
+                                // Ask/defer decisions are not persisted to the audit log
                             }
                             ClientMessage::ApproveAll { ref filter } => {
-                                let mut q = queue.lock().await;
-                                let n = q.resolve_all(filter, Decision::Approve);
-                                info!("approved {n} decisions");
+                                let ids = {
+                                    let mut q = ctx.queue.lock().await;
+                                    q.resolve_all(filter, Decision::Approve)
+                                };
+                                info!("approved {} decisions", ids.len());
+                                for id in ids {
+                                    if let Err(e) = ctx.state_db.resolve_pending(id, Decision::Approve).await {
+                                        warn!("eager persist failed for {id}: {e}");
+                                    }
+                                }
                             }
                             ClientMessage::DenyAll { ref filter } => {
-                                let mut q = queue.lock().await;
-                                let n = q.resolve_all(filter, Decision::Deny);
-                                info!("denied {n} decisions");
+                                let ids = {
+                                    let mut q = ctx.queue.lock().await;
+                                    q.resolve_all(filter, Decision::Deny)
+                                };
+                                info!("denied {} decisions", ids.len());
+                                for id in ids {
+                                    if let Err(e) = ctx.state_db.resolve_pending(id, Decision::Deny).await {
+                                        warn!("eager persist failed for {id}: {e}");
+                                    }
+                                }
                             }
                             ClientMessage::SpawnAgent(req) => {
-                                let mut pr = process_registry.lock().await;
+                                let mut pr = ctx.process_registry.lock().await;
                                 match pr.spawn_agent(req).await {
                                     Ok(agent) => {
                                         let resp = encode(&ServerMessage::AgentSpawned(agent))?;
@@ -481,14 +507,14 @@ async fn handle_tui(
                                 }
                             }
                             ClientMessage::ListAgents => {
-                                let pr = process_registry.lock().await;
+                                let pr = ctx.process_registry.lock().await;
                                 let agents = pr.list();
                                 let resp = encode(&ServerMessage::AgentList { agents })?;
                                 writer.write_all(resp.as_bytes()).await?;
                             }
                             ClientMessage::ReimportEvents => {
-                                let events_path = home_dir.join("events.jsonl");
-                                match crate::event_ingest::reimport_all(&events_path, &state_db).await {
+                                let events_path = ctx.home_dir.join("events.jsonl");
+                                match crate::event_ingest::reimport_all(&events_path, &ctx.state_db).await {
                                     Ok(count) => {
                                         let resp = encode(&ServerMessage::ReimportComplete { count })?;
                                         writer.write_all(resp.as_bytes()).await?;
@@ -501,11 +527,11 @@ async fn handle_tui(
                                     }
                                 }
                             }
-                            ClientMessage::QueryHistory { ref agent_id, limit } => {
+                            ClientMessage::QueryHistory { ref agent_id, limit, ref request_id } => {
                                 let limit = limit.unwrap_or(200);
-                                match state_db.query_history(agent_id.as_deref(), limit).await {
+                                match ctx.state_db.query_history(agent_id.as_deref(), limit).await {
                                     Ok(entries) => {
-                                        let resp = encode(&ServerMessage::HistoryResponse { entries })?;
+                                        let resp = encode(&ServerMessage::HistoryResponse { entries, request_id: request_id.clone() })?;
                                         writer.write_all(resp.as_bytes()).await?;
                                     }
                                     Err(e) => {
@@ -517,9 +543,9 @@ async fn handle_tui(
                                 }
                             }
                             ClientMessage::SearchHistory(ref search) => {
-                                match state_db.search_history(search).await {
+                                match ctx.state_db.search_history(search).await {
                                     Ok(entries) => {
-                                        let resp = encode(&ServerMessage::HistoryResponse { entries })?;
+                                        let resp = encode(&ServerMessage::HistoryResponse { entries, request_id: search.request_id.clone() })?;
                                         writer.write_all(resp.as_bytes()).await?;
                                     }
                                     Err(e) => {
@@ -531,11 +557,11 @@ async fn handle_tui(
                                 }
                             }
                             ClientMessage::QuerySessions => {
-                                match state_db.query_sessions().await {
+                                match ctx.state_db.query_sessions().await {
                                     Ok(mut sessions) => {
                                         // Enrich with live status
                                         let live_agents = {
-                                            let reg = agent_registry.lock().await;
+                                            let reg = ctx.agent_registry.lock().await;
                                             reg.snapshot()
                                         };
                                         let live_ids: std::collections::HashSet<String> =
@@ -543,7 +569,7 @@ async fn handle_tui(
 
                                         // Pending counts from queue
                                         let pending_counts: std::collections::HashMap<String, u32> = {
-                                            let q = queue.lock().await;
+                                            let q = ctx.queue.lock().await;
                                             let snapshot = q.snapshot();
                                             let mut counts = std::collections::HashMap::new();
                                             for req in &snapshot {
@@ -564,8 +590,8 @@ async fn handle_tui(
                                                     agent_id: agent.agent_id.clone(),
                                                     agent_type: agent.agent_type.clone(),
                                                     project: agent.project.clone(),
-                                                    first_seen: agent.started_at,
-                                                    last_seen: agent.started_at,
+                                                    first_seen: agent.connected_at,
+                                                    last_seen: agent.last_seen,
                                                     total_calls: 0,
                                                     approved: 0,
                                                     denied: 0,
@@ -594,11 +620,11 @@ async fn handle_tui(
                                 }
                             }
                             ClientMessage::QueryProjects => {
-                                match state_db.query_projects().await {
+                                match ctx.state_db.query_projects().await {
                                     Ok(mut projects) => {
                                         // Enrich with live agent presence
                                         let live_agents = {
-                                            let reg = agent_registry.lock().await;
+                                            let reg = ctx.agent_registry.lock().await;
                                             reg.snapshot()
                                         };
                                         let mut live_projects: std::collections::HashSet<std::path::PathBuf> =
@@ -609,7 +635,7 @@ async fn handle_tui(
 
                                         // Pending counts per project
                                         let pending_counts: std::collections::HashMap<std::path::PathBuf, u32> = {
-                                            let q = queue.lock().await;
+                                            let q = ctx.queue.lock().await;
                                             let snapshot = q.snapshot();
                                             let mut counts = std::collections::HashMap::new();
                                             for req in &snapshot {
@@ -628,8 +654,8 @@ async fn handle_tui(
                                             if !projects.iter().any(|p| p.project == agent.project) {
                                                 projects.push(wisphive_protocol::ProjectSummary {
                                                     project: agent.project.clone(),
-                                                    first_seen: agent.started_at,
-                                                    last_seen: agent.started_at,
+                                                    first_seen: agent.connected_at,
+                                                    last_seen: agent.last_seen,
                                                     total_calls: 0,
                                                     approved: 0,
                                                     denied: 0,
@@ -658,7 +684,7 @@ async fn handle_tui(
                                 }
                             }
                             ClientMessage::StopAgent { ref agent_id } => {
-                                let mut pr = process_registry.lock().await;
+                                let mut pr = ctx.process_registry.lock().await;
                                 match pr.stop_agent(agent_id).await {
                                     Ok(exit_code) => {
                                         let resp = encode(&ServerMessage::AgentExited {
@@ -678,7 +704,7 @@ async fn handle_tui(
                             ClientMessage::ApprovePermission { id, suggestion_index, message } => {
                                 // Look up the selected suggestion from the queued request
                                 let selected = {
-                                    let q = queue.lock().await;
+                                    let q = ctx.queue.lock().await;
                                     q.snapshot().iter()
                                         .find(|r| r.id == id)
                                         .and_then(|r| r.permission_suggestions.as_ref())
@@ -693,8 +719,13 @@ async fn handle_tui(
                                     additional_context: None,
                                     selected_permission: selected,
                                 };
-                                let mut q = queue.lock().await;
-                                q.resolve(id, rich);
+                                {
+                                    let mut q = ctx.queue.lock().await;
+                                    q.resolve(id, rich);
+                                }
+                                if let Err(e) = ctx.state_db.resolve_pending(id, Decision::Approve).await {
+                                    warn!("eager persist failed for {id}: {e}");
+                                }
                             }
                             _ => {
                                 warn!("unexpected message from TUI: {:?}", msg);

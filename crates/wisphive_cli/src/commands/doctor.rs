@@ -50,13 +50,9 @@ pub fn run(project: Option<PathBuf>) -> Result<()> {
         eprintln!("  OK  hooks mode is active");
         ok_count += 1;
     } else if mode == "off" {
-        issues.push(format!(
-            "FAIL  hooks mode is \"off\" (hooks are pass-through)\n      fix: wisphive hooks enable"
-        ));
+        issues.push("FAIL  hooks mode is \"off\" (hooks are pass-through)\n      fix: wisphive hooks enable".to_string());
     } else {
-        issues.push(format!(
-            "FAIL  hooks mode not set (defaults to off)\n      fix: wisphive hooks enable"
-        ));
+        issues.push("FAIL  hooks mode not set (defaults to off)\n      fix: wisphive hooks enable".to_string());
     }
 
     // ── 4. Daemon ──
@@ -86,26 +82,18 @@ pub fn run(project: Option<PathBuf>) -> Result<()> {
         eprintln!("  OK  daemon is running");
         ok_count += 1;
     } else if pid_path.exists() {
-        issues.push(format!(
-            "FAIL  daemon has a stale PID file (process not running)\n      fix: rm ~/.wisphive/wisphive.pid && wisphive daemon start"
-        ));
+        issues.push("FAIL  daemon has a stale PID file (process not running)\n      fix: rm ~/.wisphive/wisphive.pid && wisphive daemon start".to_string());
     } else {
-        issues.push(format!(
-            "FAIL  daemon is not running\n      fix: wisphive daemon start"
-        ));
+        issues.push("FAIL  daemon is not running\n      fix: wisphive daemon start".to_string());
     }
 
     if daemon_alive && socket_path.exists() {
         eprintln!("  OK  daemon socket exists");
         ok_count += 1;
     } else if daemon_alive && !socket_path.exists() {
-        issues.push(format!(
-            "FAIL  daemon is running but socket is missing\n      fix: wisphive daemon stop && wisphive daemon start"
-        ));
+        issues.push("FAIL  daemon is running but socket is missing\n      fix: wisphive daemon stop && wisphive daemon start".to_string());
     } else if !daemon_alive && socket_path.exists() {
-        issues.push(format!(
-            "WARN  stale socket file (daemon not running)\n      fix: rm ~/.wisphive/wisphive.sock && wisphive daemon start"
-        ));
+        issues.push("WARN  stale socket file (daemon not running)\n      fix: rm ~/.wisphive/wisphive.sock && wisphive daemon start".to_string());
     }
     // If both missing, we already reported daemon not running.
 
@@ -169,9 +157,9 @@ pub fn run(project: Option<PathBuf>) -> Result<()> {
 
     // ── 6. Permissions ──
 
-    if settings_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&settings_path) {
-            if let Ok(settings) = serde_json::from_str::<serde_json::Value>(&content) {
+    if settings_path.exists()
+        && let Ok(content) = std::fs::read_to_string(&settings_path)
+            && let Ok(settings) = serde_json::from_str::<serde_json::Value>(&content) {
                 let has_perms = settings
                     .get("permissions")
                     .and_then(|p| p.get("allow"))
@@ -188,8 +176,6 @@ pub fn run(project: Option<PathBuf>) -> Result<()> {
                     ));
                 }
             }
-        }
-    }
 
     // ── Summary ──
 

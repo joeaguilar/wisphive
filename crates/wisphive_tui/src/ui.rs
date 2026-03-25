@@ -94,7 +94,7 @@ fn draw_detail_view(frame: &mut Frame, app: &App) {
                 if let Some(ref suggestions) = req.permission_suggestions {
                     let n = suggestions.len();
                     format!(" [1-{}]select [N]deny [M]deny+msg [?]defer [q/Esc]back [Q]uit{}", n, scroll_info)
-                } else if req.tool_input.get("questions").and_then(|v| v.as_array()).map_or(false, |a| !a.is_empty()) {
+                } else if req.tool_input.get("questions").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty()) {
                     // AskUserQuestion: PermissionRequest without suggestions
                     let n = req.tool_input
                         .get("questions")
@@ -917,7 +917,7 @@ fn draw_picker_modal(frame: &mut Frame, app: &App) {
 
     let project_count = app.project_summaries.len();
     // Height: 2 (title border + body) + max 12 project rows + 2 (bottom border + status)
-    let list_height = project_count.max(1).min(12) as u16;
+    let list_height = project_count.clamp(1, 12) as u16;
     let modal_height = (list_height + 5).min(area.height.saturating_sub(4));
     let modal_width = 70.min(area.width.saturating_sub(4));
 

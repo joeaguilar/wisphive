@@ -93,7 +93,7 @@ async fn send_macos_notification(title: &str, body: &str) -> Result<(), String> 
         .await;
 
     match tn_result {
-        Ok(status) if status.success() => return Ok(()),
+        Ok(status) if status.success() => Ok(()),
         _ => {
             // Fall back to osascript display notification
             let script = format!(

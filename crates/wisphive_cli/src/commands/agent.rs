@@ -1,6 +1,6 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -138,7 +138,7 @@ pub async fn stop(agent_id: String) -> Result<()> {
 }
 
 /// Verify the system is ready to spawn an agent.
-fn preflight_checks(project: &PathBuf) -> Result<()> {
+fn preflight_checks(project: &Path) -> Result<()> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let wisphive_dir = PathBuf::from(&home).join(".wisphive");
 
@@ -160,9 +160,9 @@ fn preflight_checks(project: &PathBuf) -> Result<()> {
         );
     }
     let pid_path = wisphive_dir.join("wisphive.pid");
-    if pid_path.exists() {
-        if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
-            if let Ok(pid) = pid_str.trim().parse::<i32>() {
+    if pid_path.exists()
+        && let Ok(pid_str) = std::fs::read_to_string(&pid_path)
+            && let Ok(pid) = pid_str.trim().parse::<i32>() {
                 #[cfg(unix)]
                 {
                     let alive = unsafe { libc::kill(pid, 0) } == 0;
@@ -173,8 +173,6 @@ fn preflight_checks(project: &PathBuf) -> Result<()> {
                     }
                 }
             }
-        }
-    }
 
     // 3. Check hooks are installed in the project
     let settings_path = project.join(".claude").join("settings.json");
@@ -186,15 +184,14 @@ fn preflight_checks(project: &PathBuf) -> Result<()> {
         );
     }
     // Verify wisphive hook is actually present
-    if let Ok(content) = std::fs::read_to_string(&settings_path) {
-        if !content.contains("wisphive") {
+    if let Ok(content) = std::fs::read_to_string(&settings_path)
+        && !content.contains("wisphive") {
             anyhow::bail!(
                 "Wisphive hooks not installed in {}.\n  fix: wisphive hooks install --project {}",
                 project.display(),
                 project.display()
             );
         }
-    }
 
     Ok(())
 }

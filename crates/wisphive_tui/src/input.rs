@@ -304,7 +304,7 @@ fn handle_detail_input(app: &mut App, key: KeyEvent) -> InputAction {
         HookEventType::PermissionRequest => {
             let has_suggestions = app.detail_request()
                 .and_then(|r| r.permission_suggestions.as_ref())
-                .map_or(false, |s| !s.is_empty());
+                .is_some_and(|s| !s.is_empty());
             let is_ask = app.detail_request()
                 .map(|r| has_ask_questions_input(&r.tool_input))
                 .unwrap_or(false);
@@ -385,7 +385,7 @@ fn handle_permission_request_keys(app: &mut App, key: KeyEvent) -> InputAction {
         KeyCode::Char(c @ '1'..='9') => {
             if let Some(req) = app.detail_request() {
                 let idx = (c as usize) - ('1' as usize);
-                let valid = req.permission_suggestions.as_ref().map_or(false, |s| idx < s.len());
+                let valid = req.permission_suggestions.as_ref().is_some_and(|s| idx < s.len());
                 if valid {
                     let id = req.id;
                     app.exit_detail_view();
@@ -423,7 +423,7 @@ fn has_ask_questions_input(tool_input: &serde_json::Value) -> bool {
     tool_input
         .get("questions")
         .and_then(|v| v.as_array())
-        .map_or(false, |a| !a.is_empty())
+        .is_some_and(|a| !a.is_empty())
 }
 
 /// ExitPlanMode / generic PermissionRequest without suggestions:
@@ -464,8 +464,8 @@ fn handle_ask_question_keys(app: &mut App, key: KeyEvent) -> InputAction {
             if let Some(req) = app.detail_request() {
                 let idx = (c as usize) - ('1' as usize);
                 let questions = req.tool_input.get("questions").and_then(|v| v.as_array());
-                if let Some(qs) = questions {
-                    if let Some(first_q) = qs.first() {
+                if let Some(qs) = questions
+                    && let Some(first_q) = qs.first() {
                         let options = first_q.get("options").and_then(|v| v.as_array());
                         let option_count = options.map_or(0, |o| o.len());
 
@@ -484,7 +484,6 @@ fn handle_ask_question_keys(app: &mut App, key: KeyEvent) -> InputAction {
                             return InputAction::ApproveWithInput { id, updated_input: updated };
                         }
                     }
-                }
             }
             InputAction::None
         }
@@ -979,7 +978,7 @@ fn handle_history_detail_input(app: &mut App, key: KeyEvent) -> InputAction {
 
 fn handle_config_input(app: &mut App, key: KeyEvent) -> InputAction {
     use crate::app::{ALL_TOOLS, ConfigRow};
-    use wisphive_protocol::{AutoApproveLevel, ToolRule};
+    use wisphive_protocol::AutoApproveLevel;
 
     // If in rule input mode, handle text input
     if app.config_rule_input_mode {
@@ -1074,7 +1073,7 @@ fn handle_config_input(app: &mut App, key: KeyEvent) -> InputAction {
                 let tool = ALL_TOOLS[*tool_idx].to_string();
                 let is_deny = *is_deny;
                 let rule_idx = *rule_idx;
-                let rule = app.config_tool_rules.entry(tool).or_insert_with(ToolRule::default);
+                let rule = app.config_tool_rules.entry(tool).or_default();
                 if is_deny {
                     if rule_idx < rule.deny_patterns.len() {
                         rule.deny_patterns.remove(rule_idx);
@@ -1096,8 +1095,6 @@ fn handle_config_input(app: &mut App, key: KeyEvent) -> InputAction {
 }
 
 fn handle_config_rule_input(app: &mut App, key: KeyEvent) -> InputAction {
-    use wisphive_protocol::ToolRule;
-
     match key.code {
         KeyCode::Esc => {
             app.config_rule_input_mode = false;
@@ -1107,9 +1104,9 @@ fn handle_config_rule_input(app: &mut App, key: KeyEvent) -> InputAction {
         }
         KeyCode::Enter => {
             let pattern = app.config_rule_buffer.trim().to_string();
-            if !pattern.is_empty() {
-                if let Some(tool) = app.config_rule_target_tool.take() {
-                    let rule = app.config_tool_rules.entry(tool).or_insert_with(ToolRule::default);
+            if !pattern.is_empty()
+                && let Some(tool) = app.config_rule_target_tool.take() {
+                    let rule = app.config_tool_rules.entry(tool).or_default();
                     if app.config_rule_is_deny {
                         if !rule.deny_patterns.contains(&pattern) {
                             rule.deny_patterns.push(pattern);
@@ -1119,7 +1116,6 @@ fn handle_config_rule_input(app: &mut App, key: KeyEvent) -> InputAction {
                     }
                     app.save_config();
                 }
-            }
             app.config_rule_input_mode = false;
             app.config_rule_buffer.clear();
             InputAction::None
