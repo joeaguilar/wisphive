@@ -88,7 +88,7 @@ All under `~/.wisphive/`:
 
 ## Reference Documentation
 
-- [tui-textarea reference](docs/tui-textarea-reference.md) — API reference, key bindings, and integration notes for the TUI text editing widget
+- [tui-textarea reference](claude/tui-textarea-reference.md) — API reference, key bindings, and integration notes for the TUI text editing widget
 
 ## Rust Edition
 
