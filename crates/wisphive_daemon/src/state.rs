@@ -2,6 +2,49 @@ use anyhow::Result;
 use sqlx::SqlitePool;
 use tracing::info;
 
+/// Row shape returned by decision_log queries (12 columns).
+type DecisionLogRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// Row shape for pending_decisions lookups (8 columns).
+type PendingRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
+/// Row shape for session aggregate queries (8 columns).
+type SessionRow = (String, String, String, String, String, i64, i64, i64);
+
+/// Parameters for logging an auto-approved tool call.
+pub struct AutoApprovedEntry<'a> {
+    pub agent_id: &'a str,
+    pub agent_type: &'a str,
+    pub project: &'a str,
+    pub tool_name: &'a str,
+    pub tool_input: &'a str,
+    pub timestamp: &'a str,
+    pub tool_use_id: Option<&'a str>,
+    pub hook_event_name: Option<&'a str>,
+}
+
 /// Manages the SQLite state database for crash recovery and audit.
 pub struct StateDb {
     pool: SqlitePool,
@@ -170,7 +213,7 @@ impl StateDb {
         decision: wisphive_protocol::Decision,
     ) -> Result<()> {
         // Move from pending to log
-        let row = sqlx::query_as::<_, (String, String, String, String, String, String, Option<String>, Option<String>)>(
+        let row = sqlx::query_as::<_, PendingRow>(
             "SELECT agent_id, agent_type, project, tool_name, tool_input, timestamp, tool_use_id, hook_event_name
              FROM pending_decisions WHERE id = ?",
         )
@@ -215,7 +258,7 @@ impl StateDb {
         agent_id: Option<&str>,
         limit: u32,
     ) -> Result<Vec<wisphive_protocol::HistoryEntry>> {
-        let rows: Vec<(String, String, String, String, String, String, String, String, String, Option<String>, Option<String>, Option<String>)> =
+        let rows: Vec<DecisionLogRow> =
             match agent_id {
                 Some(aid) => {
                     sqlx::query_as(
@@ -342,7 +385,7 @@ impl StateDb {
             where_clause
         );
 
-        let mut query = sqlx::query_as::<_, (String, String, String, String, String, String, String, String, String, Option<String>, Option<String>, Option<String>)>(&sql);
+        let mut query = sqlx::query_as::<_, DecisionLogRow>(&sql);
         for bind in &binds {
             query = query.bind(bind);
         }
@@ -355,33 +398,46 @@ impl StateDb {
     /// Get the underlying pool for direct queries.
     /// Insert an auto-approved tool call directly into decision_log.
     /// Called by the event ingest task when processing events.jsonl.
-    pub async fn log_auto_approved(
-        &self,
-        agent_id: &str,
-        agent_type: &str,
-        project: &str,
-        tool_name: &str,
-        tool_input: &str,
-        timestamp: &str,
-        tool_use_id: Option<&str>,
-        hook_event_name: Option<&str>,
-    ) -> Result<()> {
-        let id = uuid::Uuid::new_v4().to_string();
+    pub async fn log_auto_approved(&self, entry: &AutoApprovedEntry<'_>) -> Result<()> {
+        // Generate a deterministic UUID so repeated reimports of the same event
+        // hit the PRIMARY KEY conflict and are ignored. This fixes bug #58.
+        // When tool_use_id is present, derive from it; otherwise hash the content.
+        let id = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            match entry.tool_use_id {
+                Some(tui) => tui.hash(&mut hasher),
+                None => {
+                    entry.agent_id.hash(&mut hasher);
+                    entry.tool_name.hash(&mut hasher);
+                    entry.timestamp.hash(&mut hasher);
+                    entry.tool_input.hash(&mut hasher);
+                }
+            }
+            let hash = hasher.finish();
+            let bytes = hash.to_le_bytes();
+            // Build a UUID-shaped string from the hash (deterministic, not RFC 4122)
+            uuid::Uuid::from_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3],
+                bytes[4], bytes[5], bytes[6], bytes[7],
+                0, 0, 0, 0, 0, 0, 0, 0,
+            ]).to_string()
+        };
         sqlx::query(
             "INSERT OR IGNORE INTO decision_log
              (id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, auto_approved, tool_use_id, hook_event_name)
              VALUES (?, ?, ?, ?, ?, ?, '\"approve\"', ?, ?, 1, ?, ?)",
         )
         .bind(&id)
-        .bind(agent_id)
-        .bind(agent_type)
-        .bind(project)
-        .bind(tool_name)
-        .bind(tool_input)
-        .bind(timestamp)
-        .bind(timestamp)
-        .bind(tool_use_id)
-        .bind(hook_event_name.unwrap_or("PreToolUse"))
+        .bind(entry.agent_id)
+        .bind(entry.agent_type)
+        .bind(entry.project)
+        .bind(entry.tool_name)
+        .bind(entry.tool_input)
+        .bind(entry.timestamp)
+        .bind(entry.timestamp)
+        .bind(entry.tool_use_id)
+        .bind(entry.hook_event_name.unwrap_or("PreToolUse"))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -435,11 +491,10 @@ impl StateDb {
         }
 
         // Reclaim disk space if we archived anything
-        if total_archived > 0 {
-            if let Err(e) = sqlx::query("VACUUM").execute(&self.pool).await {
+        if total_archived > 0
+            && let Err(e) = sqlx::query("VACUUM").execute(&self.pool).await {
                 tracing::warn!("VACUUM after retention failed: {e}");
             }
-        }
 
         Ok(total_archived)
     }
@@ -471,7 +526,7 @@ impl StateDb {
                 placeholders.join(",")
             );
 
-            let mut query = sqlx::query_as::<_, (String, String, String, String, String, String, String, String, String, Option<String>, Option<String>, Option<String>)>(&select_sql);
+            let mut query = sqlx::query_as::<_, DecisionLogRow>(&select_sql);
             for (id,) in chunk {
                 query = query.bind(id);
             }
@@ -516,7 +571,7 @@ impl StateDb {
 
     /// Query distinct sessions from decision_log with aggregated stats.
     pub async fn query_sessions(&self) -> Result<Vec<wisphive_protocol::SessionSummary>> {
-        let rows: Vec<(String, String, String, String, String, i64, i64, i64)> = sqlx::query_as(
+        let rows: Vec<SessionRow> = sqlx::query_as(
             "SELECT agent_id, agent_type, project,
                     MIN(requested_at) as first_seen,
                     MAX(resolved_at) as last_seen,
@@ -603,7 +658,7 @@ impl StateDb {
 
 /// Convert raw SQL rows to HistoryEntry structs.
 fn rows_to_entries(
-    rows: Vec<(String, String, String, String, String, String, String, String, String, Option<String>, Option<String>, Option<String>)>,
+    rows: Vec<DecisionLogRow>,
 ) -> Vec<wisphive_protocol::HistoryEntry> {
     rows.into_iter()
         .filter_map(|(id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id, hook_event_name)| {
@@ -623,4 +678,490 @@ fn rows_to_entries(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wisphive_protocol::{AgentType, Decision, DecisionRequest, HookEventType};
+
+    /// Create an in-memory StateDb for testing.
+    async fn test_db() -> StateDb {
+        StateDb::open(":memory:").await.unwrap()
+    }
+
+    fn make_request(tool: &str, agent_id: &str, project: &str) -> DecisionRequest {
+        DecisionRequest {
+            id: uuid::Uuid::new_v4(),
+            agent_id: agent_id.into(),
+            agent_type: AgentType::ClaudeCode,
+            project: std::path::PathBuf::from(project),
+            tool_name: tool.into(),
+            tool_input: serde_json::json!({"command": "test"}),
+            timestamp: chrono::Utc::now(),
+            hook_event_name: HookEventType::PreToolUse,
+            tool_use_id: None,
+            permission_suggestions: None,
+            event_data: None,
+        }
+    }
+
+    fn make_request_with_tool_use_id(tool: &str, agent_id: &str, tool_use_id: &str) -> DecisionRequest {
+        DecisionRequest {
+            id: uuid::Uuid::new_v4(),
+            agent_id: agent_id.into(),
+            agent_type: AgentType::ClaudeCode,
+            project: std::path::PathBuf::from("/test"),
+            tool_name: tool.into(),
+            tool_input: serde_json::json!({"command": "test"}),
+            timestamp: chrono::Utc::now(),
+            hook_event_name: HookEventType::PreToolUse,
+            tool_use_id: Some(tool_use_id.into()),
+            permission_suggestions: None,
+            event_data: None,
+        }
+    }
+
+    /// Shorthand for tests: call log_auto_approved with positional args.
+    async fn log_auto(
+        db: &StateDb,
+        agent_id: &str,
+        agent_type: &str,
+        project: &str,
+        tool_name: &str,
+        tool_input: &str,
+        timestamp: &str,
+        tool_use_id: Option<&str>,
+        hook_event_name: Option<&str>,
+    ) {
+        db.log_auto_approved(&AutoApprovedEntry {
+            agent_id,
+            agent_type,
+            project,
+            tool_name,
+            tool_input,
+            timestamp,
+            tool_use_id,
+            hook_event_name,
+        })
+        .await
+        .unwrap();
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // persist_pending + resolve_pending
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn persist_and_resolve_pending() {
+        let db = test_db().await;
+        let req = make_request("Bash", "cc-1", "/muse");
+        let id = req.id;
+
+        db.persist_pending(&req).await.unwrap();
+        db.resolve_pending(id, Decision::Approve).await.unwrap();
+
+        let history = db.query_history(None, 10).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].tool_name, "Bash");
+        assert_eq!(history[0].decision, Decision::Approve);
+    }
+
+    #[tokio::test]
+    async fn resolve_pending_removes_from_pending() {
+        let db = test_db().await;
+        let req = make_request("Bash", "cc-1", "/muse");
+        let id = req.id;
+
+        db.persist_pending(&req).await.unwrap();
+        db.resolve_pending(id, Decision::Deny).await.unwrap();
+
+        // Resolving again should be a no-op (pending row already deleted)
+        db.resolve_pending(id, Decision::Approve).await.unwrap();
+
+        let history = db.query_history(None, 10).await.unwrap();
+        // Should still be just 1 entry (the deny), not 2
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].decision, Decision::Deny);
+    }
+
+    #[tokio::test]
+    async fn resolve_nonexistent_pending_is_noop() {
+        let db = test_db().await;
+        let fake_id = uuid::Uuid::new_v4();
+        // Should not error — just silently does nothing
+        db.resolve_pending(fake_id, Decision::Approve).await.unwrap();
+        let history = db.query_history(None, 10).await.unwrap();
+        assert!(history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn persist_pending_with_tool_use_id() {
+        let db = test_db().await;
+        let req = make_request_with_tool_use_id("Bash", "cc-1", "tui-123");
+        let id = req.id;
+
+        db.persist_pending(&req).await.unwrap();
+        db.resolve_pending(id, Decision::Approve).await.unwrap();
+
+        let history = db.query_history(None, 10).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].tool_use_id, Some("tui-123".to_string()));
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // query_history
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn query_history_empty_db() {
+        let db = test_db().await;
+        let history = db.query_history(None, 10).await.unwrap();
+        assert!(history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_history_filters_by_agent_id() {
+        let db = test_db().await;
+
+        let r1 = make_request("Bash", "cc-1", "/muse");
+        let r2 = make_request("Edit", "cc-2", "/rpg");
+        let r3 = make_request("Write", "cc-1", "/muse");
+
+        db.persist_pending(&r1).await.unwrap();
+        db.resolve_pending(r1.id, Decision::Approve).await.unwrap();
+        db.persist_pending(&r2).await.unwrap();
+        db.resolve_pending(r2.id, Decision::Deny).await.unwrap();
+        db.persist_pending(&r3).await.unwrap();
+        db.resolve_pending(r3.id, Decision::Approve).await.unwrap();
+
+        let all = db.query_history(None, 10).await.unwrap();
+        assert_eq!(all.len(), 3);
+
+        let cc1 = db.query_history(Some("cc-1"), 10).await.unwrap();
+        assert_eq!(cc1.len(), 2);
+        assert!(cc1.iter().all(|e| e.agent_id == "cc-1"));
+
+        let cc2 = db.query_history(Some("cc-2"), 10).await.unwrap();
+        assert_eq!(cc2.len(), 1);
+        assert_eq!(cc2[0].tool_name, "Edit");
+    }
+
+    #[tokio::test]
+    async fn query_history_respects_limit() {
+        let db = test_db().await;
+
+        for i in 0..5 {
+            let r = make_request(&format!("Tool{i}"), "cc-1", "/muse");
+            db.persist_pending(&r).await.unwrap();
+            db.resolve_pending(r.id, Decision::Approve).await.unwrap();
+        }
+
+        let limited = db.query_history(None, 3).await.unwrap();
+        assert_eq!(limited.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn query_history_reverse_chronological() {
+        let db = test_db().await;
+
+        let r1 = make_request("First", "cc-1", "/muse");
+        db.persist_pending(&r1).await.unwrap();
+        db.resolve_pending(r1.id, Decision::Approve).await.unwrap();
+
+        let r2 = make_request("Second", "cc-1", "/muse");
+        db.persist_pending(&r2).await.unwrap();
+        db.resolve_pending(r2.id, Decision::Approve).await.unwrap();
+
+        let history = db.query_history(None, 10).await.unwrap();
+        assert_eq!(history[0].tool_name, "Second"); // most recent first
+        assert_eq!(history[1].tool_name, "First");
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // log_auto_approved
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn log_auto_approved_creates_entry() {
+        let db = test_db().await;
+        log_auto(&db, "cc-1", "\"claude_code\"", "/muse", "Read", "{}", "2024-01-01T00:00:00Z", Some("tui-1"), Some("PreToolUse")).await;
+
+        let history = db.query_history(None, 10).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].tool_name, "Read");
+        assert_eq!(history[0].decision, Decision::Approve);
+    }
+
+    #[tokio::test]
+    async fn log_auto_approved_dedup_with_tool_use_id() {
+        let db = test_db().await;
+
+        // Insert same event twice with same tool_use_id
+        log_auto(&db, "cc-1", "\"claude_code\"", "/muse", "Read", "{}", "2024-01-01T00:00:00Z", Some("tui-1"), Some("PreToolUse")).await;
+        log_auto(&db, "cc-1", "\"claude_code\"", "/muse", "Read", "{}", "2024-01-01T00:00:00Z", Some("tui-1"), Some("PreToolUse")).await;
+
+        let history = db.query_history(None, 10).await.unwrap();
+        assert_eq!(history.len(), 1, "duplicate with same tool_use_id should be ignored");
+    }
+
+    /// Fixed #58: Events without tool_use_id are now deduplicated via
+    /// deterministic content-hashed IDs in log_auto_approved().
+    #[tokio::test]
+    async fn log_auto_approved_dedup_without_tool_use_id() {
+        let db = test_db().await;
+
+        // Insert same event twice with NO tool_use_id
+        log_auto(&db, "cc-1", "\"claude_code\"", "/muse", "Read", "{}", "2024-01-01T00:00:00Z", None, Some("PreToolUse")).await;
+        log_auto(&db, "cc-1", "\"claude_code\"", "/muse", "Read", "{}", "2024-01-01T00:00:00Z", None, Some("PreToolUse")).await;
+
+        let history = db.query_history(None, 10).await.unwrap();
+        assert_eq!(history.len(), 1, "deterministic IDs should deduplicate events without tool_use_id");
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // attach_tool_result
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn attach_tool_result_by_tool_use_id() {
+        let db = test_db().await;
+        let req = make_request_with_tool_use_id("Bash", "cc-1", "tui-456");
+        let id = req.id;
+        db.persist_pending(&req).await.unwrap();
+        db.resolve_pending(id, Decision::Approve).await.unwrap();
+
+        let result = serde_json::json!({"output": "build succeeded"});
+        let matched = db.attach_tool_result("cc-1", "Bash", &result, Some("tui-456")).await.unwrap();
+        assert!(matched.is_some());
+        assert_eq!(matched.unwrap(), id);
+
+        let history = db.query_history(None, 10).await.unwrap();
+        assert!(history[0].tool_result.is_some());
+    }
+
+    #[tokio::test]
+    async fn attach_tool_result_fuzzy_fallback() {
+        let db = test_db().await;
+        let req = make_request("Bash", "cc-1", "/muse");
+        let id = req.id;
+        db.persist_pending(&req).await.unwrap();
+        db.resolve_pending(id, Decision::Approve).await.unwrap();
+
+        let result = serde_json::json!({"output": "ok"});
+        // No tool_use_id → fuzzy match by agent_id + tool_name + recency
+        let matched = db.attach_tool_result("cc-1", "Bash", &result, None).await.unwrap();
+        assert!(matched.is_some());
+    }
+
+    #[tokio::test]
+    async fn attach_tool_result_no_match() {
+        let db = test_db().await;
+        let result = serde_json::json!({"output": "orphan"});
+        let matched = db.attach_tool_result("cc-99", "Bash", &result, None).await.unwrap();
+        assert!(matched.is_none());
+    }
+
+    #[tokio::test]
+    async fn attach_tool_result_does_not_overwrite() {
+        let db = test_db().await;
+        let req = make_request_with_tool_use_id("Bash", "cc-1", "tui-789");
+        db.persist_pending(&req).await.unwrap();
+        db.resolve_pending(req.id, Decision::Approve).await.unwrap();
+
+        let r1 = serde_json::json!({"output": "first"});
+        db.attach_tool_result("cc-1", "Bash", &r1, Some("tui-789")).await.unwrap();
+
+        // Second attach to same tool_use_id should find no match (already has result)
+        let r2 = serde_json::json!({"output": "second"});
+        let matched = db.attach_tool_result("cc-1", "Bash", &r2, Some("tui-789")).await.unwrap();
+        assert!(matched.is_none(), "should not overwrite existing tool_result");
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // search_history
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn search_history_by_query() {
+        let db = test_db().await;
+
+        log_auto(&db, "cc-1", "\"claude_code\"", "/muse", "Bash", "{\"command\":\"cargo build\"}", "2024-01-01T00:00:00Z", Some("a"), None).await;
+        log_auto(&db, "cc-1", "\"claude_code\"", "/muse", "Edit", "{\"file\":\"main.rs\"}", "2024-01-01T00:01:00Z", Some("b"), None).await;
+
+        let search = wisphive_protocol::HistorySearch {
+            query: Some("cargo".into()),
+            ..Default::default()
+        };
+        let results = db.search_history(&search).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].tool_name, "Bash");
+    }
+
+    #[tokio::test]
+    async fn search_history_by_tool_name() {
+        let db = test_db().await;
+
+        log_auto(&db, "cc-1", "\"claude_code\"", "/muse", "Bash", "{}", "2024-01-01T00:00:00Z", Some("a"), None).await;
+        log_auto(&db, "cc-1", "\"claude_code\"", "/muse", "Edit", "{}", "2024-01-01T00:01:00Z", Some("b"), None).await;
+
+        let search = wisphive_protocol::HistorySearch {
+            tool_name: Some("Edit".into()),
+            ..Default::default()
+        };
+        let results = db.search_history(&search).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].tool_name, "Edit");
+    }
+
+    #[tokio::test]
+    async fn search_history_by_agent_id() {
+        let db = test_db().await;
+
+        log_auto(&db, "cc-1", "\"claude_code\"", "/muse", "Bash", "{}", "2024-01-01T00:00:00Z", Some("a"), None).await;
+        log_auto(&db, "cc-2", "\"claude_code\"", "/rpg", "Bash", "{}", "2024-01-01T00:01:00Z", Some("b"), None).await;
+
+        let search = wisphive_protocol::HistorySearch {
+            agent_id: Some("cc-2".into()),
+            ..Default::default()
+        };
+        let results = db.search_history(&search).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].agent_id, "cc-2");
+    }
+
+    #[tokio::test]
+    async fn search_history_empty_result() {
+        let db = test_db().await;
+        let search = wisphive_protocol::HistorySearch {
+            query: Some("nonexistent".into()),
+            ..Default::default()
+        };
+        let results = db.search_history(&search).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // query_sessions
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn query_sessions_empty() {
+        let db = test_db().await;
+        let sessions = db.query_sessions().await.unwrap();
+        assert!(sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_sessions_aggregates_by_agent() {
+        let db = test_db().await;
+
+        // Two approves for cc-1, one deny for cc-2
+        let r1 = make_request("Bash", "cc-1", "/muse");
+        db.persist_pending(&r1).await.unwrap();
+        db.resolve_pending(r1.id, Decision::Approve).await.unwrap();
+
+        let r2 = make_request("Edit", "cc-1", "/muse");
+        db.persist_pending(&r2).await.unwrap();
+        db.resolve_pending(r2.id, Decision::Approve).await.unwrap();
+
+        let r3 = make_request("Bash", "cc-2", "/rpg");
+        db.persist_pending(&r3).await.unwrap();
+        db.resolve_pending(r3.id, Decision::Deny).await.unwrap();
+
+        let sessions = db.query_sessions().await.unwrap();
+        assert_eq!(sessions.len(), 2);
+
+        let s1 = sessions.iter().find(|s| s.agent_id == "cc-1").unwrap();
+        assert_eq!(s1.total_calls, 2);
+        assert_eq!(s1.approved, 2);
+        assert_eq!(s1.denied, 0);
+
+        let s2 = sessions.iter().find(|s| s.agent_id == "cc-2").unwrap();
+        assert_eq!(s2.total_calls, 1);
+        assert_eq!(s2.approved, 0);
+        assert_eq!(s2.denied, 1);
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // query_projects
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn query_projects_empty() {
+        let db = test_db().await;
+        let projects = db.query_projects().await.unwrap();
+        assert!(projects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_projects_aggregates_by_project() {
+        let db = test_db().await;
+
+        let r1 = make_request("Bash", "cc-1", "/muse");
+        db.persist_pending(&r1).await.unwrap();
+        db.resolve_pending(r1.id, Decision::Approve).await.unwrap();
+
+        let r2 = make_request("Edit", "cc-2", "/muse");
+        db.persist_pending(&r2).await.unwrap();
+        db.resolve_pending(r2.id, Decision::Deny).await.unwrap();
+
+        let r3 = make_request("Bash", "cc-3", "/rpg");
+        db.persist_pending(&r3).await.unwrap();
+        db.resolve_pending(r3.id, Decision::Approve).await.unwrap();
+
+        let projects = db.query_projects().await.unwrap();
+        assert_eq!(projects.len(), 2);
+
+        let muse = projects.iter().find(|p| p.project == std::path::PathBuf::from("/muse")).unwrap();
+        assert_eq!(muse.total_calls, 2);
+        assert_eq!(muse.agent_count, 2);
+        assert_eq!(muse.approved, 1);
+        assert_eq!(muse.denied, 1);
+
+        let rpg = projects.iter().find(|p| p.project == std::path::PathBuf::from("/rpg")).unwrap();
+        assert_eq!(rpg.total_calls, 1);
+        assert_eq!(rpg.agent_count, 1);
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // archive_and_prune
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn archive_prune_by_max_rows() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let archive_path = tmp.path().join("archive.jsonl");
+
+        // Insert 5 entries
+        for i in 0..5 {
+            let r = make_request(&format!("Tool{i}"), "cc-1", "/muse");
+            db.persist_pending(&r).await.unwrap();
+            db.resolve_pending(r.id, Decision::Approve).await.unwrap();
+        }
+
+        // Prune to max 3 rows
+        let archived = db.archive_and_prune(&archive_path, 3, 365).await.unwrap();
+        assert_eq!(archived, 2, "should archive 2 oldest entries");
+
+        let remaining = db.query_history(None, 100).await.unwrap();
+        assert_eq!(remaining.len(), 3);
+
+        // Verify archive file was written
+        let archive_content = std::fs::read_to_string(&archive_path).unwrap();
+        let lines: Vec<&str> = archive_content.trim().lines().collect();
+        assert_eq!(lines.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn archive_prune_empty_db_is_noop() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let archive_path = tmp.path().join("archive.jsonl");
+
+        let archived = db.archive_and_prune(&archive_path, 100, 365).await.unwrap();
+        assert_eq!(archived, 0);
+        assert!(!archive_path.exists());
+    }
 }

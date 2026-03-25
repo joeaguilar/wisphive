@@ -72,20 +72,19 @@ impl DecisionQueue {
     }
 
     /// Resolve all pending decisions matching an optional filter.
-    /// Returns the number of decisions resolved.
-    pub fn resolve_all(&mut self, filter: &Option<DecisionFilter>, decision: Decision) -> usize {
+    /// Returns the IDs of resolved decisions.
+    pub fn resolve_all(&mut self, filter: &Option<DecisionFilter>, decision: Decision) -> Vec<Uuid> {
         let ids: Vec<Uuid> = self
             .pending_items
             .iter()
-            .filter(|req| filter.as_ref().map_or(true, |f| f.matches(req)))
+            .filter(|req| filter.as_ref().is_none_or(|f| f.matches(req)))
             .map(|req| req.id)
             .collect();
 
-        let count = ids.len();
-        for id in ids {
-            self.resolve(id, RichDecision::from(decision));
+        for id in &ids {
+            self.resolve(*id, RichDecision::from(decision));
         }
-        count
+        ids
     }
 
     /// Get a snapshot of all pending items (for TUI initial sync).
@@ -260,8 +259,8 @@ mod tests {
         let rx2 = q.enqueue(r2);
         let rx3 = q.enqueue(r3);
 
-        let count = q.resolve_all(&None, Decision::Approve);
-        assert_eq!(count, 3);
+        let ids = q.resolve_all(&None, Decision::Approve);
+        assert_eq!(ids.len(), 3);
         assert_eq!(q.len(), 0);
 
         assert_eq!(rx1.await.unwrap().decision, Decision::Approve);
@@ -284,9 +283,9 @@ mod tests {
             tool_name: Some("Bash".into()),
             ..Default::default()
         });
-        let count = q.resolve_all(&filter, Decision::Deny);
+        let ids = q.resolve_all(&filter, Decision::Deny);
 
-        assert_eq!(count, 2);
+        assert_eq!(ids.len(), 2);
         assert_eq!(q.len(), 1); // Only Write remains
         assert_eq!(q.snapshot()[0].tool_name, "Write");
 
@@ -309,9 +308,9 @@ mod tests {
             project: Some(PathBuf::from("/muse")),
             ..Default::default()
         });
-        let count = q.resolve_all(&filter, Decision::Approve);
+        let ids = q.resolve_all(&filter, Decision::Approve);
 
-        assert_eq!(count, 2);
+        assert_eq!(ids.len(), 2);
         assert_eq!(q.len(), 1);
         assert_eq!(q.snapshot()[0].project, PathBuf::from("/rpg"));
 
@@ -329,17 +328,17 @@ mod tests {
             tool_name: Some("NonExistent".into()),
             ..Default::default()
         });
-        let count = q.resolve_all(&filter, Decision::Approve);
+        let ids = q.resolve_all(&filter, Decision::Approve);
 
-        assert_eq!(count, 0);
+        assert!(ids.is_empty());
         assert_eq!(q.len(), 1); // Nothing resolved
     }
 
     #[test]
     fn resolve_all_on_empty_queue() {
         let mut q = make_queue();
-        let count = q.resolve_all(&None, Decision::Approve);
-        assert_eq!(count, 0);
+        let ids = q.resolve_all(&None, Decision::Approve);
+        assert!(ids.is_empty());
     }
 
     // ════════════════════════════════════════════════════════════

@@ -82,6 +82,9 @@ pub enum ClientMessage {
         /// Maximum number of entries to return (default 200).
         #[serde(skip_serializing_if = "Option::is_none")]
         limit: Option<u32>,
+        /// Opaque correlation ID echoed back in the response.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
 
     /// Hook reports a tool execution result (fire-and-forget, PostToolUse).
@@ -184,7 +187,12 @@ pub enum ServerMessage {
 
     /// Response to QueryHistory request.
     #[serde(rename = "history_response")]
-    HistoryResponse { entries: Vec<HistoryEntry> },
+    HistoryResponse {
+        entries: Vec<HistoryEntry>,
+        /// Echoed correlation ID from the request.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        request_id: Option<String>,
+    },
 
     /// Response to QuerySessions: list of session summaries.
     #[serde(rename = "sessions_response")]
@@ -299,5 +307,419 @@ mod tests {
             ..Default::default()
         };
         assert!(!filter.matches(&req));
+    }
+
+    // ── Server messages ──────────────────────────────────────────────
+
+    #[test]
+    fn round_trip_welcome() {
+        let msg = ServerMessage::Welcome { version: PROTOCOL_VERSION };
+        let encoded = encode(&msg).unwrap();
+        let decoded: ServerMessage = decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::Welcome { version } => assert_eq!(version, PROTOCOL_VERSION),
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_decision_response() {
+        let id = uuid::Uuid::new_v4();
+        let msg = ServerMessage::DecisionResponse {
+            id,
+            decision: Decision::Approve,
+            message: Some("looks good".into()),
+            updated_input: Some(serde_json::json!({"command": "cargo test"})),
+            additional_context: Some("run tests first".into()),
+            selected_permission: None,
+        };
+        let encoded = encode(&msg).unwrap();
+        let decoded: ServerMessage = decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::DecisionResponse {
+                id: did,
+                decision,
+                message,
+                updated_input,
+                additional_context,
+                ..
+            } => {
+                assert_eq!(did, id);
+                assert_eq!(decision, Decision::Approve);
+                assert_eq!(message.unwrap(), "looks good");
+                assert_eq!(updated_input.unwrap(), serde_json::json!({"command": "cargo test"}));
+                assert_eq!(additional_context.unwrap(), "run tests first");
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_queue_snapshot() {
+        let req = DecisionRequest {
+            id: uuid::Uuid::new_v4(),
+            agent_id: "cc-2".into(),
+            agent_type: AgentType::ClaudeCode,
+            project: PathBuf::from("/tmp/proj"),
+            tool_name: "Write".into(),
+            tool_input: serde_json::json!({"path": "/tmp/proj/foo.rs"}),
+            timestamp: chrono::Utc::now(),
+            hook_event_name: Default::default(),
+            tool_use_id: None,
+            permission_suggestions: None,
+            event_data: None,
+        };
+        let msg = ServerMessage::QueueSnapshot { items: vec![req] };
+        let encoded = encode(&msg).unwrap();
+        let decoded: ServerMessage = decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::QueueSnapshot { items } => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].tool_name, "Write");
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_error() {
+        let msg = ServerMessage::Error { message: "something went wrong".into() };
+        let encoded = encode(&msg).unwrap();
+        let decoded: ServerMessage = decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::Error { message } => assert_eq!(message, "something went wrong"),
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_decision_resolved() {
+        let id = uuid::Uuid::new_v4();
+        let msg = ServerMessage::DecisionResolved { id, decision: Decision::Deny };
+        let encoded = encode(&msg).unwrap();
+        let decoded: ServerMessage = decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::DecisionResolved { id: did, decision } => {
+                assert_eq!(did, id);
+                assert_eq!(decision, Decision::Deny);
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_reimport_complete() {
+        let msg = ServerMessage::ReimportComplete { count: 42 };
+        let encoded = encode(&msg).unwrap();
+        let decoded: ServerMessage = decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::ReimportComplete { count } => assert_eq!(count, 42),
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_history_response() {
+        use crate::types::HistoryEntry;
+        let entry = HistoryEntry {
+            id: uuid::Uuid::new_v4(),
+            agent_id: "cc-1".into(),
+            agent_type: AgentType::ClaudeCode,
+            project: PathBuf::from("/proj"),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({"command": "ls"}),
+            decision: Decision::Approve,
+            requested_at: chrono::Utc::now(),
+            resolved_at: chrono::Utc::now(),
+            tool_result: None,
+            tool_use_id: None,
+            hook_event_name: None,
+        };
+        let msg = ServerMessage::HistoryResponse {
+            entries: vec![entry],
+            request_id: Some("req-123".into()),
+        };
+        let encoded = encode(&msg).unwrap();
+        let decoded: ServerMessage = decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::HistoryResponse { entries, request_id } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].tool_name, "Bash");
+                assert_eq!(request_id.unwrap(), "req-123");
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    // ── Client messages ──────────────────────────────────────────────
+
+    #[test]
+    fn round_trip_approve() {
+        let id = uuid::Uuid::new_v4();
+        let msg = ClientMessage::Approve {
+            id,
+            message: Some("approved with edits".into()),
+            updated_input: Some(serde_json::json!({"command": "cargo build --release"})),
+            always_allow: true,
+            additional_context: Some("use release mode".into()),
+        };
+        let encoded = encode(&msg).unwrap();
+        let decoded: ClientMessage = decode(&encoded).unwrap();
+        match decoded {
+            ClientMessage::Approve {
+                id: did,
+                message,
+                updated_input,
+                always_allow,
+                additional_context,
+            } => {
+                assert_eq!(did, id);
+                assert_eq!(message.unwrap(), "approved with edits");
+                assert_eq!(
+                    updated_input.unwrap(),
+                    serde_json::json!({"command": "cargo build --release"})
+                );
+                assert!(always_allow);
+                assert_eq!(additional_context.unwrap(), "use release mode");
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_deny() {
+        let id = uuid::Uuid::new_v4();
+        let msg = ClientMessage::Deny {
+            id,
+            message: Some("too dangerous".into()),
+        };
+        let encoded = encode(&msg).unwrap();
+        let decoded: ClientMessage = decode(&encoded).unwrap();
+        match decoded {
+            ClientMessage::Deny { id: did, message } => {
+                assert_eq!(did, id);
+                assert_eq!(message.unwrap(), "too dangerous");
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_ask() {
+        let id = uuid::Uuid::new_v4();
+        let msg = ClientMessage::Ask { id };
+        let encoded = encode(&msg).unwrap();
+        let decoded: ClientMessage = decode(&encoded).unwrap();
+        match decoded {
+            ClientMessage::Ask { id: did } => assert_eq!(did, id),
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_approve_all_with_filter() {
+        let msg = ClientMessage::ApproveAll {
+            filter: Some(DecisionFilter {
+                tool_name: Some("Bash".into()),
+                project: Some(PathBuf::from("/proj")),
+                agent_type: Some(AgentType::ClaudeCode),
+            }),
+        };
+        let encoded = encode(&msg).unwrap();
+        let decoded: ClientMessage = decode(&encoded).unwrap();
+        match decoded {
+            ClientMessage::ApproveAll { filter } => {
+                let f = filter.unwrap();
+                assert_eq!(f.tool_name.unwrap(), "Bash");
+                assert_eq!(f.project.unwrap(), PathBuf::from("/proj"));
+                assert_eq!(f.agent_type.unwrap(), AgentType::ClaudeCode);
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_deny_all_no_filter() {
+        let msg = ClientMessage::DenyAll { filter: None };
+        let encoded = encode(&msg).unwrap();
+        let decoded: ClientMessage = decode(&encoded).unwrap();
+        match decoded {
+            ClientMessage::DenyAll { filter } => assert!(filter.is_none()),
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_query_history() {
+        let msg = ClientMessage::QueryHistory {
+            agent_id: Some("cc-5".into()),
+            limit: Some(50),
+            request_id: Some("qh-1".into()),
+        };
+        let encoded = encode(&msg).unwrap();
+        let decoded: ClientMessage = decode(&encoded).unwrap();
+        match decoded {
+            ClientMessage::QueryHistory { agent_id, limit, request_id } => {
+                assert_eq!(agent_id.unwrap(), "cc-5");
+                assert_eq!(limit.unwrap(), 50);
+                assert_eq!(request_id.unwrap(), "qh-1");
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_search_history() {
+        use crate::types::HistorySearch;
+        let search = HistorySearch {
+            query: Some("cargo".into()),
+            tool_name: Some("Bash".into()),
+            agent_id: None,
+            limit: Some(10),
+            request_id: Some("sh-1".into()),
+        };
+        let msg = ClientMessage::SearchHistory(search);
+        let encoded = encode(&msg).unwrap();
+        let decoded: ClientMessage = decode(&encoded).unwrap();
+        match decoded {
+            ClientMessage::SearchHistory(s) => {
+                assert_eq!(s.query.unwrap(), "cargo");
+                assert_eq!(s.tool_name.unwrap(), "Bash");
+                assert!(s.agent_id.is_none());
+                assert_eq!(s.limit.unwrap(), 10);
+                assert_eq!(s.request_id.unwrap(), "sh-1");
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_query_sessions() {
+        let msg = ClientMessage::QuerySessions;
+        let encoded = encode(&msg).unwrap();
+        let decoded: ClientMessage = decode(&encoded).unwrap();
+        assert!(matches!(decoded, ClientMessage::QuerySessions));
+    }
+
+    #[test]
+    fn round_trip_query_projects() {
+        let msg = ClientMessage::QueryProjects;
+        let encoded = encode(&msg).unwrap();
+        let decoded: ClientMessage = decode(&encoded).unwrap();
+        assert!(matches!(decoded, ClientMessage::QueryProjects));
+    }
+
+    #[test]
+    fn round_trip_reimport_events() {
+        let msg = ClientMessage::ReimportEvents;
+        let encoded = encode(&msg).unwrap();
+        let decoded: ClientMessage = decode(&encoded).unwrap();
+        assert!(matches!(decoded, ClientMessage::ReimportEvents));
+    }
+
+    #[test]
+    fn round_trip_agent_register() {
+        let msg = ClientMessage::AgentRegister {
+            agent_id: "cc-99".into(),
+            agent_type: AgentType::Red,
+            project: PathBuf::from("/home/user/project"),
+        };
+        let encoded = encode(&msg).unwrap();
+        let decoded: ClientMessage = decode(&encoded).unwrap();
+        match decoded {
+            ClientMessage::AgentRegister { agent_id, agent_type, project } => {
+                assert_eq!(agent_id, "cc-99");
+                assert_eq!(agent_type, AgentType::Red);
+                assert_eq!(project, PathBuf::from("/home/user/project"));
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_tool_result() {
+        use crate::types::ToolResult;
+        let tr = ToolResult {
+            agent_id: "cc-1".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({"command": "echo hi"}),
+            tool_result: serde_json::json!({"stdout": "hi\n", "exit_code": 0}),
+            timestamp: chrono::Utc::now(),
+            tool_use_id: Some("tu-abc".into()),
+        };
+        let msg = ClientMessage::ToolResult(tr);
+        let encoded = encode(&msg).unwrap();
+        let decoded: ClientMessage = decode(&encoded).unwrap();
+        match decoded {
+            ClientMessage::ToolResult(r) => {
+                assert_eq!(r.agent_id, "cc-1");
+                assert_eq!(r.tool_name, "Bash");
+                assert_eq!(r.tool_use_id.unwrap(), "tu-abc");
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    // ── Encoding edge cases ──────────────────────────────────────────
+
+    #[test]
+    fn encode_appends_newline() {
+        let msg = ServerMessage::Welcome { version: 1 };
+        let encoded = encode(&msg).unwrap();
+        assert!(encoded.ends_with('\n'));
+        // Exactly one trailing newline
+        assert!(!encoded.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn decode_strips_whitespace() {
+        let msg = ClientMessage::Hello {
+            client: ClientType::Tui,
+            version: PROTOCOL_VERSION,
+        };
+        let encoded = encode(&msg).unwrap();
+        // Wrap with leading/trailing spaces and newlines
+        let padded = format!("  \n  {}  \n  ", encoded.trim());
+        let decoded: ClientMessage = decode(&padded).unwrap();
+        match decoded {
+            ClientMessage::Hello { client, version } => {
+                assert_eq!(client, ClientType::Tui);
+                assert_eq!(version, PROTOCOL_VERSION);
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn decode_invalid_json_returns_error() {
+        let result = decode::<ClientMessage>("this is not json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn tag_based_discrimination() {
+        let client_msg = ClientMessage::Hello {
+            client: ClientType::Hook,
+            version: PROTOCOL_VERSION,
+        };
+        let server_msg = ServerMessage::Welcome { version: PROTOCOL_VERSION };
+
+        let client_json = encode(&client_msg).unwrap();
+        let server_json = encode(&server_msg).unwrap();
+
+        // Both are valid JSON — verify they contain the right "type" tag
+        assert!(client_json.contains("\"type\":\"hello\""));
+        assert!(server_json.contains("\"type\":\"welcome\""));
+
+        // Each decodes to the correct variant of its own enum
+        let decoded_client: ClientMessage = decode(&client_json).unwrap();
+        assert!(matches!(decoded_client, ClientMessage::Hello { .. }));
+
+        let decoded_server: ServerMessage = decode(&server_json).unwrap();
+        assert!(matches!(decoded_server, ServerMessage::Welcome { .. }));
+
+        // Cross-decoding should fail (hello is not a ServerMessage variant)
+        let cross_result = decode::<ServerMessage>(&client_json);
+        assert!(cross_result.is_err());
     }
 }
