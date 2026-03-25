@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "wisphive",
+    version,
     about = "Agent control plane for multiplexed AI workflows"
 )]
 struct Cli {
@@ -48,7 +49,7 @@ enum Command {
     /// Manage AI agent processes
     Agent {
         #[command(subcommand)]
-        action: AgentAction,
+        action: Box<AgentAction>,
     },
 
     /// Browse and search the audit history
@@ -130,53 +131,7 @@ enum DaemonAction {
 #[derive(Subcommand)]
 enum AgentAction {
     /// Start an AI agent in a project directory
-    Start {
-        /// Path to the project directory (defaults to current directory)
-        #[arg(long)]
-        project: Option<std::path::PathBuf>,
-        /// Model to use (e.g. "sonnet", "opus")
-        #[arg(long)]
-        model: Option<String>,
-        /// Prompt to pass to the agent
-        #[arg(long)]
-        prompt: String,
-        /// Display name for the agent session
-        #[arg(long)]
-        name: Option<String>,
-        /// Reasoning effort level (low, medium, high)
-        #[arg(long)]
-        reasoning: Option<String>,
-        /// Maximum number of agentic turns
-        #[arg(long)]
-        max_turns: Option<u32>,
-        /// Permission mode (default, plan, bypassPermissions)
-        #[arg(long)]
-        permission_mode: Option<String>,
-        /// Custom system prompt (replaces default)
-        #[arg(long)]
-        system_prompt: Option<String>,
-        /// Additional system prompt (appended to default)
-        #[arg(long)]
-        append_system_prompt: Option<String>,
-        /// Restrict to specific tools (repeatable)
-        #[arg(long = "allowed-tools")]
-        allowed_tools: Option<Vec<String>>,
-        /// Block specific tools (repeatable)
-        #[arg(long = "disallowed-tools")]
-        disallowed_tools: Option<Vec<String>>,
-        /// Continue the most recent session
-        #[arg(long = "continue", conflicts_with = "resume")]
-        continue_session: bool,
-        /// Resume a specific session by ID
-        #[arg(long, conflicts_with = "continue_session")]
-        resume: Option<String>,
-        /// Output format (json, stream-json, text)
-        #[arg(long)]
-        output_format: Option<String>,
-        /// Enable verbose output
-        #[arg(long)]
-        verbose: bool,
-    },
+    Start(Box<StartArgs>),
     /// List running agent processes
     List,
     /// Stop a running agent process
@@ -184,6 +139,55 @@ enum AgentAction {
         /// Agent ID to stop
         agent_id: String,
     },
+}
+
+#[derive(clap::Args)]
+struct StartArgs {
+    /// Path to the project directory (defaults to current directory)
+    #[arg(long)]
+    project: Option<std::path::PathBuf>,
+    /// Model to use (e.g. "sonnet", "opus")
+    #[arg(long)]
+    model: Option<String>,
+    /// Prompt to pass to the agent
+    #[arg(long)]
+    prompt: String,
+    /// Display name for the agent session
+    #[arg(long)]
+    name: Option<String>,
+    /// Reasoning effort level (low, medium, high)
+    #[arg(long)]
+    reasoning: Option<String>,
+    /// Maximum number of agentic turns
+    #[arg(long)]
+    max_turns: Option<u32>,
+    /// Permission mode (default, plan, bypassPermissions)
+    #[arg(long)]
+    permission_mode: Option<String>,
+    /// Custom system prompt (replaces default)
+    #[arg(long)]
+    system_prompt: Option<String>,
+    /// Additional system prompt (appended to default)
+    #[arg(long)]
+    append_system_prompt: Option<String>,
+    /// Restrict to specific tools (repeatable)
+    #[arg(long = "allowed-tools")]
+    allowed_tools: Option<Vec<String>>,
+    /// Block specific tools (repeatable)
+    #[arg(long = "disallowed-tools")]
+    disallowed_tools: Option<Vec<String>>,
+    /// Continue the most recent session
+    #[arg(long = "continue", conflicts_with = "resume")]
+    continue_session: bool,
+    /// Resume a specific session by ID
+    #[arg(long, conflicts_with = "continue_session")]
+    resume: Option<String>,
+    /// Output format (json, stream-json, text)
+    #[arg(long)]
+    output_format: Option<String>,
+    /// Enable verbose output
+    #[arg(long)]
+    verbose: bool,
 }
 
 #[derive(Subcommand)]
@@ -290,43 +294,27 @@ fn main() -> anyhow::Result<()> {
         Command::Agent { action } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
-                match action {
-                    AgentAction::Start {
-                        project,
-                        prompt,
-                        model,
-                        name,
-                        reasoning,
-                        max_turns,
-                        permission_mode,
-                        system_prompt,
-                        append_system_prompt,
-                        allowed_tools,
-                        disallowed_tools,
-                        continue_session,
-                        resume,
-                        output_format,
-                        verbose,
-                    } => {
-                        let proj = project
+                match *action {
+                    AgentAction::Start(args) => {
+                        let proj = args.project
                             .or_else(|| std::env::current_dir().ok())
                             .unwrap_or_else(|| std::path::PathBuf::from("."));
                         commands::agent::start(wisphive_protocol::SpawnAgentRequest {
                             project: proj,
-                            prompt,
-                            model,
-                            name,
-                            reasoning,
-                            max_turns,
-                            permission_mode,
-                            system_prompt,
-                            append_system_prompt,
-                            allowed_tools,
-                            disallowed_tools,
-                            continue_session,
-                            resume,
-                            output_format,
-                            verbose,
+                            prompt: args.prompt,
+                            model: args.model,
+                            name: args.name,
+                            reasoning: args.reasoning,
+                            max_turns: args.max_turns,
+                            permission_mode: args.permission_mode,
+                            system_prompt: args.system_prompt,
+                            append_system_prompt: args.append_system_prompt,
+                            allowed_tools: args.allowed_tools,
+                            disallowed_tools: args.disallowed_tools,
+                            continue_session: args.continue_session,
+                            resume: args.resume,
+                            output_format: args.output_format,
+                            verbose: args.verbose,
                         }).await
                     }
                     AgentAction::List => commands::agent::list().await,
@@ -359,7 +347,10 @@ fn main() -> anyhow::Result<()> {
             let socket_path = home.join("wisphive.sock");
 
             let host_octets: [u8; 4] = match host.as_str() {
-                "0.0.0.0" => [0, 0, 0, 0],
+                "0.0.0.0" => {
+                    eprintln!("WARNING: Web UI is exposed on all network interfaces. Ensure this is intentional.");
+                    [0, 0, 0, 0]
+                }
                 "127.0.0.1" | "localhost" => [127, 0, 0, 1],
                 other => {
                     let parts: Vec<u8> = other.split('.').filter_map(|s| s.parse().ok()).collect();
@@ -380,14 +371,13 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("Wisphive Web: http://{host}:{port}");
                 if host_octets == [0, 0, 0, 0] {
                     // Show local IP for LAN access
-                    if let Ok(output) = std::process::Command::new("ipconfig").arg("getifaddr").arg("en0").output() {
-                        if let Ok(ip) = String::from_utf8(output.stdout) {
+                    if let Ok(output) = std::process::Command::new("ipconfig").arg("getifaddr").arg("en0").output()
+                        && let Ok(ip) = String::from_utf8(output.stdout) {
                             let ip = ip.trim();
                             if !ip.is_empty() {
                                 eprintln!("  LAN:      http://{ip}:{port}");
                             }
                         }
-                    }
                 }
             }
             rt.block_on(wisphive_web::serve(socket_path, port, dev, host_octets))

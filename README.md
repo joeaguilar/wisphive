@@ -22,7 +22,7 @@ AI coding agents are powerful but opaque. They execute shell commands, edit file
 ### Install
 
 ```bash
-git clone https://github.com/your-org/wisphive.git
+git clone https://github.com/joeaguilar/wisphive.git
 cd wisphive
 ./install.sh    # builds release, installs to ~/.cargo/bin, codesigns on macOS
 ```
