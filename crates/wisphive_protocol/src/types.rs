@@ -65,7 +65,9 @@ pub struct PermissionSuggestion {
 
 /// The type of Claude Code hook event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum HookEventType {
+    #[default]
     PreToolUse,
     PostToolUse,
     PermissionRequest,
@@ -85,11 +87,6 @@ pub enum HookEventType {
     Unknown,
 }
 
-impl Default for HookEventType {
-    fn default() -> Self {
-        Self::PreToolUse
-    }
-}
 
 impl std::fmt::Display for HookEventType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -404,10 +401,12 @@ pub struct ToolRule {
 /// Auto-approve permission levels. Higher levels include all tools from lower levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum AutoApproveLevel {
     /// Nothing auto-approved. Every tool goes through the TUI.
     Off,
     /// Read-only + orchestration tools (default).
+    #[default]
     Read,
     /// Level 1 + file modifications (Edit, Write, NotebookEdit).
     Write,
@@ -453,7 +452,7 @@ impl AutoApproveLevel {
             if *level > *self {
                 break;
             }
-            if level.tier_tools().iter().any(|&t| t == tool_name) {
+            if level.tier_tools().contains(&tool_name) {
                 return true;
             }
         }
@@ -461,11 +460,6 @@ impl AutoApproveLevel {
     }
 }
 
-impl Default for AutoApproveLevel {
-    fn default() -> Self {
-        Self::Read
-    }
-}
 
 impl std::fmt::Display for AutoApproveLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -511,21 +505,18 @@ pub struct DecisionFilter {
 impl DecisionFilter {
     /// Returns true if the given request matches this filter.
     pub fn matches(&self, req: &DecisionRequest) -> bool {
-        if let Some(ref tool) = self.tool_name {
-            if req.tool_name != *tool {
+        if let Some(ref tool) = self.tool_name
+            && req.tool_name != *tool {
                 return false;
             }
-        }
-        if let Some(ref project) = self.project {
-            if req.project != *project {
+        if let Some(ref project) = self.project
+            && req.project != *project {
                 return false;
             }
-        }
-        if let Some(ref agent_type) = self.agent_type {
-            if req.agent_type != *agent_type {
+        if let Some(ref agent_type) = self.agent_type
+            && req.agent_type != *agent_type {
                 return false;
             }
-        }
         true
     }
 }
