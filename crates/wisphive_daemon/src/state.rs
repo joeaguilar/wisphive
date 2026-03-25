@@ -134,6 +134,17 @@ impl StateDb {
 
     /// Persist a pending decision for crash recovery.
     pub async fn persist_pending(&self, req: &wisphive_protocol::DecisionRequest) -> Result<()> {
+        // For events without tool_input (Stop, ConfigChange, etc.), store event_data instead
+        let stored_input = if req.tool_input.is_null() {
+            if let Some(ref data) = req.event_data {
+                data.clone()
+            } else {
+                req.tool_input.clone()
+            }
+        } else {
+            req.tool_input.clone()
+        };
+
         sqlx::query(
             "INSERT OR REPLACE INTO pending_decisions (id, agent_id, agent_type, project, tool_name, tool_input, timestamp, tool_use_id, hook_event_name)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -143,7 +154,7 @@ impl StateDb {
         .bind(serde_json::to_string(&req.agent_type)?)
         .bind(req.project.to_string_lossy().to_string())
         .bind(&req.tool_name)
-        .bind(serde_json::to_string(&req.tool_input)?)
+        .bind(serde_json::to_string(&stored_input)?)
         .bind(req.timestamp.to_rfc3339())
         .bind(&req.tool_use_id)
         .bind(req.hook_event_name.to_string())
