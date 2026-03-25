@@ -300,11 +300,12 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
 
     let is_permission_request = event_type == wisphive_protocol::HookEventType::PermissionRequest;
 
+    // For events without a tool_name (Stop, ConfigChange, etc.), use the event type name
     let tool_name = hook_event
         .get("tool_name")
         .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| event_type.to_string());
 
     // Extract agent identity early (needed for registration before auto-approve check)
     let agent_id = hook_event

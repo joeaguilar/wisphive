@@ -71,15 +71,48 @@ pub fn format_project_status(status: &ProjectStatus) -> String {
 
 /// Truncate tool input to a compact summary string.
 fn truncate_tool_input(req: &DecisionRequest) -> String {
-    // Show the most relevant field from the tool input
-    let summary = if let Some(cmd) = req.tool_input.get("command").and_then(|v| v.as_str()) {
-        cmd.to_string()
-    } else if let Some(path) = req.tool_input.get("file_path").and_then(|v| v.as_str()) {
-        path.to_string()
-    } else if let Some(pattern) = req.tool_input.get("pattern").and_then(|v| v.as_str()) {
-        pattern.to_string()
-    } else {
-        req.tool_input.to_string()
+    use wisphive_protocol::HookEventType;
+
+    // For non-PreToolUse events, show a meaningful summary from event_data
+    let summary = match req.hook_event_name {
+        HookEventType::Stop | HookEventType::SubagentStop => {
+            req.event_data
+                .as_ref()
+                .and_then(|d| d.get("last_assistant_message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("agent stopped")
+                .to_string()
+        }
+        HookEventType::UserPromptSubmit => {
+            req.event_data
+                .as_ref()
+                .and_then(|d| d.get("prompt"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        }
+        HookEventType::ConfigChange => {
+            req.event_data
+                .as_ref()
+                .and_then(|d| d.get("file_path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("settings changed")
+                .to_string()
+        }
+        _ => {
+            // PreToolUse and others: show the most relevant field from tool_input
+            if let Some(cmd) = req.tool_input.get("command").and_then(|v| v.as_str()) {
+                cmd.to_string()
+            } else if let Some(path) = req.tool_input.get("file_path").and_then(|v| v.as_str()) {
+                path.to_string()
+            } else if let Some(pattern) = req.tool_input.get("pattern").and_then(|v| v.as_str()) {
+                pattern.to_string()
+            } else if req.tool_input.is_null() {
+                String::new()
+            } else {
+                req.tool_input.to_string()
+            }
+        }
     };
 
     if summary.len() > 50 {
