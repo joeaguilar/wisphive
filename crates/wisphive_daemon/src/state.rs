@@ -169,7 +169,7 @@ impl StateDb {
 
         if let Some((agent_id, agent_type, project, tool_name, tool_input, requested_at, tool_use_id, hook_event_name)) = row {
             sqlx::query(
-                "INSERT INTO decision_log (id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_use_id, hook_event_name)
+                "INSERT OR IGNORE INTO decision_log (id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_use_id, hook_event_name)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(id.to_string())
@@ -423,10 +423,20 @@ impl StateDb {
             }
         }
 
+        // Reclaim disk space if we archived anything
+        if total_archived > 0 {
+            if let Err(e) = sqlx::query("VACUUM").execute(&self.pool).await {
+                tracing::warn!("VACUUM after retention failed: {e}");
+            }
+        }
+
         Ok(total_archived)
     }
 
     /// Archive specific rows to JSONL file and delete from SQLite.
+    ///
+    /// Processes in batches of 500 for efficiency. Rows are written to the
+    /// archive file before being deleted, ensuring no data loss.
     async fn archive_rows_by_ids(
         &self,
         ids: &[(String,)],
@@ -434,46 +444,59 @@ impl StateDb {
     ) -> Result<u64> {
         use std::io::Write;
 
-        // Fetch full rows for archiving
         let mut archived = 0u64;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(archive_path)?;
 
-        for (id,) in ids {
-            let row: Option<(String, String, String, String, String, String, String, String, String, Option<String>, Option<String>)> =
-                sqlx::query_as(
-                    "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id
-                     FROM decision_log WHERE id = ?",
-                )
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?;
+        for chunk in ids.chunks(500) {
+            // Build placeholders for batch SELECT
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let select_sql = format!(
+                "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, \
+                 requested_at, resolved_at, tool_result, tool_use_id \
+                 FROM decision_log WHERE id IN ({})",
+                placeholders.join(",")
+            );
 
-            if let Some((id, agent_id, _agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id)) = row {
+            let mut query = sqlx::query_as::<_, (String, String, String, String, String, String, String, String, String, Option<String>, Option<String>)>(&select_sql);
+            for (id,) in chunk {
+                query = query.bind(id);
+            }
+            let rows = query.fetch_all(&self.pool).await?;
+
+            // Write all rows to archive file
+            for (id, agent_id, _agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id) in &rows {
                 let entry = serde_json::json!({
                     "id": id,
                     "agent_id": agent_id,
                     "project": project,
                     "tool_name": tool_name,
-                    "tool_input": serde_json::from_str::<serde_json::Value>(&tool_input).unwrap_or(serde_json::Value::Null),
+                    "tool_input": serde_json::from_str::<serde_json::Value>(tool_input).unwrap_or(serde_json::Value::Null),
                     "decision": decision,
                     "requested_at": requested_at,
                     "resolved_at": resolved_at,
-                    "tool_result": tool_result.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                    "tool_result": tool_result.as_deref().and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
                     "tool_use_id": tool_use_id,
                 });
                 let mut line = serde_json::to_string(&entry).unwrap_or_default();
                 line.push('\n');
                 file.write_all(line.as_bytes())?;
-
-                sqlx::query("DELETE FROM decision_log WHERE id = ?")
-                    .bind(&id)
-                    .execute(&self.pool)
-                    .await?;
                 archived += 1;
             }
+            file.flush()?;
+
+            // Batch delete after archive is flushed to disk
+            let delete_sql = format!(
+                "DELETE FROM decision_log WHERE id IN ({})",
+                placeholders.join(",")
+            );
+            let mut delete_query = sqlx::query(&delete_sql);
+            for (id,) in chunk {
+                delete_query = delete_query.bind(id);
+            }
+            delete_query.execute(&self.pool).await?;
         }
 
         Ok(archived)
