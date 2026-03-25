@@ -15,12 +15,19 @@ export interface WisphiveState {
   queue: DecisionRequest[];
   agents: AgentInfo[];
   history: HistoryEntry[];
+  agentTimeline: HistoryEntry[];
+  sessionTimeline: HistoryEntry[];
   sessions: SessionSummary[];
   projects: ProjectSummary[];
 }
 
 const WS_URL =
   import.meta.env.VITE_WS_URL || `ws://${window.location.host}/ws`;
+
+// Well-known request_id prefixes for routing responses
+const CHANNEL_HISTORY = "history";
+const CHANNEL_AGENT = "agent";
+const CHANNEL_SESSION = "session";
 
 export function useWisphive() {
   const wsRef = useRef<WebSocket | null>(null);
@@ -30,6 +37,8 @@ export function useWisphive() {
     queue: [],
     agents: [],
     history: [],
+    agentTimeline: [],
+    sessionTimeline: [],
     sessions: [],
     projects: [],
   });
@@ -49,9 +58,7 @@ export function useWisphive() {
           case "new_decision": {
             const { type: _, ...req } = msg;
             const newQueue = [...prev.queue, req as DecisionRequest];
-            // Tab title badge
             document.title = newQueue.length > 0 ? `(${newQueue.length}) Wisphive` : "Wisphive";
-            // Browser notification if tab not focused
             if (document.hidden && Notification.permission === "granted") {
               new Notification(`Wisphive: ${(req as DecisionRequest).tool_name}`, {
                 body: `${(req as DecisionRequest).agent_id.slice(0, 20)} needs a decision`,
@@ -81,8 +88,15 @@ export function useWisphive() {
               agents: prev.agents.filter((a) => a.agent_id !== msg.agent_id),
             };
 
-          case "history_response":
+          case "history_response": {
+            const channel = msg.request_id ?? CHANNEL_HISTORY;
+            if (channel.startsWith(CHANNEL_AGENT)) {
+              return { ...prev, agentTimeline: msg.entries };
+            } else if (channel.startsWith(CHANNEL_SESSION)) {
+              return { ...prev, sessionTimeline: msg.entries };
+            }
             return { ...prev, history: msg.entries };
+          }
 
           case "sessions_response":
             return { ...prev, sessions: msg.sessions };
@@ -91,7 +105,7 @@ export function useWisphive() {
             return { ...prev, projects: msg.projects };
 
           case "reimport_complete":
-            return prev; // No-op, the subsequent history query will update
+            return prev;
 
           case "error":
             console.error("Daemon error:", msg.message);
@@ -113,7 +127,6 @@ export function useWisphive() {
     wsRef.current = ws;
 
     ws.onopen = () => {
-      // Request notification permission on first connect
       if ("Notification" in window && Notification.permission === "default") {
         Notification.requestPermission();
       }
@@ -125,7 +138,6 @@ export function useWisphive() {
 
     ws.onclose = () => {
       setState((prev) => ({ ...prev, connected: false }));
-      // Reconnect after 2s
       reconnectTimer.current = setTimeout(connect, 2000);
     };
 
@@ -164,8 +176,21 @@ export function useWisphive() {
 
   const queryHistory = useCallback(
     (agentId?: string) => {
-      send({ type: "reimport_events" });
-      send({ type: "query_history", agent_id: agentId, limit: 200 });
+      send({ type: "query_history", agent_id: agentId, limit: 200, request_id: CHANNEL_HISTORY });
+    },
+    [send],
+  );
+
+  const queryAgentTimeline = useCallback(
+    (agentId: string) => {
+      send({ type: "query_history", agent_id: agentId, limit: 200, request_id: CHANNEL_AGENT });
+    },
+    [send],
+  );
+
+  const querySessionTimeline = useCallback(
+    (agentId: string) => {
+      send({ type: "query_history", agent_id: agentId, limit: 200, request_id: CHANNEL_SESSION });
     },
     [send],
   );
@@ -179,8 +204,8 @@ export function useWisphive() {
   }, [send]);
 
   const searchHistory = useCallback(
-    (query: string) => {
-      send({ type: "search_history", query, limit: 200 });
+    (query: string, requestId?: string) => {
+      send({ type: "search_history", query, limit: 200, request_id: requestId ?? CHANNEL_HISTORY });
     },
     [send],
   );
@@ -198,6 +223,8 @@ export function useWisphive() {
     approve,
     deny,
     queryHistory,
+    queryAgentTimeline,
+    querySessionTimeline,
     querySessions,
     queryProjects,
     searchHistory,

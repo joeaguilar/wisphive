@@ -104,14 +104,13 @@ async fn run_loop(
                         InputAction::Quit => break,
                         InputAction::Approve(id) => {
                             // Track stopped agents before removing from queue
-                            if let Some(req) = app.queue.iter().find(|r| r.id == id) {
-                                if matches!(req.hook_event_name,
+                            if let Some(req) = app.queue.iter().find(|r| r.id == id)
+                                && matches!(req.hook_event_name,
                                     wisphive_protocol::HookEventType::Stop
                                     | wisphive_protocol::HookEventType::SubagentStop
                                 ) {
                                     app.stopped_agents.insert(req.agent_id.clone());
                                 }
-                            }
                             tracing::info!(%id, "approved");
                             conn.send(&ClientMessage::Approve {
                                 id,
@@ -146,13 +145,12 @@ async fn run_loop(
                             conn.send(&ClientMessage::SpawnAgent(req)).await?;
                         }
                         InputAction::QueryHistory { agent_id } => {
-                            tracing::info!(?agent_id, "querying history (with reimport)");
+                            tracing::info!(?agent_id, "querying history");
                             app.history_page = 0;
-                            // Sync events.jsonl into DB before querying
-                            conn.send(&ClientMessage::ReimportEvents).await?;
                             conn.send(&ClientMessage::QueryHistory {
                                 agent_id,
                                 limit: Some(HISTORY_PAGE_SIZE + 1),
+                                request_id: None,
                             }).await?;
                         }
                         InputAction::QueryHistoryPage { agent_id, page } => {
@@ -161,6 +159,7 @@ async fn run_loop(
                             conn.send(&ClientMessage::QueryHistory {
                                 agent_id,
                                 limit: Some(offset + HISTORY_PAGE_SIZE + 1),
+                                request_id: None,
                             }).await?;
                         }
                         InputAction::SearchHistory { search } => {
@@ -181,6 +180,7 @@ async fn run_loop(
                             conn.send(&ClientMessage::QueryHistory {
                                 agent_id: Some(agent_id),
                                 limit: Some(HISTORY_PAGE_SIZE + 1),
+                                request_id: None,
                             }).await?;
                         }
                         InputAction::QuerySessionTimelinePage { agent_id, page } => {
@@ -189,6 +189,7 @@ async fn run_loop(
                             conn.send(&ClientMessage::QueryHistory {
                                 agent_id: Some(agent_id),
                                 limit: Some(offset + HISTORY_PAGE_SIZE + 1),
+                                request_id: None,
                             }).await?;
                         }
                         InputAction::DenyWithMessage { id, message } => {
@@ -288,7 +289,7 @@ async fn run_loop(
                         app.stopped_agents.remove(agent_id);
                         app.rebuild_projects();
                     }
-                    Some(ServerMessage::HistoryResponse { entries }) => {
+                    Some(ServerMessage::HistoryResponse { entries, .. }) => {
                         tracing::info!(count = entries.len(), "received history");
                         let page_size = HISTORY_PAGE_SIZE as usize;
 
