@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { DecisionRequest } from "../types/protocol";
 import { TextModal, ConfirmModal } from "./Modal";
+import { ToolContent } from "./ToolContent";
 
 interface DetailViewProps {
   request: DecisionRequest;
@@ -10,28 +11,6 @@ interface DetailViewProps {
 
 // Safe string extraction from unknown values
 const str = (v: unknown): string => (typeof v === "string" ? v : String(v ?? ""));
-
-// Simple diff renderer — split old/new into lines and show unified view
-function DiffView({ oldStr, newStr }: { oldStr: string; newStr: string }) {
-  const oldLines = oldStr.split("\n");
-  const newLines = newStr.split("\n");
-  return (
-    <div className="diff-view">
-      {oldLines.map((line, i) => (
-        <div key={`old-${i}`} className="diff-line diff-remove">
-          <span className="diff-gutter">-</span>
-          <span className="diff-text">{line}</span>
-        </div>
-      ))}
-      {newLines.map((line, i) => (
-        <div key={`new-${i}`} className="diff-line diff-add">
-          <span className="diff-gutter">+</span>
-          <span className="diff-text">{line}</span>
-        </div>
-      ))}
-    </div>
-  );
-}
 
 // Simple markdown to HTML (headers, bold, code, lists)
 function renderMarkdown(text: string): string {
@@ -51,18 +30,7 @@ export function DetailView({ request, onApprove, onDeny }: DetailViewProps) {
   const [modal, setModal] = useState<"deny-msg" | "context" | "always" | null>(null);
   const { tool_name, tool_input: rawInput, agent_id, project, timestamp, hook_event_name, event_data } = request;
   const tool_input = rawInput ?? {};
-  // Event data fields
   const planContent = typeof event_data?.plan_content === "string" ? event_data.plan_content : null;
-  const promptText = typeof event_data?.prompt === "string" ? event_data.prompt : null;
-  const lastMessage = typeof event_data?.last_assistant_message === "string" ? event_data.last_assistant_message : null;
-  const teammateName = typeof event_data?.teammate_name === "string" ? event_data.teammate_name : null;
-  const taskSubject = typeof event_data?.task_subject === "string" ? event_data.task_subject : null;
-  // Tool input fields
-  const command = typeof tool_input.command === "string" ? tool_input.command : null;
-  const oldString = typeof tool_input.old_string === "string" ? tool_input.old_string : null;
-  const newString = typeof tool_input.new_string === "string" ? tool_input.new_string : null;
-  const filePath = typeof tool_input.file_path === "string" ? tool_input.file_path : null;
-  const content = typeof tool_input.content === "string" ? tool_input.content : null;
 
   return (
     <div className="detail-view">
@@ -77,42 +45,7 @@ export function DetailView({ request, onApprove, onDeny }: DetailViewProps) {
         <div><strong>Time:</strong> {new Date(timestamp).toLocaleTimeString()}</div>
       </div>
 
-      {/* UserPromptSubmit: show the submitted prompt */}
-      {promptText && (
-        <div className="detail-section">
-          <h3>Submitted Prompt</h3>
-          <pre className="code-block">{promptText}</pre>
-        </div>
-      )}
-
-      {/* Stop: show last assistant message */}
-      {lastMessage && (
-        <div className="detail-section">
-          <h3>Last Message</h3>
-          <pre className="plan-content">{lastMessage}</pre>
-        </div>
-      )}
-
-      {/* TeammateIdle */}
-      {teammateName && (
-        <div className="detail-section">
-          <h3>Teammate Status</h3>
-          <p>Teammate <strong>{teammateName}</strong> is idle.</p>
-        </div>
-      )}
-
-      {/* TaskCompleted */}
-      {taskSubject && (
-        <div className="detail-section">
-          <h3>Task Completed</h3>
-          <p><strong>{taskSubject}</strong></p>
-          {typeof event_data?.task_description === "string" && (
-            <pre className="code-block">{event_data.task_description as string}</pre>
-          )}
-        </div>
-      )}
-
-      {/* ExitPlanMode: plan content */}
+      {/* ExitPlanMode: plan content with markdown rendering */}
       {planContent && (
         <div className="detail-section">
           <h3>Plan</h3>
@@ -142,41 +75,14 @@ export function DetailView({ request, onApprove, onDeny }: DetailViewProps) {
         </div>
       )}
 
-      {command && (
-        <div className="detail-section">
-          <h3>Command</h3>
-          <pre className="code-block">{command}</pre>
-        </div>
-      )}
-
-      {(oldString || newString) && (
-        <div className="detail-section">
-          <h3>Changes</h3>
-          {filePath && <div className="file-path">{filePath}</div>}
-          <DiffView oldStr={oldString || ""} newStr={newString || ""} />
-        </div>
-      )}
-
-      {content && tool_name === "Write" && (
-        <div className="detail-section">
-          <h3>Content (new file)</h3>
-          {filePath && <div className="file-path">{filePath}</div>}
-          <pre className="code-block">{content}</pre>
-        </div>
-      )}
-
-      {!command && !oldString && !content && !Array.isArray(tool_input.questions) &&
-       !planContent && !promptText && !lastMessage && !teammateName && !taskSubject && (
-        <div className="detail-section">
-          <h3>Tool Input</h3>
-          <pre className="code-block">
-            {Object.keys(tool_input).length > 0
-              ? JSON.stringify(tool_input, null, 2)
-              : event_data
-                ? JSON.stringify(event_data, null, 2)
-                : "(no data)"}
-          </pre>
-        </div>
+      {/* Shared tool/event content (unless handled above) */}
+      {!planContent && !Array.isArray(tool_input.questions) && (
+        <ToolContent
+          toolName={tool_name}
+          toolInput={rawInput}
+          hookEventName={hook_event_name}
+          eventData={event_data}
+        />
       )}
 
       <div className="detail-actions">

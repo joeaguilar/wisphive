@@ -215,11 +215,11 @@ impl StateDb {
         agent_id: Option<&str>,
         limit: u32,
     ) -> Result<Vec<wisphive_protocol::HistoryEntry>> {
-        let rows: Vec<(String, String, String, String, String, String, String, String, String, Option<String>, Option<String>)> =
+        let rows: Vec<(String, String, String, String, String, String, String, String, String, Option<String>, Option<String>, Option<String>)> =
             match agent_id {
                 Some(aid) => {
                     sqlx::query_as(
-                        "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id
+                        "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id, hook_event_name
                          FROM decision_log WHERE agent_id = ? ORDER BY resolved_at DESC LIMIT ?",
                     )
                     .bind(aid)
@@ -229,7 +229,7 @@ impl StateDb {
                 }
                 None => {
                     sqlx::query_as(
-                        "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id
+                        "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id, hook_event_name
                          FROM decision_log ORDER BY resolved_at DESC LIMIT ?",
                     )
                     .bind(limit)
@@ -337,12 +337,12 @@ impl StateDb {
         };
 
         let sql = format!(
-            "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id
+            "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id, hook_event_name
              FROM decision_log WHERE {} ORDER BY resolved_at DESC LIMIT ?",
             where_clause
         );
 
-        let mut query = sqlx::query_as::<_, (String, String, String, String, String, String, String, String, String, Option<String>, Option<String>)>(&sql);
+        let mut query = sqlx::query_as::<_, (String, String, String, String, String, String, String, String, String, Option<String>, Option<String>, Option<String>)>(&sql);
         for bind in &binds {
             query = query.bind(bind);
         }
@@ -466,19 +466,19 @@ impl StateDb {
             let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
             let select_sql = format!(
                 "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, \
-                 requested_at, resolved_at, tool_result, tool_use_id \
+                 requested_at, resolved_at, tool_result, tool_use_id, hook_event_name \
                  FROM decision_log WHERE id IN ({})",
                 placeholders.join(",")
             );
 
-            let mut query = sqlx::query_as::<_, (String, String, String, String, String, String, String, String, String, Option<String>, Option<String>)>(&select_sql);
+            let mut query = sqlx::query_as::<_, (String, String, String, String, String, String, String, String, String, Option<String>, Option<String>, Option<String>)>(&select_sql);
             for (id,) in chunk {
                 query = query.bind(id);
             }
             let rows = query.fetch_all(&self.pool).await?;
 
             // Write all rows to archive file
-            for (id, agent_id, _agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id) in &rows {
+            for (id, agent_id, _agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id, hook_event_name) in &rows {
                 let entry = serde_json::json!({
                     "id": id,
                     "agent_id": agent_id,
@@ -490,6 +490,7 @@ impl StateDb {
                     "resolved_at": resolved_at,
                     "tool_result": tool_result.as_deref().and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
                     "tool_use_id": tool_use_id,
+                    "hook_event_name": hook_event_name,
                 });
                 let mut line = serde_json::to_string(&entry).unwrap_or_default();
                 line.push('\n');
@@ -602,10 +603,10 @@ impl StateDb {
 
 /// Convert raw SQL rows to HistoryEntry structs.
 fn rows_to_entries(
-    rows: Vec<(String, String, String, String, String, String, String, String, String, Option<String>, Option<String>)>,
+    rows: Vec<(String, String, String, String, String, String, String, String, String, Option<String>, Option<String>, Option<String>)>,
 ) -> Vec<wisphive_protocol::HistoryEntry> {
     rows.into_iter()
-        .filter_map(|(id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id)| {
+        .filter_map(|(id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id, hook_event_name)| {
             Some(wisphive_protocol::HistoryEntry {
                 id: id.parse().ok()?,
                 agent_id,
@@ -618,6 +619,7 @@ fn rows_to_entries(
                 resolved_at: chrono::DateTime::parse_from_rfc3339(&resolved_at).ok()?.with_timezone(&chrono::Utc),
                 tool_result: tool_result.and_then(|s| serde_json::from_str(&s).ok()),
                 tool_use_id,
+                hook_event_name,
             })
         })
         .collect()

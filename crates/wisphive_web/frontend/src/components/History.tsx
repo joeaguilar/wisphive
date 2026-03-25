@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import type { HistoryEntry } from "../types/protocol";
+import { ToolContent } from "./ToolContent";
 
 interface HistoryProps {
   entries: HistoryEntry[];
@@ -46,6 +47,7 @@ export function History({ entries, onLoad, onSearch }: HistoryProps) {
           onKeyDown={(e) => { if (e.key === "Enter") handleSearch(); }}
         />
         <button className="btn-secondary" onClick={handleSearch}>Search</button>
+        <button className="btn-secondary" onClick={() => onLoad(agentFilter ?? undefined)}>Refresh</button>
         {(agentFilter || search) && (
           <button className="btn-secondary" onClick={() => { setAgentFilter(null); setSearch(""); onLoad(); }}>
             Clear filters
@@ -80,16 +82,12 @@ export function History({ entries, onLoad, onSearch }: HistoryProps) {
                     <div><strong>Requested:</strong> {formatTime(entry.requested_at)}</div>
                     <div><strong>Resolved:</strong> {formatTime(entry.resolved_at)}</div>
                   </div>
-                  <div className="detail-section">
-                    <h3>Tool Input</h3>
-                    <pre className="code-block">{JSON.stringify(entry.tool_input, null, 2)}</pre>
-                  </div>
-                  {entry.tool_result && (
-                    <div className="detail-section">
-                      <h3>Tool Result</h3>
-                      <pre className="code-block">{JSON.stringify(entry.tool_result, null, 2)}</pre>
-                    </div>
-                  )}
+                  <ToolContent
+                    toolName={entry.tool_name}
+                    toolInput={entry.tool_input}
+                    hookEventName={entry.hook_event_name}
+                    toolResult={entry.tool_result}
+                  />
                 </div>
               )}
             </div>
