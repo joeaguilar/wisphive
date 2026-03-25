@@ -24,13 +24,22 @@ pub const ALL_TOOLS: &[&str] = &[
     "Bash",
 ];
 
-/// A row in the config view — either the level selector, a tool, or an inline rule.
+/// A row in the config view — either the level selector, a tool, an inline rule, or an event toggle.
 #[derive(Debug, Clone)]
 pub enum ConfigRow {
     Level,
     Tool(usize),
     Rule { tool_idx: usize, rule_idx: usize, is_deny: bool },
+    /// Toggle for event-type auto-approve (key name in config.json).
+    EventToggle(&'static str),
 }
+
+/// Event types that can be auto-approved, with display names.
+pub const EVENT_TOGGLES: &[(&str, &str)] = &[
+    ("auto_approve_stop", "Stop/SubagentStop"),
+    ("auto_approve_user_prompt", "UserPromptSubmit"),
+    ("auto_approve_config_change", "ConfigChange"),
+];
 
 /// Minimal config snapshot for reading auto-approve settings from config.json.
 #[derive(Deserialize, Default)]
@@ -43,6 +52,12 @@ pub struct ConfigSnapshot {
     pub auto_approve_remove: Option<Vec<String>>,
     #[serde(default)]
     pub tool_rules: Option<HashMap<String, ToolRule>>,
+    #[serde(default)]
+    pub auto_approve_stop: Option<bool>,
+    #[serde(default)]
+    pub auto_approve_user_prompt: Option<bool>,
+    #[serde(default)]
+    pub auto_approve_config_change: Option<bool>,
 }
 
 /// Which screen the TUI is showing.
@@ -156,6 +171,8 @@ pub struct App {
     pub config_rule_target_tool: Option<String>,
     /// Whether the new rule is a deny pattern (true) or allow pattern (false).
     pub config_rule_is_deny: bool,
+    /// Event-type auto-approve toggles (keyed by config.json field name).
+    pub config_event_toggles: HashMap<String, bool>,
     /// Session summaries (live + historical).
     pub sessions: Vec<wisphive_protocol::SessionSummary>,
     /// Currently selected index in the sessions list.
@@ -225,6 +242,7 @@ impl App {
             config_rule_buffer: String::new(),
             config_rule_target_tool: None,
             config_rule_is_deny: true,
+            config_event_toggles: HashMap::new(),
             sessions: Vec::new(),
             sessions_index: 0,
             session_timeline_agent_id: None,
@@ -469,6 +487,11 @@ impl App {
         self.config_add = config.auto_approve_add.unwrap_or_default();
         self.config_remove = config.auto_approve_remove.unwrap_or_default();
         self.config_tool_rules = config.tool_rules.unwrap_or_default();
+        // Load event toggles with defaults (Stop=false, UserPrompt=true, ConfigChange=true)
+        self.config_event_toggles.clear();
+        self.config_event_toggles.insert("auto_approve_stop".into(), config.auto_approve_stop.unwrap_or(false));
+        self.config_event_toggles.insert("auto_approve_user_prompt".into(), config.auto_approve_user_prompt.unwrap_or(true));
+        self.config_event_toggles.insert("auto_approve_config_change".into(), config.auto_approve_config_change.unwrap_or(true));
         self.config_index = 0;
         self.config_rule_input_mode = false;
         self.config_rule_buffer.clear();
@@ -539,6 +562,11 @@ impl App {
             );
         }
 
+        // Persist event-type auto-approve toggles
+        for (key, value) in &self.config_event_toggles {
+            obj.insert(key.clone(), serde_json::Value::Bool(*value));
+        }
+
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -559,6 +587,10 @@ impl App {
     /// Build a flat list of config rows for indexing in the config view.
     pub fn config_rows(&self) -> Vec<ConfigRow> {
         let mut rows = vec![ConfigRow::Level];
+        // Event-type auto-approve toggles
+        for (key, _) in EVENT_TOGGLES {
+            rows.push(ConfigRow::EventToggle(key));
+        }
         for (i, tool) in ALL_TOOLS.iter().enumerate() {
             rows.push(ConfigRow::Tool(i));
             if let Some(rule) = self.config_tool_rules.get(*tool) {

@@ -1026,9 +1026,13 @@ fn handle_config_input(app: &mut App, key: KeyEvent) -> InputAction {
             }
             InputAction::None
         }
-        // Toggle tool override (when on a tool row)
+        // Toggle tool override or event toggle
         KeyCode::Enter | KeyCode::Char(' ') => {
-            if let Some(ConfigRow::Tool(tool_idx)) = rows.get(app.config_index) {
+            if let Some(ConfigRow::EventToggle(key)) = rows.get(app.config_index) {
+                let current = app.config_event_toggles.get(*key).copied().unwrap_or(false);
+                app.config_event_toggles.insert(key.to_string(), !current);
+                app.save_config();
+            } else if let Some(ConfigRow::Tool(tool_idx)) = rows.get(app.config_index) {
                 let tool = ALL_TOOLS[*tool_idx].to_string();
                 let in_level = app.config_level.includes(&tool);
                 let in_add = app.config_add.contains(&tool);

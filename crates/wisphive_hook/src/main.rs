@@ -340,8 +340,14 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
 
     // Auto-approve certain event types based on config (with sensible defaults)
     if is_event_auto_approved(event_type, &wisphive_dir) {
+        // For events with null tool_input, log event_data instead so the context is preserved
+        let log_input = if tool_input.is_null() {
+            extract_event_data(event_type, &hook_event).unwrap_or(tool_input.clone())
+        } else {
+            tool_input.clone()
+        };
         log_auto_approved(
-            &wisphive_dir, &tool_use_id, &agent_id, &project, &tool_name, &tool_input, event_type,
+            &wisphive_dir, &tool_use_id, &agent_id, &project, &tool_name, &log_input, event_type,
         );
         return Ok(HookResponse::simple(Decision::Approve));
     }
