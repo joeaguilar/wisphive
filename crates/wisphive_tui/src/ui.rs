@@ -302,7 +302,7 @@ fn draw_history_detail_view(frame: &mut Frame, app: &App) {
 }
 
 fn draw_config_view(frame: &mut Frame, app: &App) {
-    use crate::app::{ALL_TOOLS, ConfigRow};
+    use crate::app::{ALL_TOOLS, ConfigRow, EVENT_TOGGLES};
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -340,6 +340,30 @@ fn draw_config_view(frame: &mut Frame, app: &App) {
                     Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
                 )));
                 lines.push(Line::from(""));
+            }
+            ConfigRow::EventToggle(key) => {
+                let display_name = EVENT_TOGGLES.iter()
+                    .find(|(k, _)| *k == *key)
+                    .map(|(_, name)| *name)
+                    .unwrap_or(key);
+                let enabled = app.config_event_toggles.get(*key).copied().unwrap_or(false);
+                let checkbox = if enabled { "[x]" } else { "[ ]" };
+                let name_style = if selected {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {arrow} {checkbox} "),
+                        Style::default().fg(if enabled { Color::Green } else { Color::Red }),
+                    ),
+                    Span::styled(format!("{:<20}", display_name), name_style),
+                    Span::styled(
+                        if enabled { "auto-approve" } else { "review in queue" }.to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
             }
             ConfigRow::Tool(tool_idx) => {
                 let tool = ALL_TOOLS[*tool_idx];
