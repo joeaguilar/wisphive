@@ -29,7 +29,8 @@ pub struct AgentInfo {
     pub agent_id: String,
     pub agent_type: AgentType,
     pub project: PathBuf,
-    pub started_at: DateTime<Utc>,
+    pub connected_at: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
 }
 
 /// A permission rule from Claude Code's PermissionRequest event.
@@ -357,6 +358,9 @@ pub struct HistorySearch {
     /// Maximum results (default 200).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+    /// Opaque correlation ID echoed back in the response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 /// A resolved decision from the audit log.
@@ -377,6 +381,9 @@ pub struct HistoryEntry {
     /// Claude Code's unique tool call ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_use_id: Option<String>,
+    /// Hook event type (PreToolUse, Stop, UserPromptSubmit, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_event_name: Option<String>,
 }
 
 /// Content-aware rule for a specific tool.
@@ -520,5 +527,346 @@ impl DecisionFilter {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn make_request(tool: &str, agent_id: &str, project: &str, agent_type: AgentType) -> DecisionRequest {
+        DecisionRequest {
+            id: uuid::Uuid::new_v4(),
+            agent_id: agent_id.into(),
+            agent_type,
+            project: PathBuf::from(project),
+            tool_name: tool.into(),
+            tool_input: serde_json::Value::Null,
+            timestamp: chrono::Utc::now(),
+            hook_event_name: Default::default(),
+            tool_use_id: None,
+            permission_suggestions: None,
+            event_data: None,
+        }
+    }
+
+    // ── AgentType ──────────────────────────────────────────────────────
+
+    #[test]
+    fn agent_type_serde_round_trip() {
+        for (variant, expected_json) in [
+            (AgentType::ClaudeCode, "\"claude_code\""),
+            (AgentType::Red, "\"red\""),
+            (AgentType::LocalLlm, "\"local_llm\""),
+        ] {
+            let serialized = serde_json::to_string(&variant).unwrap();
+            assert_eq!(serialized, expected_json, "serialize {:?}", variant);
+            let deserialized: AgentType = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(deserialized, variant, "deserialize {:?}", variant);
+        }
+    }
+
+    #[test]
+    fn agent_type_display() {
+        assert_eq!(AgentType::ClaudeCode.to_string(), "claude_code");
+        assert_eq!(AgentType::Red.to_string(), "red");
+        assert_eq!(AgentType::LocalLlm.to_string(), "local_llm");
+    }
+
+    // ── HookEventType ──────────────────────────────────────────────────
+
+    #[test]
+    fn hook_event_type_all_variants_round_trip() {
+        let variants = [
+            HookEventType::PreToolUse,
+            HookEventType::PostToolUse,
+            HookEventType::PermissionRequest,
+            HookEventType::Elicitation,
+            HookEventType::ElicitationResult,
+            HookEventType::UserPromptSubmit,
+            HookEventType::Stop,
+            HookEventType::SubagentStop,
+            HookEventType::ConfigChange,
+            HookEventType::TeammateIdle,
+            HookEventType::TaskCompleted,
+            HookEventType::WorktreeCreate,
+            HookEventType::SessionStart,
+            HookEventType::SessionEnd,
+            HookEventType::Notification,
+        ];
+        for variant in variants {
+            let serialized = serde_json::to_string(&variant).unwrap();
+            let deserialized: HookEventType = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(deserialized, variant, "round-trip failed for {:?}", variant);
+        }
+    }
+
+    #[test]
+    fn hook_event_type_unknown_serde() {
+        let deserialized: HookEventType = serde_json::from_str("\"SomeFutureEvent\"").unwrap();
+        assert_eq!(deserialized, HookEventType::Unknown);
+    }
+
+    #[test]
+    fn hook_event_type_display_from_str_round_trip() {
+        let variants = [
+            HookEventType::PreToolUse,
+            HookEventType::PostToolUse,
+            HookEventType::PermissionRequest,
+            HookEventType::Elicitation,
+            HookEventType::ElicitationResult,
+            HookEventType::UserPromptSubmit,
+            HookEventType::Stop,
+            HookEventType::SubagentStop,
+            HookEventType::ConfigChange,
+            HookEventType::TeammateIdle,
+            HookEventType::TaskCompleted,
+            HookEventType::WorktreeCreate,
+            HookEventType::SessionStart,
+            HookEventType::SessionEnd,
+            HookEventType::Notification,
+            HookEventType::Unknown,
+        ];
+        for variant in variants {
+            let display = variant.to_string();
+            let parsed: HookEventType = display.parse().unwrap();
+            assert_eq!(parsed, variant, "Display→FromStr failed for {:?} (display={:?})", variant, display);
+        }
+    }
+
+    #[test]
+    fn hook_event_type_from_str_unknown() {
+        let parsed: HookEventType = "TotallyMadeUp".parse().unwrap();
+        assert_eq!(parsed, HookEventType::Unknown);
+    }
+
+    // ── Decision ───────────────────────────────────────────────────────
+
+    #[test]
+    fn decision_serde_snake_case() {
+        for (variant, expected) in [
+            (Decision::Approve, "\"approve\""),
+            (Decision::Deny, "\"deny\""),
+            (Decision::Ask, "\"ask\""),
+        ] {
+            let serialized = serde_json::to_string(&variant).unwrap();
+            assert_eq!(serialized, expected);
+            let deserialized: Decision = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(deserialized, variant);
+        }
+    }
+
+    // ── RichDecision ───────────────────────────────────────────────────
+
+    #[test]
+    fn rich_decision_approve_defaults() {
+        let rd = RichDecision::approve();
+        assert_eq!(rd.decision, Decision::Approve);
+        assert!(rd.message.is_none());
+        assert!(rd.updated_input.is_none());
+        assert!(!rd.always_allow);
+        assert!(rd.additional_context.is_none());
+        assert!(rd.selected_permission.is_none());
+    }
+
+    #[test]
+    fn rich_decision_deny_defaults() {
+        let rd = RichDecision::deny();
+        assert_eq!(rd.decision, Decision::Deny);
+        assert!(rd.message.is_none());
+        assert!(rd.updated_input.is_none());
+        assert!(!rd.always_allow);
+        assert!(rd.additional_context.is_none());
+        assert!(rd.selected_permission.is_none());
+    }
+
+    #[test]
+    fn rich_decision_from_decision() {
+        for decision in [Decision::Approve, Decision::Deny, Decision::Ask] {
+            let rd: RichDecision = decision.into();
+            assert_eq!(rd.decision, decision);
+            assert!(rd.message.is_none());
+            assert!(rd.updated_input.is_none());
+            assert!(!rd.always_allow);
+            assert!(rd.additional_context.is_none());
+            assert!(rd.selected_permission.is_none());
+        }
+    }
+
+    // ── AutoApproveLevel ───────────────────────────────────────────────
+
+    #[test]
+    fn auto_approve_off_includes_nothing() {
+        assert!(!AutoApproveLevel::Off.includes("Read"));
+        assert!(!AutoApproveLevel::Off.includes("Bash"));
+        assert!(!AutoApproveLevel::Off.includes("Edit"));
+        assert!(!AutoApproveLevel::Off.includes("anything"));
+    }
+
+    #[test]
+    fn auto_approve_read_includes_read_tools() {
+        assert!(AutoApproveLevel::Read.includes("Read"));
+        assert!(AutoApproveLevel::Read.includes("Grep"));
+        assert!(AutoApproveLevel::Read.includes("Glob"));
+        assert!(AutoApproveLevel::Read.includes("WebSearch"));
+        assert!(!AutoApproveLevel::Read.includes("Edit"));
+        assert!(!AutoApproveLevel::Read.includes("Bash"));
+    }
+
+    #[test]
+    fn auto_approve_write_includes_read_and_write() {
+        // Write tier tools
+        assert!(AutoApproveLevel::Write.includes("Edit"));
+        assert!(AutoApproveLevel::Write.includes("Write"));
+        assert!(AutoApproveLevel::Write.includes("NotebookEdit"));
+        // Read tier tools (inherited)
+        assert!(AutoApproveLevel::Write.includes("Read"));
+        assert!(AutoApproveLevel::Write.includes("Grep"));
+        // Execute tier tools (not included)
+        assert!(!AutoApproveLevel::Write.includes("Bash"));
+    }
+
+    #[test]
+    fn auto_approve_execute_includes_all_below() {
+        assert!(AutoApproveLevel::Execute.includes("Bash"));
+        assert!(AutoApproveLevel::Execute.includes("Edit"));
+        assert!(AutoApproveLevel::Execute.includes("Read"));
+        assert!(AutoApproveLevel::Execute.includes("Write"));
+        assert!(AutoApproveLevel::Execute.includes("Grep"));
+    }
+
+    #[test]
+    fn auto_approve_all_includes_everything() {
+        assert!(AutoApproveLevel::All.includes("anything"));
+        assert!(AutoApproveLevel::All.includes("Bash"));
+        assert!(AutoApproveLevel::All.includes("Read"));
+        assert!(AutoApproveLevel::All.includes("SomeFutureTool"));
+        assert!(AutoApproveLevel::All.includes(""));
+    }
+
+    #[test]
+    fn auto_approve_from_str_names() {
+        assert_eq!("off".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::Off);
+        assert_eq!("read".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::Read);
+        assert_eq!("write".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::Write);
+        assert_eq!("execute".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::Execute);
+        assert_eq!("exec".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::Execute);
+        assert_eq!("all".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::All);
+    }
+
+    #[test]
+    fn auto_approve_from_str_numbers() {
+        assert_eq!("0".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::Off);
+        assert_eq!("1".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::Read);
+        assert_eq!("2".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::Write);
+        assert_eq!("3".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::Execute);
+        assert_eq!("4".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::All);
+    }
+
+    #[test]
+    fn auto_approve_from_str_case_insensitive() {
+        assert_eq!("OFF".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::Off);
+        assert_eq!("Read".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::Read);
+        assert_eq!("WRITE".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::Write);
+        assert_eq!("Execute".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::Execute);
+        assert_eq!("ALL".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::All);
+    }
+
+    #[test]
+    fn auto_approve_from_str_invalid() {
+        assert!("bogus".parse::<AutoApproveLevel>().is_err());
+        assert!("5".parse::<AutoApproveLevel>().is_err());
+        assert!("".parse::<AutoApproveLevel>().is_err());
+    }
+
+    #[test]
+    fn auto_approve_default_is_read() {
+        assert_eq!(AutoApproveLevel::default(), AutoApproveLevel::Read);
+    }
+
+    #[test]
+    fn auto_approve_display() {
+        assert_eq!(AutoApproveLevel::Off.to_string(), "off");
+        assert_eq!(AutoApproveLevel::Read.to_string(), "read");
+        assert_eq!(AutoApproveLevel::Write.to_string(), "write");
+        assert_eq!(AutoApproveLevel::Execute.to_string(), "execute");
+        assert_eq!(AutoApproveLevel::All.to_string(), "all");
+    }
+
+    // ── DecisionFilter ─────────────────────────────────────────────────
+
+    #[test]
+    fn filter_empty_matches_everything() {
+        let filter = DecisionFilter::default();
+        let req = make_request("Bash", "agent-1", "/tmp/proj", AgentType::ClaudeCode);
+        assert!(filter.matches(&req));
+
+        let req2 = make_request("Edit", "agent-2", "/other/proj", AgentType::Red);
+        assert!(filter.matches(&req2));
+    }
+
+    #[test]
+    fn filter_tool_name_matches() {
+        let filter = DecisionFilter {
+            tool_name: Some("Bash".into()),
+            ..Default::default()
+        };
+        let bash_req = make_request("Bash", "agent-1", "/proj", AgentType::ClaudeCode);
+        assert!(filter.matches(&bash_req));
+
+        let edit_req = make_request("Edit", "agent-1", "/proj", AgentType::ClaudeCode);
+        assert!(!filter.matches(&edit_req));
+    }
+
+    #[test]
+    fn filter_project_matches() {
+        let filter = DecisionFilter {
+            project: Some(PathBuf::from("/my/project")),
+            ..Default::default()
+        };
+        let matching = make_request("Bash", "agent-1", "/my/project", AgentType::ClaudeCode);
+        assert!(filter.matches(&matching));
+
+        let non_matching = make_request("Bash", "agent-1", "/other/project", AgentType::ClaudeCode);
+        assert!(!filter.matches(&non_matching));
+    }
+
+    #[test]
+    fn filter_agent_type_matches() {
+        let filter = DecisionFilter {
+            agent_type: Some(AgentType::Red),
+            ..Default::default()
+        };
+        let red_req = make_request("Bash", "agent-1", "/proj", AgentType::Red);
+        assert!(filter.matches(&red_req));
+
+        let claude_req = make_request("Bash", "agent-1", "/proj", AgentType::ClaudeCode);
+        assert!(!filter.matches(&claude_req));
+    }
+
+    #[test]
+    fn filter_multiple_fields_all_must_match() {
+        let filter = DecisionFilter {
+            tool_name: Some("Bash".into()),
+            project: Some(PathBuf::from("/my/project")),
+            agent_type: None,
+        };
+
+        // Both match
+        let full_match = make_request("Bash", "agent-1", "/my/project", AgentType::ClaudeCode);
+        assert!(filter.matches(&full_match));
+
+        // Tool matches, project doesn't
+        let tool_only = make_request("Bash", "agent-1", "/other/project", AgentType::ClaudeCode);
+        assert!(!filter.matches(&tool_only));
+
+        // Project matches, tool doesn't
+        let project_only = make_request("Edit", "agent-1", "/my/project", AgentType::ClaudeCode);
+        assert!(!filter.matches(&project_only));
+
+        // Neither matches
+        let neither = make_request("Edit", "agent-1", "/other/project", AgentType::ClaudeCode);
+        assert!(!filter.matches(&neither));
     }
 }

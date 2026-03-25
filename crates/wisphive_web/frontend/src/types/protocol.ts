@@ -39,6 +39,7 @@ export interface HistoryEntry {
   resolved_at: string;
   tool_result?: Record<string, unknown>;
   tool_use_id?: string;
+  hook_event_name?: string;
 }
 
 export interface AgentInfo {
@@ -71,7 +72,7 @@ export type ServerMessage =
   | { type: "agent_connected" } & AgentInfo
   | { type: "agent_disconnected"; agent_id: string }
   | { type: "agents_snapshot"; agents: AgentInfo[] }
-  | { type: "history_response"; entries: HistoryEntry[] }
+  | { type: "history_response"; entries: HistoryEntry[]; request_id?: string }
   | { type: "sessions_response"; sessions: SessionSummary[] }
   | { type: "projects_response"; projects: ProjectSummary[] }
   | { type: "reimport_complete"; count: number }
@@ -101,9 +102,9 @@ export type ClientMessage =
   | { type: "deny"; id: string; message?: string }
   | { type: "approve_all"; filter?: unknown }
   | { type: "deny_all"; filter?: unknown }
-  | { type: "query_history"; agent_id?: string; limit?: number }
+  | { type: "query_history"; agent_id?: string; limit?: number; request_id?: string }
   | { type: "query_sessions" }
   | { type: "query_projects" }
   | { type: "reimport_events" }
   | { type: "spawn_agent" } & SpawnAgentRequest
-  | { type: "search_history"; query?: string; tool_name?: string; agent_id?: string; limit?: number };
+  | { type: "search_history"; query?: string; tool_name?: string; agent_id?: string; limit?: number; request_id?: string };
