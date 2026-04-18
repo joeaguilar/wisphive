@@ -9,14 +9,16 @@ import { Projects } from "./components/Projects";
 import { Agents } from "./components/Agents";
 import { SpawnModal } from "./components/SpawnModal";
 import { ConfigView } from "./components/Config";
+import { Terminals } from "./components/Terminals";
 import "./app.css";
 
-type View = "queue" | "history" | "sessions" | "projects" | "agents" | "config";
+type View = "queue" | "history" | "sessions" | "projects" | "agents" | "config" | "terminals";
 
 function App() {
   const {
-    connected, queue, agents, projects, history, agentTimeline, sessionTimeline, sessions,
+    connected, queue, agents, projects, history, agentTimeline, sessionTimeline, sessions, terminals,
     approve, deny, spawnAgent, queryProjects, queryHistory, queryAgentTimeline, querySessionTimeline, searchHistory, querySessions,
+    termList, termCreate, termAttach, termDetach, termInput, termResize, termClose, termReplay, registerTerminalHandler,
   } = useWisphive();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [view, setView] = useState<View>("queue");
@@ -72,6 +74,7 @@ function App() {
     onViewProjects: () => setView("projects"),
     onViewAgents: () => setView("agents"),
     onViewConfig: () => setView("config"),
+    onViewTerminals: () => setView("terminals"),
     onSpawn: () => setShowSpawn(true),
     onHelp: () => setShowHelp((v) => !v),
   }), [handleNext, handlePrev, selectedId, view, queue, approve, deny, showHelp, showSpawn, agentDrilldown, sessionAgent]);
@@ -104,6 +107,9 @@ function App() {
         </button>
         <button className={view === "agents" ? "active" : ""} onClick={() => setView("agents")}>
           Agents {agents.length > 0 && <span className="badge">{agents.length}</span>}
+        </button>
+        <button className={view === "terminals" ? "active" : ""} onClick={() => setView("terminals")}>
+          Terminals {terminals.filter((t) => t.status === "running").length > 0 && <span className="badge">{terminals.filter((t) => t.status === "running").length}</span>}
         </button>
         <button className={view === "config" ? "active" : ""} onClick={() => setView("config")}>
           Config
@@ -178,6 +184,22 @@ function App() {
             onLoad={queryProjects}
             onSpawnInProject={(project) => { setSpawnDefaultProject(project); setShowSpawn(true); }}
             onDrillDown={(project) => { searchHistory(project); setView("history"); }}
+          />
+        )}
+        {view === "terminals" && (
+          <Terminals
+            terminals={terminals}
+            projects={projects}
+            onRefresh={termList}
+            onRefreshProjects={queryProjects}
+            onCreate={termCreate}
+            onAttach={termAttach}
+            onDetach={termDetach}
+            onClose={termClose}
+            onReplay={termReplay}
+            onInput={termInput}
+            onResize={termResize}
+            registerHandler={registerTerminalHandler}
           />
         )}
         {view === "config" && <ConfigView />}

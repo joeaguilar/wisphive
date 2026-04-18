@@ -3,7 +3,13 @@ use uuid::Uuid;
 
 use std::path::PathBuf;
 
-use crate::types::{AgentInfo, AgentType, Decision, DecisionFilter, DecisionRequest, HistoryEntry, HistorySearch, ManagedAgent, PermissionSuggestion, ProjectSummary, SessionSummary, SpawnAgentRequest, ToolResult};
+use std::collections::HashMap;
+
+use crate::types::{
+    AgentInfo, AgentType, Decision, DecisionFilter, DecisionRequest, HistoryEntry, HistorySearch,
+    ManagedAgent, PermissionSuggestion, ProjectSummary, SessionSummary, SpawnAgentRequest,
+    TerminalDirection, TerminalSessionMeta, TerminalStatus, ToolResult,
+};
 
 /// Identifies the type of client connecting to the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +130,67 @@ pub enum ClientMessage {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         message: Option<String>,
     },
+
+    // ── Terminal sessions ─────────────────────────────────────────────
+    /// Create a new daemon-managed PTY session.
+    #[serde(rename = "term_create")]
+    TermCreate {
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        label: Option<String>,
+        /// Command to spawn. None = user's login shell (`$SHELL -l`).
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        command: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        args: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        cwd: Option<PathBuf>,
+        cols: u16,
+        rows: u16,
+        /// Extra env vars merged into the child's environment.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        env: Option<HashMap<String, String>>,
+    },
+
+    /// Attach to an existing terminal session to receive live output.
+    /// Daemon replies with a `TermCatchup` snapshot followed by ongoing `TermChunk`s.
+    #[serde(rename = "term_attach")]
+    TermAttach { id: Uuid },
+
+    /// Detach from a terminal session (stop receiving its output on this connection).
+    #[serde(rename = "term_detach")]
+    TermDetach { id: Uuid },
+
+    /// Forward bytes to the PTY's stdin. `data` is base64-encoded.
+    #[serde(rename = "term_input")]
+    TermInput { id: Uuid, data: String },
+
+    /// Resize the PTY window.
+    #[serde(rename = "term_resize")]
+    TermResize { id: Uuid, cols: u16, rows: u16 },
+
+    /// Close a terminal session. If `kill` is true, send SIGKILL to the child.
+    #[serde(rename = "term_close")]
+    TermClose {
+        id: Uuid,
+        #[serde(default)]
+        kill: bool,
+    },
+
+    /// List all terminal sessions (running + historical).
+    #[serde(rename = "term_list")]
+    TermList,
+
+    /// Replay a session's event history as a stream of `TermReplayChunk`s.
+    #[serde(rename = "term_replay")]
+    TermReplay {
+        id: Uuid,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        from_seq: Option<u64>,
+        /// Playback speed multiplier; clients pace the writes client-side.
+        /// Passed through unchanged so the daemon can skip pacing server-side.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        speed: Option<f32>,
+    },
 }
 
 /// Messages sent from the daemon to clients.
@@ -213,6 +280,69 @@ pub enum ServerMessage {
     /// Error message.
     #[serde(rename = "error")]
     Error { message: String },
+
+    // ── Terminal sessions ─────────────────────────────────────────────
+    /// Confirms a terminal session was created and delivers its metadata.
+    #[serde(rename = "term_created")]
+    TermCreated(TerminalSessionMeta),
+
+    /// Response to `TermList`.
+    #[serde(rename = "term_list_response")]
+    TermListResponse { sessions: Vec<TerminalSessionMeta> },
+
+    /// A live chunk of bytes from a terminal. `data` is base64-encoded.
+    #[serde(rename = "term_chunk")]
+    TermChunk {
+        id: Uuid,
+        seq: u64,
+        ts_us: i64,
+        direction: TerminalDirection,
+        data: String,
+    },
+
+    /// Catchup snapshot sent when a client attaches to a running session.
+    /// `screen` is a base64-encoded vt100 `contents_formatted()` buffer that,
+    /// when written to a terminal emulator, reproduces the current screen state.
+    #[serde(rename = "term_catchup")]
+    TermCatchup {
+        id: Uuid,
+        cols: u16,
+        rows: u16,
+        /// The sequence number of the next live chunk the viewer will receive.
+        next_seq: u64,
+        screen: String,
+    },
+
+    /// A terminal session has ended (cleanly, killed, or orphaned).
+    #[serde(rename = "term_ended")]
+    TermEnded {
+        id: Uuid,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        exit_code: Option<i32>,
+        status: TerminalStatus,
+    },
+
+    /// A single event from a replay stream. `data` is base64-encoded.
+    #[serde(rename = "term_replay_chunk")]
+    TermReplayChunk {
+        id: Uuid,
+        seq: u64,
+        ts_us: i64,
+        direction: TerminalDirection,
+        data: String,
+    },
+
+    /// Signals the end of a replay stream.
+    #[serde(rename = "term_replay_done")]
+    TermReplayDone { id: Uuid, total_events: u64 },
+
+    /// A terminal-specific error (session not found, lagged, create failed, etc.).
+    #[serde(rename = "term_error")]
+    TermError {
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        id: Option<Uuid>,
+        message: String,
+    },
 }
 
 /// Protocol version. Increment on breaking wire format changes.
@@ -268,6 +398,7 @@ mod tests {
             tool_use_id: None,
             permission_suggestions: None,
             event_data: None,
+            terminal_session_id: None,
         };
         let msg = ClientMessage::DecisionRequest(req);
         let encoded = encode(&msg).unwrap();
@@ -294,6 +425,7 @@ mod tests {
             tool_use_id: None,
             permission_suggestions: None,
             event_data: None,
+            terminal_session_id: None,
         };
 
         let filter = DecisionFilter {
@@ -368,6 +500,7 @@ mod tests {
             tool_use_id: None,
             permission_suggestions: None,
             event_data: None,
+            terminal_session_id: None,
         };
         let msg = ServerMessage::QueueSnapshot { items: vec![req] };
         let encoded = encode(&msg).unwrap();
@@ -434,6 +567,7 @@ mod tests {
             tool_result: None,
             tool_use_id: None,
             hook_event_name: None,
+            terminal_session_id: None,
         };
         let msg = ServerMessage::HistoryResponse {
             entries: vec![entry],
@@ -694,6 +828,227 @@ mod tests {
     fn decode_invalid_json_returns_error() {
         let result = decode::<ClientMessage>("this is not json");
         assert!(result.is_err());
+    }
+
+    // ── Terminal session messages ────────────────────────────────────
+
+    fn sample_meta() -> TerminalSessionMeta {
+        TerminalSessionMeta {
+            id: uuid::Uuid::new_v4(),
+            label: Some("main".into()),
+            command: "/bin/zsh".into(),
+            args: vec!["-l".into()],
+            cwd: PathBuf::from("/tmp/proj"),
+            cols: 80,
+            rows: 24,
+            started_at: chrono::Utc::now(),
+            ended_at: None,
+            exit_code: None,
+            status: TerminalStatus::Running,
+        }
+    }
+
+    #[test]
+    fn round_trip_term_create() {
+        let msg = ClientMessage::TermCreate {
+            label: Some("shell".into()),
+            command: None,
+            args: None,
+            cwd: Some(PathBuf::from("/tmp")),
+            cols: 120,
+            rows: 40,
+            env: None,
+        };
+        let encoded = encode(&msg).unwrap();
+        assert!(encoded.contains("\"type\":\"term_create\""));
+        let decoded: ClientMessage = decode(&encoded).unwrap();
+        match decoded {
+            ClientMessage::TermCreate { label, cols, rows, .. } => {
+                assert_eq!(label.unwrap(), "shell");
+                assert_eq!(cols, 120);
+                assert_eq!(rows, 40);
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_term_input_with_control_bytes() {
+        use base64::Engine;
+        // Tab, newline, carriage return, Ctrl-C, high byte (Latin-1 é), UTF-8 snowman prefix
+        let raw: &[u8] = &[0x09, 0x0a, 0x0d, 0x03, 0xe9, 0xe2, 0x98, 0x83];
+        let encoded_payload = base64::engine::general_purpose::STANDARD.encode(raw);
+        let id = uuid::Uuid::new_v4();
+        let msg = ClientMessage::TermInput { id, data: encoded_payload.clone() };
+        let line = encode(&msg).unwrap();
+        let decoded: ClientMessage = decode(&line).unwrap();
+        match decoded {
+            ClientMessage::TermInput { id: did, data } => {
+                assert_eq!(did, id);
+                let round_tripped =
+                    base64::engine::general_purpose::STANDARD.decode(&data).unwrap();
+                assert_eq!(round_tripped, raw);
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_term_attach_detach_close_list_replay() {
+        let id = uuid::Uuid::new_v4();
+        for msg in [
+            ClientMessage::TermAttach { id },
+            ClientMessage::TermDetach { id },
+            ClientMessage::TermClose { id, kill: true },
+            ClientMessage::TermList,
+            ClientMessage::TermReplay { id, from_seq: Some(42), speed: Some(2.0) },
+            ClientMessage::TermResize { id, cols: 100, rows: 30 },
+        ] {
+            let encoded = encode(&msg).unwrap();
+            let _: ClientMessage = decode(&encoded).unwrap();
+        }
+    }
+
+    #[test]
+    fn round_trip_term_created_and_list_response() {
+        let meta = sample_meta();
+        let created = ServerMessage::TermCreated(meta.clone());
+        let encoded = encode(&created).unwrap();
+        let decoded: ServerMessage = decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::TermCreated(m) => {
+                assert_eq!(m.command, "/bin/zsh");
+                assert_eq!(m.status, TerminalStatus::Running);
+            }
+            _ => panic!("unexpected variant"),
+        }
+        let list = ServerMessage::TermListResponse { sessions: vec![meta] };
+        let encoded = encode(&list).unwrap();
+        let decoded: ServerMessage = decode(&encoded).unwrap();
+        assert!(matches!(decoded, ServerMessage::TermListResponse { .. }));
+    }
+
+    #[test]
+    fn round_trip_term_chunk_and_catchup() {
+        use base64::Engine;
+        let id = uuid::Uuid::new_v4();
+        // Payload with embedded newlines must survive JSON encoding.
+        let raw = b"hello\nworld\r\n\x1b[31mred\x1b[0m";
+        let data = base64::engine::general_purpose::STANDARD.encode(raw);
+        let chunk = ServerMessage::TermChunk {
+            id,
+            seq: 1,
+            ts_us: 123_456_789,
+            direction: TerminalDirection::Output,
+            data: data.clone(),
+        };
+        let encoded = encode(&chunk).unwrap();
+        assert_eq!(encoded.matches('\n').count(), 1, "encoding must contain exactly one newline");
+        let decoded: ServerMessage = decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::TermChunk { direction, data: d, .. } => {
+                assert_eq!(direction, TerminalDirection::Output);
+                let bytes = base64::engine::general_purpose::STANDARD.decode(&d).unwrap();
+                assert_eq!(bytes, raw);
+            }
+            _ => panic!("unexpected variant"),
+        }
+
+        let catchup = ServerMessage::TermCatchup {
+            id,
+            cols: 80,
+            rows: 24,
+            next_seq: 5,
+            screen: data,
+        };
+        let encoded = encode(&catchup).unwrap();
+        let _: ServerMessage = decode(&encoded).unwrap();
+    }
+
+    #[test]
+    fn round_trip_term_ended_and_error() {
+        let id = uuid::Uuid::new_v4();
+        let ended = ServerMessage::TermEnded {
+            id,
+            exit_code: Some(0),
+            status: TerminalStatus::Exited,
+        };
+        let encoded = encode(&ended).unwrap();
+        let _: ServerMessage = decode(&encoded).unwrap();
+
+        let err = ServerMessage::TermError {
+            id: Some(id),
+            message: "session not found".into(),
+        };
+        let encoded = encode(&err).unwrap();
+        let _: ServerMessage = decode(&encoded).unwrap();
+    }
+
+    #[test]
+    fn round_trip_term_replay_chunk_and_done() {
+        let id = uuid::Uuid::new_v4();
+        let chunk = ServerMessage::TermReplayChunk {
+            id,
+            seq: 7,
+            ts_us: 1_000,
+            direction: TerminalDirection::Input,
+            data: "aGVsbG8=".into(),
+        };
+        let encoded = encode(&chunk).unwrap();
+        let _: ServerMessage = decode(&encoded).unwrap();
+
+        let done = ServerMessage::TermReplayDone { id, total_events: 42 };
+        let encoded = encode(&done).unwrap();
+        let _: ServerMessage = decode(&encoded).unwrap();
+    }
+
+    #[test]
+    fn round_trip_decision_request_with_terminal_session_id() {
+        let term_id = uuid::Uuid::new_v4();
+        let req = DecisionRequest {
+            id: uuid::Uuid::new_v4(),
+            agent_id: "cc-1".into(),
+            agent_type: AgentType::ClaudeCode,
+            project: PathBuf::from("/proj"),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
+            timestamp: chrono::Utc::now(),
+            hook_event_name: Default::default(),
+            tool_use_id: None,
+            permission_suggestions: None,
+            event_data: None,
+            terminal_session_id: Some(term_id),
+        };
+        let encoded = encode(&ClientMessage::DecisionRequest(req)).unwrap();
+        let decoded: ClientMessage = decode(&encoded).unwrap();
+        match decoded {
+            ClientMessage::DecisionRequest(r) => {
+                assert_eq!(r.terminal_session_id, Some(term_id));
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn terminal_status_and_direction_display_round_trip() {
+        use std::str::FromStr;
+        for status in [
+            TerminalStatus::Running,
+            TerminalStatus::Exited,
+            TerminalStatus::Killed,
+            TerminalStatus::Orphaned,
+        ] {
+            let parsed = TerminalStatus::from_str(&status.to_string()).unwrap();
+            assert_eq!(parsed, status);
+        }
+        for dir in [
+            TerminalDirection::Input,
+            TerminalDirection::Output,
+            TerminalDirection::Resize,
+        ] {
+            let parsed = TerminalDirection::from_str(&dir.to_string()).unwrap();
+            assert_eq!(parsed, dir);
+        }
     }
 
     #[test]

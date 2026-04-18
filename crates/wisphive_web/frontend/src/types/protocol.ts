@@ -63,6 +63,24 @@ export interface SessionSummary {
   pending_count: number;
 }
 
+// Terminal sessions
+export type TerminalStatus = "running" | "exited" | "killed" | "orphaned";
+export type TerminalDirection = "input" | "output" | "resize";
+
+export interface TerminalSessionMeta {
+  id: string;
+  label?: string;
+  command: string;
+  args: string[];
+  cwd: string;
+  cols: number;
+  rows: number;
+  started_at: string;
+  ended_at?: string;
+  exit_code?: number;
+  status: TerminalStatus;
+}
+
 // Server → Client messages
 export type ServerMessage =
   | { type: "welcome"; version: number }
@@ -76,7 +94,15 @@ export type ServerMessage =
   | { type: "sessions_response"; sessions: SessionSummary[] }
   | { type: "projects_response"; projects: ProjectSummary[] }
   | { type: "reimport_complete"; count: number }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string }
+  | { type: "term_created" } & TerminalSessionMeta
+  | { type: "term_list_response"; sessions: TerminalSessionMeta[] }
+  | { type: "term_chunk"; id: string; seq: number; ts_us: number; direction: TerminalDirection; data: string }
+  | { type: "term_catchup"; id: string; cols: number; rows: number; next_seq: number; screen: string }
+  | { type: "term_ended"; id: string; exit_code?: number; status: TerminalStatus }
+  | { type: "term_replay_chunk"; id: string; seq: number; ts_us: number; direction: TerminalDirection; data: string }
+  | { type: "term_replay_done"; id: string; total_events: number }
+  | { type: "term_error"; id?: string; message: string };
 
 export interface ProjectSummary {
   project: string;
@@ -107,4 +133,12 @@ export type ClientMessage =
   | { type: "query_projects" }
   | { type: "reimport_events" }
   | { type: "spawn_agent" } & SpawnAgentRequest
-  | { type: "search_history"; query?: string; tool_name?: string; agent_id?: string; limit?: number; request_id?: string };
+  | { type: "search_history"; query?: string; tool_name?: string; agent_id?: string; limit?: number; request_id?: string }
+  | { type: "term_create"; label?: string; command?: string; args?: string[]; cwd?: string; cols: number; rows: number; env?: Record<string, string> }
+  | { type: "term_attach"; id: string }
+  | { type: "term_detach"; id: string }
+  | { type: "term_input"; id: string; data: string }
+  | { type: "term_resize"; id: string; cols: number; rows: number }
+  | { type: "term_close"; id: string; kill?: boolean }
+  | { type: "term_list" }
+  | { type: "term_replay"; id: string; from_seq?: number; speed?: number };

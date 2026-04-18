@@ -24,6 +24,9 @@ tracing-subscriber.workspace = true
 libc.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
+base64.workspace = true
+uuid.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -43,6 +43,21 @@ pub enum InputAction {
     QueryProjects,
     /// Approve a PermissionRequest with a specific suggestion selected.
     ApprovePermission { id: uuid::Uuid, suggestion_index: usize },
+    // ── Terminal sessions ────────────────────────────────────────
+    /// Ask the daemon for the list of terminal sessions.
+    TermList,
+    /// Create a new terminal session with the user's default shell.
+    TermNew { label: Option<String>, cwd: Option<std::path::PathBuf> },
+    /// Attach to a terminal session.
+    TermAttach { id: uuid::Uuid },
+    /// Detach from a terminal session.
+    TermDetach { id: uuid::Uuid },
+    /// Close a terminal session.
+    TermClose { id: uuid::Uuid },
+    /// Forward raw input bytes to a PTY.
+    TermInput { id: uuid::Uuid, bytes: Vec<u8> },
+    /// Start replaying a terminal session.
+    TermReplay { id: uuid::Uuid },
     /// Quit the application.
     Quit,
 }
@@ -67,6 +82,9 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
         ViewMode::Sessions => return handle_sessions_input(app, key),
         ViewMode::SessionTimeline => return handle_session_timeline_input(app, key),
         ViewMode::ProjectsExplorer => return handle_projects_view_input(app, key),
+        ViewMode::TerminalList => return handle_terminal_list_input(app, key),
+        ViewMode::TerminalView => return handle_terminal_view_input(app, key),
+        ViewMode::TerminalReplay => return handle_terminal_replay_input(app, key),
         ViewMode::Dashboard => {}
     }
 
@@ -115,6 +133,16 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
         // Project picker: quick-select a project and spawn agent
         KeyCode::Char('P') => {
             app.modal = Some(Modal::pick_project());
+            return InputAction::QueryProjects;
+        }
+        // Open terminal list
+        KeyCode::Char('t') => {
+            app.enter_terminal_list_view();
+            return InputAction::TermList;
+        }
+        // Open a terminal in a specific project (project picker → spawn).
+        KeyCode::Char('T') => {
+            app.modal = Some(Modal::pick_project_for_terminal());
             return InputAction::QueryProjects;
         }
         _ => {}
@@ -1280,12 +1308,31 @@ fn handle_picker_modal_input(app: &mut App, mut modal: Modal, key: KeyEvent) -> 
         }
         KeyCode::Enter => {
             if let Some(project) = app.project_summaries.get(picker.index) {
-                let project_path = project.project.to_string_lossy().to_string();
-                let mut spawn_modal = Modal::spawn_agent();
-                if let Some(ref mut spawn) = spawn_modal.spawn {
-                    spawn.set_project(&project_path);
+                let project_path: std::path::PathBuf = project.project.clone();
+                match modal.action {
+                    crate::modal::ModalAction::PickProjectForTerminal => {
+                        // Pick → immediately spawn a terminal in that project,
+                        // then jump into the terminal list view so the user
+                        // can see and attach the new session.
+                        let label = project_path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .map(|s| s.to_string());
+                        app.enter_terminal_list_view();
+                        return InputAction::TermNew {
+                            label,
+                            cwd: Some(project_path),
+                        };
+                    }
+                    _ => {
+                        // Default: pick → open spawn-agent modal pre-filled.
+                        let mut spawn_modal = Modal::spawn_agent();
+                        if let Some(ref mut spawn) = spawn_modal.spawn {
+                            spawn.set_project(&project_path.to_string_lossy());
+                        }
+                        app.modal = Some(spawn_modal);
+                    }
                 }
-                app.modal = Some(spawn_modal);
             }
             InputAction::None
         }
@@ -1357,4 +1404,196 @@ fn handle_spawn_modal_input(
             InputAction::None
         }
     }
+}
+
+fn handle_terminal_list_input(app: &mut App, key: KeyEvent) -> InputAction {
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => {
+            app.exit_terminal_list_view();
+            InputAction::None
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.terminals_down();
+            InputAction::None
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.terminals_up();
+            InputAction::None
+        }
+        // Spawn a new terminal with defaults ($SHELL -l in current cwd).
+        KeyCode::Char('n') => {
+            let cwd = std::env::current_dir().ok();
+            InputAction::TermNew {
+                label: Some(format!("session-{}", chrono::Utc::now().timestamp())),
+                cwd,
+            }
+        }
+        // Spawn a new terminal in a chosen project (opens project picker).
+        KeyCode::Char('P') => {
+            app.modal = Some(Modal::pick_project_for_terminal());
+            InputAction::QueryProjects
+        }
+        KeyCode::Enter => {
+            if let Some(meta) = app.selected_terminal() {
+                let id = meta.id;
+                let running = matches!(meta.status, wisphive_protocol::TerminalStatus::Running);
+                if running {
+                    let meta = meta.clone();
+                    app.enter_terminal_view(&meta);
+                    InputAction::TermAttach { id }
+                } else {
+                    // Non-running: fall through to replay.
+                    let meta = meta.clone();
+                    app.enter_terminal_replay_view(&meta);
+                    InputAction::TermReplay { id }
+                }
+            } else {
+                InputAction::None
+            }
+        }
+        KeyCode::Char('r') => {
+            if let Some(meta) = app.selected_terminal() {
+                let id = meta.id;
+                let meta = meta.clone();
+                app.enter_terminal_replay_view(&meta);
+                InputAction::TermReplay { id }
+            } else {
+                InputAction::None
+            }
+        }
+        KeyCode::Char('d') => {
+            if let Some(meta) = app.selected_terminal() {
+                InputAction::TermClose { id: meta.id }
+            } else {
+                InputAction::None
+            }
+        }
+        _ => InputAction::None,
+    }
+}
+
+fn handle_terminal_view_input(app: &mut App, key: KeyEvent) -> InputAction {
+    let Some(active) = app.active_terminal.as_ref() else {
+        app.view_mode = ViewMode::Dashboard;
+        return InputAction::None;
+    };
+    let id = active.id;
+
+    // Escape hatches (bulletproof across terminals):
+    //   F10 — immediate detach
+    //   Esc Esc within 600 ms — detach (first Esc still reaches the PTY)
+    if matches!(key.code, KeyCode::F(10)) {
+        app.last_terminal_esc = None;
+        app.exit_terminal_view();
+        return InputAction::TermDetach { id };
+    }
+    if matches!(key.code, KeyCode::Esc) {
+        let now = std::time::Instant::now();
+        let recent = app
+            .last_terminal_esc
+            .map(|t| now.duration_since(t) < std::time::Duration::from_millis(600))
+            .unwrap_or(false);
+        if recent {
+            app.last_terminal_esc = None;
+            app.exit_terminal_view();
+            return InputAction::TermDetach { id };
+        }
+        app.last_terminal_esc = Some(now);
+        // Fall through — forward this first Esc to the PTY so single-tap
+        // Esc still reaches apps like vim/claude normally.
+    } else {
+        // Any non-Esc key resets the double-tap window.
+        app.last_terminal_esc = None;
+    }
+
+    let bytes = crossterm_key_to_bytes(key);
+    if bytes.is_empty() {
+        return InputAction::None;
+    }
+    InputAction::TermInput { id, bytes }
+}
+
+fn handle_terminal_replay_input(app: &mut App, key: KeyEvent) -> InputAction {
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => {
+            app.exit_terminal_replay_view();
+            InputAction::None
+        }
+        _ => InputAction::None,
+    }
+}
+
+/// Translate a crossterm key event into the byte sequence a terminal
+/// application would receive on stdin. Covers the subset needed for common
+/// interactive use (claude, vim, bash line-editing); unsupported keys return
+/// an empty Vec.
+pub fn crossterm_key_to_bytes(key: KeyEvent) -> Vec<u8> {
+    use KeyCode::*;
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    let mut out = Vec::with_capacity(8);
+    // ALT-prefixed sequences get an ESC prefix (xterm convention).
+    let push_alt = |v: &mut Vec<u8>| {
+        if alt {
+            v.push(0x1b);
+        }
+    };
+
+    match key.code {
+        Char(c) => {
+            push_alt(&mut out);
+            if ctrl {
+                let upper = c.to_ascii_uppercase();
+                if ('A'..='_').contains(&upper) {
+                    out.push((upper as u8) & 0x1f);
+                } else if c == ' ' {
+                    out.push(0);
+                } else {
+                    let mut buf = [0u8; 4];
+                    let s = c.encode_utf8(&mut buf);
+                    out.extend_from_slice(s.as_bytes());
+                }
+            } else {
+                let mut buf = [0u8; 4];
+                let s = c.encode_utf8(&mut buf);
+                out.extend_from_slice(s.as_bytes());
+            }
+        }
+        Enter => out.push(b'\r'),
+        Tab => out.push(b'\t'),
+        BackTab => out.extend_from_slice(b"\x1b[Z"),
+        Backspace => out.push(0x7f),
+        Esc => out.push(0x1b),
+        Left => out.extend_from_slice(b"\x1b[D"),
+        Right => out.extend_from_slice(b"\x1b[C"),
+        Up => out.extend_from_slice(b"\x1b[A"),
+        Down => out.extend_from_slice(b"\x1b[B"),
+        Home => out.extend_from_slice(b"\x1b[H"),
+        End => out.extend_from_slice(b"\x1b[F"),
+        PageUp => out.extend_from_slice(b"\x1b[5~"),
+        PageDown => out.extend_from_slice(b"\x1b[6~"),
+        Delete => out.extend_from_slice(b"\x1b[3~"),
+        Insert => out.extend_from_slice(b"\x1b[2~"),
+        F(n) => {
+            let seq: Vec<u8> = match n {
+                1 => b"\x1bOP".to_vec(),
+                2 => b"\x1bOQ".to_vec(),
+                3 => b"\x1bOR".to_vec(),
+                4 => b"\x1bOS".to_vec(),
+                5 => b"\x1b[15~".to_vec(),
+                6 => b"\x1b[17~".to_vec(),
+                7 => b"\x1b[18~".to_vec(),
+                8 => b"\x1b[19~".to_vec(),
+                9 => b"\x1b[20~".to_vec(),
+                10 => b"\x1b[21~".to_vec(),
+                11 => b"\x1b[23~".to_vec(),
+                12 => b"\x1b[24~".to_vec(),
+                _ => Vec::new(),
+            };
+            out.extend_from_slice(&seq);
+        }
+        _ => {}
+    }
+    out
 }

@@ -244,6 +244,46 @@ async fn run_loop(
                             }).await?;
                             app.remove_decision(id);
                         }
+                        InputAction::TermList => {
+                            tracing::info!("querying terminal sessions");
+                            conn.send(&ClientMessage::TermList).await?;
+                        }
+                        InputAction::TermNew { label, cwd } => {
+                            tracing::info!(?label, ?cwd, "creating terminal session");
+                            // Query a sensible initial pty size from the
+                            // current terminal. Fallback is 80x24.
+                            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                            conn.send(&ClientMessage::TermCreate {
+                                label,
+                                command: None,
+                                args: None,
+                                cwd,
+                                cols,
+                                rows,
+                                env: None,
+                            }).await?;
+                        }
+                        InputAction::TermAttach { id } => {
+                            tracing::info!(%id, "attaching terminal session");
+                            conn.send(&ClientMessage::TermAttach { id }).await?;
+                        }
+                        InputAction::TermDetach { id } => {
+                            tracing::info!(%id, "detaching terminal session");
+                            conn.send(&ClientMessage::TermDetach { id }).await?;
+                        }
+                        InputAction::TermClose { id } => {
+                            tracing::info!(%id, "closing terminal session");
+                            conn.send(&ClientMessage::TermClose { id, kill: true }).await?;
+                        }
+                        InputAction::TermInput { id, bytes } => {
+                            use base64::Engine as _;
+                            let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                            conn.send(&ClientMessage::TermInput { id, data }).await?;
+                        }
+                        InputAction::TermReplay { id } => {
+                            tracing::info!(%id, "replaying terminal session");
+                            conn.send(&ClientMessage::TermReplay { id, from_seq: None, speed: None }).await?;
+                        }
                         InputAction::None => {}
                     }
                 }
@@ -322,6 +362,69 @@ async fn run_loop(
                     }
                     Some(ServerMessage::ReimportComplete { count }) => {
                         tracing::info!(count, "reimport complete");
+                    }
+                    Some(ServerMessage::TermCreated(meta)) => {
+                        tracing::info!(id = %meta.id, "terminal session created");
+                        // Auto-attach: enter the view and request the stream.
+                        let id = meta.id;
+                        app.terminals.insert(0, meta.clone());
+                        app.enter_terminal_view(&meta);
+                        conn.send(&ClientMessage::TermAttach { id }).await?;
+                    }
+                    Some(ServerMessage::TermListResponse { sessions }) => {
+                        tracing::info!(count = sessions.len(), "terminal list response");
+                        app.terminals = sessions;
+                        if app.terminals_index >= app.terminals.len() {
+                            app.terminals_index = 0;
+                        }
+                    }
+                    Some(ServerMessage::TermChunk { id, seq, direction, data, .. }) => {
+                        use base64::Engine as _;
+                        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&data) {
+                            // Only feed the active terminal (not replay).
+                            if let Some(active) = app.active_terminal.as_mut()
+                                && active.id == id
+                                && matches!(direction, wisphive_protocol::TerminalDirection::Output)
+                            {
+                                active.feed_chunk(seq, &bytes);
+                            }
+                        }
+                    }
+                    Some(ServerMessage::TermCatchup { id, cols, rows, next_seq, screen }) => {
+                        use base64::Engine as _;
+                        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&screen)
+                            && let Some(active) = app.active_terminal.as_mut()
+                            && active.id == id {
+                                active.resize(cols, rows);
+                                active.last_seq = next_seq;
+                                active.feed_catchup(&bytes);
+                            }
+                    }
+                    Some(ServerMessage::TermEnded { id, status, .. }) => {
+                        tracing::info!(%id, ?status, "terminal ended");
+                        if let Some(active) = app.active_terminal.as_mut()
+                            && active.id == id {
+                                active.ended = true;
+                            }
+                        if let Some(meta) = app.terminals.iter_mut().find(|m| m.id == id) {
+                            meta.status = status;
+                        }
+                    }
+                    Some(ServerMessage::TermReplayChunk { id, direction, data, .. }) => {
+                        use base64::Engine as _;
+                        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&data)
+                            && let Some(replay) = app.replay_terminal.as_mut()
+                            && replay.id == id
+                            && matches!(direction, wisphive_protocol::TerminalDirection::Output)
+                        {
+                            replay.parser.process(&bytes);
+                        }
+                    }
+                    Some(ServerMessage::TermReplayDone { id, .. }) => {
+                        tracing::info!(%id, "terminal replay done");
+                    }
+                    Some(ServerMessage::TermError { id, message }) => {
+                        tracing::warn!(?id, %message, "terminal error");
                     }
                     Some(_) => {}
                     None => {

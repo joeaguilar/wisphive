@@ -1140,3 +1140,146 @@ kbd {
   }
   .detail-header h2 { font-size: 14px; }
 }
+
+/* ── Terminals view ────────────────────────────────────────────── */
+
+.terminals-layout {
+  display: flex;
+  height: 100%;
+  gap: var(--space-md);
+  min-height: 0;
+}
+
+.terminals-sidebar {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 0 0 320px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-sidebar);
+  overflow: hidden;
+}
+
+.terminals-sidebar-toolbar {
+  display: flex;
+  gap: var(--space-sm);
+  padding: var(--space-sm);
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+.terminals-sidebar-list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.terminals-sidebar-empty {
+  padding: var(--space-md);
+  opacity: 0.6;
+}
+
+.terminals-sidebar-item {
+  padding: var(--space-sm) var(--space-md);
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+
+.terminals-sidebar-item:hover { background: var(--bg-card-hover); }
+.terminals-sidebar-item.selected { background: var(--bg-selected); }
+
+.terminals-sidebar-item .row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.terminals-sidebar-item .cmd,
+.terminals-sidebar-item .meta {
+  font-size: var(--font-sm);
+  opacity: 0.7;
+}
+
+.terminals-sidebar-item .meta { opacity: 0.5; }
+
+.terminals-sidebar-item .actions {
+  display: flex;
+  gap: var(--space-xs);
+  margin-top: var(--space-xs);
+}
+
+.term-status {
+  font-size: var(--font-sm);
+  padding: 2px 6px;
+  border-radius: var(--radius);
+  background: #333;
+}
+.term-status-running { background: #1d6b1d; }
+.term-status-orphaned { background: #6b5b1d; }
+.term-status-killed { background: #6b1d1d; }
+
+.terminals-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.terminals-empty-state {
+  padding: var(--space-xl);
+  opacity: 0.5;
+}
+
+/* Narrow screens: stack list on top of the terminal so claude code and
+   other TUI apps get a usable viewport. */
+@media (max-width: 900px) {
+  .terminals-layout {
+    flex-direction: column;
+  }
+  .terminals-sidebar {
+    flex: 0 0 auto;
+    max-height: 35vh;
+    min-height: 140px;
+  }
+  .terminals-main {
+    flex: 1 1 auto;
+    min-height: 60vh;
+  }
+}
+
+.terminals-project-picker {
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-card);
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+.terminals-project-picker-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: var(--space-sm) var(--space-md);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-sidebar);
+}
+
+.terminals-project-picker-empty {
+  padding: var(--space-md);
+  opacity: 0.6;
+  font-size: var(--font-sm);
+}
+
+.terminals-project-picker-item {
+  padding: var(--space-sm) var(--space-md);
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+
+.terminals-project-picker-item:hover { background: var(--bg-card-hover); }
+
+.terminals-project-picker-item .path {
+  font-size: var(--font-sm);
+  opacity: 0.6;
+}

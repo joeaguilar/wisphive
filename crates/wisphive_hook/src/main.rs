@@ -385,6 +385,13 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
             }
         }
 
+    // Correlation with wisphive-managed terminal sessions: the daemon
+    // exports WISPHIVE_TERMINAL_SESSION_ID into the PTY, which flows through
+    // the shell to any `claude` process and on into this hook.
+    let terminal_session_id = std::env::var("WISPHIVE_TERMINAL_SESSION_ID")
+        .ok()
+        .and_then(|s| uuid::Uuid::parse_str(&s).ok());
+
     let request = DecisionRequest {
         id: uuid::Uuid::new_v4(),
         agent_id,
@@ -397,6 +404,7 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
         tool_use_id: tool_use_id.clone(),
         permission_suggestions,
         event_data,
+        terminal_session_id,
     };
 
     // Layer 4: Connect to daemon socket (fails instantly if daemon is dead)

@@ -19,6 +19,8 @@ pub enum ModalAction {
     AnswerQuestion,
     /// Pick a project from the list, then transition to SpawnAgent.
     PickProject,
+    /// Pick a project from the list and immediately spawn a terminal in it.
+    PickProjectForTerminal,
 }
 
 /// Active input field in the spawn agent modal.
@@ -293,6 +295,18 @@ impl Modal {
             title: "Pick Project".into(),
             body: "Select a project to spawn an agent (j/k navigate, Enter select, Esc cancel):".into(),
             action: ModalAction::PickProject,
+            target_id: None,
+            spawn: None,
+            textarea: None,
+            picker: Some(PickerState { index: 0 }),
+        }
+    }
+
+    pub fn pick_project_for_terminal() -> Self {
+        Self {
+            title: "Open Terminal in Project".into(),
+            body: "Select a project to open a terminal in (j/k navigate, Enter select, Esc cancel):".into(),
+            action: ModalAction::PickProjectForTerminal,
             target_id: None,
             spawn: None,
             textarea: None,

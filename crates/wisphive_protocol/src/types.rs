@@ -157,6 +157,11 @@ pub struct DecisionRequest {
     /// Event-specific data (e.g., Elicitation schema, Stop reason, prompt text).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_data: Option<serde_json::Value>,
+    /// ID of the wisphive terminal session this call originated from, if any.
+    /// Set via the `WISPHIVE_TERMINAL_SESSION_ID` env var propagated from a
+    /// daemon-managed PTY down through the shell to the hook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_session_id: Option<Uuid>,
 }
 
 /// The human's decision on a tool call.
@@ -381,6 +386,107 @@ pub struct HistoryEntry {
     /// Hook event type (PreToolUse, Stop, UserPromptSubmit, etc.).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_event_name: Option<String>,
+    /// ID of the wisphive terminal session this call originated from, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_session_id: Option<Uuid>,
+}
+
+// ── Terminal sessions ───────────────────────────────────────────────
+
+/// Lifecycle status of a daemon-managed terminal session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalStatus {
+    /// The PTY is open and the child process is running.
+    Running,
+    /// The child process exited cleanly.
+    Exited,
+    /// The child was killed (by daemon shutdown or explicit close).
+    Killed,
+    /// The daemon restarted while the session was running; the PTY is gone.
+    /// Event history can still be replayed from SQLite.
+    Orphaned,
+}
+
+impl std::fmt::Display for TerminalStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Running => write!(f, "running"),
+            Self::Exited => write!(f, "exited"),
+            Self::Killed => write!(f, "killed"),
+            Self::Orphaned => write!(f, "orphaned"),
+        }
+    }
+}
+
+impl std::str::FromStr for TerminalStatus {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "running" => Ok(Self::Running),
+            "exited" => Ok(Self::Exited),
+            "killed" => Ok(Self::Killed),
+            "orphaned" => Ok(Self::Orphaned),
+            _ => Err(format!("unknown terminal status: {s}")),
+        }
+    }
+}
+
+/// Direction of a terminal event in the audit log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalDirection {
+    /// Bytes the user typed (written to the PTY master).
+    Input,
+    /// Bytes emitted by the child process (read from the PTY master).
+    Output,
+    /// A PTY resize event. Payload encodes `cols,rows` as UTF-8 text.
+    Resize,
+}
+
+impl std::fmt::Display for TerminalDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Input => write!(f, "input"),
+            Self::Output => write!(f, "output"),
+            Self::Resize => write!(f, "resize"),
+        }
+    }
+}
+
+impl std::str::FromStr for TerminalDirection {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "input" => Ok(Self::Input),
+            "output" => Ok(Self::Output),
+            "resize" => Ok(Self::Resize),
+            _ => Err(format!("unknown terminal direction: {s}")),
+        }
+    }
+}
+
+/// Metadata describing a terminal session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalSessionMeta {
+    pub id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// The command that was spawned (argv[0]).
+    pub command: String,
+    /// Arguments passed to the command.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Working directory the child was started in.
+    pub cwd: PathBuf,
+    pub cols: u16,
+    pub rows: u16,
+    pub started_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    pub status: TerminalStatus,
 }
 
 /// Content-aware rule for a specific tool.
@@ -539,6 +645,7 @@ mod tests {
             tool_use_id: None,
             permission_suggestions: None,
             event_data: None,
+            terminal_session_id: None,
         }
     }
 

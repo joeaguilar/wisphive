@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use uuid::Uuid;
 use std::collections::{HashMap, HashSet};
 
-use wisphive_protocol::{AgentInfo, AutoApproveLevel, DecisionRequest, HistoryEntry, ToolRule};
+use wisphive_protocol::{
+    AgentInfo, AutoApproveLevel, DecisionRequest, HistoryEntry, TerminalSessionMeta, ToolRule,
+};
 
 use serde::Deserialize;
 
@@ -79,6 +81,12 @@ pub enum ViewMode {
     SessionTimeline,
     /// Project explorer.
     ProjectsExplorer,
+    /// List of wisphive-managed PTY terminals.
+    TerminalList,
+    /// Attached to a running terminal — live PTY rendered via vt100.
+    TerminalView,
+    /// Replaying a terminal session's recorded events.
+    TerminalReplay,
 }
 
 /// Which panel currently has focus.
@@ -195,6 +203,75 @@ pub struct App {
     pub stopped_agents: HashSet<String>,
     /// Whether the detail view is showing rendered markdown preview.
     pub markdown_preview: bool,
+
+    // ── Terminal sessions ────────────────────────────────────────
+    /// Known terminal sessions (running + historical).
+    pub terminals: Vec<TerminalSessionMeta>,
+    /// Currently selected index in the terminals list.
+    pub terminals_index: usize,
+    /// Live attached terminal state (vt100 parser + metadata).
+    pub active_terminal: Option<ActiveTerminal>,
+    /// Replay session state.
+    pub replay_terminal: Option<ActiveTerminal>,
+    /// Last time Esc was pressed while attached to a terminal.
+    /// Used to detect double-tap detach (two Escs within a short window).
+    pub last_terminal_esc: Option<std::time::Instant>,
+}
+
+/// Client-side state for a live (or replayed) terminal session.
+pub struct ActiveTerminal {
+    pub id: Uuid,
+    pub label: Option<String>,
+    pub command: String,
+    pub cols: u16,
+    pub rows: u16,
+    pub parser: vt100::Parser,
+    pub ended: bool,
+    /// Highest seq we've applied to the parser. Used to drop late/reordered frames.
+    pub last_seq: u64,
+}
+
+impl ActiveTerminal {
+    pub fn new(meta: &TerminalSessionMeta) -> Self {
+        Self {
+            id: meta.id,
+            label: meta.label.clone(),
+            command: meta.command.clone(),
+            cols: meta.cols,
+            rows: meta.rows,
+            parser: vt100::Parser::new(meta.rows, meta.cols, 0),
+            ended: matches!(
+                meta.status,
+                wisphive_protocol::TerminalStatus::Exited
+                    | wisphive_protocol::TerminalStatus::Killed
+                    | wisphive_protocol::TerminalStatus::Orphaned
+            ),
+            last_seq: 0,
+        }
+    }
+
+    /// Feed a catchup snapshot (vt100 `contents_formatted()` output).
+    pub fn feed_catchup(&mut self, screen: &[u8]) {
+        // Reset parser state and replay the catchup buffer.
+        self.parser = vt100::Parser::new(self.rows, self.cols, 0);
+        self.parser.process(screen);
+    }
+
+    /// Feed a live chunk. Returns false if the chunk is out of order.
+    pub fn feed_chunk(&mut self, seq: u64, bytes: &[u8]) -> bool {
+        if seq < self.last_seq {
+            return false;
+        }
+        self.last_seq = seq;
+        self.parser.process(bytes);
+        true
+    }
+
+    pub fn resize(&mut self, cols: u16, rows: u16) {
+        self.cols = cols;
+        self.rows = rows;
+        self.parser.set_size(rows, cols);
+    }
 }
 
 /// Aggregated project status for the dashboard.
@@ -254,6 +331,11 @@ impl App {
             project_summaries_index: 0,
             stopped_agents: HashSet::new(),
             markdown_preview: false,
+            terminals: Vec::new(),
+            terminals_index: 0,
+            active_terminal: None,
+            replay_terminal: None,
+            last_terminal_esc: None,
         }
     }
 
@@ -710,6 +792,54 @@ impl App {
 
     pub fn selected_project_summary(&self) -> Option<&wisphive_protocol::ProjectSummary> {
         self.project_summaries.get(self.project_summaries_index)
+    }
+
+    // ── Terminal session view helpers ──
+
+    pub fn enter_terminal_list_view(&mut self) {
+        self.terminals_index = 0;
+        self.push_view(ViewMode::TerminalList);
+    }
+
+    pub fn exit_terminal_list_view(&mut self) {
+        self.navigate_back();
+    }
+
+    pub fn terminals_up(&mut self) {
+        if self.terminals_index > 0 {
+            self.terminals_index -= 1;
+        }
+    }
+
+    pub fn terminals_down(&mut self) {
+        let len = self.terminals.len();
+        if len > 0 && self.terminals_index < len - 1 {
+            self.terminals_index += 1;
+        }
+    }
+
+    pub fn selected_terminal(&self) -> Option<&TerminalSessionMeta> {
+        self.terminals.get(self.terminals_index)
+    }
+
+    pub fn enter_terminal_view(&mut self, meta: &TerminalSessionMeta) {
+        self.active_terminal = Some(ActiveTerminal::new(meta));
+        self.push_view(ViewMode::TerminalView);
+    }
+
+    pub fn exit_terminal_view(&mut self) {
+        self.active_terminal = None;
+        self.navigate_back();
+    }
+
+    pub fn enter_terminal_replay_view(&mut self, meta: &TerminalSessionMeta) {
+        self.replay_terminal = Some(ActiveTerminal::new(meta));
+        self.push_view(ViewMode::TerminalReplay);
+    }
+
+    pub fn exit_terminal_replay_view(&mut self) {
+        self.replay_terminal = None;
+        self.navigate_back();
     }
 
     /// Remove a decision from the queue by ID.
