@@ -867,6 +867,38 @@ async fn handle_tui(
                                     }
                                 }
                             }
+                            ClientMessage::TermSetGroup { id, group } => {
+                                match ctx.terminal_manager.set_group(id, group.as_deref()).await {
+                                    Ok(()) => {
+                                        if let Ok(sessions) = ctx.terminal_manager.list_all().await {
+                                            let _ = ctx.tui_tx.send(ServerMessage::TermListResponse { sessions });
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let resp = encode(&ServerMessage::TermError {
+                                            id: Some(id),
+                                            message: format!("term set group failed: {e}"),
+                                        })?;
+                                        writer.write_all(resp.as_bytes()).await?;
+                                    }
+                                }
+                            }
+                            ClientMessage::TermReorder { id, sort_order } => {
+                                match ctx.terminal_manager.set_sort_order(id, sort_order).await {
+                                    Ok(()) => {
+                                        if let Ok(sessions) = ctx.terminal_manager.list_all().await {
+                                            let _ = ctx.tui_tx.send(ServerMessage::TermListResponse { sessions });
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let resp = encode(&ServerMessage::TermError {
+                                            id: Some(id),
+                                            message: format!("term reorder failed: {e}"),
+                                        })?;
+                                        writer.write_all(resp.as_bytes()).await?;
+                                    }
+                                }
+                            }
                             ClientMessage::TermReplay { id, from_seq, speed: _ } => {
                                 // Pull events from SQLite and stream them as
                                 // replay chunks. Speed pacing is client-side.
