@@ -487,6 +487,14 @@ pub struct TerminalSessionMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     pub status: TerminalStatus,
+    /// Optional user-assigned group label for sidebar organization. None = ungrouped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_name: Option<String>,
+    /// Manual sort order within a group. Lower values render first. Defaults
+    /// to `-started_at_ms` so newest-first is the natural order before the
+    /// user drags anything.
+    #[serde(default)]
+    pub sort_order: i64,
 }
 
 /// Content-aware rule for a specific tool.

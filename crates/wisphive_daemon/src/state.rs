@@ -183,6 +183,28 @@ impl StateDb {
         .execute(&self.pool)
         .await?;
 
+        // Sidebar-grouping columns added after the table was introduced.
+        // ALTER fails if the column already exists, which is fine — ignore.
+        sqlx::query("ALTER TABLE terminal_sessions ADD COLUMN group_name TEXT")
+            .execute(&self.pool)
+            .await
+            .ok();
+        sqlx::query("ALTER TABLE terminal_sessions ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
+            .execute(&self.pool)
+            .await
+            .ok();
+        // Backfill sort_order for pre-migration rows so newest-first ordering
+        // is preserved without user intervention. Uses -epoch-ms so lower
+        // values sort first. Only touches rows that still have the default 0.
+        sqlx::query(
+            "UPDATE terminal_sessions
+             SET sort_order = -CAST((julianday(started_at) - 2440587.5) * 86400000 AS INTEGER)
+             WHERE sort_order = 0",
+        )
+        .execute(&self.pool)
+        .await
+        .ok();
+
         // Per-event stream: raw input/output/resize bytes for replay.
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS terminal_events (
@@ -208,6 +230,14 @@ impl StateDb {
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_terminal_sessions_status_started
              ON terminal_sessions(status, started_at DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Index supporting the new list ordering (status + sort_order).
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_terminal_sessions_sort_order
+             ON terminal_sessions(sort_order)",
         )
         .execute(&self.pool)
         .await?;
@@ -744,8 +774,8 @@ impl StateDb {
     pub async fn create_terminal_session(&self, meta: &TerminalSessionMeta) -> Result<()> {
         let args_json = serde_json::to_string(&meta.args)?;
         sqlx::query(
-            "INSERT INTO terminal_sessions (id, label, command, args, cwd, env_json, cols, rows, started_at, ended_at, exit_code, status)
-             VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO terminal_sessions (id, label, command, args, cwd, env_json, cols, rows, started_at, ended_at, exit_code, status, group_name, sort_order)
+             VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(meta.id.to_string())
         .bind(&meta.label)
@@ -758,8 +788,38 @@ impl StateDb {
         .bind(meta.ended_at.map(|t| t.to_rfc3339()))
         .bind(meta.exit_code)
         .bind(meta.status.to_string())
+        .bind(meta.group_name.as_deref())
+        .bind(meta.sort_order)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Assign (or clear, when `group` is None) the group label for a session.
+    pub async fn set_terminal_group(
+        &self,
+        id: uuid::Uuid,
+        group: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query("UPDATE terminal_sessions SET group_name = ? WHERE id = ?")
+            .bind(group)
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Update a session's manual sort order.
+    pub async fn set_terminal_sort_order(
+        &self,
+        id: uuid::Uuid,
+        sort_order: i64,
+    ) -> Result<()> {
+        sqlx::query("UPDATE terminal_sessions SET sort_order = ? WHERE id = ?")
+            .bind(sort_order)
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -784,7 +844,9 @@ impl StateDb {
         Ok(())
     }
 
-    /// List all terminal sessions, newest first. Running sessions first, then historical.
+    /// List all terminal sessions. Ordered by `sort_order` ASC (manual order,
+    /// with a newest-first default baked in at creation), tiebroken by
+    /// `started_at` DESC. The client is responsible for sectioning by status.
     pub async fn list_terminal_sessions(&self) -> Result<Vec<TerminalSessionMeta>> {
         type Row = (
             String,
@@ -798,18 +860,35 @@ impl StateDb {
             Option<String>,
             Option<i64>,
             String,
+            Option<String>,
+            i64,
         );
         let rows: Vec<Row> = sqlx::query_as(
-            "SELECT id, label, command, args, cwd, cols, rows, started_at, ended_at, exit_code, status
+            "SELECT id, label, command, args, cwd, cols, rows, started_at, ended_at, exit_code, status, group_name, sort_order
              FROM terminal_sessions
-             ORDER BY (status = 'running') DESC, started_at DESC
+             ORDER BY sort_order ASC, started_at DESC
              LIMIT 500",
         )
         .fetch_all(&self.pool)
         .await?;
 
         let mut out = Vec::with_capacity(rows.len());
-        for (id, label, command, args_json, cwd, cols, rows_, started_at, ended_at, exit_code, status) in rows {
+        for (
+            id,
+            label,
+            command,
+            args_json,
+            cwd,
+            cols,
+            rows_,
+            started_at,
+            ended_at,
+            exit_code,
+            status,
+            group_name,
+            sort_order,
+        ) in rows
+        {
             let Ok(id) = uuid::Uuid::parse_str(&id) else { continue };
             let args: Vec<String> = serde_json::from_str(&args_json).unwrap_or_default();
             let Ok(started_at) = chrono::DateTime::parse_from_rfc3339(&started_at) else { continue };
@@ -829,6 +908,8 @@ impl StateDb {
                 ended_at,
                 exit_code: exit_code.map(|c| c as i32),
                 status,
+                group_name,
+                sort_order,
             });
         }
         Ok(out)
@@ -1458,6 +1539,8 @@ mod tests {
             ended_at: None,
             exit_code: None,
             status: TerminalStatus::Running,
+            group_name: None,
+            sort_order: 0,
         }
     }
 
@@ -1511,6 +1594,39 @@ mod tests {
         let from_two = db.replay_terminal_events(id, Some(2)).await.unwrap();
         assert_eq!(from_two.len(), 2);
         assert_eq!(from_two[0].0, 2);
+    }
+
+    #[tokio::test]
+    async fn terminal_group_and_sort_order_round_trip() {
+        let db = test_db().await;
+        // Three sessions with distinct ids. Leave group/sort_order at defaults.
+        let ids: Vec<uuid::Uuid> = (0..3).map(|_| uuid::Uuid::new_v4()).collect();
+        for id in &ids {
+            db.create_terminal_session(&make_term_meta(*id)).await.unwrap();
+        }
+
+        // Assign the first two to a group, reorder them.
+        db.set_terminal_group(ids[0], Some("frontend")).await.unwrap();
+        db.set_terminal_group(ids[1], Some("frontend")).await.unwrap();
+        db.set_terminal_sort_order(ids[0], 200).await.unwrap();
+        db.set_terminal_sort_order(ids[1], 100).await.unwrap();
+        db.set_terminal_sort_order(ids[2], 50).await.unwrap();
+
+        let list = db.list_terminal_sessions().await.unwrap();
+        // Ordered by sort_order ASC: ids[2] (50), ids[1] (100), ids[0] (200).
+        assert_eq!(list[0].id, ids[2]);
+        assert_eq!(list[0].group_name, None);
+        assert_eq!(list[0].sort_order, 50);
+        assert_eq!(list[1].id, ids[1]);
+        assert_eq!(list[1].group_name.as_deref(), Some("frontend"));
+        assert_eq!(list[2].id, ids[0]);
+        assert_eq!(list[2].group_name.as_deref(), Some("frontend"));
+
+        // Clearing the group (None) removes the label.
+        db.set_terminal_group(ids[0], None).await.unwrap();
+        let after = db.list_terminal_sessions().await.unwrap();
+        let found = after.iter().find(|m| m.id == ids[0]).unwrap();
+        assert_eq!(found.group_name, None);
     }
 
     #[tokio::test]

@@ -12,6 +12,7 @@ export interface DecisionRequest {
   tool_use_id?: string;
   permission_suggestions?: PermissionSuggestion[];
   event_data?: Record<string, unknown>;
+  terminal_session_id?: string;
 }
 
 export interface PermissionSuggestion {
@@ -79,6 +80,8 @@ export interface TerminalSessionMeta {
   ended_at?: string;
   exit_code?: number;
   status: TerminalStatus;
+  group_name?: string;
+  sort_order: number;
 }
 
 // Server → Client messages
@@ -141,4 +144,6 @@ export type ClientMessage =
   | { type: "term_resize"; id: string; cols: number; rows: number }
   | { type: "term_close"; id: string; kill?: boolean }
   | { type: "term_list" }
-  | { type: "term_replay"; id: string; from_seq?: number; speed?: number };
+  | { type: "term_replay"; id: string; from_seq?: number; speed?: number }
+  | { type: "term_set_group"; id: string; group?: string }
+  | { type: "term_reorder"; id: string; sort_order: number };

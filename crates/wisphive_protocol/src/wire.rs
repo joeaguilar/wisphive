@@ -191,6 +191,21 @@ pub enum ClientMessage {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         speed: Option<f32>,
     },
+
+    /// Assign a group label to a terminal session (None clears to ungrouped).
+    /// Groups are purely organizational — purely a sidebar display hint.
+    #[serde(rename = "term_set_group")]
+    TermSetGroup {
+        id: Uuid,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        group: Option<String>,
+    },
+
+    /// Update a terminal session's manual sort order. Smaller values sort first
+    /// within a group. Clients use fractional indexing (midpoint between
+    /// neighbors) to avoid rewriting sibling rows on each drag.
+    #[serde(rename = "term_reorder")]
+    TermReorder { id: Uuid, sort_order: i64 },
 }
 
 /// Messages sent from the daemon to clients.
@@ -845,6 +860,8 @@ mod tests {
             ended_at: None,
             exit_code: None,
             status: TerminalStatus::Running,
+            group_name: None,
+            sort_order: 0,
         }
     }
 

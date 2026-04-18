@@ -18,7 +18,7 @@ function App() {
   const {
     connected, queue, agents, projects, history, agentTimeline, sessionTimeline, sessions, terminals,
     approve, deny, spawnAgent, queryProjects, queryHistory, queryAgentTimeline, querySessionTimeline, searchHistory, querySessions,
-    termList, termCreate, termAttach, termDetach, termInput, termResize, termClose, termReplay, registerTerminalHandler,
+    termList, termCreate, termAttach, termDetach, termInput, termResize, termClose, termReplay, termSetGroup, termReorder, registerTerminalHandler,
   } = useWisphive();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [view, setView] = useState<View>("queue");
@@ -189,6 +189,7 @@ function App() {
         {view === "terminals" && (
           <Terminals
             terminals={terminals}
+            queue={queue}
             projects={projects}
             onRefresh={termList}
             onRefreshProjects={queryProjects}
@@ -199,6 +200,8 @@ function App() {
             onReplay={termReplay}
             onInput={termInput}
             onResize={termResize}
+            onSetGroup={termSetGroup}
+            onReorder={termReorder}
             registerHandler={registerTerminalHandler}
           />
         )}

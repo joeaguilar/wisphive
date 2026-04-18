@@ -221,6 +221,9 @@ impl TerminalSessionManager {
         let (db_tx, db_rx) = mpsc::channel::<TermFrame>(1024);
 
         let started_at = chrono::Utc::now();
+        // Default sort_order = -started_at_ms so new sessions sort newest-first
+        // before the user drags anything. User reorders overwrite this.
+        let sort_order = -started_at.timestamp_millis();
         let meta = TerminalSessionMeta {
             id,
             label,
@@ -233,6 +236,8 @@ impl TerminalSessionManager {
             ended_at: None,
             exit_code: None,
             status: TerminalStatus::Running,
+            group_name: None,
+            sort_order,
         };
         self.state_db.create_terminal_session(&meta).await?;
 
@@ -401,16 +406,24 @@ impl TerminalSessionManager {
     }
 
     /// List both running and historical sessions, merging SQLite with the
-    /// in-memory running map (which is authoritative for status=Running).
+    /// in-memory running map (which is authoritative for status=Running and
+    /// current PTY dimensions). Group/sort metadata always comes from the DB,
+    /// so user reorders aren't clobbered by stale live meta.
     pub async fn list_all(&self) -> Result<Vec<TerminalSessionMeta>> {
         let mut historical = self.state_db.list_terminal_sessions().await?;
-        // Overwrite any entries whose live meta we have (running, updated cols/rows, etc).
         let running = self.list_running().await;
         let live_ids: HashMap<Uuid, TerminalSessionMeta> =
             running.into_iter().map(|m| (m.id, m)).collect();
         for m in historical.iter_mut() {
             if let Some(live) = live_ids.get(&m.id) {
-                *m = live.clone();
+                // Keep live's status/cols/rows/ended_at/exit_code, but keep
+                // DB's group_name/sort_order (the user's source of truth).
+                m.status = live.status;
+                m.cols = live.cols;
+                m.rows = live.rows;
+                m.ended_at = live.ended_at;
+                m.exit_code = live.exit_code;
+                m.label = live.label.clone();
             }
         }
         // Add running sessions that don't appear in SQLite yet (shouldn't
@@ -421,6 +434,28 @@ impl TerminalSessionManager {
             }
         }
         Ok(historical)
+    }
+
+    /// Assign a group label to a session (None clears it). Persists to SQLite
+    /// and keeps the live in-memory meta in sync for running sessions.
+    pub async fn set_group(&self, id: Uuid, group: Option<&str>) -> Result<()> {
+        self.state_db.set_terminal_group(id, group).await?;
+        let sessions = self.sessions.lock().await;
+        if let Some(sess) = sessions.get(&id) {
+            sess.meta.lock().await.group_name = group.map(|s| s.to_string());
+        }
+        Ok(())
+    }
+
+    /// Update a session's manual sort order. Persists to SQLite and mirrors
+    /// to the live meta so list_all reflects the change immediately.
+    pub async fn set_sort_order(&self, id: Uuid, order: i64) -> Result<()> {
+        self.state_db.set_terminal_sort_order(id, order).await?;
+        let sessions = self.sessions.lock().await;
+        if let Some(sess) = sessions.get(&id) {
+            sess.meta.lock().await.sort_order = order;
+        }
+        Ok(())
     }
 
     /// Graceful shutdown: kill every running session's child and mark it as

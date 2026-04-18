@@ -335,6 +335,20 @@ export function useWisphive() {
     [send],
   );
 
+  const termSetGroup = useCallback(
+    (id: string, group?: string) => {
+      send({ type: "term_set_group", id, group });
+    },
+    [send],
+  );
+
+  const termReorder = useCallback(
+    (id: string, sortOrder: number) => {
+      send({ type: "term_reorder", id, sort_order: sortOrder });
+    },
+    [send],
+  );
+
   const registerTerminalHandler = useCallback((id: string, handler: TerminalOutputHandler) => {
     terminalHandlersRef.current.set(id, handler);
     return () => {
@@ -362,6 +376,8 @@ export function useWisphive() {
     termResize,
     termClose,
     termReplay,
+    termSetGroup,
+    termReorder,
     registerTerminalHandler,
   };
 }
