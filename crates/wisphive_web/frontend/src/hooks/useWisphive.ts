@@ -8,6 +8,7 @@ import type {
   ServerMessage,
   SessionSummary,
   SpawnAgentRequest,
+  TerminalSessionMeta,
 } from "../types/protocol";
 
 export interface WisphiveState {
@@ -19,7 +20,16 @@ export interface WisphiveState {
   sessionTimeline: HistoryEntry[];
   sessions: SessionSummary[];
   projects: ProjectSummary[];
+  terminals: TerminalSessionMeta[];
 }
+
+/// Callback fired when live PTY output arrives. Consumers wire this into
+/// xterm.js to render the session.
+export type TerminalOutputHandler = (
+  id: string,
+  direction: "chunk" | "catchup" | "replay_chunk",
+  bytes: Uint8Array,
+) => void;
 
 const WS_URL =
   import.meta.env.VITE_WS_URL || `ws://${window.location.host}/ws`;
@@ -32,6 +42,7 @@ const CHANNEL_SESSION = "session";
 export function useWisphive() {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const terminalHandlersRef = useRef<Map<string, TerminalOutputHandler>>(new Map());
   const [state, setState] = useState<WisphiveState>({
     connected: false,
     queue: [],
@@ -41,6 +52,7 @@ export function useWisphive() {
     sessionTimeline: [],
     sessions: [],
     projects: [],
+    terminals: [],
   });
 
   const handleMessage = useCallback((data: string) => {
@@ -109,6 +121,56 @@ export function useWisphive() {
 
           case "error":
             console.error("Daemon error:", msg.message);
+            return prev;
+
+          case "term_created": {
+            const { type: _, ...meta } = msg;
+            return {
+              ...prev,
+              terminals: [meta as TerminalSessionMeta, ...prev.terminals.filter((t) => t.id !== (meta as TerminalSessionMeta).id)],
+            };
+          }
+
+          case "term_list_response":
+            return { ...prev, terminals: msg.sessions };
+
+          case "term_chunk": {
+            const handler = terminalHandlersRef.current.get(msg.id);
+            if (handler && msg.direction === "output") {
+              handler(msg.id, "chunk", decodeBase64(msg.data));
+            }
+            return prev;
+          }
+
+          case "term_catchup": {
+            const handler = terminalHandlersRef.current.get(msg.id);
+            if (handler) {
+              handler(msg.id, "catchup", decodeBase64(msg.screen));
+            }
+            return prev;
+          }
+
+          case "term_ended":
+            return {
+              ...prev,
+              terminals: prev.terminals.map((t) =>
+                t.id === msg.id ? { ...t, status: msg.status, exit_code: msg.exit_code } : t,
+              ),
+            };
+
+          case "term_replay_chunk": {
+            const handler = terminalHandlersRef.current.get(msg.id);
+            if (handler && msg.direction === "output") {
+              handler(msg.id, "replay_chunk", decodeBase64(msg.data));
+            }
+            return prev;
+          }
+
+          case "term_replay_done":
+            return prev;
+
+          case "term_error":
+            console.warn("Terminal error:", msg.message);
             return prev;
 
           default:
@@ -217,6 +279,69 @@ export function useWisphive() {
     [send],
   );
 
+  // ── Terminal session actions ───────────────────────────────────
+  const termList = useCallback(() => {
+    send({ type: "term_list" });
+  }, [send]);
+
+  const termCreate = useCallback(
+    (opts: { label?: string; command?: string; args?: string[]; cwd?: string; cols: number; rows: number }) => {
+      send({ type: "term_create", ...opts });
+    },
+    [send],
+  );
+
+  const termAttach = useCallback(
+    (id: string) => {
+      send({ type: "term_attach", id });
+    },
+    [send],
+  );
+
+  const termDetach = useCallback(
+    (id: string) => {
+      send({ type: "term_detach", id });
+    },
+    [send],
+  );
+
+  const termInput = useCallback(
+    (id: string, data: string) => {
+      // Convert JS string to base64, UTF-8 preserving.
+      const bytes = new TextEncoder().encode(data);
+      send({ type: "term_input", id, data: encodeBase64(bytes) });
+    },
+    [send],
+  );
+
+  const termResize = useCallback(
+    (id: string, cols: number, rows: number) => {
+      send({ type: "term_resize", id, cols, rows });
+    },
+    [send],
+  );
+
+  const termClose = useCallback(
+    (id: string, kill = true) => {
+      send({ type: "term_close", id, kill });
+    },
+    [send],
+  );
+
+  const termReplay = useCallback(
+    (id: string, fromSeq?: number) => {
+      send({ type: "term_replay", id, from_seq: fromSeq });
+    },
+    [send],
+  );
+
+  const registerTerminalHandler = useCallback((id: string, handler: TerminalOutputHandler) => {
+    terminalHandlersRef.current.set(id, handler);
+    return () => {
+      terminalHandlersRef.current.delete(id);
+    };
+  }, []);
+
   return {
     ...state,
     send,
@@ -229,5 +354,29 @@ export function useWisphive() {
     queryProjects,
     searchHistory,
     spawnAgent,
+    termList,
+    termCreate,
+    termAttach,
+    termDetach,
+    termInput,
+    termResize,
+    termClose,
+    termReplay,
+    registerTerminalHandler,
   };
+}
+
+// ── base64 helpers ─────────────────────────────────────────────────
+
+function decodeBase64(s: string): Uint8Array {
+  const binary = atob(s);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function encodeBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
 }

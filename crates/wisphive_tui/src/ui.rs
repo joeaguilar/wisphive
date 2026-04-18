@@ -19,8 +19,153 @@ pub fn draw(frame: &mut Frame, app: &App) {
         ViewMode::Sessions => draw_sessions_view(frame, app),
         ViewMode::ProjectsExplorer => draw_projects_explorer(frame, app),
         ViewMode::SessionTimeline => draw_session_timeline_view(frame, app),
+        ViewMode::TerminalList => draw_terminal_list_view(frame, app),
+        ViewMode::TerminalView => draw_terminal_view(frame, app),
+        ViewMode::TerminalReplay => draw_terminal_replay_view(frame, app),
         ViewMode::Dashboard => draw_dashboard(frame, app),
     }
+}
+
+fn draw_terminal_list_view(frame: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(frame.area());
+
+    let items: Vec<ListItem> = app
+        .terminals
+        .iter()
+        .map(|t| {
+            let label = t.label.as_deref().unwrap_or("(no label)");
+            let status_color = match t.status {
+                wisphive_protocol::TerminalStatus::Running => Color::Green,
+                wisphive_protocol::TerminalStatus::Exited => Color::Gray,
+                wisphive_protocol::TerminalStatus::Killed => Color::Red,
+                wisphive_protocol::TerminalStatus::Orphaned => Color::Yellow,
+            };
+            let status = format!("{}", t.status);
+            let line = Line::from(vec![
+                Span::styled(format!("{:<10} ", status), Style::default().fg(status_color)),
+                Span::styled(format!("{:<20} ", label), Style::default().fg(Color::White)),
+                Span::raw(format!("{} ", t.command)),
+                Span::styled(
+                    format!("{}x{} ", t.cols, t.rows),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    format!("{}", t.started_at.format("%Y-%m-%d %H:%M:%S")),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]);
+            ListItem::new(line)
+        })
+        .collect();
+
+    let title = format!(" Terminals ({}) ", app.terminals.len());
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(title),
+        )
+        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .highlight_symbol("► ");
+
+    let mut state = ratatui::widgets::ListState::default();
+    if !app.terminals.is_empty() {
+        state.select(Some(app.terminals_index));
+    }
+    frame.render_stateful_widget(list, chunks[0], &mut state);
+
+    let status = Paragraph::new(Line::from(vec![
+        Span::styled("[n]", Style::default().fg(Color::Yellow)),
+        Span::raw(" new  "),
+        Span::styled("[P]", Style::default().fg(Color::Yellow)),
+        Span::raw(" new in project  "),
+        Span::styled("[Enter]", Style::default().fg(Color::Yellow)),
+        Span::raw(" attach  "),
+        Span::styled("[r]", Style::default().fg(Color::Yellow)),
+        Span::raw(" replay  "),
+        Span::styled("[d]", Style::default().fg(Color::Yellow)),
+        Span::raw(" close  "),
+        Span::styled("[j/k]", Style::default().fg(Color::Yellow)),
+        Span::raw(" move  "),
+        Span::styled("[q/Esc]", Style::default().fg(Color::Yellow)),
+        Span::raw(" back"),
+    ]));
+    frame.render_widget(status, chunks[1]);
+}
+
+fn draw_terminal_view(frame: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(frame.area());
+
+    if let Some(active) = app.active_terminal.as_ref() {
+        let screen = active.parser.screen();
+        let title = format!(
+            " Terminal: {} — {}{} ",
+            active.label.as_deref().unwrap_or("(no label)"),
+            active.command,
+            if active.ended { " [ended]" } else { "" }
+        );
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Green))
+            .title(title);
+        let widget = tui_term::widget::PseudoTerminal::new(screen).block(block);
+        frame.render_widget(widget, chunks[0]);
+    } else {
+        let msg = Paragraph::new("(no active terminal)")
+            .block(Block::default().borders(Borders::ALL).title(" Terminal "));
+        frame.render_widget(msg, chunks[0]);
+    }
+
+    let status = Paragraph::new(Line::from(vec![
+        Span::styled("[F10]", Style::default().fg(Color::Yellow)),
+        Span::raw(" detach  "),
+        Span::styled("[Esc Esc]", Style::default().fg(Color::Yellow)),
+        Span::raw(" detach  "),
+        Span::styled("[Ctrl-C]", Style::default().fg(Color::Yellow)),
+        Span::raw(" → PTY  "),
+        Span::styled("all other keys", Style::default().fg(Color::Yellow)),
+        Span::raw(" → session"),
+    ]));
+    frame.render_widget(status, chunks[1]);
+}
+
+fn draw_terminal_replay_view(frame: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(frame.area());
+
+    if let Some(replay) = app.replay_terminal.as_ref() {
+        let screen = replay.parser.screen();
+        let title = format!(
+            " Replay: {} — {} ",
+            replay.label.as_deref().unwrap_or("(no label)"),
+            replay.command
+        );
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Magenta))
+            .title(title);
+        let widget = tui_term::widget::PseudoTerminal::new(screen).block(block);
+        frame.render_widget(widget, chunks[0]);
+    } else {
+        let msg = Paragraph::new("(no replay active)")
+            .block(Block::default().borders(Borders::ALL).title(" Replay "));
+        frame.render_widget(msg, chunks[0]);
+    }
+
+    let status = Paragraph::new(Line::from(vec![
+        Span::styled("[q/Esc]", Style::default().fg(Color::Yellow)),
+        Span::raw(" back"),
+    ]));
+    frame.render_widget(status, chunks[1]);
 }
 
 fn draw_dashboard(frame: &mut Frame, app: &App) {

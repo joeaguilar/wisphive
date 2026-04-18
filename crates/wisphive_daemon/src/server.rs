@@ -16,6 +16,7 @@ use crate::process_registry::ProcessRegistry;
 use crate::queue::DecisionQueue;
 use crate::registry::AgentRegistry;
 use crate::state::StateDb;
+use crate::terminal::TerminalSessionManager;
 
 /// Shared context passed to each connection handler, replacing many individual arguments.
 struct ConnectionContext {
@@ -24,6 +25,7 @@ struct ConnectionContext {
     agent_registry: Arc<Mutex<AgentRegistry>>,
     tui_tx: broadcast::Sender<ServerMessage>,
     state_db: Arc<StateDb>,
+    terminal_manager: Arc<TerminalSessionManager>,
     hook_timeout_secs: u64,
     notifications_enabled: bool,
     home_dir: PathBuf,
@@ -38,6 +40,7 @@ pub struct Server {
     agent_registry: Arc<Mutex<AgentRegistry>>,
     tui_tx: broadcast::Sender<ServerMessage>,
     state_db: Arc<StateDb>,
+    terminal_manager: Arc<TerminalSessionManager>,
 }
 
 impl Server {
@@ -51,6 +54,8 @@ impl Server {
         let state_db = Arc::new(StateDb::open(&db_path).await?);
         let process_registry = Arc::new(Mutex::new(ProcessRegistry::new()));
         let agent_registry = Arc::new(Mutex::new(AgentRegistry::new()));
+        let terminal_manager =
+            Arc::new(TerminalSessionManager::new(state_db.clone(), tui_tx.clone()));
 
         Ok(Self {
             config,
@@ -59,6 +64,7 @@ impl Server {
             agent_registry,
             tui_tx,
             state_db,
+            terminal_manager,
         })
     }
 
@@ -145,6 +151,7 @@ impl Server {
                                 agent_registry: self.agent_registry.clone(),
                                 tui_tx: self.tui_tx.clone(),
                                 state_db: self.state_db.clone(),
+                                terminal_manager: self.terminal_manager.clone(),
                                 hook_timeout_secs: self.config.hook_timeout_secs,
                                 notifications_enabled: self.config.notifications_enabled,
                                 home_dir: self.config.home_dir.clone(),
@@ -175,6 +182,9 @@ impl Server {
                 pr.shutdown_all().await;
             }
         }
+
+        // Shutdown terminal sessions (kill PTY children).
+        self.terminal_manager.shutdown_all().await;
 
         // Cleanup socket
         let _ = std::fs::remove_file(&self.config.socket_path);
@@ -379,6 +389,8 @@ async fn handle_tui(
     mut writer: tokio::net::unix::OwnedWriteHalf,
     ctx: &ConnectionContext,
 ) -> Result<()> {
+    use tokio::sync::mpsc;
+
     // Send agents snapshot
     let agents_snap = {
         let reg = ctx.agent_registry.lock().await;
@@ -398,8 +410,31 @@ async fn handle_tui(
     // Subscribe to broadcast events for this TUI
     let mut tui_rx = ctx.tui_tx.subscribe();
 
+    // Per-connection channel for messages produced by worker tasks
+    // (e.g. per-session terminal forwarders). The select loop drains this
+    // and writes to the single owned socket, so there's no lock contention
+    // on the writer.
+    let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<ServerMessage>();
+
+    // Attached terminal sessions on this connection. Aborted on detach,
+    // disconnect, or TermEnded. Key: terminal session id.
+    let mut term_attachments: std::collections::HashMap<uuid::Uuid, tokio::task::JoinHandle<()>> =
+        std::collections::HashMap::new();
+
     loop {
         tokio::select! {
+            // Per-connection messages from worker tasks (e.g. terminal forwarders)
+            msg = conn_rx.recv() => {
+                match msg {
+                    Some(m) => {
+                        let encoded = encode(&m)?;
+                        if writer.write_all(encoded.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
             // Forward daemon events to TUI
             event = tui_rx.recv() => {
                 match event {
@@ -701,6 +736,175 @@ async fn handle_tui(
                                     }
                                 }
                             }
+                            ClientMessage::TermCreate { label, command, args, cwd, cols, rows, env } => {
+                                match ctx.terminal_manager
+                                    .create(label, command, args, cwd, cols, rows, env)
+                                    .await
+                                {
+                                    Ok(meta) => {
+                                        let resp = encode(&ServerMessage::TermCreated(meta))?;
+                                        writer.write_all(resp.as_bytes()).await?;
+                                    }
+                                    Err(e) => {
+                                        let resp = encode(&ServerMessage::TermError {
+                                            id: None,
+                                            message: format!("term create failed: {e}"),
+                                        })?;
+                                        writer.write_all(resp.as_bytes()).await?;
+                                    }
+                                }
+                            }
+                            ClientMessage::TermAttach { id } => {
+                                if let Some(handle) = term_attachments.remove(&id) {
+                                    handle.abort();
+                                }
+                                let session = ctx.terminal_manager.get(id).await;
+                                match session {
+                                    Some(session) => {
+                                        // Snapshot the current screen BEFORE subscribing so
+                                        // the seq counter we capture matches what we'll see
+                                        // on the receiver.
+                                        let next_seq = session.seq_load();
+                                        let catchup = crate::terminal::catchup_message(&session, next_seq);
+                                        let encoded = encode(&catchup)?;
+                                        writer.write_all(encoded.as_bytes()).await?;
+
+                                        let mut rx = session.subscribe();
+                                        let sess_id = session.id;
+                                        let tx = conn_tx.clone();
+                                        let handle = tokio::spawn(async move {
+                                            loop {
+                                                match rx.recv().await {
+                                                    Ok(frame) => {
+                                                        if frame.seq < next_seq {
+                                                            continue;
+                                                        }
+                                                        let msg = crate::terminal::frame_to_chunk(sess_id, &frame);
+                                                        if tx.send(msg).is_err() {
+                                                            break;
+                                                        }
+                                                    }
+                                                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                                                        let _ = tx.send(ServerMessage::TermError {
+                                                            id: Some(sess_id),
+                                                            message: "attachment lagged, please re-attach".into(),
+                                                        });
+                                                        break;
+                                                    }
+                                                    Err(broadcast::error::RecvError::Closed) => break,
+                                                }
+                                            }
+                                        });
+                                        term_attachments.insert(id, handle);
+                                    }
+                                    None => {
+                                        let resp = encode(&ServerMessage::TermError {
+                                            id: Some(id),
+                                            message: "terminal session not found or no longer running".into(),
+                                        })?;
+                                        writer.write_all(resp.as_bytes()).await?;
+                                    }
+                                }
+                            }
+                            ClientMessage::TermDetach { id } => {
+                                if let Some(handle) = term_attachments.remove(&id) {
+                                    handle.abort();
+                                }
+                            }
+                            ClientMessage::TermInput { id, data } => {
+                                match crate::terminal::decode_b64(&data) {
+                                    Ok(bytes) => {
+                                        if let Err(e) = ctx.terminal_manager.write_input(id, bytes).await {
+                                            let resp = encode(&ServerMessage::TermError {
+                                                id: Some(id),
+                                                message: format!("term input failed: {e}"),
+                                            })?;
+                                            writer.write_all(resp.as_bytes()).await?;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let resp = encode(&ServerMessage::TermError {
+                                            id: Some(id),
+                                            message: format!("invalid term input payload: {e}"),
+                                        })?;
+                                        writer.write_all(resp.as_bytes()).await?;
+                                    }
+                                }
+                            }
+                            ClientMessage::TermResize { id, cols, rows } => {
+                                if let Err(e) = ctx.terminal_manager.resize(id, cols, rows).await {
+                                    let resp = encode(&ServerMessage::TermError {
+                                        id: Some(id),
+                                        message: format!("term resize failed: {e}"),
+                                    })?;
+                                    writer.write_all(resp.as_bytes()).await?;
+                                }
+                            }
+                            ClientMessage::TermClose { id, kill } => {
+                                if let Some(handle) = term_attachments.remove(&id) {
+                                    handle.abort();
+                                }
+                                if let Err(e) = ctx.terminal_manager.close(id, kill).await {
+                                    let resp = encode(&ServerMessage::TermError {
+                                        id: Some(id),
+                                        message: format!("term close failed: {e}"),
+                                    })?;
+                                    writer.write_all(resp.as_bytes()).await?;
+                                }
+                            }
+                            ClientMessage::TermList => {
+                                match ctx.terminal_manager.list_all().await {
+                                    Ok(sessions) => {
+                                        let resp = encode(&ServerMessage::TermListResponse { sessions })?;
+                                        writer.write_all(resp.as_bytes()).await?;
+                                    }
+                                    Err(e) => {
+                                        let resp = encode(&ServerMessage::TermError {
+                                            id: None,
+                                            message: format!("term list failed: {e}"),
+                                        })?;
+                                        writer.write_all(resp.as_bytes()).await?;
+                                    }
+                                }
+                            }
+                            ClientMessage::TermReplay { id, from_seq, speed: _ } => {
+                                // Pull events from SQLite and stream them as
+                                // replay chunks. Speed pacing is client-side.
+                                let state_db = ctx.state_db.clone();
+                                let tx = conn_tx.clone();
+                                tokio::spawn(async move {
+                                    match state_db.replay_terminal_events(id, from_seq).await {
+                                        Ok(events) => {
+                                            let total = events.len() as u64;
+                                            for (seq, ts_us, direction, payload) in events {
+                                                let msg = ServerMessage::TermReplayChunk {
+                                                    id,
+                                                    seq,
+                                                    ts_us,
+                                                    direction,
+                                                    data: base64::Engine::encode(
+                                                        &base64::engine::general_purpose::STANDARD,
+                                                        &payload,
+                                                    ),
+                                                };
+                                                if tx.send(msg).is_err() {
+                                                    return;
+                                                }
+                                            }
+                                            let _ = tx.send(ServerMessage::TermReplayDone {
+                                                id,
+                                                total_events: total,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            let _ = tx.send(ServerMessage::TermError {
+                                                id: Some(id),
+                                                message: format!("replay failed: {e}"),
+                                            });
+                                        }
+                                    }
+                                });
+                            }
                             ClientMessage::ApprovePermission { id, suggestion_index, message } => {
                                 // Look up the selected suggestion from the queued request
                                 let selected = {
@@ -740,6 +944,12 @@ async fn handle_tui(
                 }
             }
         }
+    }
+
+    // Abort any attached terminal forwarders tied to this connection so
+    // they stop trying to send down a dead channel.
+    for (_, handle) in term_attachments.drain() {
+        handle.abort();
     }
 
     info!("TUI client disconnected");

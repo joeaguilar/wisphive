@@ -70,6 +70,57 @@ enum Command {
         #[arg(long)]
         project: Option<std::path::PathBuf>,
     },
+
+    /// Manage wisphive-owned terminal (PTY) sessions
+    Term {
+        #[command(subcommand)]
+        action: TermAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum TermAction {
+    /// Spawn a new terminal session (defaults to $SHELL -l in current cwd)
+    New {
+        /// Human-readable label for the session
+        #[arg(long)]
+        label: Option<String>,
+        /// Working directory for the spawned command
+        #[arg(long)]
+        cwd: Option<std::path::PathBuf>,
+        /// Command to run (defaults to $SHELL -l)
+        #[arg(long)]
+        cmd: Option<String>,
+        /// Args passed to --cmd (repeatable)
+        #[arg(long)]
+        arg: Vec<String>,
+        /// After creating, enter the session from this terminal
+        #[arg(long)]
+        attach: bool,
+    },
+    /// List all terminal sessions (running + historical)
+    List,
+    /// Attach to a running terminal session
+    Attach {
+        /// Session UUID
+        id: String,
+    },
+    /// Replay a terminal session's recorded events
+    Replay {
+        /// Session UUID
+        id: String,
+        /// Playback speed multiplier (1.0 = realtime)
+        #[arg(long, default_value = "1.0")]
+        speed: f32,
+    },
+    /// Close (kill) a running terminal session
+    Close {
+        /// Session UUID
+        id: String,
+        /// Force kill the child process
+        #[arg(long)]
+        kill: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -120,8 +171,22 @@ enum AutoApproveAction {
 
 #[derive(Subcommand)]
 enum DaemonAction {
-    /// Start the background daemon
-    Start,
+    /// Start the background daemon. Optionally also serve the web UI in the
+    /// same process with `--web`.
+    Start {
+        /// Also serve the web UI in this process.
+        #[arg(long)]
+        web: bool,
+        /// Web UI bind address (implies --web). Use 0.0.0.0 for LAN access.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Web UI HTTP port (implies --web).
+        #[arg(long, default_value = "3100")]
+        port: u16,
+        /// Dev mode: only serve the WebSocket, expect Vite dev server for the frontend.
+        #[arg(long)]
+        web_dev: bool,
+    },
     /// Stop the running daemon
     Stop,
     /// Show daemon status
@@ -328,9 +393,63 @@ fn main() -> anyhow::Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
                 match action {
-                    DaemonAction::Start => commands::daemon::start().await,
+                    DaemonAction::Start { web, host, port, web_dev } => {
+                        // Any of --web / non-default --host / non-default --port / --web-dev
+                        // implies "serve the web UI too".
+                        let web_requested = web
+                            || web_dev
+                            || host != "127.0.0.1"
+                            || port != 3100;
+                        let web_opts = if web_requested {
+                            let host_octets: [u8; 4] = match host.as_str() {
+                                "0.0.0.0" => [0, 0, 0, 0],
+                                "127.0.0.1" | "localhost" => [127, 0, 0, 1],
+                                other => {
+                                    let parts: Vec<u8> = other
+                                        .split('.')
+                                        .filter_map(|s| s.parse().ok())
+                                        .collect();
+                                    if parts.len() == 4 {
+                                        [parts[0], parts[1], parts[2], parts[3]]
+                                    } else {
+                                        eprintln!("Invalid --host: {other}");
+                                        return Ok(());
+                                    }
+                                }
+                            };
+                            eprintln!(
+                                "Wisphive Web: http://{}:{}{}",
+                                if host_octets == [0, 0, 0, 0] { "0.0.0.0".to_string() } else { host.clone() },
+                                port,
+                                if web_dev { " (dev mode — run `npm run dev` for the UI)" } else { "" },
+                            );
+                            Some(commands::daemon::WebOptions {
+                                host: host_octets,
+                                port,
+                                dev: web_dev,
+                            })
+                        } else {
+                            None
+                        };
+                        commands::daemon::start(web_opts).await
+                    }
                     DaemonAction::Stop => commands::daemon::stop().await,
                     DaemonAction::Status => commands::daemon::status().await,
+                }
+            })
+        }
+        Command::Term { action } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async move {
+                match action {
+                    TermAction::New { label, cwd, cmd, arg, attach } => {
+                        let args = if arg.is_empty() { None } else { Some(arg) };
+                        commands::term::new_session(label, cwd, cmd, args, attach).await
+                    }
+                    TermAction::List => commands::term::list().await,
+                    TermAction::Attach { id } => commands::term::attach(id).await,
+                    TermAction::Replay { id, speed } => commands::term::replay(id, speed).await,
+                    TermAction::Close { id, kill } => commands::term::close(id, kill).await,
                 }
             })
         }

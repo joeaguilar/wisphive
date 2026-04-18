@@ -127,6 +127,7 @@ fn make_decision_request(tool_name: &str) -> DecisionRequest {
         tool_use_id: None,
         permission_suggestions: None,
         event_data: None,
+        terminal_session_id: None,
     }
 }
 

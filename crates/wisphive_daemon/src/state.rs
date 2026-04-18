@@ -1,8 +1,9 @@
 use anyhow::Result;
 use sqlx::SqlitePool;
 use tracing::info;
+use wisphive_protocol::{TerminalDirection, TerminalSessionMeta, TerminalStatus};
 
-/// Row shape returned by decision_log queries (12 columns).
+/// Row shape returned by decision_log queries (13 columns).
 type DecisionLogRow = (
     String,
     String,
@@ -16,9 +17,11 @@ type DecisionLogRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
 );
 
 /// Row shape for pending_decisions lookups (8 columns).
+#[allow(dead_code)]
 type PendingRow = (
     String,
     String,
@@ -26,6 +29,19 @@ type PendingRow = (
     String,
     String,
     String,
+    Option<String>,
+    Option<String>,
+);
+
+/// Pending row extended with terminal_session_id (9 columns).
+type PendingRowWithTerm = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
     Option<String>,
     Option<String>,
 );
@@ -58,6 +74,10 @@ impl StateDb {
 
         let db = Self { pool };
         db.migrate().await?;
+        // Any terminal session still marked running at startup belongs to a
+        // prior daemon instance whose PTY is gone. Mark orphaned so replay
+        // still works but clients know the live stream is unreachable.
+        db.mark_running_terminals_orphaned().await?;
         info!("state database ready at {}", path);
         Ok(db)
     }
@@ -132,6 +152,66 @@ impl StateDb {
             .await
             .ok();
 
+        // Add terminal_session_id columns for correlating decisions with
+        // wisphive-managed terminal sessions (idempotent).
+        sqlx::query("ALTER TABLE pending_decisions ADD COLUMN terminal_session_id TEXT")
+            .execute(&self.pool)
+            .await
+            .ok();
+        sqlx::query("ALTER TABLE decision_log ADD COLUMN terminal_session_id TEXT")
+            .execute(&self.pool)
+            .await
+            .ok();
+
+        // Terminal session metadata
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS terminal_sessions (
+                id TEXT PRIMARY KEY,
+                label TEXT,
+                command TEXT NOT NULL,
+                args TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                env_json TEXT,
+                cols INTEGER NOT NULL,
+                rows INTEGER NOT NULL,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                exit_code INTEGER,
+                status TEXT NOT NULL DEFAULT 'running'
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Per-event stream: raw input/output/resize bytes for replay.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS terminal_events (
+                session_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                ts_us INTEGER NOT NULL,
+                direction TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                PRIMARY KEY (session_id, seq),
+                FOREIGN KEY (session_id) REFERENCES terminal_sessions(id)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_terminal_events_session_seq
+             ON terminal_events(session_id, seq)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_terminal_sessions_status_started
+             ON terminal_sessions(status, started_at DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Indexes for PostToolUse correlation and history queries
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_decision_log_agent_tool_resolved
@@ -189,8 +269,8 @@ impl StateDb {
         };
 
         sqlx::query(
-            "INSERT OR REPLACE INTO pending_decisions (id, agent_id, agent_type, project, tool_name, tool_input, timestamp, tool_use_id, hook_event_name)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO pending_decisions (id, agent_id, agent_type, project, tool_name, tool_input, timestamp, tool_use_id, hook_event_name, terminal_session_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(req.id.to_string())
         .bind(&req.agent_id)
@@ -201,6 +281,7 @@ impl StateDb {
         .bind(req.timestamp.to_rfc3339())
         .bind(&req.tool_use_id)
         .bind(req.hook_event_name.to_string())
+        .bind(req.terminal_session_id.map(|u| u.to_string()))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -213,18 +294,18 @@ impl StateDb {
         decision: wisphive_protocol::Decision,
     ) -> Result<()> {
         // Move from pending to log
-        let row = sqlx::query_as::<_, PendingRow>(
-            "SELECT agent_id, agent_type, project, tool_name, tool_input, timestamp, tool_use_id, hook_event_name
+        let row = sqlx::query_as::<_, PendingRowWithTerm>(
+            "SELECT agent_id, agent_type, project, tool_name, tool_input, timestamp, tool_use_id, hook_event_name, terminal_session_id
              FROM pending_decisions WHERE id = ?",
         )
         .bind(id.to_string())
         .fetch_optional(&self.pool)
         .await?;
 
-        if let Some((agent_id, agent_type, project, tool_name, tool_input, requested_at, tool_use_id, hook_event_name)) = row {
+        if let Some((agent_id, agent_type, project, tool_name, tool_input, requested_at, tool_use_id, hook_event_name, terminal_session_id)) = row {
             sqlx::query(
-                "INSERT OR IGNORE INTO decision_log (id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_use_id, hook_event_name)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO decision_log (id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_use_id, hook_event_name, terminal_session_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(id.to_string())
             .bind(agent_id)
@@ -237,6 +318,7 @@ impl StateDb {
             .bind(chrono::Utc::now().to_rfc3339())
             .bind(tool_use_id)
             .bind(hook_event_name)
+            .bind(terminal_session_id)
             .execute(&self.pool)
             .await?;
         }
@@ -262,7 +344,7 @@ impl StateDb {
             match agent_id {
                 Some(aid) => {
                     sqlx::query_as(
-                        "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id, hook_event_name
+                        "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id, hook_event_name, terminal_session_id
                          FROM decision_log WHERE agent_id = ? ORDER BY resolved_at DESC LIMIT ?",
                     )
                     .bind(aid)
@@ -272,7 +354,7 @@ impl StateDb {
                 }
                 None => {
                     sqlx::query_as(
-                        "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id, hook_event_name
+                        "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id, hook_event_name, terminal_session_id
                          FROM decision_log ORDER BY resolved_at DESC LIMIT ?",
                     )
                     .bind(limit)
@@ -380,7 +462,7 @@ impl StateDb {
         };
 
         let sql = format!(
-            "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id, hook_event_name
+            "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id, hook_event_name, terminal_session_id
              FROM decision_log WHERE {} ORDER BY resolved_at DESC LIMIT ?",
             where_clause
         );
@@ -521,7 +603,7 @@ impl StateDb {
             let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
             let select_sql = format!(
                 "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, \
-                 requested_at, resolved_at, tool_result, tool_use_id, hook_event_name \
+                 requested_at, resolved_at, tool_result, tool_use_id, hook_event_name, terminal_session_id \
                  FROM decision_log WHERE id IN ({})",
                 placeholders.join(",")
             );
@@ -533,7 +615,7 @@ impl StateDb {
             let rows = query.fetch_all(&self.pool).await?;
 
             // Write all rows to archive file
-            for (id, agent_id, _agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id, hook_event_name) in &rows {
+            for (id, agent_id, _agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id, hook_event_name, terminal_session_id) in &rows {
                 let entry = serde_json::json!({
                     "id": id,
                     "agent_id": agent_id,
@@ -546,6 +628,7 @@ impl StateDb {
                     "tool_result": tool_result.as_deref().and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
                     "tool_use_id": tool_use_id,
                     "hook_event_name": hook_event_name,
+                    "terminal_session_id": terminal_session_id,
                 });
                 let mut line = serde_json::to_string(&entry).unwrap_or_default();
                 line.push('\n');
@@ -654,6 +737,196 @@ impl StateDb {
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
+
+    // ── Terminal session helpers ──────────────────────────────────
+
+    /// Insert a new terminal session row.
+    pub async fn create_terminal_session(&self, meta: &TerminalSessionMeta) -> Result<()> {
+        let args_json = serde_json::to_string(&meta.args)?;
+        sqlx::query(
+            "INSERT INTO terminal_sessions (id, label, command, args, cwd, env_json, cols, rows, started_at, ended_at, exit_code, status)
+             VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(meta.id.to_string())
+        .bind(&meta.label)
+        .bind(&meta.command)
+        .bind(args_json)
+        .bind(meta.cwd.to_string_lossy().to_string())
+        .bind(i64::from(meta.cols))
+        .bind(i64::from(meta.rows))
+        .bind(meta.started_at.to_rfc3339())
+        .bind(meta.ended_at.map(|t| t.to_rfc3339()))
+        .bind(meta.exit_code)
+        .bind(meta.status.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Mark a terminal session as finished and record its final status.
+    pub async fn end_terminal_session(
+        &self,
+        id: uuid::Uuid,
+        exit_code: Option<i32>,
+        status: TerminalStatus,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE terminal_sessions
+             SET ended_at = ?, exit_code = ?, status = ?
+             WHERE id = ?",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(exit_code)
+        .bind(status.to_string())
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// List all terminal sessions, newest first. Running sessions first, then historical.
+    pub async fn list_terminal_sessions(&self) -> Result<Vec<TerminalSessionMeta>> {
+        type Row = (
+            String,
+            Option<String>,
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            String,
+            Option<String>,
+            Option<i64>,
+            String,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT id, label, command, args, cwd, cols, rows, started_at, ended_at, exit_code, status
+             FROM terminal_sessions
+             ORDER BY (status = 'running') DESC, started_at DESC
+             LIMIT 500",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (id, label, command, args_json, cwd, cols, rows_, started_at, ended_at, exit_code, status) in rows {
+            let Ok(id) = uuid::Uuid::parse_str(&id) else { continue };
+            let args: Vec<String> = serde_json::from_str(&args_json).unwrap_or_default();
+            let Ok(started_at) = chrono::DateTime::parse_from_rfc3339(&started_at) else { continue };
+            let ended_at = ended_at
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                .map(|d| d.with_timezone(&chrono::Utc));
+            let Ok(status) = status.parse::<TerminalStatus>() else { continue };
+            out.push(TerminalSessionMeta {
+                id,
+                label,
+                command,
+                args,
+                cwd: std::path::PathBuf::from(cwd),
+                cols: cols as u16,
+                rows: rows_ as u16,
+                started_at: started_at.with_timezone(&chrono::Utc),
+                ended_at,
+                exit_code: exit_code.map(|c| c as i32),
+                status,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Look up a single terminal session by ID.
+    pub async fn get_terminal_session(&self, id: uuid::Uuid) -> Result<Option<TerminalSessionMeta>> {
+        // Tiny wrapper: filter list_terminal_sessions by id. For 500-row
+        // cap that is cheap; avoids a duplicate query/hydration path.
+        Ok(self
+            .list_terminal_sessions()
+            .await?
+            .into_iter()
+            .find(|m| m.id == id))
+    }
+
+    /// Insert a batch of terminal events in a single transaction.
+    ///
+    /// `rows` is `(session_id, seq, ts_us, direction, payload)`.
+    pub async fn insert_terminal_events_batch(
+        &self,
+        rows: &[(uuid::Uuid, u64, i64, TerminalDirection, Vec<u8>)],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        for (session_id, seq, ts_us, direction, payload) in rows {
+            sqlx::query(
+                "INSERT OR IGNORE INTO terminal_events (session_id, seq, ts_us, direction, payload)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(session_id.to_string())
+            .bind(*seq as i64)
+            .bind(*ts_us)
+            .bind(direction.to_string())
+            .bind(payload.as_slice())
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Stream events for replay. Returns `(seq, ts_us, direction, payload)`.
+    pub async fn replay_terminal_events(
+        &self,
+        id: uuid::Uuid,
+        from_seq: Option<u64>,
+    ) -> Result<Vec<(u64, i64, TerminalDirection, Vec<u8>)>> {
+        let rows: Vec<(i64, i64, String, Vec<u8>)> = sqlx::query_as(
+            "SELECT seq, ts_us, direction, payload
+             FROM terminal_events
+             WHERE session_id = ? AND seq >= ?
+             ORDER BY seq ASC",
+        )
+        .bind(id.to_string())
+        .bind(from_seq.unwrap_or(0) as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (seq, ts_us, dir, payload) in rows {
+            let Ok(direction) = dir.parse::<TerminalDirection>() else { continue };
+            out.push((seq as u64, ts_us, direction, payload));
+        }
+        Ok(out)
+    }
+
+    /// Mark any sessions still flagged 'running' as orphaned. Called on daemon
+    /// startup — a running session across a restart has no live PTY behind it.
+    pub async fn mark_running_terminals_orphaned(&self) -> Result<()> {
+        sqlx::query(
+            "UPDATE terminal_sessions
+             SET status = 'orphaned', ended_at = COALESCE(ended_at, ?)
+             WHERE status = 'running'",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Delete terminal events older than the retention cutoff for sessions
+    /// that have already ended. Metadata rows are preserved.
+    pub async fn prune_terminal_events(&self, cutoff: chrono::DateTime<chrono::Utc>) -> Result<u64> {
+        let res = sqlx::query(
+            "DELETE FROM terminal_events
+             WHERE session_id IN (
+                 SELECT id FROM terminal_sessions
+                 WHERE ended_at IS NOT NULL AND ended_at < ?
+             )",
+        )
+        .bind(cutoff.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
 }
 
 /// Convert raw SQL rows to HistoryEntry structs.
@@ -661,7 +934,7 @@ fn rows_to_entries(
     rows: Vec<DecisionLogRow>,
 ) -> Vec<wisphive_protocol::HistoryEntry> {
     rows.into_iter()
-        .filter_map(|(id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id, hook_event_name)| {
+        .filter_map(|(id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id, hook_event_name, terminal_session_id)| {
             Some(wisphive_protocol::HistoryEntry {
                 id: id.parse().ok()?,
                 agent_id,
@@ -675,6 +948,7 @@ fn rows_to_entries(
                 tool_result: tool_result.and_then(|s| serde_json::from_str(&s).ok()),
                 tool_use_id,
                 hook_event_name,
+                terminal_session_id: terminal_session_id.as_deref().and_then(|s| uuid::Uuid::parse_str(s).ok()),
             })
         })
         .collect()
@@ -703,6 +977,7 @@ mod tests {
             tool_use_id: None,
             permission_suggestions: None,
             event_data: None,
+            terminal_session_id: None,
         }
     }
 
@@ -719,6 +994,7 @@ mod tests {
             tool_use_id: Some(tool_use_id.into()),
             permission_suggestions: None,
             event_data: None,
+            terminal_session_id: None,
         }
     }
 
@@ -1163,5 +1439,103 @@ mod tests {
         let archived = db.archive_and_prune(&archive_path, 100, 365).await.unwrap();
         assert_eq!(archived, 0);
         assert!(!archive_path.exists());
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // Terminal sessions
+    // ════════════════════════════════════════════════════════════
+
+    fn make_term_meta(id: uuid::Uuid) -> TerminalSessionMeta {
+        TerminalSessionMeta {
+            id,
+            label: Some("main".into()),
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), "echo hi".into()],
+            cwd: std::path::PathBuf::from("/tmp"),
+            cols: 80,
+            rows: 24,
+            started_at: chrono::Utc::now(),
+            ended_at: None,
+            exit_code: None,
+            status: TerminalStatus::Running,
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_session_create_and_list() {
+        let db = test_db().await;
+        let id = uuid::Uuid::new_v4();
+        db.create_terminal_session(&make_term_meta(id)).await.unwrap();
+
+        let list = db.list_terminal_sessions().await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, id);
+        assert_eq!(list[0].command, "/bin/sh");
+        assert_eq!(list[0].args, vec!["-c".to_string(), "echo hi".into()]);
+        assert_eq!(list[0].status, TerminalStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn terminal_session_end_sets_fields() {
+        let db = test_db().await;
+        let id = uuid::Uuid::new_v4();
+        db.create_terminal_session(&make_term_meta(id)).await.unwrap();
+        db.end_terminal_session(id, Some(0), TerminalStatus::Exited).await.unwrap();
+
+        let got = db.get_terminal_session(id).await.unwrap().unwrap();
+        assert_eq!(got.status, TerminalStatus::Exited);
+        assert_eq!(got.exit_code, Some(0));
+        assert!(got.ended_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn terminal_events_batch_and_replay_preserve_order_and_bytes() {
+        let db = test_db().await;
+        let id = uuid::Uuid::new_v4();
+        db.create_terminal_session(&make_term_meta(id)).await.unwrap();
+
+        let rows = vec![
+            (id, 1u64, 100i64, TerminalDirection::Output, b"hello\n".to_vec()),
+            (id, 2, 200, TerminalDirection::Input, b"yes\r".to_vec()),
+            (id, 3, 300, TerminalDirection::Output, vec![0x1b, b'[', b'3', b'1', b'm']),
+        ];
+        db.insert_terminal_events_batch(&rows).await.unwrap();
+
+        let replayed = db.replay_terminal_events(id, None).await.unwrap();
+        assert_eq!(replayed.len(), 3);
+        assert_eq!(replayed[0].0, 1);
+        assert_eq!(replayed[0].2, TerminalDirection::Output);
+        assert_eq!(replayed[0].3, b"hello\n");
+        assert_eq!(replayed[2].3, vec![0x1b, b'[', b'3', b'1', b'm']);
+
+        let from_two = db.replay_terminal_events(id, Some(2)).await.unwrap();
+        assert_eq!(from_two.len(), 2);
+        assert_eq!(from_two[0].0, 2);
+    }
+
+    #[tokio::test]
+    async fn mark_running_orphaned_on_startup() {
+        let db = test_db().await;
+        let id = uuid::Uuid::new_v4();
+        db.create_terminal_session(&make_term_meta(id)).await.unwrap();
+        // Directly invoke the sweeper (also runs inside StateDb::open).
+        db.mark_running_terminals_orphaned().await.unwrap();
+        let got = db.get_terminal_session(id).await.unwrap().unwrap();
+        assert_eq!(got.status, TerminalStatus::Orphaned);
+        assert!(got.ended_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn terminal_session_id_persists_through_decision_log() {
+        let db = test_db().await;
+        let term_id = uuid::Uuid::new_v4();
+        let mut req = make_request("Bash", "cc-1", "/proj");
+        req.terminal_session_id = Some(term_id);
+        db.persist_pending(&req).await.unwrap();
+        db.resolve_pending(req.id, Decision::Approve).await.unwrap();
+
+        let history = db.query_history(Some("cc-1"), 10).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].terminal_session_id, Some(term_id));
     }
 }
