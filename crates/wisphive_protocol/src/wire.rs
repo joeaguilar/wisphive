@@ -19,6 +19,39 @@ pub enum ClientType {
     Tui,
 }
 
+/// Stable identifier for an authenticated web device (phone, tablet, laptop).
+///
+/// Newtype so it can't be accidentally swapped with other stringly-typed
+/// ids floating around the protocol (`agent_id`, `tool_use_id`, `session_id`).
+/// Wire format is a bare string.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DeviceId(pub String);
+
+impl std::fmt::Display for DeviceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for DeviceId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for DeviceId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for DeviceId {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
 /// Messages sent from clients (hook or TUI) to the daemon.
 ///
 /// Wire format: newline-delimited JSON over Unix socket.
@@ -34,6 +67,9 @@ pub enum ClientMessage {
     DecisionRequest(DecisionRequest),
 
     /// TUI approves a single queued decision (with optional rich fields).
+    ///
+    /// Originating device id travels on the outer [`ClientCommand`] envelope, not
+    /// on the variant — see crate-level docs on `ClientCommand` for the rationale.
     #[serde(rename = "approve")]
     Approve {
         id: Uuid,
@@ -45,10 +81,6 @@ pub enum ClientMessage {
         always_allow: bool,
         #[serde(skip_serializing_if = "Option::is_none", default)]
         additional_context: Option<String>,
-        /// Originating web device id. None when the command came from the TUI
-        /// (local fs access is implicitly trusted).
-        #[serde(skip_serializing_if = "Option::is_none", default)]
-        device_id: Option<String>,
     },
 
     /// TUI denies a single queued decision (with optional feedback).
@@ -57,33 +89,19 @@ pub enum ClientMessage {
         id: Uuid,
         #[serde(skip_serializing_if = "Option::is_none", default)]
         message: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none", default)]
-        device_id: Option<String>,
     },
 
     /// TUI defers to the agent's native permission prompt.
     #[serde(rename = "ask")]
-    Ask {
-        id: Uuid,
-        #[serde(skip_serializing_if = "Option::is_none", default)]
-        device_id: Option<String>,
-    },
+    Ask { id: Uuid },
 
     /// TUI approves all items matching an optional filter.
     #[serde(rename = "approve_all")]
-    ApproveAll {
-        filter: Option<DecisionFilter>,
-        #[serde(skip_serializing_if = "Option::is_none", default)]
-        device_id: Option<String>,
-    },
+    ApproveAll { filter: Option<DecisionFilter> },
 
     /// TUI denies all items matching an optional filter.
     #[serde(rename = "deny_all")]
-    DenyAll {
-        filter: Option<DecisionFilter>,
-        #[serde(skip_serializing_if = "Option::is_none", default)]
-        device_id: Option<String>,
-    },
+    DenyAll { filter: Option<DecisionFilter> },
 
     /// Request the daemon to spawn a new agent process.
     #[serde(rename = "spawn_agent")]
@@ -147,8 +165,6 @@ pub enum ClientMessage {
         suggestion_index: usize,
         #[serde(skip_serializing_if = "Option::is_none", default)]
         message: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none", default)]
-        device_id: Option<String>,
     },
 
     // ── Terminal sessions ─────────────────────────────────────────────
@@ -226,6 +242,49 @@ pub enum ClientMessage {
     /// neighbors) to avoid rewriting sibling rows on each drag.
     #[serde(rename = "term_reorder")]
     TermReorder { id: Uuid, sort_order: i64 },
+}
+
+/// Envelope wrapping a [`ClientMessage`] with per-connection client context.
+///
+/// Client context (currently just `device_id`; eventually IP, session id, UA
+/// hash) lives on the envelope so new decision variants don't have to remember
+/// to carry each field individually. The body is `#[serde(flatten)]`d, so the
+/// wire format is byte-identical to a bare `ClientMessage` — decoders that
+/// used to target `ClientMessage` can switch to `ClientCommand` and old
+/// payloads (including ones that embedded `device_id` on the variant) continue
+/// to decode cleanly: the top-level envelope absorbs the field.
+///
+/// Callers that don't need client context can keep encoding a `ClientMessage`
+/// directly — the bytes match `ClientCommand { body, device_id: None }`
+/// because `skip_serializing_if = "Option::is_none"` elides the field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientCommand {
+    #[serde(flatten)]
+    pub body: ClientMessage,
+    /// Originating web device id. None for TUI/local connections (implicitly
+    /// trusted) and for non-decision variants that have no actor attribution.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub device_id: Option<DeviceId>,
+}
+
+impl ClientCommand {
+    pub fn new(body: ClientMessage) -> Self {
+        Self {
+            body,
+            device_id: None,
+        }
+    }
+
+    pub fn with_device_id(mut self, device_id: DeviceId) -> Self {
+        self.device_id = Some(device_id);
+        self
+    }
+}
+
+impl From<ClientMessage> for ClientCommand {
+    fn from(body: ClientMessage) -> Self {
+        Self::new(body)
+    }
 }
 
 /// Messages sent from the daemon to clients.
@@ -689,7 +748,6 @@ mod tests {
             updated_input: Some(serde_json::json!({"command": "cargo build --release"})),
             always_allow: true,
             additional_context: Some("use release mode".into()),
-            device_id: Some("dev-abc".into()),
         };
         let encoded = encode(&msg).unwrap();
         let decoded: ClientMessage = decode(&encoded).unwrap();
@@ -700,7 +758,6 @@ mod tests {
                 updated_input,
                 always_allow,
                 additional_context,
-                device_id,
             } => {
                 assert_eq!(did, id);
                 assert_eq!(message.unwrap(), "approved with edits");
@@ -710,7 +767,6 @@ mod tests {
                 );
                 assert!(always_allow);
                 assert_eq!(additional_context.unwrap(), "use release mode");
-                assert_eq!(device_id.as_deref(), Some("dev-abc"));
             }
             _ => panic!("unexpected variant"),
         }
@@ -722,19 +778,13 @@ mod tests {
         let msg = ClientMessage::Deny {
             id,
             message: Some("too dangerous".into()),
-            device_id: None,
         };
         let encoded = encode(&msg).unwrap();
         let decoded: ClientMessage = decode(&encoded).unwrap();
         match decoded {
-            ClientMessage::Deny {
-                id: did,
-                message,
-                device_id,
-            } => {
+            ClientMessage::Deny { id: did, message } => {
                 assert_eq!(did, id);
                 assert_eq!(message.unwrap(), "too dangerous");
-                assert!(device_id.is_none());
             }
             _ => panic!("unexpected variant"),
         }
@@ -743,17 +793,11 @@ mod tests {
     #[test]
     fn round_trip_ask() {
         let id = uuid::Uuid::new_v4();
-        let msg = ClientMessage::Ask {
-            id,
-            device_id: None,
-        };
+        let msg = ClientMessage::Ask { id };
         let encoded = encode(&msg).unwrap();
         let decoded: ClientMessage = decode(&encoded).unwrap();
         match decoded {
-            ClientMessage::Ask {
-                id: did,
-                device_id: _,
-            } => assert_eq!(did, id),
+            ClientMessage::Ask { id: did } => assert_eq!(did, id),
             _ => panic!("unexpected variant"),
         }
     }
@@ -766,15 +810,11 @@ mod tests {
                 project: Some(PathBuf::from("/proj")),
                 agent_type: Some(AgentType::ClaudeCode),
             }),
-            device_id: None,
         };
         let encoded = encode(&msg).unwrap();
         let decoded: ClientMessage = decode(&encoded).unwrap();
         match decoded {
-            ClientMessage::ApproveAll {
-                filter,
-                device_id: _,
-            } => {
+            ClientMessage::ApproveAll { filter } => {
                 let f = filter.unwrap();
                 assert_eq!(f.tool_name.unwrap(), "Bash");
                 assert_eq!(f.project.unwrap(), PathBuf::from("/proj"));
@@ -786,17 +826,11 @@ mod tests {
 
     #[test]
     fn round_trip_deny_all_no_filter() {
-        let msg = ClientMessage::DenyAll {
-            filter: None,
-            device_id: None,
-        };
+        let msg = ClientMessage::DenyAll { filter: None };
         let encoded = encode(&msg).unwrap();
         let decoded: ClientMessage = decode(&encoded).unwrap();
         match decoded {
-            ClientMessage::DenyAll {
-                filter,
-                device_id: _,
-            } => assert!(filter.is_none()),
+            ClientMessage::DenyAll { filter } => assert!(filter.is_none()),
             _ => panic!("unexpected variant"),
         }
     }
@@ -1283,42 +1317,93 @@ mod tests {
         }
     }
 
-    /// Decoding a ClientMessage that pre-dates the `device_id` field must
-    /// still succeed — the TUI never emits it, so all historical wire traffic
-    /// must continue to round-trip.
+    /// Legacy wire format (pre-envelope) embedded `device_id` on the variant
+    /// itself. The [`ClientCommand`] envelope flattens the body, so those
+    /// historical payloads still decode — the field lands on the envelope
+    /// instead of the variant, and the envelope's `device_id` is populated.
     #[test]
-    fn decode_approve_without_device_id_is_backward_compatible() {
+    fn decode_legacy_approve_with_inline_device_id_is_backward_compatible() {
+        let id = uuid::Uuid::new_v4();
+        let legacy = format!(
+            r#"{{"type":"approve","id":"{id}","always_allow":false,"device_id":"dev-abc"}}"#
+        );
+        let decoded: ClientCommand = decode(&legacy).unwrap();
+        match decoded.body {
+            ClientMessage::Approve { id: did, .. } => assert_eq!(did, id),
+            _ => panic!("unexpected variant"),
+        }
+        assert_eq!(
+            decoded.device_id.as_ref().map(|d| d.0.as_str()),
+            Some("dev-abc")
+        );
+    }
+
+    /// Payloads that pre-date both the envelope and the per-variant device_id
+    /// (i.e. bare approves from a legacy TUI) must still decode with
+    /// `device_id = None`.
+    #[test]
+    fn decode_legacy_approve_without_device_id_is_backward_compatible() {
         let id = uuid::Uuid::new_v4();
         let legacy = format!(r#"{{"type":"approve","id":"{id}","always_allow":false}}"#);
-        let decoded: ClientMessage = decode(&legacy).unwrap();
-        match decoded {
-            ClientMessage::Approve {
-                id: did, device_id, ..
-            } => {
-                assert_eq!(did, id);
-                assert!(
-                    device_id.is_none(),
-                    "missing device_id should default to None"
-                );
-            }
+        let decoded: ClientCommand = decode(&legacy).unwrap();
+        match decoded.body {
+            ClientMessage::Approve { id: did, .. } => assert_eq!(did, id),
+            _ => panic!("unexpected variant"),
+        }
+        assert!(decoded.device_id.is_none());
+    }
+
+    /// The envelope must elide `device_id` when None so encoding a
+    /// plain [`ClientMessage`] stays byte-equivalent to a
+    /// `ClientCommand { body, device_id: None }` — critical for existing
+    /// callers (TUI, tests) that keep emitting bare ClientMessages.
+    #[test]
+    fn envelope_device_id_omitted_when_none() {
+        let id = uuid::Uuid::new_v4();
+        let command = ClientCommand::new(ClientMessage::Deny { id, message: None });
+        let encoded = encode(&command).unwrap();
+        assert!(
+            !encoded.contains("device_id"),
+            "wire output should omit device_id when None: {encoded}"
+        );
+
+        // And the bare ClientMessage encoding must match the envelope's.
+        let bare = encode(&ClientMessage::Deny { id, message: None }).unwrap();
+        assert_eq!(
+            encoded, bare,
+            "envelope with None device_id must be byte-identical to bare ClientMessage"
+        );
+    }
+
+    #[test]
+    fn envelope_round_trip_with_device_id() {
+        let id = uuid::Uuid::new_v4();
+        let command = ClientCommand::new(ClientMessage::Approve {
+            id,
+            message: None,
+            updated_input: None,
+            always_allow: false,
+            additional_context: None,
+        })
+        .with_device_id(DeviceId::from("dev-phone-7"));
+        let encoded = encode(&command).unwrap();
+        assert!(encoded.contains("\"device_id\":\"dev-phone-7\""));
+        assert!(encoded.contains("\"type\":\"approve\""));
+        let decoded: ClientCommand = decode(&encoded).unwrap();
+        assert_eq!(decoded.device_id.unwrap().0, "dev-phone-7");
+        match decoded.body {
+            ClientMessage::Approve { id: did, .. } => assert_eq!(did, id),
             _ => panic!("unexpected variant"),
         }
     }
 
     #[test]
-    fn device_id_omitted_when_none() {
-        let id = uuid::Uuid::new_v4();
-        let msg = ClientMessage::Deny {
-            id,
-            message: None,
-            device_id: None,
-        };
-        let encoded = encode(&msg).unwrap();
-        // skip_serializing_if = None → field must not appear in wire output.
-        assert!(
-            !encoded.contains("device_id"),
-            "wire output should omit device_id when None: {encoded}"
-        );
+    fn device_id_newtype_wire_format_is_bare_string() {
+        let d = DeviceId::from("dev-42");
+        let j = serde_json::to_string(&d).unwrap();
+        assert_eq!(j, "\"dev-42\"");
+        let back: DeviceId = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.0, "dev-42");
     }
 
     #[test]

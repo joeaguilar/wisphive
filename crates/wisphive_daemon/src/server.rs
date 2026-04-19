@@ -465,13 +465,16 @@ async fn handle_tui(
             line = lines.next_line() => {
                 match line {
                     Ok(Some(text)) => {
-                        let msg: ClientMessage = match wisphive_protocol::decode(&text) {
-                            Ok(m) => m,
-                            Err(e) => {
-                                warn!("invalid TUI message: {e}");
-                                continue;
-                            }
-                        };
+                        let command: wisphive_protocol::ClientCommand =
+                            match wisphive_protocol::decode(&text) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    warn!("invalid TUI message: {e}");
+                                    continue;
+                                }
+                            };
+                        let _device_id = command.device_id.clone();
+                        let msg = command.body;
                         match msg {
                             // TODO(itr#213): enforce `_device_id` presence for sudo-class tools
                             // (Bash/Write/Edit/NotebookEdit/MultiEdit + ConfigChange). Today the
@@ -479,7 +482,7 @@ async fn handle_tui(
                             // from the TUI (local fs access = implicit fresh-auth). When
                             // ws_bridge.rs starts injecting device_id, this arm MUST call
                             // into the reauth gate instead of ignoring the field.
-                            ClientMessage::Approve { id, message, updated_input, always_allow, additional_context, device_id: _device_id } => {
+                            ClientMessage::Approve { id, message, updated_input, always_allow, additional_context } => {
                                 let rich = RichDecision {
                                     decision: Decision::Approve,
                                     message,
@@ -499,7 +502,7 @@ async fn handle_tui(
                                 }
                             }
                             // TODO(itr#213): honour `_device_id` for sudo-class deny paths.
-                            ClientMessage::Deny { id, message, device_id: _device_id } => {
+                            ClientMessage::Deny { id, message } => {
                                 let rich = RichDecision {
                                     decision: Decision::Deny,
                                     message,
@@ -514,14 +517,14 @@ async fn handle_tui(
                                 }
                             }
                             // TODO(itr#213): honour `_device_id` for sudo-class ask paths.
-                            ClientMessage::Ask { id, device_id: _device_id } => {
+                            ClientMessage::Ask { id } => {
                                 let mut q = ctx.queue.lock().await;
                                 q.resolve(id, RichDecision::from(Decision::Ask));
                                 // Ask/defer decisions are not persisted to the audit log
                             }
                             // TODO(itr#213): honour `_device_id` — bulk-approve from the web
                             // must re-check sudo for every matched pending decision.
-                            ClientMessage::ApproveAll { ref filter, device_id: _device_id } => {
+                            ClientMessage::ApproveAll { ref filter } => {
                                 let ids = {
                                     let mut q = ctx.queue.lock().await;
                                     q.resolve_all(filter, Decision::Approve)
@@ -534,7 +537,7 @@ async fn handle_tui(
                                 }
                             }
                             // TODO(itr#213): honour `_device_id` for bulk deny over web.
-                            ClientMessage::DenyAll { ref filter, device_id: _device_id } => {
+                            ClientMessage::DenyAll { ref filter } => {
                                 let ids = {
                                     let mut q = ctx.queue.lock().await;
                                     q.resolve_all(filter, Decision::Deny)
@@ -959,7 +962,7 @@ async fn handle_tui(
                             }
                             // TODO(itr#213): honour `_device_id` for ApprovePermission — a
                             // PermissionRequest approve is itself sudo-class on the web.
-                            ClientMessage::ApprovePermission { id, suggestion_index, message, device_id: _device_id } => {
+                            ClientMessage::ApprovePermission { id, suggestion_index, message } => {
                                 // Look up the selected suggestion from the queued request
                                 let selected = {
                                     let q = ctx.queue.lock().await;

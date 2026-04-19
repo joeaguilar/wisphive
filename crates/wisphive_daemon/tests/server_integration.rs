@@ -220,7 +220,6 @@ async fn non_hello_first_message_gets_error() {
         updated_input: None,
         always_allow: false,
         additional_context: None,
-        device_id: None,
     })
     .unwrap();
     writer.write_all(msg.as_bytes()).await.unwrap();
@@ -277,7 +276,6 @@ async fn hook_sends_request_tui_approves_hook_gets_response() {
         updated_input: None,
         always_allow: false,
         additional_context: None,
-        device_id: None,
     })
     .unwrap();
     tui_writer.write_all(approve.as_bytes()).await.unwrap();
@@ -324,7 +322,6 @@ async fn hook_sends_request_tui_denies_hook_gets_deny() {
     let deny = encode(&ClientMessage::Deny {
         id: req_id,
         message: None,
-        device_id: None,
     })
     .unwrap();
     tui_writer.write_all(deny.as_bytes()).await.unwrap();
@@ -373,7 +370,6 @@ async fn tui_receives_decision_resolved_after_approve() {
         updated_input: None,
         always_allow: false,
         additional_context: None,
-        device_id: None,
     })
     .unwrap();
     tui_writer.write_all(approve.as_bytes()).await.unwrap();
@@ -434,7 +430,6 @@ async fn multiple_hooks_queued_then_resolved_individually() {
         updated_input: None,
         always_allow: false,
         additional_context: None,
-        device_id: None,
     })
     .unwrap();
     tui_writer.write_all(approve2.as_bytes()).await.unwrap();
@@ -457,7 +452,6 @@ async fn multiple_hooks_queued_then_resolved_individually() {
     let deny1 = encode(&ClientMessage::Deny {
         id: id1,
         message: None,
-        device_id: None,
     })
     .unwrap();
     tui_writer.write_all(deny1.as_bytes()).await.unwrap();
@@ -510,11 +504,7 @@ async fn approve_all_resolves_all_pending_hooks() {
     }
 
     // TUI sends ApproveAll
-    let approve_all = encode(&ClientMessage::ApproveAll {
-        filter: None,
-        device_id: None,
-    })
-    .unwrap();
+    let approve_all = encode(&ClientMessage::ApproveAll { filter: None }).unwrap();
     tui_writer.write_all(approve_all.as_bytes()).await.unwrap();
 
     // All hooks should get Approve
@@ -556,7 +546,6 @@ async fn hook_sends_non_decision_request_after_hello_gets_error() {
         updated_input: None,
         always_allow: false,
         additional_context: None,
-        device_id: None,
     })
     .unwrap();
     writer.write_all(msg.as_bytes()).await.unwrap();
