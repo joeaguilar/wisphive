@@ -3,17 +3,29 @@ mod security;
 pub mod tls;
 mod ws_bridge;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::WebSocketUpgrade;
 use axum::extract::ws::WebSocket;
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use rust_embed::RustEmbed;
-use security::{SecurityConfig, security_middleware};
+use security::{AuthedDevice, ClientIp, SecurityConfig, security_middleware};
+use serde::{Deserialize, Serialize};
 use tracing::info;
+use wisphive_daemon::state::StateDb;
+
+/// Hard deadline on Argon2 verify. itr#245: without it, a stalled verify
+/// pins a per-IP throttle slot for the full [`STALE_IN_FLIGHT_AGE`] (5 min)
+/// and self-DoSes the originating IP. 5 s is generous — our Argon2 params
+/// (m=19_456 KiB, t=2, p=1) complete in ~50 ms on a laptop; anything past
+/// this is a stalled worker thread, not slow hardware.
+///
+/// [`STALE_IN_FLIGHT_AGE`]: auth::LoginThrottle
+const VERIFY_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Shared server state.
 #[derive(Clone)]
@@ -29,33 +41,51 @@ struct AppState {
 struct FrontendAssets;
 
 /// Serve an embedded static file, falling back to index.html for SPA routing.
+///
+/// Intentionally does NOT serve the SPA shell for `/api/*` or `/ws` paths:
+/// those namespaces are API surface. An unregistered API path falling
+/// through to index.html would hand HTML to an API client (confusing) and,
+/// worse, would mask a 404 for a route the caller expected to exist (e.g.
+/// the retired `/api/web-token`, which acceptance for itr#213 requires
+/// resolve as 404, not 200-with-HTML).
 async fn static_handler(uri: axum::http::Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
 
     if let Some(file) = FrontendAssets::get(path) {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
-        (
+        return (
             [(axum::http::header::CONTENT_TYPE, mime.as_ref())],
             file.data.to_vec(),
         )
-            .into_response()
-    } else if let Some(file) = FrontendAssets::get("index.html") {
+            .into_response();
+    }
+
+    let request_path = uri.path();
+    if request_path.starts_with("/api/") || request_path == "/ws" {
+        return (axum::http::StatusCode::NOT_FOUND, "not found").into_response();
+    }
+
+    if let Some(file) = FrontendAssets::get("index.html") {
         Html(std::str::from_utf8(&file.data).unwrap_or("").to_string()).into_response()
     } else {
         (axum::http::StatusCode::NOT_FOUND, "not found").into_response()
     }
 }
 
-/// WebSocket upgrade handler — bridges browser ↔ daemon.
+/// WebSocket upgrade handler — bridges browser ↔ daemon. The `AuthedDevice`
+/// extractor gates the handler: if the security middleware didn't attach one,
+/// axum returns 401 before we get here, so reaching this function means the
+/// device is verified and non-revoked.
 async fn ws_handler(
     ws: WebSocketUpgrade,
     axum::extract::State(state): axum::extract::State<AppState>,
+    axum::Extension(device): axum::Extension<AuthedDevice>,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_ws(socket, state.socket_path))
+    ws.on_upgrade(move |socket| handle_ws(socket, state.socket_path, device))
 }
 
-async fn handle_ws(ws: WebSocket, socket_path: PathBuf) {
-    if let Err(e) = ws_bridge::bridge(ws, &socket_path).await {
+async fn handle_ws(ws: WebSocket, socket_path: PathBuf, device: AuthedDevice) {
+    if let Err(e) = ws_bridge::bridge(ws, &socket_path, device).await {
         tracing::warn!("WebSocket bridge error: {e}");
     }
 }
@@ -95,23 +125,164 @@ async fn put_config(
     }
 }
 
-/// GET /api/web-token — bootstrap endpoint so the frontend can read the
-/// per-process bearer token. Gated by Origin + Host checks in the security
-/// middleware (it bypasses the bearer check to break the chicken-and-egg).
-async fn get_web_token(axum::extract::State(state): axum::extract::State<AppState>) -> Response {
-    let body = serde_json::json!({ "token": state.security.token() });
-    (
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
-        body.to_string(),
-    )
-        .into_response()
+#[derive(Debug, Deserialize)]
+struct LoginRequest {
+    password: String,
+    /// Friendly label stored alongside the device token so the operator can
+    /// tell devices apart on the dashboard (e.g. "iphone", "laptop-work").
+    /// Optional; falls back to a truncated device id.
+    #[serde(default)]
+    device_name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct LoginResponse {
+    device_id: String,
+    /// The raw bearer token — the client MUST save this; it's not retrievable
+    /// from the server afterwards. The server stores only `sha256(raw)`.
+    token: String,
+}
+
+/// POST /api/auth/login — the credential bootstrap endpoint.
+///
+/// Flow:
+/// 1. Reserve a per-IP in-flight slot via [`LoginThrottle::try_begin_attempt`].
+///    On `Err`, return `429 Too Many Requests` with a `Retry-After` header.
+/// 2. Fetch the stored Argon2 hash. If none is set (first-run host), treat
+///    it as an invalid-credentials failure rather than leaking the state.
+/// 3. Verify the presented password against the hash inside a
+///    [`tokio::task::spawn_blocking`] wrapped in `tokio::time::timeout`
+///    ([`VERIFY_DEADLINE`]). A stalled verify would otherwise pin the
+///    in-flight slot for `STALE_IN_FLIGHT_AGE` (5 min) and self-DoS the IP.
+/// 4. On success, generate a fresh device token and store its hash.
+///
+/// The throttle guard is consumed explicitly on every code path that can
+/// reach here (`record_success` on the happy path, `record_failure` on every
+/// early return). If the request future itself is cancelled — browser
+/// disconnects mid-verify, hyper drops the conn — the guard's `Drop` runs
+/// fail-closed and records an implicit failure. We intentionally DON'T
+/// gate `record_failure` behind a status check; letting Drop handle
+/// "everything except the paths I wrote" would make it an `if happy { ... }
+/// else { implicit drop }` pattern, which the `consume` flag's placement
+/// makes subtly racy (see auth.rs::AttemptGuard docs).
+async fn post_auth_login(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    client_ip: ClientIp,
+    axum::Json(body): axum::Json<LoginRequest>,
+) -> Response {
+    let security = state.security.clone();
+    let throttle = security.throttle().clone();
+    let db = security.state_db().clone();
+
+    // (1) Reserve in-flight slot or 429.
+    let guard = match throttle.try_begin_attempt(client_ip.0).await {
+        Ok(g) => g,
+        Err(decision) => {
+            let retry = decision
+                .retry_after
+                .unwrap_or(Duration::from_secs(1))
+                .as_secs()
+                .max(1);
+            return (
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                [("retry-after", retry.to_string())],
+                "throttled",
+            )
+                .into_response();
+        }
+    };
+
+    // (2) Fetch stored password hash. Treat "no password set" as a failed
+    // login — leaking the absence lets an attacker distinguish first-run
+    // hosts (which admit any POST) from hardened ones.
+    let phc = match db.get_web_password_hash().await {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            guard.record_failure().await;
+            return (axum::http::StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read web password hash");
+            guard.record_failure().await;
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+            )
+                .into_response();
+        }
+    };
+
+    // (3) Verify under a hard deadline.
+    //
+    // Argon2id verify is CPU-bound (~50 ms at our params); run it on the
+    // blocking pool so the async runtime keeps responding to other
+    // requests. Moving the password into the closure means we don't hold
+    // a reference across await points — the spawn_blocking JoinHandle is
+    // 'static.
+    let password = body.password.clone();
+    let phc_owned = phc.clone();
+    let verify_handle =
+        tokio::task::spawn_blocking(move || auth::verify_password(&password, &phc_owned));
+    let verified = match tokio::time::timeout(VERIFY_DEADLINE, verify_handle).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(join_err)) => {
+            tracing::warn!(error = %join_err, "password verify task panicked");
+            false
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                deadline_secs = VERIFY_DEADLINE.as_secs(),
+                "password verify exceeded deadline"
+            );
+            false
+        }
+    };
+
+    if !verified {
+        guard.record_failure().await;
+        return (axum::http::StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+    }
+
+    // (4) Issue a fresh device token. Store only the hash.
+    let id = uuid::Uuid::new_v4().to_string();
+    let name = body.device_name.clone().unwrap_or_else(|| {
+        let short = id.get(..8).unwrap_or("unknown");
+        format!("device-{short}")
+    });
+    let token = auth::generate_device_token();
+    if let Err(e) = db.insert_web_device(&id, &name, &token.hash_hex).await {
+        tracing::warn!(error = %e, "failed to persist new device token");
+        guard.record_failure().await;
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "could not record device",
+        )
+            .into_response();
+    }
+
+    // Best-effort audit row; don't fail the login on audit error.
+    let _ = db
+        .append_web_audit(
+            "web_login_success",
+            Some(&id),
+            Some(&client_ip.0.to_string()),
+            None,
+        )
+        .await;
+
+    guard.record_success().await;
+    axum::Json(LoginResponse {
+        device_id: id,
+        token: token.raw,
+    })
+    .into_response()
 }
 
 fn build_router(state: AppState, dev_mode: bool) -> Router {
     let security = state.security.clone();
     let api = Router::new()
         .route("/ws", get(ws_handler))
-        .route("/api/web-token", get(get_web_token))
+        .route("/api/auth/login", post(post_auth_login))
         .route("/api/config", get(get_config).put(put_config));
 
     let router = if dev_mode {
@@ -143,13 +314,15 @@ pub async fn serve(
         .unwrap_or(std::path::Path::new("."))
         .to_path_buf();
     let config_path = home_dir.join("config.json");
+    let db_path = home_dir.join("wisphive.db");
 
-    let security = SecurityConfig::build(&home_dir, port, dev_mode)?;
-    let token_path = home_dir.join("web.token");
-    info!(
-        token_path = %token_path.display(),
-        "web security: bearer token written (mode 0600); include it as ?token= on /ws or Authorization: Bearer on /api/*"
-    );
+    // Open the same SQLite file the daemon owns; WAL mode + connection
+    // pooling means multiple handles in the same process share snapshots
+    // safely.
+    let state_db = StateDb::open(db_path.to_string_lossy().as_ref()).await?;
+
+    let bind_host: IpAddr = Ipv4Addr::from(host).into();
+    let security = SecurityConfig::build(state_db, bind_host, port, dev_mode)?;
 
     let state = AppState {
         socket_path,
@@ -163,7 +336,11 @@ pub async fn serve(
     info!(%addr, dev_mode, "web server starting");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 

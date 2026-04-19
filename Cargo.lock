@@ -4076,6 +4076,7 @@ dependencies = [
  "tracing",
  "uuid",
  "webauthn-rs",
+ "wisphive_daemon",
  "wisphive_protocol",
  "x509-parser",
 ]

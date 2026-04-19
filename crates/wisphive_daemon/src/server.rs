@@ -473,16 +473,16 @@ async fn handle_tui(
                                     continue;
                                 }
                             };
-                        let _device_id = command.device_id.clone();
+                        // Every decision arm below logs `%device_id` (None = local
+                        // TUI, implicitly trusted). The sudo-class gate that
+                        // re-checks freshness before honouring a web-origin
+                        // approve lives in itr#218's ws_bridge work and hooks
+                        // into this same `device_id`.
+                        let device_id = command.device_id.clone();
                         let msg = command.body;
                         match msg {
-                            // TODO(itr#213): enforce `_device_id` presence for sudo-class tools
-                            // (Bash/Write/Edit/NotebookEdit/MultiEdit + ConfigChange). Today the
-                            // web bridge does not exist yet, so every decision command comes
-                            // from the TUI (local fs access = implicit fresh-auth). When
-                            // ws_bridge.rs starts injecting device_id, this arm MUST call
-                            // into the reauth gate instead of ignoring the field.
                             ClientMessage::Approve { id, message, updated_input, always_allow, additional_context } => {
+                                info!(?device_id, %id, "approve");
                                 let rich = RichDecision {
                                     decision: Decision::Approve,
                                     message,
@@ -501,8 +501,8 @@ async fn handle_tui(
                                     warn!("eager persist failed for {id}: {e}");
                                 }
                             }
-                            // TODO(itr#213): honour `_device_id` for sudo-class deny paths.
                             ClientMessage::Deny { id, message } => {
+                                info!(?device_id, %id, "deny");
                                 let rich = RichDecision {
                                     decision: Decision::Deny,
                                     message,
@@ -516,33 +516,30 @@ async fn handle_tui(
                                     warn!("eager persist failed for {id}: {e}");
                                 }
                             }
-                            // TODO(itr#213): honour `_device_id` for sudo-class ask paths.
                             ClientMessage::Ask { id } => {
+                                info!(?device_id, %id, "ask");
                                 let mut q = ctx.queue.lock().await;
                                 q.resolve(id, RichDecision::from(Decision::Ask));
                                 // Ask/defer decisions are not persisted to the audit log
                             }
-                            // TODO(itr#213): honour `_device_id` — bulk-approve from the web
-                            // must re-check sudo for every matched pending decision.
                             ClientMessage::ApproveAll { ref filter } => {
                                 let ids = {
                                     let mut q = ctx.queue.lock().await;
                                     q.resolve_all(filter, Decision::Approve)
                                 };
-                                info!("approved {} decisions", ids.len());
+                                info!(?device_id, count = ids.len(), "approve_all");
                                 for id in ids {
                                     if let Err(e) = ctx.state_db.resolve_pending(id, Decision::Approve).await {
                                         warn!("eager persist failed for {id}: {e}");
                                     }
                                 }
                             }
-                            // TODO(itr#213): honour `_device_id` for bulk deny over web.
                             ClientMessage::DenyAll { ref filter } => {
                                 let ids = {
                                     let mut q = ctx.queue.lock().await;
                                     q.resolve_all(filter, Decision::Deny)
                                 };
-                                info!("denied {} decisions", ids.len());
+                                info!(?device_id, count = ids.len(), "deny_all");
                                 for id in ids {
                                     if let Err(e) = ctx.state_db.resolve_pending(id, Decision::Deny).await {
                                         warn!("eager persist failed for {id}: {e}");
@@ -960,9 +957,8 @@ async fn handle_tui(
                                     }
                                 });
                             }
-                            // TODO(itr#213): honour `_device_id` for ApprovePermission — a
-                            // PermissionRequest approve is itself sudo-class on the web.
                             ClientMessage::ApprovePermission { id, suggestion_index, message } => {
+                                info!(?device_id, %id, suggestion_index, "approve_permission");
                                 // Look up the selected suggestion from the queued request
                                 let selected = {
                                     let q = ctx.queue.lock().await;

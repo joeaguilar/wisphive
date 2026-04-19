@@ -167,6 +167,12 @@ pub struct WebAuditRow {
 }
 
 /// Manages the SQLite state database for crash recovery and audit.
+///
+/// Cheap to clone — the internal [`SqlitePool`] is an Arc-backed connection
+/// pool, so cloning hands out another handle to the same pool rather than
+/// opening new connections. Web auth plumbing relies on this to share a
+/// single DB handle between the axum middleware and per-request handlers.
+#[derive(Clone)]
 pub struct StateDb {
     pool: SqlitePool,
 }

@@ -1,65 +1,146 @@
 //! Security layer for the web UI.
 //!
-//! Gates the /ws and /api routes behind three checks:
+//! Gates `/ws` and `/api/*` routes behind three checks:
 //!
 //! 1. **Host header allowlist** — defeats DNS rebinding. The daemon is bound
-//!    to localhost (or 0.0.0.0 for LAN), but a rebound domain would send a
-//!    non-localhost `Host` header, which we reject.
+//!    to localhost (or a LAN IP), but a rebound domain would send a
+//!    non-local `Host` header, which we reject.
 //! 2. **Origin header allowlist** — when present, must match our configured
 //!    origins. Same-origin navigations to `/` don't include `Origin`, so we
 //!    don't require it — but any cross-origin fetch (CSRF, WebSocket) will.
-//! 3. **Bearer token** — per-process, 32 random bytes, base64url. Written
-//!    0600 to `~/.wisphive/web.token`. Required on /ws (via `?token=` query)
-//!    and /api/* (via `Authorization: Bearer` or `?token=` query).
+//! 3. **Device bearer token** — per-device random bearer tokens issued by
+//!    `/api/auth/login` after a valid password. Only the SHA-256 hash is
+//!    persisted in `web_devices`; the raw token is shown to the client
+//!    exactly once. Every `/api/*` (except `/api/auth/login`) and `/ws`
+//!    request MUST carry a matching, non-revoked token via
+//!    `Authorization: Bearer <raw>` or `?token=<raw>`.
 //!
 //! Together these defeat the CVSS ~9.0 vector where a malicious web page
 //! opens `ws://127.0.0.1:3100/ws` and drives the daemon with full Tui
 //! privileges.
+//!
+//! The old per-process `web.token` file and `/api/web-token` bootstrap are
+//! retired: they shipped one shared bearer per daemon, so a stolen token
+//! couldn't be narrowed (every browser shared it) or revoked (restart the
+//! daemon and everyone else loses access too). Per-device tokens fix both.
 
-use std::path::{Path, PathBuf};
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::{FromRequestParts, Request, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use base64::Engine;
-use rand::RngCore;
+use wisphive_daemon::state::{StateDb, WebDeviceRow};
+use wisphive_protocol::DeviceId;
 
-/// Everything the security middleware needs. Cheap to clone (Arc internally).
+use crate::auth::{LoginThrottle, sha256_hex};
+
+/// Authenticated web device context attached to a request by the security
+/// middleware. Handlers and the ws_bridge read this from
+/// `request.extensions()` to learn which device is driving.
+#[derive(Clone, Debug)]
+pub struct AuthedDevice {
+    pub id: DeviceId,
+    /// Operator-chosen device label, surfaced in audit logs + the (future)
+    /// devices dashboard. Kept as an owned String so the extension is
+    /// `'static` and can outlive the DB row.
+    #[allow(dead_code)]
+    pub name: String,
+}
+
+/// Remote IP for the current request. Populated by [`security_middleware`]
+/// from `ConnectInfo<SocketAddr>` when axum is wired with
+/// `into_make_service_with_connect_info`, or from a synthetic `ClientIp`
+/// request extension in tests. Handlers read this via the
+/// [`FromRequestParts`] impl below.
+#[derive(Copy, Clone, Debug)]
+pub struct ClientIp(pub IpAddr);
+
+impl<S: Send + Sync> FromRequestParts<S> for ClientIp {
+    type Rejection = (StatusCode, &'static str);
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        if let Some(ip) = parts.extensions.get::<ClientIp>() {
+            return Ok(*ip);
+        }
+        if let Some(ci) = parts
+            .extensions
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        {
+            return Ok(ClientIp(ci.0.ip()));
+        }
+        // Fall back to loopback so local smoke tests and the oneshot
+        // test harness keep working without a real TCP listener. In
+        // production the middleware will have inserted ClientIp above,
+        // so we never hit this branch.
+        Ok(ClientIp(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)))
+    }
+}
+
+/// Everything the security middleware + login handler need. Cheap to clone
+/// (Arc internally).
 #[derive(Clone)]
 pub struct SecurityConfig {
     inner: Arc<SecurityConfigInner>,
 }
 
 struct SecurityConfigInner {
-    token: String,
     allowed_origins: Vec<String>,
     allowed_hosts: Vec<String>,
+    state_db: StateDb,
+    throttle: LoginThrottle,
 }
 
 impl SecurityConfig {
-    /// Build a security config. Generates a fresh token, writes it 0600 to
-    /// `<home_dir>/web.token`, and seeds the host/origin allowlists for
-    /// `127.0.0.1:<port>` and `localhost:<port>`.
+    /// Build a security config.
+    ///
+    /// Seeds the host/origin allowlists for `127.0.0.1:<port>`,
+    /// `localhost:<port>`, and — when `bind_host` is `0.0.0.0` or another
+    /// non-loopback address — every additional hostname/IP that
+    /// [`crate::tls::enumerate_lan_urls`] would advertise in the startup
+    /// banner. That keeps the allowlist in lockstep with the URLs users are
+    /// told to type on their phones: if we tell them the URL, we accept it.
     ///
     /// Dev mode also allows `http://localhost:5173` / `http://127.0.0.1:5173`
     /// (Vite's default dev port) as origins, because in dev the frontend is
     /// served cross-origin by Vite.
     ///
     /// `WISPHIVE_WEB_ALLOWED_ORIGINS` and `WISPHIVE_WEB_ALLOWED_HOSTS` env
-    /// vars (comma-separated) extend the allowlists — required when binding
-    /// to `0.0.0.0` for LAN access, since we can't guess the client's IP.
-    pub fn build(home_dir: &Path, port: u16, dev_mode: bool) -> anyhow::Result<Self> {
-        let token = generate_token();
-        write_token_file(home_dir, &token)?;
-
+    /// vars (comma-separated) extend the allowlists further — use for
+    /// reverse-proxy setups that bind something the auto-LAN enumeration
+    /// can't see.
+    pub fn build(
+        state_db: StateDb,
+        bind_host: IpAddr,
+        port: u16,
+        dev_mode: bool,
+    ) -> anyhow::Result<Self> {
         let mut allowed_origins = vec![
             format!("http://127.0.0.1:{port}"),
             format!("http://localhost:{port}"),
+            format!("https://127.0.0.1:{port}"),
+            format!("https://localhost:{port}"),
         ];
         let mut allowed_hosts = vec![format!("127.0.0.1:{port}"), format!("localhost:{port}")];
+
+        // Auto-LAN: mirror whatever enumerate_lan_urls advertises to the
+        // user as valid phone URLs. Without this, `wisphive web --host 0.0.0.0`
+        // would print `https://192.168.1.7:3100` and then reject it at the
+        // Host-header check.
+        for url in crate::tls::enumerate_lan_urls(bind_host, port) {
+            if !allowed_origins.contains(&url) {
+                allowed_origins.push(url.clone());
+            }
+            if let Some(host_port) = url.strip_prefix("https://") {
+                let host_port = host_port.to_string();
+                if !allowed_hosts.contains(&host_port) {
+                    allowed_hosts.push(host_port);
+                }
+            }
+        }
 
         if dev_mode {
             allowed_origins.push("http://localhost:5173".to_string());
@@ -79,32 +160,39 @@ impl SecurityConfig {
 
         Ok(Self {
             inner: Arc::new(SecurityConfigInner {
-                token,
                 allowed_origins,
                 allowed_hosts,
+                state_db,
+                throttle: LoginThrottle::new(),
             }),
         })
     }
 
-    /// Construct a config with an explicit token. Used for tests so we can
-    /// assert exactly which token the middleware expects.
+    /// Construct a config with explicit allowlists + an externally-owned DB.
+    /// Used by tests so we can assert exact middleware behaviour without a
+    /// live TCP listener.
     #[cfg(test)]
     pub fn for_test(
-        token: String,
         allowed_origins: Vec<String>,
         allowed_hosts: Vec<String>,
+        state_db: StateDb,
     ) -> Self {
         Self {
             inner: Arc::new(SecurityConfigInner {
-                token,
                 allowed_origins,
                 allowed_hosts,
+                state_db,
+                throttle: LoginThrottle::new(),
             }),
         }
     }
 
-    pub fn token(&self) -> &str {
-        &self.inner.token
+    pub fn state_db(&self) -> &StateDb {
+        &self.inner.state_db
+    }
+
+    pub fn throttle(&self) -> &LoginThrottle {
+        &self.inner.throttle
     }
 
     fn check_host(&self, headers: &HeaderMap) -> bool {
@@ -126,35 +214,42 @@ impl SecurityConfig {
         self.inner.allowed_origins.iter().any(|o| o == origin)
     }
 
-    fn check_token(&self, headers: &HeaderMap, query: Option<&str>) -> bool {
-        // Try Authorization: Bearer <token>
-        if let Some(auth) = headers.get("authorization").and_then(|h| h.to_str().ok())
-            && let Some(token) = auth
-                .strip_prefix("Bearer ")
-                .or_else(|| auth.strip_prefix("bearer "))
-            && constant_time_eq(token.as_bytes(), self.inner.token.as_bytes())
+    /// Look up the presented token against `web_devices`. Returns the device
+    /// row on a valid, non-revoked match.
+    ///
+    /// The presented token is hashed with SHA-256 before the DB lookup —
+    /// the raw token never reaches the daemon crate, and `find_web_device_
+    /// by_token_hash` filters `revoked_at IS NULL` server-side so a revoked
+    /// token and a never-seen token are indistinguishable from here. That
+    /// matches the handoff's "no info leak" rule: both fall through as
+    /// `None` and the caller returns 401.
+    async fn lookup_device_token(&self, presented_raw: &str) -> Option<WebDeviceRow> {
+        let presented_hash = sha256_hex(presented_raw.as_bytes());
+        match self
+            .inner
+            .state_db
+            .find_web_device_by_token_hash(&presented_hash)
+            .await
         {
-            return true;
+            Ok(Some(row)) => Some(row),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, "device token lookup failed");
+                None
+            }
         }
-
-        // Try ?token= query param. Browsers can't set Authorization on
-        // WebSocket upgrades, so this is the primary path for /ws.
-        if let Some(q) = query
-            && let Some(token) = extract_query_param(q, "token")
-            && constant_time_eq(token.as_bytes(), self.inner.token.as_bytes())
-        {
-            return true;
-        }
-
-        false
     }
 }
 
 /// Axum middleware — gates requests based on SecurityConfig. Returns 403 for
-/// bad Host/Origin, 401 for missing/bad bearer token on protected paths.
+/// bad Host/Origin, 401 for missing/bad device token on protected paths.
+///
+/// On valid authentication, attaches an [`AuthedDevice`] extension to the
+/// request so downstream handlers (and the ws_bridge) can learn which device
+/// is driving without re-running the lookup.
 pub async fn security_middleware(
     State(security): State<SecurityConfig>,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: Next,
 ) -> Response {
     let headers = req.headers().clone();
@@ -179,38 +274,94 @@ pub async fn security_middleware(
         return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
     }
 
-    if path_requires_bearer(path) && !security.check_token(&headers, uri.query()) {
-        tracing::warn!(?path, "rejecting request: missing or invalid bearer token");
-        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+    // Propagate ConnectInfo into a typed ClientIp extension so handlers can
+    // pull it via one path regardless of whether they're under the real
+    // axum::serve or a oneshot test request that seeded ClientIp directly.
+    if req.extensions().get::<ClientIp>().is_none()
+        && let Some(ci) = req
+            .extensions()
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+    {
+        let ip = ClientIp(ci.0.ip());
+        req.extensions_mut().insert(ip);
+    }
+
+    if path_requires_device_token(path) {
+        let token = match extract_presented_token(&headers, uri.query()) {
+            Some(t) => t,
+            None => {
+                tracing::warn!(?path, "rejecting request: missing device token");
+                return (StatusCode::UNAUTHORIZED, "missing device token").into_response();
+            }
+        };
+        let device = match security.lookup_device_token(&token).await {
+            Some(row) => row,
+            None => {
+                tracing::warn!(?path, "rejecting request: unknown or revoked device token");
+                return (StatusCode::UNAUTHORIZED, "invalid device token").into_response();
+            }
+        };
+
+        // Keep the operator's device list meaningful: inline rather than
+        // spawned, because the query is ~1 ms and spawning forces us to
+        // move `security` into a 'static future (which the borrow checker
+        // then keeps alive past the middleware's natural lifetime).
+        let ip_str = req.extensions().get::<ClientIp>().map(|c| c.0.to_string());
+        if let Err(e) = security
+            .state_db()
+            .touch_web_device(&device.id, ip_str.as_deref())
+            .await
+        {
+            tracing::warn!(device_id = %device.id, error = %e, "touch_web_device failed");
+        }
+
+        req.extensions_mut().insert(AuthedDevice {
+            id: DeviceId(device.id),
+            name: device.name,
+        });
     }
 
     next.run(req).await
 }
 
-/// Which paths require a bearer token. /api/web-token is the chicken-and-egg
-/// bootstrap — it's origin+host-gated but not bearer-gated, so the frontend
-/// can fetch the token on startup.
-fn path_requires_bearer(path: &str) -> bool {
+/// Which paths require a device token. `/api/auth/login` is the credential
+/// bootstrap — it's origin+host-gated and throttled, but obviously can't
+/// require a device token since it's how you GET one.
+///
+/// `/api/web-token` is the retired per-process bootstrap route. We
+/// deliberately exempt it from the gate even though the router no longer
+/// handles it, so that the fallback (static handler / axum default) can
+/// return a clean `404 Not Found` instead of a misleading `401
+/// Unauthorized`. A 401 would tell clients "this path is a real thing, you
+/// just can't see it" — exactly the opposite of the signal we want: that
+/// the endpoint is gone and callers should move to `/api/auth/login`.
+pub(crate) fn path_requires_device_token(path: &str) -> bool {
     if path == "/ws" {
         return true;
     }
-    if path == "/api/web-token" {
+    if path == "/api/auth/login" || path == "/api/web-token" {
         return false;
     }
     path.starts_with("/api/")
 }
 
-/// Constant-time byte comparison — the simple `==` operator leaks timing
-/// information that can be amplified to recover tokens one byte at a time.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
+/// Read a presented token from `Authorization: Bearer <raw>` or `?token=<raw>`.
+/// Browsers can't set Authorization on WebSocket upgrades, so the query
+/// form is the primary path for `/ws`.
+fn extract_presented_token(headers: &HeaderMap, query: Option<&str>) -> Option<String> {
+    if let Some(auth) = headers.get("authorization").and_then(|h| h.to_str().ok())
+        && let Some(token) = auth
+            .strip_prefix("Bearer ")
+            .or_else(|| auth.strip_prefix("bearer "))
+    {
+        return Some(token.to_string());
     }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+    if let Some(q) = query
+        && let Some(token) = extract_query_param(q, "token")
+    {
+        return Some(token.to_string());
     }
-    diff == 0
+    None
 }
 
 /// Extract `key=value` from a URL query string without pulling in a full URL
@@ -227,66 +378,22 @@ fn extract_query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
-fn generate_token() -> String {
-    let mut bytes = [0u8; 32];
-    rand::rng().fill_bytes(&mut bytes);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-}
-
-fn token_path(home_dir: &Path) -> PathBuf {
-    home_dir.join("web.token")
-}
-
-#[cfg(unix)]
-fn write_token_file(home_dir: &Path, token: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    std::fs::create_dir_all(home_dir)?;
-    let path = token_path(home_dir);
-
-    // Remove first so we don't inherit wider permissions from a previous run
-    // with a different mode.
-    let _ = std::fs::remove_file(&path);
-
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)?;
-    file.write_all(token.as_bytes())?;
-    file.write_all(b"\n")?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_token_file(home_dir: &Path, token: &str) -> std::io::Result<()> {
-    std::fs::create_dir_all(home_dir)?;
-    std::fs::write(token_path(home_dir), format!("{token}\n"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn generate_token_produces_unique_base64url() {
-        let a = generate_token();
-        let b = generate_token();
-        assert_ne!(a, b);
-        // base64url of 32 bytes with no padding is 43 chars.
-        assert_eq!(a.len(), 43);
-        assert!(
-            a.chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        );
-    }
-
-    #[test]
-    fn constant_time_eq_works() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"abcd"));
+    fn path_requires_device_token_rules() {
+        assert!(path_requires_device_token("/ws"));
+        assert!(path_requires_device_token("/api/config"));
+        assert!(path_requires_device_token("/api/devices"));
+        assert!(!path_requires_device_token("/api/auth/login"));
+        // Retired bootstrap route is exempt so the router's fallback
+        // can 404 cleanly instead of the gate 401-ing first.
+        assert!(!path_requires_device_token("/api/web-token"));
+        assert!(!path_requires_device_token("/"));
+        assert!(!path_requires_device_token("/index.html"));
+        assert!(!path_requires_device_token("/assets/foo.js"));
     }
 
     #[test]
@@ -300,38 +407,31 @@ mod tests {
     }
 
     #[test]
-    fn path_requires_bearer_rules() {
-        assert!(path_requires_bearer("/ws"));
-        assert!(path_requires_bearer("/api/config"));
-        assert!(!path_requires_bearer("/api/web-token"));
-        assert!(!path_requires_bearer("/"));
-        assert!(!path_requires_bearer("/index.html"));
-        assert!(!path_requires_bearer("/assets/foo.js"));
+    fn extract_presented_token_prefers_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer header-token".parse().unwrap());
+        assert_eq!(
+            extract_presented_token(&headers, Some("token=query-token")).as_deref(),
+            Some("header-token")
+        );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn write_token_file_is_0600() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        write_token_file(tmp.path(), "abc").unwrap();
-        let meta = std::fs::metadata(tmp.path().join("web.token")).unwrap();
-        let mode = meta.permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "expected 0600, got {:o}", mode);
+    fn extract_presented_token_falls_back_to_query() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            extract_presented_token(&headers, Some("token=query-token")).as_deref(),
+            Some("query-token")
+        );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn write_token_file_overwrites_with_new_perms() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("web.token");
-        // Pre-create with wide perms
-        std::fs::write(&path, "old").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
-        write_token_file(tmp.path(), "new").unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "new");
+    fn extract_presented_token_accepts_lowercase_bearer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "bearer lc-token".parse().unwrap());
+        assert_eq!(
+            extract_presented_token(&headers, None).as_deref(),
+            Some("lc-token")
+        );
     }
 }

@@ -116,7 +116,7 @@ pub fn verify_device_token(presented_raw: &str, stored_hash_hex: &str) -> bool {
 }
 
 /// SHA-256 → lowercase hex.
-fn sha256_hex(input: &[u8]) -> String {
+pub(crate) fn sha256_hex(input: &[u8]) -> String {
     let digest = Sha256::digest(input);
     let mut out = String::with_capacity(digest.len() * 2);
     for b in digest.iter() {
