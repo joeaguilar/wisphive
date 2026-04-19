@@ -11,28 +11,47 @@ Wisphive is a multiplexed AI agent control plane that gates tool calls from AI a
 ```bash
 cargo build --workspace          # Build all crates (debug)
 cargo build --release            # Build release binaries
-cargo test --workspace           # Run all tests (15 total: 12 integration, 3 unit)
+cargo test --workspace           # Run all tests
 cargo test -p wisphive_daemon    # Test a single crate
 cargo test server_cleans_up      # Run a single test by name
-cargo clippy --workspace         # Lint
+cargo clippy --workspace -- -D warnings   # Lint (must be warning-free)
+cargo fmt --all                  # Format
 ./install.sh                     # Build release + install to ~/.cargo/bin + codesign on macOS
 ```
 
-Two binaries are produced: `wisphive` (CLI/daemon/TUI) and `wisphive-hook` (Claude Code hook subprocess).
+Prefer `just <task>` for common workflows — see `justfile` for the full list (`build`, `test`, `clippy`, `daemon`, `tui`, `web`, `web-dev`, `frontend-dev`, `frontend-build`, `bootstrap`, `reinstall`, `doctor`, `off`, etc.).
+
+Two binaries are produced: `wisphive` (CLI/daemon/TUI/web) and `wisphive-hook` (Claude Code hook subprocess).
+
+### Frontend
+
+The web UI lives in `crates/wisphive_web/frontend` (React 19 + TypeScript + Vite, with `xterm.js` for embedded terminals).
+
+```bash
+just frontend-install    # npm install
+just frontend-dev        # Vite dev server on :5173 — pair with `just web-dev`
+just frontend-build      # Production build → frontend/dist/ (embedded via rust-embed)
+just frontend-lint       # ESLint
+```
+
+In production (`wisphive web` or `wisphive daemon start --web`) the Rust binary serves the embedded `dist/` assets and the WebSocket bridge from one process. In dev (`--dev`), it serves only `/ws` and expects Vite to serve the UI.
 
 ## Architecture
 
 ```
-Claude Code → wisphive-hook (subprocess) → Unix socket → wisphive daemon → TUI + passive notification
+Claude Code → wisphive-hook (subprocess) → Unix socket → wisphive daemon → TUI + web UI + passive notification
 ```
 
-Six workspace crates with clear dependency flow:
+`wisphive-hook` is installed as both `PreToolUse` (blocks for decision) and `PostToolUse` (audit trail) in the project's `.claude/settings.json`.
 
-- **wisphive_protocol** — Shared types and newline-delimited JSON wire protocol. `DecisionRequest`, `Decision`, `ClientMessage`/`ServerMessage`. All other crates depend on this.
-- **wisphive_daemon** — Async Tokio server on `~/.wisphive/wisphive.sock`. Accepts hook connections (blocking until decision), TUI connections (bidirectional streaming via broadcast channel), persists state to SQLite (`~/.wisphive/wisphive.db`), sends platform notifications.
-- **wisphive_hook** — Lightweight binary that runs as a Claude Code `PreToolUse` hook. Three-layer decision logic: (1) check `~/.wisphive/mode` file, (2) auto-approve safe tools via `~/.wisphive/auto-approve.json`, (3) connect to daemon for human review. Exit codes: 0=approve, 2=deny, 1=error (fail-open).
-- **wisphive_tui** — Ratatui terminal UI. Connects to daemon as a streaming client. Three panels: queue, agents, projects. Keys: `a`/`d` approve/deny, `A`/`D` bulk, `/` filter, Tab switch panels.
-- **wisphive_cli** — Clap-based CLI (`wisphive` binary). Subcommands: `daemon {start,stop,status}`, `hooks {install,uninstall,enable,disable,status}`, `tui`, `doctor`, `emergency-off`.
+Seven workspace crates with clear dependency flow:
+
+- **wisphive_protocol** — Shared types and newline-delimited JSON wire protocol. `DecisionRequest`, `Decision`, `ClientMessage`/`ServerMessage`, `SpawnAgentRequest`, terminal events. All other crates depend on this.
+- **wisphive_daemon** — Async Tokio server on `~/.wisphive/wisphive.sock`. Accepts hook connections (blocking until decision), TUI/web connections (bidirectional streaming via broadcast channel), persists state to SQLite (`~/.wisphive/wisphive.db`), spawns headless agents via the process registry, manages `portable-pty` terminal sessions, sends platform notifications.
+- **wisphive_hook** — Lightweight binary that runs as a Claude Code `PreToolUse` / `PostToolUse` hook. Three-layer decision logic: (1) check `~/.wisphive/mode` file, (2) auto-approve safe tools via `~/.wisphive/auto-approve.json`, (3) connect to daemon for human review. Exit codes: 0=approve, 2=deny, 1=error (fail-open).
+- **wisphive_tui** — Ratatui terminal UI. Connects to daemon as a streaming client. Panels include queue, agents, projects, terminals. Keys: `a`/`d` approve/deny, `A`/`D` bulk, `/` filter, Tab switch panels.
+- **wisphive_web** — Axum HTTP/WebSocket server. Embeds the Vite-built React frontend via `rust-embed` and bridges browser ↔ daemon over `/ws`. Optional TLS via `rustls`/`rcgen` self-signed certs. Auth primitives in `auth.rs` (Argon2id passwords, SHA-256-hashed device tokens, per-IP login throttle, `webauthn-rs` for passkeys); request gating in `security.rs` (bearer token + Origin/Host allowlist). Can run standalone (`wisphive web`) or in-process with the daemon (`wisphive daemon start --web`).
+- **wisphive_cli** — Clap-based CLI (`wisphive` binary). Subcommands: `daemon {start [--web --host --port --web-dev], stop, status}`, `hooks {install, uninstall, enable, disable, status}`, `tui`, `web {--host --port --dev}`, `agent {start, list, stop}`, `history {search, recent}`, `config {list, get, set, auto-approve {status, level, add, remove, reset}}`, `term {new, list, attach, replay, close}`, `doctor`, `emergency-off`. Web UI default port is `3100` (CLI) — note `justfile` uses `8080` for the `web` recipe.
 - **wisphive_adapters** — `AgentAdapter` trait and implementations (ClaudeCode is hook-based/passive; Red and LocalLLM are stubs).
 
 ## Key Design Decisions
@@ -86,11 +105,37 @@ All under `~/.wisphive/`:
 - `mode` — "active" or "off" (global kill switch)
 - `auto-approve.json` — List of tool names that skip daemon review
 - `web.token` — Per-process bearer token for the web UI (mode 0600). Regenerated on every `wisphive daemon start` / `wisphive web`. Required as `?token=` on `/ws` and `Authorization: Bearer` (or `?token=`) on `/api/*`. Frontend bootstraps it via `GET /api/web-token`, which is gated by Origin + Host checks but not by the bearer. Allowlists seed with `127.0.0.1:<port>` / `localhost:<port>` (plus `localhost:5173` in dev mode); extend via `WISPHIVE_WEB_ALLOWED_ORIGINS` / `WISPHIVE_WEB_ALLOWED_HOSTS` env vars when binding to `0.0.0.0`.
+- `web.cert.pem` / `web.key.pem` — Self-signed TLS cert/key for the web UI (key is mode 0600). Validity is capped at 397 days; rotation writes atomically under `web.cert.lock` (flock) with metadata in `web.cert.meta.json`. See `crates/wisphive_web/src/tls.rs`.
 
 ## Reference Documentation
 
 - [tui-textarea reference](claude/tui-textarea-reference.md) — API reference, key bindings, and integration notes for the TUI text editing widget
+- [investigation-empty-detail-views](claude/investigation-empty-detail-views.md) — notes on why `ExitPlanMode` and `AskUserQuestion` rendered empty detail views in the TUI
+- [docs/plan-cross-agent-conflict-gate.md](docs/plan-cross-agent-conflict-gate.md), [docs/plan-decision-plugins.md](docs/plan-decision-plugins.md), [docs/plan-policy-learning-engine.md](docs/plan-policy-learning-engine.md) — design docs for upcoming workstreams
+- [docs/open-source-path.md](docs/open-source-path.md) — OSS positioning and roadmap
 
 ## Rust Edition
 
-The workspace uses Rust **edition 2024**. Requires nightly or a recent stable toolchain that supports it.
+The workspace uses Rust **edition 2024**. Requires Rust **nightly** (per `CONTRIBUTING.md`); a recent stable toolchain that supports edition 2024 also works.
+
+## When to Update This File
+
+Keep `CLAUDE.md` aligned with reality — a stale entry here misleads every future Claude Code session. Update it in the same PR as the change whenever you:
+
+- **Add, remove, or rename a workspace crate** (update the architecture section, dependency flow, and crate count).
+- **Add or rename a top-level CLI subcommand or change a default flag value** (the CLI subcommand list is hand-maintained from `crates/wisphive_cli/src/main.rs`).
+- **Add, remove, or rename a runtime file under `~/.wisphive/`** (sockets, PID, DB, mode, certs, tokens, config). Include permissions/locking semantics when non-obvious.
+- **Change the IPC wire protocol** (new client kinds, new framing, breaking message changes).
+- **Add a new Claude Code hook event handler** in `wisphive_hook`, or learn a new fact about hook stdin/stdout schema (the "Claude Code Hook Response Format" section is the canonical reference for the project).
+- **Change a fail-open / fail-closed default, timeout, or other safety-critical default** (the "Key Design Decisions" section).
+- **Add a new build/test/lint command** that contributors will need (or change an existing one).
+- **Add reference docs under `claude/` or `docs/`** that future sessions should know exist.
+
+Do **not** add to `CLAUDE.md`:
+
+- Per-task notes, in-progress work, or transient TODOs (use `itr` issues or commit messages).
+- File-by-file or line-by-line inventories that `git ls-files` / `Glob` can derive on demand.
+- Generic Rust/React/Tokio guidance — assume the reader is fluent.
+- Counts that drift (test counts, LOC, issue counts). Prefer the command that produces the count.
+
+If you're unsure whether something belongs here, ask: *"Would the next Claude Code session waste time or make a wrong assumption without this?"* If yes, add it. If no, leave it out.
