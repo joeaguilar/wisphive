@@ -464,7 +464,13 @@ async fn handle_tui(
                             }
                         };
                         match msg {
-                            ClientMessage::Approve { id, message, updated_input, always_allow, additional_context, device_id: _ } => {
+                            // TODO(itr#213): enforce `_device_id` presence for sudo-class tools
+                            // (Bash/Write/Edit/NotebookEdit/MultiEdit + ConfigChange). Today the
+                            // web bridge does not exist yet, so every decision command comes
+                            // from the TUI (local fs access = implicit fresh-auth). When
+                            // ws_bridge.rs starts injecting device_id, this arm MUST call
+                            // into the reauth gate instead of ignoring the field.
+                            ClientMessage::Approve { id, message, updated_input, always_allow, additional_context, device_id: _device_id } => {
                                 let rich = RichDecision {
                                     decision: Decision::Approve,
                                     message,
@@ -483,7 +489,8 @@ async fn handle_tui(
                                     warn!("eager persist failed for {id}: {e}");
                                 }
                             }
-                            ClientMessage::Deny { id, message, device_id: _ } => {
+                            // TODO(itr#213): honour `_device_id` for sudo-class deny paths.
+                            ClientMessage::Deny { id, message, device_id: _device_id } => {
                                 let rich = RichDecision {
                                     decision: Decision::Deny,
                                     message,
@@ -497,12 +504,15 @@ async fn handle_tui(
                                     warn!("eager persist failed for {id}: {e}");
                                 }
                             }
-                            ClientMessage::Ask { id, device_id: _ } => {
+                            // TODO(itr#213): honour `_device_id` for sudo-class ask paths.
+                            ClientMessage::Ask { id, device_id: _device_id } => {
                                 let mut q = ctx.queue.lock().await;
                                 q.resolve(id, RichDecision::from(Decision::Ask));
                                 // Ask/defer decisions are not persisted to the audit log
                             }
-                            ClientMessage::ApproveAll { ref filter, device_id: _ } => {
+                            // TODO(itr#213): honour `_device_id` — bulk-approve from the web
+                            // must re-check sudo for every matched pending decision.
+                            ClientMessage::ApproveAll { ref filter, device_id: _device_id } => {
                                 let ids = {
                                     let mut q = ctx.queue.lock().await;
                                     q.resolve_all(filter, Decision::Approve)
@@ -514,7 +524,8 @@ async fn handle_tui(
                                     }
                                 }
                             }
-                            ClientMessage::DenyAll { ref filter, device_id: _ } => {
+                            // TODO(itr#213): honour `_device_id` for bulk deny over web.
+                            ClientMessage::DenyAll { ref filter, device_id: _device_id } => {
                                 let ids = {
                                     let mut q = ctx.queue.lock().await;
                                     q.resolve_all(filter, Decision::Deny)
@@ -937,7 +948,9 @@ async fn handle_tui(
                                     }
                                 });
                             }
-                            ClientMessage::ApprovePermission { id, suggestion_index, message, device_id: _ } => {
+                            // TODO(itr#213): honour `_device_id` for ApprovePermission — a
+                            // PermissionRequest approve is itself sudo-class on the web.
+                            ClientMessage::ApprovePermission { id, suggestion_index, message, device_id: _device_id } => {
                                 // Look up the selected suggestion from the queued request
                                 let selected = {
                                     let q = ctx.queue.lock().await;

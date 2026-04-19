@@ -1,7 +1,44 @@
 use anyhow::Result;
 use sqlx::SqlitePool;
+use sqlx::sqlite::SqliteConnectOptions;
+use std::str::FromStr;
 use tracing::info;
 use wisphive_protocol::{TerminalDirection, TerminalSessionMeta, TerminalStatus};
+
+/// Typed error surface for the web-auth helpers. Auth callers need to
+/// distinguish `NotFound` (→ 401/404) from `Duplicate` (→ 409) from `Db`
+/// (→ 500) and from `Revoked` (→ 401 + throttle bump). Using `anyhow` here
+/// would collapse those into stringly-typed guesses.
+#[derive(Debug, thiserror::Error)]
+pub enum WebAuthError {
+    /// No row matched the lookup (device id, token hash, passkey id, etc.).
+    #[error("web auth target not found")]
+    NotFound,
+    /// The device exists but has been revoked.
+    #[error("web device is revoked")]
+    Revoked,
+    /// Unique-constraint violation (e.g. duplicate device id or token hash).
+    #[error("web auth duplicate")]
+    Duplicate,
+    /// Underlying database / sqlx error.
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+}
+
+impl WebAuthError {
+    /// Classify a sqlx error, promoting UNIQUE constraint failures to
+    /// `Duplicate` so callers can map them to 409 without string matching.
+    fn from_sqlx(err: sqlx::Error) -> Self {
+        if let Some(db_err) = err.as_database_error()
+            && db_err.message().contains("UNIQUE constraint failed")
+        {
+            return Self::Duplicate;
+        }
+        Self::Db(err)
+    }
+}
+
+pub type WebAuthResult<T> = std::result::Result<T, WebAuthError>;
 
 /// Row shape returned by decision_log queries (13 columns).
 type DecisionLogRow = (
@@ -143,8 +180,13 @@ pub struct StateDb {
 impl StateDb {
     /// Open (or create) the database at the given path.
     pub async fn open(path: &str) -> Result<Self> {
+        // SQLite defaults `foreign_keys=OFF` per-connection. Enabling it on
+        // the connect options applies to every pooled connection so the
+        // `ON DELETE CASCADE` on web_passkeys → web_devices is actually
+        // enforced at runtime.
         let url = format!("sqlite:{}?mode=rwc", path);
-        let pool = SqlitePool::connect(&url).await?;
+        let opts = SqliteConnectOptions::from_str(&url)?.foreign_keys(true);
+        let pool = SqlitePool::connect_with(opts).await?;
 
         let db = Self { pool };
         db.migrate().await?;
@@ -357,7 +399,7 @@ impl StateDb {
             "CREATE TABLE IF NOT EXISTS web_devices (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
-                token_hash TEXT NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
                 created_at TEXT NOT NULL,
                 last_seen_at TEXT,
                 last_ip TEXT,
@@ -913,9 +955,13 @@ impl StateDb {
     }
 
     // ── Web UI auth helpers ───────────────────────────────────────
+    //
+    // All helpers return `WebAuthResult<T>` (not `anyhow::Result`) so auth
+    // callers can distinguish NotFound / Revoked / Duplicate / Db without
+    // string-matching on error messages.
 
     /// Upsert the single-row web password hash.
-    pub async fn set_web_password(&self, argon2_hash: &str) -> Result<()> {
+    pub async fn set_web_password(&self, argon2_hash: &str) -> WebAuthResult<()> {
         sqlx::query(
             "INSERT INTO web_password (id, argon2_hash, updated_at) VALUES (1, ?, ?)
              ON CONFLICT(id) DO UPDATE SET argon2_hash = excluded.argon2_hash, updated_at = excluded.updated_at",
@@ -923,38 +969,63 @@ impl StateDb {
         .bind(argon2_hash)
         .bind(chrono::Utc::now().to_rfc3339())
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(WebAuthError::from_sqlx)?;
         Ok(())
     }
 
     /// Fetch the stored web password hash, if one has been set.
-    pub async fn get_web_password_hash(&self) -> Result<Option<String>> {
+    pub async fn get_web_password_hash(&self) -> WebAuthResult<Option<String>> {
         let row: Option<(String,)> =
             sqlx::query_as("SELECT argon2_hash FROM web_password WHERE id = 1")
                 .fetch_optional(&self.pool)
-                .await?;
+                .await
+                .map_err(WebAuthError::from_sqlx)?;
         Ok(row.map(|(h,)| h))
     }
 
     /// Wipe the password + all devices + passkeys (reset). The audit rows
     /// stay so the operator can see the reset event.
-    pub async fn reset_web_password(&self) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM web_passkeys").execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM web_devices").execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM web_password").execute(&mut *tx).await?;
-        tx.commit().await?;
+    ///
+    /// Passkey rows would be reaped by the `ON DELETE CASCADE` on
+    /// `web_passkeys.device_id` once `web_devices` is deleted, but we delete
+    /// them explicitly first so the transaction is resilient to an operator
+    /// running against an older DB where `foreign_keys=OFF` happened to be
+    /// the default.
+    pub async fn reset_web_password(&self) -> WebAuthResult<()> {
+        let mut tx = self.pool.begin().await.map_err(WebAuthError::from_sqlx)?;
+        sqlx::query("DELETE FROM web_passkeys")
+            .execute(&mut *tx)
+            .await
+            .map_err(WebAuthError::from_sqlx)?;
+        sqlx::query("DELETE FROM web_devices")
+            .execute(&mut *tx)
+            .await
+            .map_err(WebAuthError::from_sqlx)?;
+        sqlx::query("DELETE FROM web_password")
+            .execute(&mut *tx)
+            .await
+            .map_err(WebAuthError::from_sqlx)?;
+        tx.commit().await.map_err(WebAuthError::from_sqlx)?;
         Ok(())
     }
 
-    /// Record a new device token binding. `token_hash` must be sha256 of the
-    /// raw bearer token that was returned to the client.
+    /// Record a new device token binding.
+    ///
+    /// INVARIANT — caller MUST pass:
+    ///   - `id`: a UUIDv4 string (never reused across a reset)
+    ///   - `token_hash`: hex-encoded sha256 of a raw bearer ≥32 random bytes
+    ///     (base64url-encoded). The raw token must never reach this crate —
+    ///     storing a hash means a `wisphive.db` leak does not yield usable
+    ///     credentials.
+    ///
+    /// Returns `Duplicate` if either `id` or `token_hash` already exists.
     pub async fn insert_web_device(
         &self,
         id: &str,
         name: &str,
         token_hash: &str,
-    ) -> Result<()> {
+    ) -> WebAuthResult<()> {
         sqlx::query(
             "INSERT INTO web_devices (id, name, token_hash, created_at)
              VALUES (?, ?, ?, ?)",
@@ -964,16 +1035,20 @@ impl StateDb {
         .bind(token_hash)
         .bind(chrono::Utc::now().to_rfc3339())
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(WebAuthError::from_sqlx)?;
         Ok(())
     }
 
     /// Find a non-revoked device by its token hash. Also returns the device
     /// name so callers can populate the request context.
+    ///
+    /// Relies on the `UNIQUE` constraint on `token_hash` for the "at most
+    /// one match" invariant; `LIMIT 1` is a belt-and-suspenders guard.
     pub async fn find_web_device_by_token_hash(
         &self,
         token_hash: &str,
-    ) -> Result<Option<WebDeviceRow>> {
+    ) -> WebAuthResult<Option<WebDeviceRow>> {
         let row: Option<WebDeviceActiveRow> = sqlx::query_as(
             "SELECT id, name, created_at, last_seen_at, last_ip
              FROM web_devices
@@ -982,7 +1057,8 @@ impl StateDb {
         )
         .bind(token_hash)
         .fetch_optional(&self.pool)
-        .await?;
+        .await
+        .map_err(WebAuthError::from_sqlx)?;
         Ok(row.map(|(id, name, created_at, last_seen_at, last_ip)| WebDeviceRow {
             id,
             name,
@@ -993,8 +1069,9 @@ impl StateDb {
         }))
     }
 
-    /// Flip `revoked_at` on a device, idempotently.
-    pub async fn revoke_web_device(&self, id: &str) -> Result<()> {
+    /// Flip `revoked_at` on a device, idempotently. A second call is a
+    /// no-op because the WHERE clause filters already-revoked rows.
+    pub async fn revoke_web_device(&self, id: &str) -> WebAuthResult<()> {
         sqlx::query(
             "UPDATE web_devices SET revoked_at = ?
              WHERE id = ? AND revoked_at IS NULL",
@@ -1002,27 +1079,34 @@ impl StateDb {
         .bind(chrono::Utc::now().to_rfc3339())
         .bind(id)
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(WebAuthError::from_sqlx)?;
         Ok(())
     }
 
     /// Record that we've just served a request on behalf of `device_id`.
     /// Best-effort: callers should fire-and-forget.
-    pub async fn touch_web_device(&self, id: &str, ip: Option<&str>) -> Result<()> {
+    ///
+    /// Only touches non-revoked devices so post-revocation forensics stay
+    /// clean (a revoked device's `last_seen_at` is frozen at the moment of
+    /// its last legitimate use).
+    pub async fn touch_web_device(&self, id: &str, ip: Option<&str>) -> WebAuthResult<()> {
         sqlx::query(
-            "UPDATE web_devices SET last_seen_at = ?, last_ip = ? WHERE id = ?",
+            "UPDATE web_devices SET last_seen_at = ?, last_ip = ?
+             WHERE id = ? AND revoked_at IS NULL",
         )
         .bind(chrono::Utc::now().to_rfc3339())
         .bind(ip)
         .bind(id)
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(WebAuthError::from_sqlx)?;
         Ok(())
     }
 
     /// List all devices, newest first. Includes revoked so the UI can show
     /// history.
-    pub async fn list_web_devices(&self) -> Result<Vec<WebDeviceRow>> {
+    pub async fn list_web_devices(&self) -> WebAuthResult<Vec<WebDeviceRow>> {
         let rows: Vec<WebDeviceFullRow> =
             sqlx::query_as(
                 "SELECT id, name, created_at, last_seen_at, last_ip, revoked_at
@@ -1030,7 +1114,8 @@ impl StateDb {
                  ORDER BY created_at DESC",
             )
             .fetch_all(&self.pool)
-            .await?;
+            .await
+            .map_err(WebAuthError::from_sqlx)?;
         Ok(rows
             .into_iter()
             .map(|(id, name, created_at, last_seen_at, last_ip, revoked_at)| WebDeviceRow {
@@ -1044,7 +1129,8 @@ impl StateDb {
             .collect())
     }
 
-    /// Persist a newly enrolled passkey.
+    /// Persist a newly enrolled passkey. Returns `Duplicate` if the
+    /// credential id is already enrolled.
     pub async fn insert_web_passkey(
         &self,
         id: &str,
@@ -1052,7 +1138,7 @@ impl StateDb {
         public_key: &[u8],
         sign_count: i64,
         transports_json: Option<&str>,
-    ) -> Result<()> {
+    ) -> WebAuthResult<()> {
         sqlx::query(
             "INSERT INTO web_passkeys (id, device_id, public_key, sign_count, transports, created_at)
              VALUES (?, ?, ?, ?, ?, ?)",
@@ -1064,7 +1150,8 @@ impl StateDb {
         .bind(transports_json)
         .bind(chrono::Utc::now().to_rfc3339())
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(WebAuthError::from_sqlx)?;
         Ok(())
     }
 
@@ -1072,7 +1159,7 @@ impl StateDb {
     pub async fn list_web_passkeys_for_device(
         &self,
         device_id: &str,
-    ) -> Result<Vec<WebPasskeyRow>> {
+    ) -> WebAuthResult<Vec<WebPasskeyRow>> {
         let rows: Vec<WebPasskeyRowRaw> =
             sqlx::query_as(
                 "SELECT id, device_id, public_key, sign_count, transports, created_at, last_used_at
@@ -1082,7 +1169,8 @@ impl StateDb {
             )
             .bind(device_id)
             .fetch_all(&self.pool)
-            .await?;
+            .await
+            .map_err(WebAuthError::from_sqlx)?;
         Ok(rows
             .into_iter()
             .map(|(id, device_id, public_key, sign_count, transports, created_at, last_used_at)| {
@@ -1099,14 +1187,29 @@ impl StateDb {
             .collect())
     }
 
-    /// Append a row to the audit log. `detail` is typically JSON.
+    /// Append a row to the audit log. `detail` is typically JSON; anything
+    /// over 4KB is truncated so a LAN attacker hammering /login cannot
+    /// inflate the DB with unbounded attacker-controlled payloads.
     pub async fn append_web_audit(
         &self,
         event: &str,
         device_id: Option<&str>,
         ip: Option<&str>,
         detail: Option<&str>,
-    ) -> Result<()> {
+    ) -> WebAuthResult<()> {
+        const MAX_DETAIL: usize = 4096;
+        let detail = detail.map(|d| {
+            if d.len() > MAX_DETAIL {
+                // Truncate at a char boundary to keep the row as valid UTF-8.
+                let mut cut = MAX_DETAIL;
+                while !d.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                &d[..cut]
+            } else {
+                d
+            }
+        });
         sqlx::query(
             "INSERT INTO web_audit (at, event, device_id, ip, detail)
              VALUES (?, ?, ?, ?, ?)",
@@ -1117,20 +1220,25 @@ impl StateDb {
         .bind(ip)
         .bind(detail)
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(WebAuthError::from_sqlx)?;
         Ok(())
     }
 
-    /// Query recent audit rows, newest first.
-    pub async fn list_web_audit(&self, limit: u32) -> Result<Vec<WebAuditRow>> {
+    /// Query recent audit rows, newest first. Limit is clamped at 1000 so a
+    /// misbehaving caller cannot force SQLite to materialize the whole
+    /// table.
+    pub async fn list_web_audit(&self, limit: u32) -> WebAuthResult<Vec<WebAuditRow>> {
+        let clamped = limit.min(1000);
         let rows: Vec<WebAuditRowRaw> =
             sqlx::query_as(
                 "SELECT id, at, event, device_id, ip, detail
                  FROM web_audit ORDER BY id DESC LIMIT ?",
             )
-            .bind(limit)
+            .bind(clamped)
             .fetch_all(&self.pool)
-            .await?;
+            .await
+            .map_err(WebAuthError::from_sqlx)?;
         Ok(rows
             .into_iter()
             .map(|(id, at, event, device_id, ip, detail)| WebAuditRow {
@@ -2095,6 +2203,77 @@ mod tests {
         // ON DELETE CASCADE kicks in when the device row is removed (via reset).
         db.reset_web_password().await.unwrap();
         assert!(db.list_web_passkeys_for_device("dev-1").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn web_device_token_hash_is_unique() {
+        let db = test_db().await;
+        db.insert_web_device("dev-1", "phone", "same-hash").await.unwrap();
+        let err = db
+            .insert_web_device("dev-2", "laptop", "same-hash")
+            .await
+            .expect_err("second device with same token_hash must fail");
+        assert!(
+            matches!(err, WebAuthError::Duplicate),
+            "expected Duplicate, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_device_fk_cascade_drops_passkeys_when_device_row_is_deleted() {
+        // Regression guard for the FK-off footgun: enabling
+        // `foreign_keys=ON` at connect time makes the CASCADE actually fire.
+        // If someone ever turns the pragma off the cascade test in
+        // `web_passkey_insert_and_list_cascade_deletes` would still pass
+        // (because reset_web_password deletes passkeys manually first), but
+        // this one will not.
+        let db = test_db().await;
+        db.insert_web_device("dev-1", "phone", "hash-1").await.unwrap();
+        db.insert_web_passkey("pk-1", "dev-1", b"cose", 0, None).await.unwrap();
+        assert_eq!(db.list_web_passkeys_for_device("dev-1").await.unwrap().len(), 1);
+
+        sqlx::query("DELETE FROM web_devices WHERE id = ?")
+            .bind("dev-1")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        assert!(
+            db.list_web_passkeys_for_device("dev-1").await.unwrap().is_empty(),
+            "ON DELETE CASCADE must reap passkeys when foreign_keys=ON"
+        );
+    }
+
+    #[tokio::test]
+    async fn touch_web_device_ignores_revoked_rows() {
+        let db = test_db().await;
+        db.insert_web_device("dev-1", "phone", "hash-1").await.unwrap();
+        db.touch_web_device("dev-1", Some("10.0.0.1")).await.unwrap();
+        let before = db
+            .list_web_devices()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|d| d.id == "dev-1")
+            .unwrap();
+        assert_eq!(before.last_ip.as_deref(), Some("10.0.0.1"));
+
+        db.revoke_web_device("dev-1").await.unwrap();
+        // Attempt to touch after revocation — must be a silent no-op.
+        db.touch_web_device("dev-1", Some("10.0.0.99")).await.unwrap();
+
+        let after = db
+            .list_web_devices()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|d| d.id == "dev-1")
+            .unwrap();
+        assert_eq!(
+            after.last_ip.as_deref(),
+            Some("10.0.0.1"),
+            "revoked device's last_ip must be frozen"
+        );
     }
 
     #[tokio::test]
