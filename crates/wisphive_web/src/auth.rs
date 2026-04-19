@@ -163,7 +163,14 @@ const SWEEP_GRACE: Duration = Duration::from_secs(60);
 /// Cap on simultaneous in-flight verify operations per (normalized) IP.
 /// 1 means: while one Argon2 verify is running for an IP, all others from
 /// that IP are throttled. Closes the parallel-attempts race.
+// TODO(itr#243): make configurable per-deployment so NAT'd offices /
+// mobile carriers can raise this without recompiling.
 const MAX_IN_FLIGHT_PER_IP: u32 = 1;
+/// How long an in-flight slot is allowed to be considered "live" before
+/// the eviction sweep treats it as a leaked guard and drops the entry
+/// anyway. Without this, a hung verify (or a `Drop` that couldn't grab
+/// `try_write`) would pin a map entry permanently and self-DoS the IP.
+const STALE_IN_FLIGHT_AGE: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Copy)]
 struct AttemptState {
@@ -210,10 +217,18 @@ pub struct ThrottleDecision {
 /// Reservation handle returned by [`LoginThrottle::try_begin_attempt`]. The
 /// reservation holds an in-flight slot for the IP that races with other
 /// attempts from the same IP. Consume with [`AttemptGuard::record_failure`]
-/// or [`AttemptGuard::record_success`]; dropping without consumption is
-/// allowed (e.g. on panic) and best-effort releases the slot.
+/// or [`AttemptGuard::record_success`].
+///
+/// **Drop is fail-closed:** dropping without explicit consumption (e.g. on
+/// panic, or because the surrounding async task was cancelled) is treated
+/// as an *implicit failure* — the in-flight slot is released AND the
+/// failure counter is bumped. Without this, an attacker who can cancel
+/// the verify (close TCP after the request line) gets unlimited tries
+/// with zero backoff. If the runtime can't acquire the lock in `Drop`
+/// (`try_write` failure), we warn and leak the slot to next-sweep
+/// recovery rather than blocking — see [`STALE_IN_FLIGHT_AGE`].
 #[derive(Debug)]
-#[must_use = "An AttemptGuard reserves an in-flight slot for an IP — call record_failure or record_success to release it explicitly"]
+#[must_use = "An AttemptGuard reserves an in-flight slot for an IP — call record_failure or record_success to release it explicitly. Dropping without consumption is treated as a failure."]
 pub struct AttemptGuard {
     inner: Arc<RwLock<ThrottleInner>>,
     /// Already-normalized (IPv6 → /64) IP key.
@@ -226,28 +241,40 @@ impl LoginThrottle {
         Self::default()
     }
 
-    /// Read-only check: would an attempt be allowed *right now*? Useful
-    /// for showing a user-facing "locked out, retry in X seconds" hint
-    /// without claiming an in-flight slot. Do NOT use this as a gate
-    /// before doing actual auth work — that's the parallel-attempts race
-    /// this whole API exists to fix. Use [`Self::try_begin_attempt`].
-    pub async fn peek(&self, ip: IpAddr) -> ThrottleDecision {
+    /// Read-only retry hint for UI banners: returns `Some(duration)` when
+    /// the IP is currently locked out and the user should be told how long
+    /// to wait. Returns `None` when the throttle has nothing to say.
+    ///
+    /// This intentionally does NOT return an `allowed: bool` — exposing
+    /// one would invite callers to gate on `peek`'s reply, reintroducing
+    /// the check-then-act race that [`Self::try_begin_attempt`] exists
+    /// to fix. Always go through `try_begin_attempt` for actual
+    /// admission decisions.
+    pub async fn peek(&self, ip: IpAddr) -> Option<Duration> {
         let key = normalize_ip(ip);
         let state = self.inner.read().await;
-        match state.map.get(&key) {
-            Some(s) => decide_now(s),
-            None => ThrottleDecision {
-                allowed: true,
-                retry_after: None,
-            },
+        let s = state.map.get(&key)?;
+        let now = Instant::now();
+        if now < s.locked_until {
+            Some(s.locked_until - now)
+        } else {
+            None
         }
     }
 
     /// Atomically check the throttle and, if allowed, reserve an in-flight
-    /// slot for `ip`. Returns `Err(decision)` if the IP is currently
-    /// locked out OR if there's already a verify in flight for the same IP.
+    /// slot for `ip`.
+    ///
+    /// Returns `Err(decision)` if:
+    /// - the IP is currently locked out (with `retry_after = locked_until - now`),
+    /// - there's already a verify in flight for the same IP (250ms retry hint),
+    /// - the throttle map is at its hard cap and no entries can be evicted
+    ///   to make room (1s retry hint — system is in degraded mode under
+    ///   what looks like a coordinated attack).
+    ///
     /// On `Ok(guard)` the caller MUST call `record_failure` or
-    /// `record_success` on the guard once verify finishes.
+    /// `record_success` on the guard once verify finishes; dropping the
+    /// guard without that is treated as an implicit failure.
     pub async fn try_begin_attempt(&self, ip: IpAddr) -> Result<AttemptGuard, ThrottleDecision> {
         let key = normalize_ip(ip);
         let mut state = self.inner.write().await;
@@ -276,9 +303,22 @@ impl LoginThrottle {
         // if needed. Existing entries don't grow the map so the sweep
         // is only required when we'd be admitting a new IP, but the
         // check is cheap and centralizes the policy here.
+        //
+        // If `ensure_room_for_new_entry` can't free a slot (every entry
+        // is in_flight > 0 and recent), we MUST refuse to insert — admitting
+        // anyway would let an attacker holding `in_flight` slots on N
+        // distinct /64s grow the map past `MAX_THROTTLE_ENTRIES`,
+        // regressing the bound itr#229 was meant to enforce.
         let is_new_entry = !state.map.contains_key(&key);
-        if is_new_entry {
-            ensure_room_for_new_entry(&mut state, now);
+        if is_new_entry && !ensure_room_for_new_entry(&mut state, now) {
+            warn!(
+                map_len = state.map.len(),
+                "throttle map at hard cap with no evictable entries; rejecting new attempt"
+            );
+            return Err(ThrottleDecision {
+                allowed: false,
+                retry_after: Some(Duration::from_secs(1)),
+            });
         }
 
         let entry = state.map.entry(key).or_insert(AttemptState {
@@ -305,13 +345,7 @@ impl AttemptGuard {
     pub async fn record_failure(mut self) {
         self.consumed = true;
         let mut state = self.inner.write().await;
-        let now = Instant::now();
-        if let Some(entry) = state.map.get_mut(&self.ip_key) {
-            entry.failures = entry.failures.saturating_add(1);
-            entry.locked_until = now + backoff_for(entry.failures);
-            entry.in_flight = entry.in_flight.saturating_sub(1);
-            entry.last_seen = now;
-        }
+        apply_failure(&mut state, self.ip_key);
     }
 
     /// Record that the verify succeeded. Drops the per-IP entry entirely
@@ -328,26 +362,41 @@ impl Drop for AttemptGuard {
         if self.consumed {
             return;
         }
-        // The guard was dropped without record_failure/record_success.
-        // Release the in-flight slot so we don't permanently throttle this
-        // IP, but do it via try_write so we don't block on the runtime
-        // (we're in sync code here). If the lock is contended right now,
-        // the next sweep will fix the inflated counter — log so it's
-        // visible in structured logs.
+        // Fail-closed: a guard dropped without explicit consumption is
+        // treated as an implicit failure. Without this, an attacker that
+        // can cancel mid-verify (close TCP after the request line) gets
+        // unlimited tries with zero backoff — exactly the bypass the
+        // try_begin_attempt API was designed to prevent.
+        //
+        // We're in sync code, so we can't `.await` the write lock; use
+        // `try_write`. On contention we log and leak the in_flight slot
+        // — `STALE_IN_FLIGHT_AGE` in `ensure_room_for_new_entry` will
+        // reap it within a few minutes, so this can't permanently
+        // throttle the IP.
         match self.inner.try_write() {
-            Ok(mut state) => {
-                if let Some(entry) = state.map.get_mut(&self.ip_key) {
-                    entry.in_flight = entry.in_flight.saturating_sub(1);
-                }
-            }
+            Ok(mut state) => apply_failure(&mut state, self.ip_key),
             Err(_) => {
                 warn!(
                     ip = %self.ip_key,
                     "AttemptGuard dropped without record under contention; \
-                     in_flight slot will leak until next sweep"
+                     fail-closed bookkeeping deferred until STALE_IN_FLIGHT_AGE sweep"
                 );
             }
         }
+    }
+}
+
+/// Sync helper shared by `record_failure` (async) and `Drop` (sync). Bumps
+/// the failure counter, pushes `locked_until`, and releases one in-flight
+/// slot. No-op if the entry has been evicted under us (which shouldn't
+/// happen because eviction skips `in_flight > 0`, but be defensive).
+fn apply_failure(state: &mut ThrottleInner, ip_key: IpAddr) {
+    let now = Instant::now();
+    if let Some(entry) = state.map.get_mut(&ip_key) {
+        entry.failures = entry.failures.saturating_add(1);
+        entry.locked_until = now + backoff_for(entry.failures);
+        entry.in_flight = entry.in_flight.saturating_sub(1);
+        entry.last_seen = now;
     }
 }
 
@@ -363,8 +412,22 @@ fn backoff_for(failures: u32) -> Duration {
     base.checked_mul(mult).map(|d| d.min(cap)).unwrap_or(cap)
 }
 
-/// Aggregate IPv6 addresses to /64. IPv4 addresses are passed through as-is.
+/// Aggregate IPv6 addresses to /64. IPv4 addresses (including IPv4-mapped
+/// IPv6 like `::ffff:a.b.c.d` that axum hands us on dual-stack listeners)
+/// are passed through as their /32.
+///
+/// Without the v4-mapped unmap step, every IPv4 client behind a dual-stack
+/// listener would collapse to a single `::` /64 bucket and share lockout
+/// state — a self-DoS waiting to happen the moment any one IPv4 client
+/// fails to log in.
 fn normalize_ip(ip: IpAddr) -> IpAddr {
+    let ip = match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        v4 @ IpAddr::V4(_) => v4,
+    };
     match ip {
         IpAddr::V4(_) => ip,
         IpAddr::V6(v6) => {
@@ -376,38 +439,42 @@ fn normalize_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
-fn decide_now(s: &AttemptState) -> ThrottleDecision {
-    let now = Instant::now();
-    if now < s.locked_until {
-        ThrottleDecision {
-            allowed: false,
-            retry_after: Some(s.locked_until - now),
-        }
-    } else {
-        ThrottleDecision {
-            allowed: true,
-            retry_after: None,
-        }
-    }
-}
-
 /// Make room for one more entry in the throttle map without exceeding
-/// [`MAX_THROTTLE_ENTRIES`].
+/// [`MAX_THROTTLE_ENTRIES`]. Returns `true` if there is room (or if no
+/// eviction was needed); `false` if the cap is full and nothing could
+/// be evicted, in which case the caller MUST refuse to insert.
 ///
-/// Two passes, cheapest first:
+/// Three passes, cheapest first:
 /// 1. **Grace sweep** (cheap, O(N)): drop entries whose lockout has
 ///    expired more than [`SWEEP_GRACE`] ago and that aren't holding an
-///    in-flight slot. This is the steady-state cleanup.
-/// 2. **Hard-cap eviction** (O(N), batched): if we're still at or above
-///    the cap after sweeping, evict a *batch* of the oldest entries by
-///    `last_seen`. Batching means the next ~MAX/EVICTION_DENOMINATOR
-///    inserts pay no eviction cost, so total amortized work is O(N) per
-///    insert under sustained spray rather than O(N²).
-fn ensure_room_for_new_entry(state: &mut ThrottleInner, now: Instant) {
+///    in-flight slot. Steady-state cleanup.
+/// 2. **Stale-in-flight reaper** (folded into the same retain): drop
+///    entries whose `in_flight > 0` *and* whose `last_seen` is older
+///    than [`STALE_IN_FLIGHT_AGE`]. Treats those as leaked guards (a
+///    `Drop` that hit `try_write` contention, or a runaway verify) —
+///    without this, a self-DoS path keeps the IP locked forever.
+/// 3. **Hard-cap eviction** (O(N), batched): if we're still at or above
+///    the cap after sweeping, batch-evict the oldest evictable entries
+///    by `last_seen`. Batching means the next ~MAX/EVICTION_DENOMINATOR
+///    inserts pay no eviction cost.
+///
+/// Returning `bool` is the MUST-FIX motivator: if every entry has
+/// `in_flight > 0` AND each is too young for the stale sweep, the
+/// previous version early-returned and `try_begin_attempt` would insert
+/// anyway, growing the map past the cap. Now we report failure and the
+/// caller refuses the new attempt — which preserves itr#229's bound
+/// even under coordinated attack load.
+fn ensure_room_for_new_entry(state: &mut ThrottleInner, now: Instant) -> bool {
     if state.map.len() >= SWEEP_HIGH_WATER {
         state.map.retain(|_, s| {
             if s.in_flight > 0 {
-                return true;
+                // Stale-in-flight reaper: a slot held longer than
+                // STALE_IN_FLIGHT_AGE is treated as leaked. We trade the
+                // bookkeeping update for whatever guard is actually
+                // still mid-verify against avoiding permanent self-DoS
+                // for the IP.
+                let age = now.saturating_duration_since(s.last_seen);
+                return age < STALE_IN_FLIGHT_AGE;
             }
             match s.locked_until.checked_add(SWEEP_GRACE) {
                 Some(deadline) => now < deadline,
@@ -417,12 +484,9 @@ fn ensure_room_for_new_entry(state: &mut ThrottleInner, now: Instant) {
     }
 
     if state.map.len() < MAX_THROTTLE_ENTRIES {
-        return;
+        return true;
     }
 
-    // Hard cap fired. Evict in a batch so the next many inserts go
-    // straight in without re-running this path. Ignore in-flight entries
-    // so we don't drop the bookkeeping for an attempt that's mid-verify.
     let target_after =
         MAX_THROTTLE_ENTRIES.saturating_sub(MAX_THROTTLE_ENTRIES / EVICTION_DENOMINATOR);
     let want_to_evict = state.map.len().saturating_sub(target_after);
@@ -434,20 +498,25 @@ fn ensure_room_for_new_entry(state: &mut ThrottleInner, now: Instant) {
         .map(|(k, s)| (*k, s.last_seen))
         .collect();
     if evictable.is_empty() {
-        return;
+        // Every entry is in_flight > 0 and not yet stale. Caller MUST
+        // refuse the new attempt — admitting anyway would grow the map
+        // past the cap and regress itr#229 under coordinated attack load.
+        return false;
     }
     let n = want_to_evict.min(evictable.len());
     if n == 0 {
-        return;
+        return state.map.len() < MAX_THROTTLE_ENTRIES;
     }
+    debug_assert!(n >= 1 && n <= evictable.len());
     // Partition (not full sort) so the n oldest are at the front. O(N)
     // average, O(N²) worst case; the chaotic order from HashMap iteration
     // makes the worst case unreachable in practice.
-    let nth_idx = n.saturating_sub(1).min(evictable.len() - 1);
+    let nth_idx = n - 1;
     evictable.select_nth_unstable_by_key(nth_idx, |&(_, ts)| ts);
     for (k, _) in evictable.into_iter().take(n) {
         state.map.remove(&k);
     }
+    state.map.len() < MAX_THROTTLE_ENTRIES
 }
 
 // ---------------------------------------------------------------------------
@@ -519,15 +588,13 @@ mod tests {
             .expect("first attempt should be allowed")
             .record_failure()
             .await;
-        let d = throttle.peek(ip).await;
-        assert!(!d.allowed);
-        let ra = d.retry_after.unwrap();
+        let ra = throttle.peek(ip).await.expect("locked out after N=1");
         assert!(
             ra >= Duration::from_millis(200) && ra <= Duration::from_millis(260),
             "N=1 retry_after expected ~250ms, got {ra:?}"
         );
         tokio::time::advance(Duration::from_millis(260)).await;
-        assert!(throttle.peek(ip).await.allowed);
+        assert!(throttle.peek(ip).await.is_none());
 
         // N=2, N=3
         throttle
@@ -548,51 +615,77 @@ mod tests {
             .unwrap()
             .record_failure()
             .await;
-        let d = throttle.peek(ip).await;
-        assert!(!d.allowed);
-        let ra = d.retry_after.unwrap();
+        let ra = throttle.peek(ip).await.expect("locked out after N=3");
         assert!(
             ra >= Duration::from_millis(900) && ra <= Duration::from_millis(1100),
             "N=3 retry_after expected ~1s, got {ra:?}"
         );
     }
 
-    /// itr#231 acceptance: 10 parallel try_begin_attempt calls from the
-    /// same IP after a clean state should produce exactly ONE Ok guard;
-    /// the other 9 must be Err'd by the in-flight cap. Without the
-    /// MAX_IN_FLIGHT_PER_IP gate, all 10 would be admitted and could
-    /// run their (slow) verifies in parallel.
+    /// itr#231 acceptance, hardened: a slow verify holds the in-flight
+    /// slot deterministically (via a Notify) while 9 racers each try to
+    /// begin. Exactly one should have won (the original holder), and the
+    /// 9 racers must all have been rejected.
+    ///
+    /// The previous version of this test could false-pass on a 1-vCPU
+    /// runner where the scheduler trivially serialized the spawns; this
+    /// version forces overlap by keeping the winner's guard alive across
+    /// the awaits.
     #[tokio::test]
     async fn parallel_attempts_one_in_flight() {
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
         let throttle = LoginThrottle::new();
         let ip: IpAddr = Ipv4Addr::new(10, 0, 0, 1).into();
 
-        let handles: Vec<_> = (0..10)
+        // Winner takes the slot first and holds it until we say so.
+        let winner = throttle
+            .try_begin_attempt(ip)
+            .await
+            .expect("winner should grab the slot");
+
+        // Spawn 9 racers; gate them behind a Notify so they all enter
+        // try_begin_attempt while the winner is demonstrably still
+        // holding the slot.
+        let gate = Arc::new(Notify::new());
+        let handles: Vec<_> = (0..9)
             .map(|_| {
                 let t = throttle.clone();
-                tokio::spawn(async move { t.try_begin_attempt(ip).await })
+                let g = gate.clone();
+                tokio::spawn(async move {
+                    g.notified().await;
+                    t.try_begin_attempt(ip).await
+                })
             })
             .collect();
+        // notify_waiters wakes everyone currently waiting on this Notify.
+        // To make sure they're all parked, yield first — Notify::notify_one
+        // would queue notifications but notify_waiters only delivers to
+        // currently-parked waiters, exactly the semantics we want.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        gate.notify_waiters();
 
-        let mut allowed = 0usize;
         let mut throttled = 0usize;
-        let mut guards = Vec::new();
+        let mut accidental_winners = 0usize;
         for h in handles {
             match h.await.unwrap() {
-                Ok(g) => {
-                    allowed += 1;
-                    guards.push(g);
+                Ok(_) => accidental_winners += 1,
+                Err(d) => {
+                    assert!(!d.allowed);
+                    throttled += 1;
                 }
-                Err(_) => throttled += 1,
             }
         }
-        assert_eq!(allowed, 1, "exactly one attempt should win the slot");
-        assert_eq!(throttled, 9, "the other nine should be throttled");
+        assert_eq!(
+            accidental_winners, 0,
+            "racers should all be throttled while the original guard is held"
+        );
+        assert_eq!(throttled, 9, "all 9 racers should report throttled");
 
-        // Release the winning guard so we don't leave state lying around.
-        for g in guards {
-            g.record_failure().await;
-        }
+        winner.record_failure().await;
     }
 
     /// itr#231 follow-up: once the first attempt finishes (fail or
@@ -659,8 +752,7 @@ mod tests {
         // And: the two /64-mates must share lockout state.
         let da = throttle.peek(a).await;
         let db = throttle.peek(b).await;
-        assert_eq!(da.allowed, db.allowed);
-        assert_eq!(da.retry_after.is_some(), db.retry_after.is_some());
+        assert_eq!(da.is_some(), db.is_some());
     }
 
     /// IPv4 should NOT be aggregated — two different /32s must produce
@@ -699,17 +791,13 @@ mod tests {
                 }
             }
         }
-        // After success, peek should be wide open and there should be no
-        // map entry left.
         // Wait out whatever lockout is in place from the last failure.
-        if let Some(ra) = throttle.peek(ip).await.retry_after {
+        if let Some(ra) = throttle.peek(ip).await {
             tokio::time::advance(ra + Duration::from_millis(10)).await;
         }
         let g = throttle.try_begin_attempt(ip).await.unwrap();
         g.record_success().await;
-        let d = throttle.peek(ip).await;
-        assert!(d.allowed);
-        assert!(d.retry_after.is_none());
+        assert!(throttle.peek(ip).await.is_none());
         assert!(!throttle.inner.read().await.map.contains_key(&ip));
     }
 
@@ -721,7 +809,7 @@ mod tests {
 
         // Push `bad` into deep lockout.
         for _ in 0..3 {
-            if let Some(ra) = throttle.peek(bad).await.retry_after {
+            if let Some(ra) = throttle.peek(bad).await {
                 tokio::time::advance(ra + Duration::from_millis(10)).await;
             }
             throttle
@@ -731,10 +819,8 @@ mod tests {
                 .record_failure()
                 .await;
         }
-        assert!(!throttle.peek(bad).await.allowed);
-        let d = throttle.peek(good).await;
-        assert!(d.allowed, "neighbour IP should be unaffected");
-        assert!(d.retry_after.is_none());
+        assert!(throttle.peek(bad).await.is_some());
+        assert!(throttle.peek(good).await.is_none());
     }
 
     #[test]
@@ -769,11 +855,11 @@ mod tests {
         assert_eq!(n, expected);
     }
 
-    /// Drop without record_failure/record_success must release the
-    /// in-flight slot — otherwise a panicking caller would permanently
-    /// throttle their own IP.
+    /// Drop without record_* must (a) release the in-flight slot AND
+    /// (b) record an implicit failure — anything else lets an attacker
+    /// who can cancel mid-verify dodge the lockout entirely.
     #[tokio::test]
-    async fn drop_without_record_releases_slot() {
+    async fn drop_without_record_records_failure() {
         let throttle = LoginThrottle::new();
         let ip: IpAddr = Ipv4Addr::new(10, 0, 0, 1).into();
 
@@ -783,10 +869,96 @@ mod tests {
             // first is in flight.
             let err = throttle.try_begin_attempt(ip).await.unwrap_err();
             assert!(!err.allowed);
-        } // _g dropped here without record
+        } // _g dropped here without record → fail-closed bumps failure
 
-        // After the drop we should be able to begin again.
-        let g = throttle.try_begin_attempt(ip).await.unwrap();
-        g.record_success().await;
+        // The in-flight slot must be released (next try_begin doesn't
+        // hit the in_flight cap)…
+        let err = throttle.try_begin_attempt(ip).await.unwrap_err();
+        // …but we should now be in lockout, NOT wide open. Without the
+        // fail-closed Drop, this would be Ok.
+        assert!(
+            !err.allowed,
+            "fail-closed Drop should leave the IP in lockout"
+        );
+        assert!(
+            err.retry_after.is_some(),
+            "lockout should have a retry_after"
+        );
+
+        // And the failure was recorded in the map.
+        let state = throttle.inner.read().await;
+        let entry = state
+            .map
+            .get(&normalize_ip(ip))
+            .expect("entry should still exist after fail-closed Drop");
+        assert_eq!(entry.failures, 1);
+        assert_eq!(entry.in_flight, 0);
+    }
+
+    /// itr#229 hardening (review M1/#8): when the map is full of
+    /// in-flight entries (every entry pinned by a held guard), a new
+    /// attempt from a previously-unseen IP must be REJECTED rather than
+    /// admitted unbounded. The previous version of
+    /// `ensure_room_for_new_entry` would early-return and the caller
+    /// would insert anyway, defeating the cap.
+    ///
+    /// We can't easily fill the cap to 10k under in-flight in a test
+    /// (would need 10k tasks holding guards), so we lower the bar
+    /// surgically: pre-populate the map up to MAX with in-flight=1
+    /// entries, then assert the next try_begin_attempt with a fresh IP
+    /// returns Err and the map size stays at MAX.
+    #[tokio::test]
+    async fn rejects_new_attempt_when_cap_full_of_in_flight() {
+        let throttle = LoginThrottle::new();
+
+        // Fill the map by directly poking the inner state (the
+        // alternative is spawning 10k tasks, which is prohibitively
+        // slow). All entries get in_flight=1 so eviction can't touch them.
+        {
+            let mut state = throttle.inner.write().await;
+            let now = Instant::now();
+            for i in 0..MAX_THROTTLE_ENTRIES {
+                let ip: IpAddr = Ipv4Addr::from((i as u32).to_be_bytes()).into();
+                state.map.insert(
+                    ip,
+                    AttemptState {
+                        failures: 0,
+                        locked_until: now,
+                        in_flight: 1,
+                        last_seen: now,
+                    },
+                );
+            }
+        }
+
+        // Anyone new should be told to retry, NOT admitted.
+        let stranger: IpAddr = Ipv4Addr::new(203, 0, 113, 7).into();
+        let err = throttle
+            .try_begin_attempt(stranger)
+            .await
+            .expect_err("cap-full-of-in-flight should reject new attempt");
+        assert!(!err.allowed);
+        assert!(err.retry_after.is_some());
+
+        // Map size must not have grown past the cap.
+        let len = throttle.inner.read().await.map.len();
+        assert_eq!(
+            len, MAX_THROTTLE_ENTRIES,
+            "map grew past cap to {len}; itr#229 bound regressed"
+        );
+    }
+
+    /// itr#229 hardening (review M2): IPv4-mapped IPv6 addresses
+    /// (`::ffff:a.b.c.d`) must unmap to v4 *before* /64 normalization.
+    /// Without this, every IPv4 client behind a dual-stack listener
+    /// collapses to a single `::` /64 bucket and shares lockout state.
+    #[test]
+    fn normalize_unmaps_v4_mapped_v6() {
+        let mapped: IpAddr = "::ffff:192.0.2.1".parse::<Ipv6Addr>().unwrap().into();
+        let unmapped: IpAddr = Ipv4Addr::new(192, 0, 2, 1).into();
+        assert_eq!(normalize_ip(mapped), unmapped);
+        // And two distinct v4-mapped addresses must produce distinct keys.
+        let other: IpAddr = "::ffff:192.0.2.2".parse::<Ipv6Addr>().unwrap().into();
+        assert_ne!(normalize_ip(mapped), normalize_ip(other));
     }
 }

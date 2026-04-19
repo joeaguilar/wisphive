@@ -175,20 +175,15 @@ fn try_load_existing(
             return Err(e).with_context(|| format!("reading cert meta {}", meta_path.display()));
         }
     };
-    // A corrupt sidecar is suspicious — log it loudly so it shows up in
-    // the daemon's structured logs, but treat it as "regenerate" since
-    // there's no actionable recovery beyond minting a fresh cert.
-    let meta: CertMeta = match serde_json::from_str(&meta_raw) {
-        Ok(m) => m,
-        Err(e) => {
-            warn!(
-                meta_path = %meta_path.display(),
-                error = %e,
-                "cert meta sidecar is corrupt; regenerating cert"
-            );
-            return Ok(None);
-        }
-    };
+    // A corrupt sidecar is suspicious. Earlier this branch warn-and-regen'd
+    // — review feedback noted that's inconsistent with the IO-error policy
+    // above, which propagates: if EACCES/EIO is a real bug worth surfacing,
+    // so is "JSON I just wrote is now garbage". Both indicate something is
+    // wrong with the home dir (manual edit, partial write from a pre-fsync
+    // codepath, disk corruption) and silently nuking the cert hides that.
+    // Propagate as Err; the daemon's outer layer can decide what to do.
+    let meta: CertMeta = serde_json::from_str(&meta_raw)
+        .with_context(|| format!("parsing cert meta {}", meta_path.display()))?;
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -230,16 +225,15 @@ fn try_load_existing(
         }
     };
 
-    let der = match cert_der_from_pem(&cert_pem) {
-        Some(d) => d,
-        None => {
-            warn!(
-                cert_path = %cert_path.display(),
-                "cert PEM has no CERTIFICATE block; regenerating"
-            );
-            return Ok(None);
-        }
-    };
+    // Parse failure here is "the file exists, we read it, but it isn't a
+    // PEM cert" — same data-integrity signal as a corrupt meta sidecar.
+    // Propagate consistently rather than silently regen.
+    let der = cert_der_from_pem(&cert_pem).with_context(|| {
+        format!(
+            "cert PEM at {} has no CERTIFICATE block",
+            cert_path.display()
+        )
+    })?;
     let fingerprint = fingerprint_from_der(&der);
 
     Ok(Some(EnsureCertResult {
@@ -773,12 +767,18 @@ mod tests {
     /// Process-wide mutex for tests that read/write `GENERATE_INVOCATIONS`.
     /// Cargo runs tests in parallel by default; without this serialization
     /// other ensure_cert tests would race the counter.
+    ///
+    /// Poison is treated as a hard error (not recovered): a poisoned lock
+    /// means a prior test panicked *inside* the critical section, which
+    /// almost certainly left the counter in an unknown state. Recovering
+    /// blindly would cause the next test to either silently pass (false
+    /// negative on the lock test) or fail for the wrong reason.
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         use std::sync::{Mutex, OnceLock};
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
+            .expect("test_lock poisoned — a prior ensure_cert test panicked inside the critical section; check the first failure")
     }
 
     /// itr#224: no `<file>.tmp` should linger after a successful run; if one
