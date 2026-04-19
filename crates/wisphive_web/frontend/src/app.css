@@ -1271,8 +1271,21 @@ kbd {
   flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
+  display: grid;
+  grid-template-rows: auto 1fr;
+}
+
+.terminals-terminal-slot {
+  grid-row: 2 / 3;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
+}
+
+.terminal-queue-dock {
+  grid-row: 1 / 2;
 }
 
 .terminals-empty-state {
@@ -1472,4 +1485,87 @@ kbd {
   font-size: 11px;
   font-weight: 600;
   margin-left: 4px;
+}
+
+/* ── TerminalQueueDock ─────────────────────────────────────── */
+.terminal-queue-dock {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  padding: var(--space-sm) var(--space-md);
+  background: #0d0d18;
+  border-bottom: 1px solid var(--border);
+  max-height: 40vh;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.terminal-queue-dock-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding-bottom: var(--space-xs);
+}
+
+.terminal-queue-dock-title {
+  font-size: var(--font-sm);
+  color: var(--text-dim);
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.terminal-queue-other-chip {
+  margin-left: auto;
+  background: transparent;
+  color: var(--cyan);
+  border: 1px solid var(--cyan);
+  border-radius: var(--radius);
+  padding: 2px 8px;
+  font-size: var(--font-sm);
+  cursor: pointer;
+}
+.terminal-queue-other-chip:hover { background: rgba(0, 188, 212, 0.1); }
+
+.terminal-queue-dock-row {
+  background: var(--bg-selected);
+  border: 1px solid var(--cyan);
+  border-radius: var(--radius-lg);
+  padding: var(--space-xs) var(--space-sm);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+}
+
+.terminal-queue-dock-row-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  cursor: pointer;
+}
+
+.terminal-queue-dock-summary {
+  flex: 1;
+  min-width: 0;
+  color: var(--text);
+  font-size: var(--font-sm);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  background: var(--bg);
+  padding: 2px var(--space-sm);
+  border-radius: var(--radius);
+}
+
+.terminal-queue-dock-inline-actions {
+  display: flex;
+  gap: var(--space-xs);
+  margin-left: auto;
+}
+
+.terminal-queue-dock-detail {
+  max-height: 40vh;
+  overflow: auto;
+  border-top: 1px solid var(--border);
+  padding-top: var(--space-sm);
 }

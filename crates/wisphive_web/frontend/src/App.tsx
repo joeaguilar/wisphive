@@ -202,6 +202,9 @@ function App() {
             onResize={termResize}
             onSetGroup={termSetGroup}
             onReorder={termReorder}
+            onApprove={(id, opts) => approve(id, opts)}
+            onDeny={(id, msg) => deny(id, msg)}
+            onJumpToQueue={() => setView("queue")}
             registerHandler={registerTerminalHandler}
           />
         )}

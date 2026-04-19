@@ -8,7 +8,7 @@ interface QueueProps {
   onDeny: (id: string) => void;
 }
 
-function timeAgo(timestamp: string): string {
+export function timeAgo(timestamp: string): string {
   const seconds = Math.floor(
     (Date.now() - new Date(timestamp).getTime()) / 1000,
   );
@@ -18,7 +18,7 @@ function timeAgo(timestamp: string): string {
 }
 
 // Event type prefix badges matching TUI indicators
-function eventPrefix(eventName: string): string {
+export function eventPrefix(eventName: string): string {
   switch (eventName) {
     case "PermissionRequest": return "P";
     case "Elicitation": return "E";
@@ -32,7 +32,7 @@ function eventPrefix(eventName: string): string {
 }
 
 // Extract a brief summary of tool input for the queue list
-function inputSummary(item: DecisionRequest): string | null {
+export function inputSummary(item: DecisionRequest): string | null {
   const input = item.tool_input;
   if (!input) return null;
 
@@ -68,7 +68,7 @@ function inputSummary(item: DecisionRequest): string | null {
 }
 
 // Extract short project name from path
-function shortProject(project: string): string {
+export function shortProject(project: string): string {
   const parts = project.split("/");
   return parts[parts.length - 1] || project;
 }

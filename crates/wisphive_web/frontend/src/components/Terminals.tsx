@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import type { DecisionRequest, ProjectSummary, TerminalSessionMeta } from "../types/protocol";
 import { TerminalView } from "./TerminalView";
+import { TerminalQueueDock } from "./TerminalQueueDock";
 
 interface TerminalsProps {
   terminals: TerminalSessionMeta[];
@@ -17,6 +18,9 @@ interface TerminalsProps {
   onResize: (id: string, cols: number, rows: number) => void;
   onSetGroup: (id: string, group?: string) => void;
   onReorder: (id: string, sortOrder: number) => void;
+  onApprove: (id: string, opts?: { additional_context?: string; always_allow?: boolean }) => void;
+  onDeny: (id: string, message?: string) => void;
+  onJumpToQueue: () => void;
   registerHandler: (
     id: string,
     handler: (id: string, direction: "chunk" | "catchup" | "replay_chunk", bytes: Uint8Array) => void,
@@ -36,7 +40,8 @@ interface DragPayload {
 export function Terminals(props: TerminalsProps) {
   const {
     terminals, queue, projects, onRefresh, onRefreshProjects, onCreate, onAttach, onDetach,
-    onClose, onReplay, onInput, onResize, onSetGroup, onReorder, registerHandler,
+    onClose, onReplay, onInput, onResize, onSetGroup, onReorder,
+    onApprove, onDeny, onJumpToQueue, registerHandler,
   } = props;
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [replayMode, setReplayMode] = useState(false);
@@ -77,6 +82,12 @@ export function Terminals(props: TerminalsProps) {
     }
     return map;
   }, [queue]);
+
+  const terminalPending = useMemo(
+    () => (selected ? queue.filter((r) => r.terminal_session_id === selected.id) : []),
+    [queue, selected],
+  );
+  const otherPendingCount = queue.length - terminalPending.length;
 
   // Section partition: active = running; orphaned = own section; archived = exited + killed.
   const { active, orphaned, archived } = useMemo(() => {
@@ -417,14 +428,25 @@ export function Terminals(props: TerminalsProps) {
 
       <div className="terminals-main">
         {selected ? (
-          <TerminalView
-            key={`${selected.id}-${replayMode ? "replay" : "live"}`}
-            session={selected}
-            replayMode={replayMode}
-            onInput={onInput}
-            onResize={onResize}
-            registerHandler={registerHandler}
-          />
+          <>
+            <TerminalQueueDock
+              terminalPending={terminalPending}
+              otherPendingCount={otherPendingCount}
+              onApprove={onApprove}
+              onDeny={onDeny}
+              onJumpToQueue={onJumpToQueue}
+            />
+            <div className="terminals-terminal-slot">
+              <TerminalView
+                key={`${selected.id}-${replayMode ? "replay" : "live"}`}
+                session={selected}
+                replayMode={replayMode}
+                onInput={onInput}
+                onResize={onResize}
+                registerHandler={registerHandler}
+              />
+            </div>
+          </>
         ) : (
           <div className="terminals-empty-state">
             Select a terminal to view it live, or press "New terminal".
