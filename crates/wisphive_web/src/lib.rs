@@ -1,3 +1,4 @@
+mod security;
 mod ws_bridge;
 
 use std::net::SocketAddr;
@@ -9,6 +10,7 @@ use axum::extract::ws::WebSocket;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use rust_embed::RustEmbed;
+use security::{SecurityConfig, security_middleware};
 use tracing::info;
 
 /// Shared server state.
@@ -16,6 +18,7 @@ use tracing::info;
 struct AppState {
     socket_path: PathBuf,
     config_path: PathBuf,
+    security: SecurityConfig,
 }
 
 /// Embedded frontend assets (built by Vite into frontend/dist/).
@@ -89,32 +92,66 @@ async fn put_config(
     }
 }
 
+/// GET /api/web-token — bootstrap endpoint so the frontend can read the
+/// per-process bearer token. Gated by Origin + Host checks in the security
+/// middleware (it bypasses the bearer check to break the chicken-and-egg).
+async fn get_web_token(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Response {
+    let body = serde_json::json!({ "token": state.security.token() });
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+fn build_router(state: AppState, dev_mode: bool) -> Router {
+    let security = state.security.clone();
+    let api = Router::new()
+        .route("/ws", get(ws_handler))
+        .route("/api/web-token", get(get_web_token))
+        .route("/api/config", get(get_config).put(put_config));
+
+    let router = if dev_mode {
+        api.with_state(state).layer(
+            tower_http::cors::CorsLayer::new()
+                .allow_origin(tower_http::cors::Any)
+                .allow_methods(tower_http::cors::Any)
+                .allow_headers(tower_http::cors::Any),
+        )
+    } else {
+        api.fallback(get(static_handler)).with_state(state)
+    };
+
+    router.layer(axum::middleware::from_fn_with_state(
+        security,
+        security_middleware,
+    ))
+}
+
 /// Start the web server.
 pub async fn serve(socket_path: PathBuf, port: u16, dev_mode: bool, host: [u8; 4]) -> anyhow::Result<()> {
-    let config_path = socket_path.parent()
+    let home_dir = socket_path
+        .parent()
         .unwrap_or(std::path::Path::new("."))
-        .join("config.json");
+        .to_path_buf();
+    let config_path = home_dir.join("config.json");
 
-    let state = AppState { socket_path, config_path };
+    let security = SecurityConfig::build(&home_dir, port, dev_mode)?;
+    let token_path = home_dir.join("web.token");
+    info!(
+        token_path = %token_path.display(),
+        "web security: bearer token written (mode 0600); include it as ?token= on /ws or Authorization: Bearer on /api/*"
+    );
 
-    let app = if dev_mode {
-        Router::new()
-            .route("/ws", get(ws_handler))
-            .route("/api/config", get(get_config).put(put_config))
-            .with_state(state)
-            .layer(
-                tower_http::cors::CorsLayer::new()
-                    .allow_origin(tower_http::cors::Any)
-                    .allow_methods(tower_http::cors::Any)
-                    .allow_headers(tower_http::cors::Any),
-            )
-    } else {
-        Router::new()
-            .route("/ws", get(ws_handler))
-            .route("/api/config", get(get_config).put(put_config))
-            .fallback(get(static_handler))
-            .with_state(state)
+    let state = AppState {
+        socket_path,
+        config_path,
+        security,
     };
+
+    let app = build_router(state, dev_mode);
 
     let addr = SocketAddr::from((host, port));
     info!(%addr, dev_mode, "web server starting");
@@ -123,3 +160,6 @@ pub async fn serve(socket_path: PathBuf, port: u16, dev_mode: bool, host: [u8; 4
     axum::serve(listener, app).await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod http_tests;

@@ -7,9 +7,17 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
+      // WebSocket bridge to the daemon. `changeOrigin` rewrites the Host
+      // header to 127.0.0.1:3100 so the daemon's Host allowlist passes; the
+      // daemon's Origin allowlist is configured to accept http://localhost:5173.
       '/ws': {
         target: 'ws://127.0.0.1:3100',
         ws: true,
+        changeOrigin: true,
+      },
+      '/api': {
+        target: 'http://127.0.0.1:3100',
+        changeOrigin: true,
       },
     },
   },

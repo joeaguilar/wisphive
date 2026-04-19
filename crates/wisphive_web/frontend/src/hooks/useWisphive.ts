@@ -10,6 +10,7 @@ import type {
   SpawnAgentRequest,
   TerminalSessionMeta,
 } from "../types/protocol";
+import { getWebToken } from "../api";
 
 export interface WisphiveState {
   connected: boolean;
@@ -31,7 +32,7 @@ export type TerminalOutputHandler = (
   bytes: Uint8Array,
 ) => void;
 
-const WS_URL =
+const WS_BASE =
   import.meta.env.VITE_WS_URL || `ws://${window.location.host}/ws`;
 
 // Well-known request_id prefixes for routing responses
@@ -182,10 +183,18 @@ export function useWisphive() {
     }
   }, []);
 
-  const connect = useCallback(() => {
+  const connect = useCallback(async () => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
-    const ws = new WebSocket(WS_URL);
+    // Daemon requires a bearer token on /ws. Browsers can't set custom
+    // headers on WebSocket constructors, so we pass it as ?token=. If the
+    // token fetch fails the socket will 401 and trigger a reconnect.
+    const token = await getWebToken();
+    const url = token
+      ? `${WS_BASE}${WS_BASE.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}`
+      : WS_BASE;
+
+    const ws = new WebSocket(url);
     wsRef.current = ws;
 
     ws.onopen = () => {
@@ -200,6 +209,7 @@ export function useWisphive() {
 
     ws.onclose = () => {
       setState((prev) => ({ ...prev, connected: false }));
+      // eslint-disable-next-line react-hooks/immutability
       reconnectTimer.current = setTimeout(connect, 2000);
     };
 

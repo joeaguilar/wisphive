@@ -85,6 +85,7 @@ All under `~/.wisphive/`:
 - `wisphive.db` — SQLite state/audit database
 - `mode` — "active" or "off" (global kill switch)
 - `auto-approve.json` — List of tool names that skip daemon review
+- `web.token` — Per-process bearer token for the web UI (mode 0600). Regenerated on every `wisphive daemon start` / `wisphive web`. Required as `?token=` on `/ws` and `Authorization: Bearer` (or `?token=`) on `/api/*`. Frontend bootstraps it via `GET /api/web-token`, which is gated by Origin + Host checks but not by the bearer. Allowlists seed with `127.0.0.1:<port>` / `localhost:<port>` (plus `localhost:5173` in dev mode); extend via `WISPHIVE_WEB_ALLOWED_ORIGINS` / `WISPHIVE_WEB_ALLOWED_HOSTS` env vars when binding to `0.0.0.0`.
 
 ## Reference Documentation
 

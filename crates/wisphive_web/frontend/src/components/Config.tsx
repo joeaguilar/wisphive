@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { apiFetch } from "../api";
 
 const LEVELS = ["off", "read", "write", "execute", "all"] as const;
 type Level = typeof LEVELS[number];
@@ -41,8 +42,6 @@ function getToolStatus(tool: string, level: Level, add: string[], remove: string
   return { auto: false, source: "level" };
 }
 
-const API_BASE = import.meta.env.VITE_API_URL || "";
-
 export function ConfigView() {
   const [level, setLevel] = useState<Level>("read");
   const [add, setAdd] = useState<string[]>([]);
@@ -51,7 +50,7 @@ export function ConfigView() {
 
   const loadConfig = useCallback(async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/config`);
+      const res = await apiFetch(`/api/config`);
       const data: Config = await res.json();
       setLevel(data.auto_approve_level || "read");
       setAdd(data.auto_approve_add || []);
@@ -62,6 +61,7 @@ export function ConfigView() {
     setLoading(false);
   }, []);
 
+  // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => { loadConfig(); }, [loadConfig]);
 
   const saveConfig = useCallback(async (newLevel: Level, newAdd: string[], newRemove: string[]) => {
@@ -71,7 +71,7 @@ export function ConfigView() {
       auto_approve_remove: newRemove.length > 0 ? newRemove : undefined,
     };
     try {
-      await fetch(`${API_BASE}/api/config`, {
+      await apiFetch(`/api/config`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(config),
