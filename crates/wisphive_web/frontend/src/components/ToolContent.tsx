@@ -2,6 +2,7 @@
  * Shared tool-specific content renderer.
  * Used by both DetailView (live queue) and History (resolved entries).
  */
+import { MarkdownText } from "./MarkdownText";
 
 // Simple diff renderer — split old/new into lines and show unified view
 function DiffView({ oldStr, newStr }: { oldStr: string; newStr: string }) {
@@ -61,16 +62,13 @@ export function ToolContent({ toolName, toolInput, hookEventName, eventData, too
       <>
         <div className="detail-section">
           <h3>Stop Reason</h3>
-          {lastMessage ? (
-            <pre className="code-block">{lastMessage}</pre>
-          ) : (
-            // Fallback: try tool_input (which may contain event_data from DB)
-            <pre className="code-block">
-              {typeof input.last_assistant_message === "string"
-                ? input.last_assistant_message as string
-                : "(no message)"}
-            </pre>
-          )}
+          {(() => {
+            const msg = lastMessage
+              ?? (typeof input.last_assistant_message === "string"
+                ? (input.last_assistant_message as string)
+                : null);
+            return msg ? <MarkdownText text={msg} /> : <pre className="code-block">(no message)</pre>;
+          })()}
           {stopHookActive !== null && (
             <div className="field-row"><strong>Stop hook active:</strong> {String(stopHookActive)}</div>
           )}
@@ -87,7 +85,7 @@ export function ToolContent({ toolName, toolInput, hookEventName, eventData, too
         {prompt && (
           <div className="detail-section">
             <h3>Submitted Prompt</h3>
-            <pre className="code-block">{prompt}</pre>
+            <MarkdownText text={prompt} />
           </div>
         )}
         <ToolResultSection result={toolResult} />
@@ -131,7 +129,7 @@ export function ToolContent({ toolName, toolInput, hookEventName, eventData, too
         <div className="detail-section">
           <h3>Task Completed</h3>
           {taskSubject && <p><strong>{taskSubject}</strong></p>}
-          {taskDesc && <pre className="code-block">{taskDesc}</pre>}
+          {taskDesc && <MarkdownText text={taskDesc} />}
         </div>
         <ToolResultSection result={toolResult} />
       </>

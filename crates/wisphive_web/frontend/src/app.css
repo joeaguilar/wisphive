@@ -352,6 +352,54 @@ pre.code-block, pre.plan-content {
 }
 .markdown-content .md-li { padding-left: var(--space-lg); }
 .markdown-content strong { color: var(--text); }
+.markdown-content a { color: var(--cyan); }
+.markdown-content .md-pre {
+  background: #0b0b0b;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: var(--space-sm);
+  margin: var(--space-sm) 0;
+  overflow-x: auto;
+  font-size: var(--font-sm);
+  white-space: pre;
+}
+.markdown-content .md-table {
+  border-collapse: collapse;
+  margin: var(--space-sm) 0;
+  font-size: var(--font-sm);
+}
+.markdown-content .md-table th,
+.markdown-content .md-table td {
+  border: 1px solid var(--border);
+  padding: 4px 8px;
+  text-align: left;
+}
+.markdown-content .md-table th { color: var(--cyan); background: #161616; }
+
+/* Markdown tab toggle */
+.md-text { display: flex; flex-direction: column; }
+.md-tabs {
+  display: flex;
+  gap: 2px;
+  margin-bottom: 6px;
+  align-self: flex-end;
+}
+.md-tab {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  padding: 2px 10px;
+  font-size: 11px;
+  font-family: inherit;
+  cursor: pointer;
+  border-radius: 3px;
+}
+.md-tab:hover { border-color: var(--cyan); color: var(--text); }
+.md-tab.active {
+  background: var(--cyan);
+  color: #000;
+  border-color: var(--cyan);
+}
 
 .detail-actions {
   display: flex;

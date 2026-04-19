@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { DecisionRequest } from "../types/protocol";
 import { TextModal, ConfirmModal } from "./Modal";
 import { ToolContent } from "./ToolContent";
+import { MarkdownText } from "./MarkdownText";
 
 interface DetailViewProps {
   request: DecisionRequest;
@@ -11,20 +12,6 @@ interface DetailViewProps {
 
 // Safe string extraction from unknown values
 const str = (v: unknown): string => (typeof v === "string" ? v : String(v ?? ""));
-
-// Simple markdown to HTML (headers, bold, code, lists)
-function renderMarkdown(text: string): string {
-  return text
-    .replace(/^### (.+)$/gm, '<h4 class="md-h3">$1</h4>')
-    .replace(/^## (.+)$/gm, '<h3 class="md-h2">$1</h3>')
-    .replace(/^# (.+)$/gm, '<h2 class="md-h1">$1</h2>')
-    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-    .replace(/`([^`]+)`/g, '<code class="md-code">$1</code>')
-    .replace(/^- (.+)$/gm, '<div class="md-li">• $1</div>')
-    .replace(/^(\d+)\. (.+)$/gm, '<div class="md-li">$1. $2</div>')
-    .replace(/\n\n/g, '<br/><br/>')
-    .replace(/\n/g, '<br/>');
-}
 
 export function DetailView({ request, onApprove, onDeny }: DetailViewProps) {
   const [modal, setModal] = useState<"deny-msg" | "context" | "always" | null>(null);
@@ -49,7 +36,7 @@ export function DetailView({ request, onApprove, onDeny }: DetailViewProps) {
       {planContent && (
         <div className="detail-section">
           <h3>Plan</h3>
-          <div className="markdown-content" dangerouslySetInnerHTML={{ __html: renderMarkdown(planContent) }} />
+          <MarkdownText text={planContent} />
         </div>
       )}
 
