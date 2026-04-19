@@ -45,6 +45,10 @@ pub enum ClientMessage {
         always_allow: bool,
         #[serde(skip_serializing_if = "Option::is_none", default)]
         additional_context: Option<String>,
+        /// Originating web device id. None when the command came from the TUI
+        /// (local fs access is implicitly trusted).
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        device_id: Option<String>,
     },
 
     /// TUI denies a single queued decision (with optional feedback).
@@ -53,19 +57,33 @@ pub enum ClientMessage {
         id: Uuid,
         #[serde(skip_serializing_if = "Option::is_none", default)]
         message: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        device_id: Option<String>,
     },
 
     /// TUI defers to the agent's native permission prompt.
     #[serde(rename = "ask")]
-    Ask { id: Uuid },
+    Ask {
+        id: Uuid,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        device_id: Option<String>,
+    },
 
     /// TUI approves all items matching an optional filter.
     #[serde(rename = "approve_all")]
-    ApproveAll { filter: Option<DecisionFilter> },
+    ApproveAll {
+        filter: Option<DecisionFilter>,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        device_id: Option<String>,
+    },
 
     /// TUI denies all items matching an optional filter.
     #[serde(rename = "deny_all")]
-    DenyAll { filter: Option<DecisionFilter> },
+    DenyAll {
+        filter: Option<DecisionFilter>,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        device_id: Option<String>,
+    },
 
     /// Request the daemon to spawn a new agent process.
     #[serde(rename = "spawn_agent")]
@@ -129,6 +147,8 @@ pub enum ClientMessage {
         suggestion_index: usize,
         #[serde(skip_serializing_if = "Option::is_none", default)]
         message: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        device_id: Option<String>,
     },
 
     // ── Terminal sessions ─────────────────────────────────────────────
@@ -295,6 +315,51 @@ pub enum ServerMessage {
     /// Error message.
     #[serde(rename = "error")]
     Error { message: String },
+
+    // ── Web UI auth events ────────────────────────────────────────────
+    /// A web login attempt failed. Broadcast to TUI clients so humans can
+    /// see suspicious activity on the host. `attempt_count` is the running
+    /// tally for this `ip` within the throttle window.
+    #[serde(rename = "web_login_failure")]
+    WebLoginFailure {
+        ip: String,
+        attempt_count: u32,
+        at: chrono::DateTime<chrono::Utc>,
+    },
+
+    /// A web login attempt succeeded; a device token was issued.
+    #[serde(rename = "web_login_success")]
+    WebLoginSuccess {
+        device_id: String,
+        device_name: String,
+        ip: String,
+        at: chrono::DateTime<chrono::Utc>,
+    },
+
+    /// A new passkey was enrolled against an existing device.
+    #[serde(rename = "web_device_registered")]
+    WebDeviceRegistered {
+        device_id: String,
+        device_name: String,
+        at: chrono::DateTime<chrono::Utc>,
+    },
+
+    /// A web device was revoked (logged out or explicitly revoked from TUI/CLI).
+    #[serde(rename = "web_device_revoked")]
+    WebDeviceRevoked {
+        device_id: String,
+        at: chrono::DateTime<chrono::Utc>,
+    },
+
+    /// A sudo-class approve from `device_id` was rejected because the device's
+    /// reauth grace window has expired. The web frontend uses this to open
+    /// the sudo modal.
+    #[serde(rename = "web_reauth_required")]
+    WebReauthRequired {
+        device_id: String,
+        tool_name: String,
+        at: chrono::DateTime<chrono::Utc>,
+    },
 
     // ── Terminal sessions ─────────────────────────────────────────────
     /// Confirms a terminal session was created and delivers its metadata.
@@ -611,6 +676,7 @@ mod tests {
             updated_input: Some(serde_json::json!({"command": "cargo build --release"})),
             always_allow: true,
             additional_context: Some("use release mode".into()),
+            device_id: Some("dev-abc".into()),
         };
         let encoded = encode(&msg).unwrap();
         let decoded: ClientMessage = decode(&encoded).unwrap();
@@ -621,6 +687,7 @@ mod tests {
                 updated_input,
                 always_allow,
                 additional_context,
+                device_id,
             } => {
                 assert_eq!(did, id);
                 assert_eq!(message.unwrap(), "approved with edits");
@@ -630,6 +697,7 @@ mod tests {
                 );
                 assert!(always_allow);
                 assert_eq!(additional_context.unwrap(), "use release mode");
+                assert_eq!(device_id.as_deref(), Some("dev-abc"));
             }
             _ => panic!("unexpected variant"),
         }
@@ -641,13 +709,15 @@ mod tests {
         let msg = ClientMessage::Deny {
             id,
             message: Some("too dangerous".into()),
+            device_id: None,
         };
         let encoded = encode(&msg).unwrap();
         let decoded: ClientMessage = decode(&encoded).unwrap();
         match decoded {
-            ClientMessage::Deny { id: did, message } => {
+            ClientMessage::Deny { id: did, message, device_id } => {
                 assert_eq!(did, id);
                 assert_eq!(message.unwrap(), "too dangerous");
+                assert!(device_id.is_none());
             }
             _ => panic!("unexpected variant"),
         }
@@ -656,11 +726,11 @@ mod tests {
     #[test]
     fn round_trip_ask() {
         let id = uuid::Uuid::new_v4();
-        let msg = ClientMessage::Ask { id };
+        let msg = ClientMessage::Ask { id, device_id: None };
         let encoded = encode(&msg).unwrap();
         let decoded: ClientMessage = decode(&encoded).unwrap();
         match decoded {
-            ClientMessage::Ask { id: did } => assert_eq!(did, id),
+            ClientMessage::Ask { id: did, device_id: _ } => assert_eq!(did, id),
             _ => panic!("unexpected variant"),
         }
     }
@@ -673,11 +743,12 @@ mod tests {
                 project: Some(PathBuf::from("/proj")),
                 agent_type: Some(AgentType::ClaudeCode),
             }),
+            device_id: None,
         };
         let encoded = encode(&msg).unwrap();
         let decoded: ClientMessage = decode(&encoded).unwrap();
         match decoded {
-            ClientMessage::ApproveAll { filter } => {
+            ClientMessage::ApproveAll { filter, device_id: _ } => {
                 let f = filter.unwrap();
                 assert_eq!(f.tool_name.unwrap(), "Bash");
                 assert_eq!(f.project.unwrap(), PathBuf::from("/proj"));
@@ -689,11 +760,11 @@ mod tests {
 
     #[test]
     fn round_trip_deny_all_no_filter() {
-        let msg = ClientMessage::DenyAll { filter: None };
+        let msg = ClientMessage::DenyAll { filter: None, device_id: None };
         let encoded = encode(&msg).unwrap();
         let decoded: ClientMessage = decode(&encoded).unwrap();
         match decoded {
-            ClientMessage::DenyAll { filter } => assert!(filter.is_none()),
+            ClientMessage::DenyAll { filter, device_id: _ } => assert!(filter.is_none()),
             _ => panic!("unexpected variant"),
         }
     }
@@ -1066,6 +1137,105 @@ mod tests {
             let parsed = TerminalDirection::from_str(&dir.to_string()).unwrap();
             assert_eq!(parsed, dir);
         }
+    }
+
+    // ── Web UI auth events ──────────────────────────────────────────
+
+    #[test]
+    fn round_trip_web_login_failure() {
+        let at = chrono::Utc::now();
+        let msg = ServerMessage::WebLoginFailure {
+            ip: "192.168.1.42".into(),
+            attempt_count: 3,
+            at,
+        };
+        let encoded = encode(&msg).unwrap();
+        assert!(encoded.contains("\"type\":\"web_login_failure\""));
+        let decoded: ServerMessage = decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::WebLoginFailure { ip, attempt_count, .. } => {
+                assert_eq!(ip, "192.168.1.42");
+                assert_eq!(attempt_count, 3);
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_web_login_success() {
+        let msg = ServerMessage::WebLoginSuccess {
+            device_id: "dev-1".into(),
+            device_name: "phone".into(),
+            ip: "10.0.0.5".into(),
+            at: chrono::Utc::now(),
+        };
+        let encoded = encode(&msg).unwrap();
+        let decoded: ServerMessage = decode(&encoded).unwrap();
+        assert!(matches!(decoded, ServerMessage::WebLoginSuccess { .. }));
+    }
+
+    #[test]
+    fn round_trip_web_device_registered_and_revoked() {
+        let reg = ServerMessage::WebDeviceRegistered {
+            device_id: "dev-2".into(),
+            device_name: "laptop".into(),
+            at: chrono::Utc::now(),
+        };
+        let _: ServerMessage = decode(&encode(&reg).unwrap()).unwrap();
+
+        let rev = ServerMessage::WebDeviceRevoked {
+            device_id: "dev-2".into(),
+            at: chrono::Utc::now(),
+        };
+        let encoded = encode(&rev).unwrap();
+        assert!(encoded.contains("\"type\":\"web_device_revoked\""));
+        let _: ServerMessage = decode(&encoded).unwrap();
+    }
+
+    #[test]
+    fn round_trip_web_reauth_required() {
+        let msg = ServerMessage::WebReauthRequired {
+            device_id: "dev-3".into(),
+            tool_name: "Bash".into(),
+            at: chrono::Utc::now(),
+        };
+        let encoded = encode(&msg).unwrap();
+        let decoded: ServerMessage = decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::WebReauthRequired { device_id, tool_name, .. } => {
+                assert_eq!(device_id, "dev-3");
+                assert_eq!(tool_name, "Bash");
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    /// Decoding a ClientMessage that pre-dates the `device_id` field must
+    /// still succeed — the TUI never emits it, so all historical wire traffic
+    /// must continue to round-trip.
+    #[test]
+    fn decode_approve_without_device_id_is_backward_compatible() {
+        let id = uuid::Uuid::new_v4();
+        let legacy = format!(
+            r#"{{"type":"approve","id":"{id}","always_allow":false}}"#
+        );
+        let decoded: ClientMessage = decode(&legacy).unwrap();
+        match decoded {
+            ClientMessage::Approve { id: did, device_id, .. } => {
+                assert_eq!(did, id);
+                assert!(device_id.is_none(), "missing device_id should default to None");
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn device_id_omitted_when_none() {
+        let id = uuid::Uuid::new_v4();
+        let msg = ClientMessage::Deny { id, message: None, device_id: None };
+        let encoded = encode(&msg).unwrap();
+        // skip_serializing_if = None → field must not appear in wire output.
+        assert!(!encoded.contains("device_id"), "wire output should omit device_id when None: {encoded}");
     }
 
     #[test]

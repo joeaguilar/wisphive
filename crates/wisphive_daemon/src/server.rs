@@ -464,7 +464,7 @@ async fn handle_tui(
                             }
                         };
                         match msg {
-                            ClientMessage::Approve { id, message, updated_input, always_allow, additional_context } => {
+                            ClientMessage::Approve { id, message, updated_input, always_allow, additional_context, device_id: _ } => {
                                 let rich = RichDecision {
                                     decision: Decision::Approve,
                                     message,
@@ -483,7 +483,7 @@ async fn handle_tui(
                                     warn!("eager persist failed for {id}: {e}");
                                 }
                             }
-                            ClientMessage::Deny { id, message } => {
+                            ClientMessage::Deny { id, message, device_id: _ } => {
                                 let rich = RichDecision {
                                     decision: Decision::Deny,
                                     message,
@@ -497,12 +497,12 @@ async fn handle_tui(
                                     warn!("eager persist failed for {id}: {e}");
                                 }
                             }
-                            ClientMessage::Ask { id } => {
+                            ClientMessage::Ask { id, device_id: _ } => {
                                 let mut q = ctx.queue.lock().await;
                                 q.resolve(id, RichDecision::from(Decision::Ask));
                                 // Ask/defer decisions are not persisted to the audit log
                             }
-                            ClientMessage::ApproveAll { ref filter } => {
+                            ClientMessage::ApproveAll { ref filter, device_id: _ } => {
                                 let ids = {
                                     let mut q = ctx.queue.lock().await;
                                     q.resolve_all(filter, Decision::Approve)
@@ -514,7 +514,7 @@ async fn handle_tui(
                                     }
                                 }
                             }
-                            ClientMessage::DenyAll { ref filter } => {
+                            ClientMessage::DenyAll { ref filter, device_id: _ } => {
                                 let ids = {
                                     let mut q = ctx.queue.lock().await;
                                     q.resolve_all(filter, Decision::Deny)
@@ -937,7 +937,7 @@ async fn handle_tui(
                                     }
                                 });
                             }
-                            ClientMessage::ApprovePermission { id, suggestion_index, message } => {
+                            ClientMessage::ApprovePermission { id, suggestion_index, message, device_id: _ } => {
                                 // Look up the selected suggestion from the queued request
                                 let selected = {
                                     let q = ctx.queue.lock().await;

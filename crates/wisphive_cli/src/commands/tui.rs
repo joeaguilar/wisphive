@@ -118,24 +118,25 @@ async fn run_loop(
                                 updated_input: None,
                                 always_allow: false,
                                 additional_context: None,
+                                device_id: None,
                             }).await?;
                             app.remove_decision(id);
                         }
                         InputAction::Deny(id) => {
                             tracing::info!(%id, "denied");
-                            conn.send(&ClientMessage::Deny { id, message: None }).await?;
+                            conn.send(&ClientMessage::Deny { id, message: None, device_id: None }).await?;
                             app.remove_decision(id);
                         }
                         InputAction::ApproveAll => {
                             tracing::info!("approved all");
-                            conn.send(&ClientMessage::ApproveAll { filter: None }).await?;
+                            conn.send(&ClientMessage::ApproveAll { filter: None, device_id: None }).await?;
                             app.queue.clear();
                             app.queue_index = 0;
                             app.rebuild_projects();
                         }
                         InputAction::DenyAll => {
                             tracing::info!("denied all");
-                            conn.send(&ClientMessage::DenyAll { filter: None }).await?;
+                            conn.send(&ClientMessage::DenyAll { filter: None, device_id: None }).await?;
                             app.queue.clear();
                             app.queue_index = 0;
                             app.rebuild_projects();
@@ -194,7 +195,7 @@ async fn run_loop(
                         }
                         InputAction::DenyWithMessage { id, message } => {
                             tracing::info!(%id, %message, "denied with message");
-                            conn.send(&ClientMessage::Deny { id, message: Some(message) }).await?;
+                            conn.send(&ClientMessage::Deny { id, message: Some(message), device_id: None }).await?;
                             app.remove_decision(id);
                         }
                         InputAction::AlwaysAllow(id) => {
@@ -205,6 +206,7 @@ async fn run_loop(
                                 updated_input: None,
                                 always_allow: true,
                                 additional_context: None,
+                                device_id: None,
                             }).await?;
                             app.remove_decision(id);
                         }
@@ -216,6 +218,7 @@ async fn run_loop(
                                 updated_input: Some(updated_input),
                                 always_allow: false,
                                 additional_context: None,
+                                device_id: None,
                             }).await?;
                             app.remove_decision(id);
                         }
@@ -227,12 +230,13 @@ async fn run_loop(
                                 updated_input: None,
                                 always_allow: false,
                                 additional_context: Some(context),
+                                device_id: None,
                             }).await?;
                             app.remove_decision(id);
                         }
                         InputAction::AskDefer(id) => {
                             tracing::info!(%id, "defer to native prompt");
-                            conn.send(&ClientMessage::Ask { id }).await?;
+                            conn.send(&ClientMessage::Ask { id, device_id: None }).await?;
                             app.remove_decision(id);
                         }
                         InputAction::ApprovePermission { id, suggestion_index } => {
@@ -241,6 +245,7 @@ async fn run_loop(
                                 id,
                                 suggestion_index,
                                 message: None,
+                                device_id: None,
                             }).await?;
                             app.remove_decision(id);
                         }

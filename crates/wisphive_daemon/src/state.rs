@@ -49,6 +49,46 @@ type PendingRowWithTerm = (
 /// Row shape for session aggregate queries (8 columns).
 type SessionRow = (String, String, String, String, String, i64, i64, i64);
 
+/// Row shape for `web_devices` fetches that include `revoked_at`.
+type WebDeviceFullRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// Row shape for `web_devices` lookups that only load active-device fields.
+type WebDeviceActiveRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
+/// Row shape for `web_passkeys` queries.
+type WebPasskeyRowRaw = (
+    String,
+    String,
+    Vec<u8>,
+    i64,
+    Option<String>,
+    String,
+    Option<String>,
+);
+
+/// Row shape for `web_audit` queries.
+type WebAuditRowRaw = (
+    i64,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 /// Parameters for logging an auto-approved tool call.
 pub struct AutoApprovedEntry<'a> {
     pub agent_id: &'a str,
@@ -59,6 +99,40 @@ pub struct AutoApprovedEntry<'a> {
     pub timestamp: &'a str,
     pub tool_use_id: Option<&'a str>,
     pub hook_event_name: Option<&'a str>,
+}
+
+/// A row from `web_devices`. `revoked_at` is `None` for active devices.
+#[derive(Debug, Clone)]
+pub struct WebDeviceRow {
+    pub id: String,
+    pub name: String,
+    pub created_at: String,
+    pub last_seen_at: Option<String>,
+    pub last_ip: Option<String>,
+    pub revoked_at: Option<String>,
+}
+
+/// A row from `web_passkeys`.
+#[derive(Debug, Clone)]
+pub struct WebPasskeyRow {
+    pub id: String,
+    pub device_id: String,
+    pub public_key: Vec<u8>,
+    pub sign_count: i64,
+    pub transports: Option<String>,
+    pub created_at: String,
+    pub last_used_at: Option<String>,
+}
+
+/// A row from `web_audit`.
+#[derive(Debug, Clone)]
+pub struct WebAuditRow {
+    pub id: i64,
+    pub at: String,
+    pub event: String,
+    pub device_id: Option<String>,
+    pub ip: Option<String>,
+    pub detail: Option<String>,
 }
 
 /// Manages the SQLite state database for crash recovery and audit.
@@ -261,6 +335,76 @@ impl StateDb {
         sqlx::query(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_decision_log_tool_use_id
              ON decision_log(tool_use_id) WHERE tool_use_id IS NOT NULL",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // ── Web UI auth tables ───────────────────────────────────────
+        // Single-row password table (id always = 1); argon2id hash.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS web_password (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                argon2_hash TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Per-device tokens. `token_hash` = sha256(raw token); raw token is
+        // only ever shown once to the client at login time.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS web_devices (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                token_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT,
+                last_ip TEXT,
+                revoked_at TEXT
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // WebAuthn credentials bound to a device. Cascade-deleted so revoking
+        // a device cleans up its passkeys too.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS web_passkeys (
+                id TEXT PRIMARY KEY,
+                device_id TEXT NOT NULL REFERENCES web_devices(id) ON DELETE CASCADE,
+                public_key BLOB NOT NULL,
+                sign_count INTEGER NOT NULL,
+                transports TEXT,
+                created_at TEXT NOT NULL,
+                last_used_at TEXT
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Append-only audit log for login/enroll/revoke events.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS web_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                at TEXT NOT NULL,
+                event TEXT NOT NULL,
+                device_id TEXT,
+                ip TEXT,
+                detail TEXT
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_web_audit_at ON web_audit(at DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_web_devices_revoked ON web_devices(revoked_at)",
         )
         .execute(&self.pool)
         .await?;
@@ -766,6 +910,238 @@ impl StateDb {
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    // ── Web UI auth helpers ───────────────────────────────────────
+
+    /// Upsert the single-row web password hash.
+    pub async fn set_web_password(&self, argon2_hash: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO web_password (id, argon2_hash, updated_at) VALUES (1, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET argon2_hash = excluded.argon2_hash, updated_at = excluded.updated_at",
+        )
+        .bind(argon2_hash)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Fetch the stored web password hash, if one has been set.
+    pub async fn get_web_password_hash(&self) -> Result<Option<String>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT argon2_hash FROM web_password WHERE id = 1")
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(h,)| h))
+    }
+
+    /// Wipe the password + all devices + passkeys (reset). The audit rows
+    /// stay so the operator can see the reset event.
+    pub async fn reset_web_password(&self) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM web_passkeys").execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM web_devices").execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM web_password").execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Record a new device token binding. `token_hash` must be sha256 of the
+    /// raw bearer token that was returned to the client.
+    pub async fn insert_web_device(
+        &self,
+        id: &str,
+        name: &str,
+        token_hash: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO web_devices (id, name, token_hash, created_at)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(token_hash)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Find a non-revoked device by its token hash. Also returns the device
+    /// name so callers can populate the request context.
+    pub async fn find_web_device_by_token_hash(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<WebDeviceRow>> {
+        let row: Option<WebDeviceActiveRow> = sqlx::query_as(
+            "SELECT id, name, created_at, last_seen_at, last_ip
+             FROM web_devices
+             WHERE token_hash = ? AND revoked_at IS NULL
+             LIMIT 1",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(id, name, created_at, last_seen_at, last_ip)| WebDeviceRow {
+            id,
+            name,
+            created_at,
+            last_seen_at,
+            last_ip,
+            revoked_at: None,
+        }))
+    }
+
+    /// Flip `revoked_at` on a device, idempotently.
+    pub async fn revoke_web_device(&self, id: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE web_devices SET revoked_at = ?
+             WHERE id = ? AND revoked_at IS NULL",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Record that we've just served a request on behalf of `device_id`.
+    /// Best-effort: callers should fire-and-forget.
+    pub async fn touch_web_device(&self, id: &str, ip: Option<&str>) -> Result<()> {
+        sqlx::query(
+            "UPDATE web_devices SET last_seen_at = ?, last_ip = ? WHERE id = ?",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(ip)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// List all devices, newest first. Includes revoked so the UI can show
+    /// history.
+    pub async fn list_web_devices(&self) -> Result<Vec<WebDeviceRow>> {
+        let rows: Vec<WebDeviceFullRow> =
+            sqlx::query_as(
+                "SELECT id, name, created_at, last_seen_at, last_ip, revoked_at
+                 FROM web_devices
+                 ORDER BY created_at DESC",
+            )
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, name, created_at, last_seen_at, last_ip, revoked_at)| WebDeviceRow {
+                id,
+                name,
+                created_at,
+                last_seen_at,
+                last_ip,
+                revoked_at,
+            })
+            .collect())
+    }
+
+    /// Persist a newly enrolled passkey.
+    pub async fn insert_web_passkey(
+        &self,
+        id: &str,
+        device_id: &str,
+        public_key: &[u8],
+        sign_count: i64,
+        transports_json: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO web_passkeys (id, device_id, public_key, sign_count, transports, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(device_id)
+        .bind(public_key)
+        .bind(sign_count)
+        .bind(transports_json)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// List all passkeys bound to a given device.
+    pub async fn list_web_passkeys_for_device(
+        &self,
+        device_id: &str,
+    ) -> Result<Vec<WebPasskeyRow>> {
+        let rows: Vec<WebPasskeyRowRaw> =
+            sqlx::query_as(
+                "SELECT id, device_id, public_key, sign_count, transports, created_at, last_used_at
+                 FROM web_passkeys
+                 WHERE device_id = ?
+                 ORDER BY created_at DESC",
+            )
+            .bind(device_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, device_id, public_key, sign_count, transports, created_at, last_used_at)| {
+                WebPasskeyRow {
+                    id,
+                    device_id,
+                    public_key,
+                    sign_count,
+                    transports,
+                    created_at,
+                    last_used_at,
+                }
+            })
+            .collect())
+    }
+
+    /// Append a row to the audit log. `detail` is typically JSON.
+    pub async fn append_web_audit(
+        &self,
+        event: &str,
+        device_id: Option<&str>,
+        ip: Option<&str>,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO web_audit (at, event, device_id, ip, detail)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(event)
+        .bind(device_id)
+        .bind(ip)
+        .bind(detail)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Query recent audit rows, newest first.
+    pub async fn list_web_audit(&self, limit: u32) -> Result<Vec<WebAuditRow>> {
+        let rows: Vec<WebAuditRowRaw> =
+            sqlx::query_as(
+                "SELECT id, at, event, device_id, ip, detail
+                 FROM web_audit ORDER BY id DESC LIMIT ?",
+            )
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, at, event, device_id, ip, detail)| WebAuditRow {
+                id,
+                at,
+                event,
+                device_id,
+                ip,
+                detail,
+            })
+            .collect())
     }
 
     // ── Terminal session helpers ──────────────────────────────────
@@ -1640,6 +2016,102 @@ mod tests {
         let got = db.get_terminal_session(id).await.unwrap().unwrap();
         assert_eq!(got.status, TerminalStatus::Orphaned);
         assert!(got.ended_at.is_some());
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // Web auth helpers
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn web_password_set_get_and_reset() {
+        let db = test_db().await;
+        assert!(db.get_web_password_hash().await.unwrap().is_none());
+
+        db.set_web_password("$argon2id$hash1").await.unwrap();
+        assert_eq!(
+            db.get_web_password_hash().await.unwrap().as_deref(),
+            Some("$argon2id$hash1")
+        );
+
+        // Upsert overwrites.
+        db.set_web_password("$argon2id$hash2").await.unwrap();
+        assert_eq!(
+            db.get_web_password_hash().await.unwrap().as_deref(),
+            Some("$argon2id$hash2")
+        );
+
+        // Reset cascades devices/passkeys and clears the password.
+        db.insert_web_device("dev-1", "phone", "tokhash-1").await.unwrap();
+        db.insert_web_passkey("pk-1", "dev-1", b"fake-key", 0, None).await.unwrap();
+        db.reset_web_password().await.unwrap();
+        assert!(db.get_web_password_hash().await.unwrap().is_none());
+        assert!(db.list_web_devices().await.unwrap().is_empty());
+        assert!(db.list_web_passkeys_for_device("dev-1").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn web_device_insert_find_revoke_list() {
+        let db = test_db().await;
+        db.insert_web_device("dev-1", "phone", "hash-1").await.unwrap();
+        db.insert_web_device("dev-2", "laptop", "hash-2").await.unwrap();
+
+        let found = db.find_web_device_by_token_hash("hash-1").await.unwrap().unwrap();
+        assert_eq!(found.id, "dev-1");
+        assert_eq!(found.name, "phone");
+
+        // Touching updates last_seen/last_ip (smoke test).
+        db.touch_web_device("dev-1", Some("192.168.1.5")).await.unwrap();
+
+        // Listing returns both; order is newest-first so dev-2 comes first.
+        let devices = db.list_web_devices().await.unwrap();
+        assert_eq!(devices.len(), 2);
+
+        // Revoking hides the device from token lookups and flips revoked_at.
+        db.revoke_web_device("dev-1").await.unwrap();
+        assert!(db.find_web_device_by_token_hash("hash-1").await.unwrap().is_none());
+        let rev = db.list_web_devices().await.unwrap();
+        let dev1 = rev.iter().find(|d| d.id == "dev-1").unwrap();
+        assert!(dev1.revoked_at.is_some());
+
+        // Revoking twice is a no-op.
+        db.revoke_web_device("dev-1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn web_passkey_insert_and_list_cascade_deletes() {
+        let db = test_db().await;
+        db.insert_web_device("dev-1", "phone", "hash-1").await.unwrap();
+        db.insert_web_passkey("pk-a", "dev-1", b"cose-a", 0, Some("[\"internal\"]"))
+            .await
+            .unwrap();
+        db.insert_web_passkey("pk-b", "dev-1", b"cose-b", 0, None).await.unwrap();
+
+        let keys = db.list_web_passkeys_for_device("dev-1").await.unwrap();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.iter().any(|k| k.id == "pk-a"));
+        assert!(keys.iter().any(|k| k.id == "pk-b"));
+        assert_eq!(keys.iter().find(|k| k.id == "pk-a").unwrap().public_key, b"cose-a");
+
+        // ON DELETE CASCADE kicks in when the device row is removed (via reset).
+        db.reset_web_password().await.unwrap();
+        assert!(db.list_web_passkeys_for_device("dev-1").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn web_audit_append_and_list_newest_first() {
+        let db = test_db().await;
+        db.append_web_audit("login_failure", None, Some("1.2.3.4"), Some("{\"reason\":\"bad_pw\"}"))
+            .await
+            .unwrap();
+        db.append_web_audit("login_success", Some("dev-1"), Some("1.2.3.4"), None).await.unwrap();
+
+        let rows = db.list_web_audit(10).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        // Newest first
+        assert_eq!(rows[0].event, "login_success");
+        assert_eq!(rows[0].device_id.as_deref(), Some("dev-1"));
+        assert_eq!(rows[1].event, "login_failure");
+        assert_eq!(rows[1].detail.as_deref(), Some("{\"reason\":\"bad_pw\"}"));
     }
 
     #[tokio::test]

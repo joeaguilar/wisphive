@@ -220,6 +220,7 @@ async fn non_hello_first_message_gets_error() {
         updated_input: None,
         always_allow: false,
         additional_context: None,
+        device_id: None,
     })
     .unwrap();
     writer.write_all(msg.as_bytes()).await.unwrap();
@@ -270,7 +271,7 @@ async fn hook_sends_request_tui_approves_hook_gets_response() {
     }
 
     // TUI approves
-    let approve = encode(&ClientMessage::Approve { id: req_id, message: None, updated_input: None, always_allow: false, additional_context: None }).unwrap();
+    let approve = encode(&ClientMessage::Approve { id: req_id, message: None, updated_input: None, always_allow: false, additional_context: None, device_id: None }).unwrap();
     tui_writer.write_all(approve.as_bytes()).await.unwrap();
 
     // Hook should receive the decision response
@@ -312,7 +313,7 @@ async fn hook_sends_request_tui_denies_hook_gets_deny() {
     .await;
 
     // TUI denies
-    let deny = encode(&ClientMessage::Deny { id: req_id, message: None }).unwrap();
+    let deny = encode(&ClientMessage::Deny { id: req_id, message: None, device_id: None }).unwrap();
     tui_writer.write_all(deny.as_bytes()).await.unwrap();
 
     // Hook receives deny
@@ -353,7 +354,7 @@ async fn tui_receives_decision_resolved_after_approve() {
     .await;
 
     // TUI approves
-    let approve = encode(&ClientMessage::Approve { id: req_id, message: None, updated_input: None, always_allow: false, additional_context: None }).unwrap();
+    let approve = encode(&ClientMessage::Approve { id: req_id, message: None, updated_input: None, always_allow: false, additional_context: None, device_id: None }).unwrap();
     tui_writer.write_all(approve.as_bytes()).await.unwrap();
 
     // TUI should also receive DecisionResolved (skip AgentDisconnected)
@@ -406,7 +407,7 @@ async fn multiple_hooks_queued_then_resolved_individually() {
     .await;
 
     // Approve hook 2 first (out of order)
-    let approve2 = encode(&ClientMessage::Approve { id: id2, message: None, updated_input: None, always_allow: false, additional_context: None }).unwrap();
+    let approve2 = encode(&ClientMessage::Approve { id: id2, message: None, updated_input: None, always_allow: false, additional_context: None, device_id: None }).unwrap();
     tui_writer.write_all(approve2.as_bytes()).await.unwrap();
 
     let hook2_resp = tokio::time::timeout(Duration::from_secs(2), hook2_lines.next_line())
@@ -424,7 +425,7 @@ async fn multiple_hooks_queued_then_resolved_individually() {
     ));
 
     // Deny hook 1
-    let deny1 = encode(&ClientMessage::Deny { id: id1, message: None }).unwrap();
+    let deny1 = encode(&ClientMessage::Deny { id: id1, message: None, device_id: None }).unwrap();
     tui_writer.write_all(deny1.as_bytes()).await.unwrap();
 
     let hook1_resp = tokio::time::timeout(Duration::from_secs(2), hook1_lines.next_line())
@@ -475,7 +476,7 @@ async fn approve_all_resolves_all_pending_hooks() {
     }
 
     // TUI sends ApproveAll
-    let approve_all = encode(&ClientMessage::ApproveAll { filter: None }).unwrap();
+    let approve_all = encode(&ClientMessage::ApproveAll { filter: None, device_id: None }).unwrap();
     tui_writer.write_all(approve_all.as_bytes()).await.unwrap();
 
     // All hooks should get Approve
@@ -517,6 +518,7 @@ async fn hook_sends_non_decision_request_after_hello_gets_error() {
         updated_input: None,
         always_allow: false,
         additional_context: None,
+        device_id: None,
     })
     .unwrap();
     writer.write_all(msg.as_bytes()).await.unwrap();
