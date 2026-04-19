@@ -1,4 +1,6 @@
+pub mod auth;
 mod security;
+pub mod tls;
 mod ws_bridge;
 
 use std::net::SocketAddr;
