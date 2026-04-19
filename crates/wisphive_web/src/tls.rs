@@ -11,25 +11,40 @@
 //! - `<home>/web.key.pem`         — PEM-encoded PKCS#8 private key (mode 0600)
 //! - `<home>/web.cert.meta.json`  — sidecar with `{created_at, sans}` so we
 //!   can decide when to regenerate without parsing X.509.
+//! - `<home>/web.cert.lock`       — empty lockfile that holds an `flock(2)`
+//!   exclusive lock for the duration of `ensure_cert`, so concurrent daemon
+//!   starts (or `wisphive web` invocations) can't clobber each other's keys.
 
 use std::fs;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rcgen::{CertificateParams, DnType, KeyPair, PKCS_ECDSA_P256_SHA256};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use time::{Duration as TimeDuration, OffsetDateTime};
 
 const CERT_FILENAME: &str = "web.cert.pem";
 const KEY_FILENAME: &str = "web.key.pem";
 const META_FILENAME: &str = "web.cert.meta.json";
+const LOCK_FILENAME: &str = "web.cert.lock";
 const COMMON_NAME: &str = "Wisphive Web";
 /// Regenerate certs older than this (seconds). 90 days.
 const MAX_CERT_AGE_SECS: u64 = 90 * 24 * 60 * 60;
+/// Cap NotAfter at 397 days from issuance. CA/Browser Forum baseline + iOS
+/// Safari + recent Chrome reject longer-lived certs even when self-signed
+/// (`ERR_CERT_VALIDITY_TOO_LONG`); without this the phone-on-LAN flow breaks.
+/// Renewal is driven by the 90-day rotation policy, so this cap only matters
+/// as the absolute upper bound.
+const CERT_VALIDITY_DAYS: i64 = 397;
+/// Backdate NotBefore by an hour to absorb mild clock skew between the
+/// machine that minted the cert and the one connecting to it.
+const CERT_NOT_BEFORE_BACKDATE_HOURS: i64 = 1;
 
 /// Result of `ensure_cert`: PEM bytes the TLS server needs plus a stable
 /// fingerprint suitable for showing in the startup banner.
@@ -56,6 +71,12 @@ pub fn ensure_cert(home_dir: &Path, bind_host: IpAddr) -> Result<EnsureCertResul
     fs::create_dir_all(home_dir)
         .with_context(|| format!("creating home dir {}", home_dir.display()))?;
 
+    // Serialize the whole load-or-generate dance against any other process
+    // touching the same home dir. Without this two `wisphive daemon start`
+    // calls (or daemon + `wisphive web`) can race and one will hand TLS a
+    // cert/key pair from different generations.
+    let _lock = FileLock::acquire_exclusive(&home_dir.join(LOCK_FILENAME))?;
+
     let cert_path = home_dir.join(CERT_FILENAME);
     let key_path = home_dir.join(KEY_FILENAME);
     let meta_path = home_dir.join(META_FILENAME);
@@ -67,6 +88,41 @@ pub fn ensure_cert(home_dir: &Path, bind_host: IpAddr) -> Result<EnsureCertResul
     }
 
     generate_and_persist(&cert_path, &key_path, &meta_path, &desired_sans)
+}
+
+/// RAII handle around an exclusive `flock(2)` on a lockfile. The kernel
+/// releases the lock when the underlying fd closes; we close on drop.
+struct FileLock {
+    _file: fs::File,
+}
+
+impl FileLock {
+    fn acquire_exclusive(path: &Path) -> Result<Self> {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("opening lockfile {}", path.display()))?;
+        // Block until we own the exclusive lock. Retry on EINTR so a stray
+        // signal (debugger, SIGCHLD) can't bounce us out before we lock.
+        let fd = file.as_raw_fd();
+        loop {
+            // SAFETY: `fd` comes from a `File` we own and outlives the call.
+            let r = unsafe { libc::flock(fd, libc::LOCK_EX) };
+            if r == 0 {
+                break;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(err).with_context(|| format!("flock(LOCK_EX) on {}", path.display()));
+        }
+        Ok(Self { _file: file })
+    }
 }
 
 fn try_load_existing(
@@ -135,11 +191,14 @@ fn generate_and_persist(
     params
         .distinguished_name
         .push(DnType::CommonName, COMMON_NAME);
-    // Note: we lean on rcgen's default not_before/not_after window. Our own
-    // 90-day rotation policy is enforced via the `created_at` timestamp in
-    // the meta sidecar (see `try_load_existing`), which is the actual source
-    // of truth for renewals — parsing X.509 dates back from PEM is more
-    // dependency than it's worth for a self-signed local cert.
+    // rcgen's defaults are NotBefore=1975 / NotAfter=4096 — modern browsers
+    // (iOS Safari, Chrome ≥ 85) reject anything over 398 days even on a
+    // self-signed cert, so we'd serve an unreachable site. Cap at 397 days
+    // and backdate by an hour for clock skew. Day-to-day renewal is still
+    // driven by the 90-day rotation in `try_load_existing`.
+    let now = OffsetDateTime::now_utc();
+    params.not_before = now - TimeDuration::hours(CERT_NOT_BEFORE_BACKDATE_HOURS);
+    params.not_after = now + TimeDuration::days(CERT_VALIDITY_DAYS);
 
     let cert = params
         .self_signed(&key_pair)
@@ -170,25 +229,62 @@ fn generate_and_persist(
     })
 }
 
-/// Write a file with `0600` perms, replacing any existing file at that path.
+/// Write `bytes` to `path` atomically with `0600` perms.
+///
+/// Strategy: write to a sibling `<path>.tmp`, fchmod via `set_permissions`
+/// (in case umask stripped the requested mode), `fsync` so the data is
+/// durable, then `rename` over the destination (POSIX guarantees atomic
+/// replacement on the same filesystem). Finally `fsync` the directory so
+/// the rename itself survives a crash. Combined with the `flock` in
+/// `ensure_cert`, this gives us: no half-written secrets on disk, and no
+/// way for two writers to interleave and produce a cert+key from
+/// different generations.
 fn write_secret(path: &Path, bytes: &[u8]) -> Result<()> {
-    if path.exists() {
-        let _ = fs::remove_file(path);
-    }
+    let dir = path
+        .parent()
+        .with_context(|| format!("path {} has no parent dir", path.display()))?;
+    let tmp = tmp_path_for(path);
+
+    // A previous crash (or a stale tmp from before `flock` existed) could
+    // leave the tmp lying around. We hold the directory's flock so nobody
+    // else is writing it concurrently — safe to remove and recreate.
+    let _ = fs::remove_file(&tmp);
+
     let mut f = fs::OpenOptions::new()
-        .create(true)
+        .create_new(true)
         .write(true)
-        .truncate(true)
         .mode(0o600)
-        .open(path)
-        .with_context(|| format!("opening {} for write", path.display()))?;
+        .open(&tmp)
+        .with_context(|| format!("creating tmp {}", tmp.display()))?;
+    // Belt-and-suspenders fchmod: `mode()` above is honored only if the
+    // file is actually created (it was), but umask can still mask bits
+    // out. `File::set_permissions` calls fchmod on the open fd.
+    f.set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("fchmod tmp {}", tmp.display()))?;
     f.write_all(bytes)
-        .with_context(|| format!("writing {}", path.display()))?;
-    // Belt-and-suspenders: re-set perms in case umask trumped `mode()`.
-    let mut perms = fs::metadata(path)?.permissions();
-    perms.set_mode(0o600);
-    fs::set_permissions(path, perms)?;
+        .with_context(|| format!("writing tmp {}", tmp.display()))?;
+    f.sync_all()
+        .with_context(|| format!("fsync tmp {}", tmp.display()))?;
+    drop(f);
+
+    fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+
+    // fsync the containing directory so the rename is durable across a
+    // power loss. Best-effort: some filesystems don't require this and
+    // some platforms refuse to open a dir for fsync.
+    if let Ok(d) = fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+
     Ok(())
+}
+
+/// Sibling tmp path: `web.cert.pem` -> `web.cert.pem.tmp`.
+fn tmp_path_for(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".tmp");
+    PathBuf::from(name)
 }
 
 /// Format a SHA-256 hash of `der` as `AB:CD:...` (uppercase hex, colons).
@@ -337,9 +433,9 @@ mod tests {
             Ok(v) => v,
             Err(_) => return,
         };
-        let has_non_loopback_v4 = ifaces.iter().any(|i| {
-            !i.is_loopback() && matches!(i.ip(), IpAddr::V4(_))
-        });
+        let has_non_loopback_v4 = ifaces
+            .iter()
+            .any(|i| !i.is_loopback() && matches!(i.ip(), IpAddr::V4(_)));
         if !has_non_loopback_v4 {
             // CI-style sandbox with only loopback — nothing to assert.
             return;
@@ -399,6 +495,97 @@ mod tests {
             let p: PathBuf = dir.path().join(name);
             let mode = fs::metadata(&p).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "{name} mode = {mode:o}");
+        }
+    }
+
+    /// itr#225: validity window must stay under the 398-day cap browsers
+    /// enforce. We parse the actual DER (via x509-parser, dev-dep only) so
+    /// we're checking what the wire really carries, not just the params we
+    /// handed rcgen.
+    #[test]
+    fn cert_validity_window_under_398_days() {
+        use x509_parser::prelude::FromDer;
+        let dir = TempDir::new().unwrap();
+        let r = ensure_cert(dir.path(), IpAddr::V4(Ipv4Addr::LOCALHOST)).unwrap();
+        let der = cert_der_from_pem(&r.cert_pem).expect("cert pem should parse");
+        let (_rest, cert) = x509_parser::certificate::X509Certificate::from_der(&der)
+            .expect("cert DER should parse");
+        let validity = cert.validity();
+        let window_secs = validity.not_after.timestamp() - validity.not_before.timestamp();
+        let window_days = window_secs / 86_400;
+        assert!(
+            window_days <= 398,
+            "validity window {window_days}d exceeds 398-day browser cap",
+        );
+        assert!(
+            window_days >= 396,
+            "validity window {window_days}d unexpectedly short — backdate logic regressed?",
+        );
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        assert!(
+            validity.not_before.timestamp() <= now,
+            "not_before is in the future; backdate broken",
+        );
+        assert!(
+            validity.not_after.timestamp() > now,
+            "not_after is already past; cert is born expired",
+        );
+    }
+
+    /// itr#224: many threads racing on `ensure_cert` must converge on a
+    /// single cert/key pair. Without the flock + atomic write they'd produce
+    /// disjoint generations and either disagree on the fingerprint or leave
+    /// a cert+key from different generations on disk.
+    #[test]
+    fn concurrent_ensure_cert_serializes() {
+        let dir = TempDir::new().unwrap();
+        let bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let path = dir.path().to_path_buf();
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let p = path.clone();
+                std::thread::spawn(move || ensure_cert(&p, bind).unwrap().fingerprint_sha256)
+            })
+            .collect();
+        let fingerprints: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let first = &fingerprints[0];
+        for f in &fingerprints {
+            assert_eq!(
+                f, first,
+                "concurrent ensure_cert disagreed: {fingerprints:?}"
+            );
+        }
+
+        let cert_pem = fs::read(path.join(CERT_FILENAME)).unwrap();
+        let key_pem = fs::read(path.join(KEY_FILENAME)).unwrap();
+        assert!(
+            !key_pem.is_empty(),
+            "key file is empty after concurrent run"
+        );
+        let der = cert_der_from_pem(&cert_pem).expect("cert pem should parse");
+        let on_disk_fp = fingerprint_from_der(&der);
+        assert_eq!(
+            &on_disk_fp, first,
+            "on-disk cert disagrees with what callers got back",
+        );
+    }
+
+    /// itr#224: no `<file>.tmp` should linger after a successful run; if one
+    /// did, a future run might see it and a recovery tool might mistake it
+    /// for the real cert.
+    #[test]
+    fn no_tmp_files_left_behind() {
+        let dir = TempDir::new().unwrap();
+        let _ = ensure_cert(dir.path(), IpAddr::V4(Ipv4Addr::LOCALHOST)).unwrap();
+        for name in [CERT_FILENAME, KEY_FILENAME, META_FILENAME] {
+            let tmp = tmp_path_for(&dir.path().join(name));
+            assert!(
+                !tmp.exists(),
+                "leftover tmp file {} after successful write",
+                tmp.display(),
+            );
         }
     }
 }

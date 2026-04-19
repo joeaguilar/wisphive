@@ -30,9 +30,12 @@ sha2.workspace = true
 argon2.workspace = true
 webauthn-rs.workspace = true
 uuid.workspace = true
+time.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tokio = { workspace = true, features = ["test-util"] }
+x509-parser = "0.16"
