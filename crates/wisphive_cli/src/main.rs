@@ -361,7 +361,8 @@ fn main() -> anyhow::Result<()> {
             rt.block_on(async {
                 match *action {
                     AgentAction::Start(args) => {
-                        let proj = args.project
+                        let proj = args
+                            .project
                             .or_else(|| std::env::current_dir().ok())
                             .unwrap_or_else(|| std::path::PathBuf::from("."));
                         commands::agent::start(wisphive_protocol::SpawnAgentRequest {
@@ -380,7 +381,8 @@ fn main() -> anyhow::Result<()> {
                             resume: args.resume,
                             output_format: args.output_format,
                             verbose: args.verbose,
-                        }).await
+                        })
+                        .await
                     }
                     AgentAction::List => commands::agent::list().await,
                     AgentAction::Stop { agent_id } => commands::agent::stop(agent_id).await,
@@ -393,22 +395,22 @@ fn main() -> anyhow::Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
                 match action {
-                    DaemonAction::Start { web, host, port, web_dev } => {
+                    DaemonAction::Start {
+                        web,
+                        host,
+                        port,
+                        web_dev,
+                    } => {
                         // Any of --web / non-default --host / non-default --port / --web-dev
                         // implies "serve the web UI too".
-                        let web_requested = web
-                            || web_dev
-                            || host != "127.0.0.1"
-                            || port != 3100;
+                        let web_requested = web || web_dev || host != "127.0.0.1" || port != 3100;
                         let web_opts = if web_requested {
                             let host_octets: [u8; 4] = match host.as_str() {
                                 "0.0.0.0" => [0, 0, 0, 0],
                                 "127.0.0.1" | "localhost" => [127, 0, 0, 1],
                                 other => {
-                                    let parts: Vec<u8> = other
-                                        .split('.')
-                                        .filter_map(|s| s.parse().ok())
-                                        .collect();
+                                    let parts: Vec<u8> =
+                                        other.split('.').filter_map(|s| s.parse().ok()).collect();
                                     if parts.len() == 4 {
                                         [parts[0], parts[1], parts[2], parts[3]]
                                     } else {
@@ -419,9 +421,17 @@ fn main() -> anyhow::Result<()> {
                             };
                             eprintln!(
                                 "Wisphive Web: http://{}:{}{}",
-                                if host_octets == [0, 0, 0, 0] { "0.0.0.0".to_string() } else { host.clone() },
+                                if host_octets == [0, 0, 0, 0] {
+                                    "0.0.0.0".to_string()
+                                } else {
+                                    host.clone()
+                                },
                                 port,
-                                if web_dev { " (dev mode — run `npm run dev` for the UI)" } else { "" },
+                                if web_dev {
+                                    " (dev mode — run `npm run dev` for the UI)"
+                                } else {
+                                    ""
+                                },
                             );
                             Some(commands::daemon::WebOptions {
                                 host: host_octets,
@@ -442,7 +452,13 @@ fn main() -> anyhow::Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async move {
                 match action {
-                    TermAction::New { label, cwd, cmd, arg, attach } => {
+                    TermAction::New {
+                        label,
+                        cwd,
+                        cmd,
+                        arg,
+                        attach,
+                    } => {
                         let args = if arg.is_empty() { None } else { Some(arg) };
                         commands::term::new_session(label, cwd, cmd, args, attach).await
                     }
@@ -467,7 +483,9 @@ fn main() -> anyhow::Result<()> {
 
             let host_octets: [u8; 4] = match host.as_str() {
                 "0.0.0.0" => {
-                    eprintln!("WARNING: Web UI is exposed on all network interfaces. Ensure this is intentional.");
+                    eprintln!(
+                        "WARNING: Web UI is exposed on all network interfaces. Ensure this is intentional."
+                    );
                     [0, 0, 0, 0]
                 }
                 "127.0.0.1" | "localhost" => [127, 0, 0, 1],
@@ -490,13 +508,17 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("Wisphive Web: http://{host}:{port}");
                 if host_octets == [0, 0, 0, 0] {
                     // Show local IP for LAN access
-                    if let Ok(output) = std::process::Command::new("ipconfig").arg("getifaddr").arg("en0").output()
-                        && let Ok(ip) = String::from_utf8(output.stdout) {
-                            let ip = ip.trim();
-                            if !ip.is_empty() {
-                                eprintln!("  LAN:      http://{ip}:{port}");
-                            }
+                    if let Ok(output) = std::process::Command::new("ipconfig")
+                        .arg("getifaddr")
+                        .arg("en0")
+                        .output()
+                        && let Ok(ip) = String::from_utf8(output.stdout)
+                    {
+                        let ip = ip.trim();
+                        if !ip.is_empty() {
+                            eprintln!("  LAN:      http://{ip}:{port}");
                         }
+                    }
                 }
             }
             rt.block_on(wisphive_web::serve(socket_path, port, dev, host_octets))

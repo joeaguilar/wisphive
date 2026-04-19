@@ -73,7 +73,11 @@ impl DecisionQueue {
 
     /// Resolve all pending decisions matching an optional filter.
     /// Returns the IDs of resolved decisions.
-    pub fn resolve_all(&mut self, filter: &Option<DecisionFilter>, decision: Decision) -> Vec<Uuid> {
+    pub fn resolve_all(
+        &mut self,
+        filter: &Option<DecisionFilter>,
+        decision: Decision,
+    ) -> Vec<Uuid> {
         let ids: Vec<Uuid> = self
             .pending_items
             .iter()

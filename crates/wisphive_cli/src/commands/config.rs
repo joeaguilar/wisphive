@@ -39,7 +39,9 @@ pub fn get(key: &str) -> Result<()> {
             let level = config.auto_approve_level.unwrap_or_default();
             eprintln!("{level}");
         }
-        _ => eprintln!("unknown config key: {key}. Valid: notifications, hook_timeout_secs, agent_timeout_secs, auto_approve_level"),
+        _ => eprintln!(
+            "unknown config key: {key}. Valid: notifications, hook_timeout_secs, agent_timeout_secs, auto_approve_level"
+        ),
     }
     Ok(())
 }
@@ -55,19 +57,25 @@ pub fn set(key: &str, value: &str) -> Result<()> {
             };
         }
         "hook_timeout_secs" => {
-            let secs: u64 = value.parse().context("hook_timeout_secs must be a number")?;
+            let secs: u64 = value
+                .parse()
+                .context("hook_timeout_secs must be a number")?;
             config.hook_timeout_secs = Some(secs);
         }
         "agent_timeout_secs" => {
-            let secs: u64 = value.parse().context("agent_timeout_secs must be a number")?;
+            let secs: u64 = value
+                .parse()
+                .context("agent_timeout_secs must be a number")?;
             config.agent_timeout_secs = Some(secs);
         }
         "auto_approve_level" => {
-            let level: wisphive_protocol::AutoApproveLevel = value.parse()
-                .map_err(|e: String| anyhow::anyhow!(e))?;
+            let level: wisphive_protocol::AutoApproveLevel =
+                value.parse().map_err(|e: String| anyhow::anyhow!(e))?;
             config.auto_approve_level = Some(level);
         }
-        _ => anyhow::bail!("unknown config key: {key}. Valid: notifications, hook_timeout_secs, agent_timeout_secs, auto_approve_level"),
+        _ => anyhow::bail!(
+            "unknown config key: {key}. Valid: notifications, hook_timeout_secs, agent_timeout_secs, auto_approve_level"
+        ),
     }
     save(&config)?;
     eprintln!("{key} = {value}");
@@ -89,13 +97,15 @@ pub fn list() -> Result<()> {
     let level = config.auto_approve_level.unwrap_or_default();
     eprintln!("auto_approve_level = {level}");
     if let Some(ref add) = config.auto_approve_add
-        && !add.is_empty() {
-            eprintln!("auto_approve_add = {}", add.join(", "));
-        }
+        && !add.is_empty()
+    {
+        eprintln!("auto_approve_add = {}", add.join(", "));
+    }
     if let Some(ref remove) = config.auto_approve_remove
-        && !remove.is_empty() {
-            eprintln!("auto_approve_remove = {}", remove.join(", "));
-        }
+        && !remove.is_empty()
+    {
+        eprintln!("auto_approve_remove = {}", remove.join(", "));
+    }
     eprintln!("\nConfig file: {}", config_path().display());
     Ok(())
 }
@@ -108,35 +118,54 @@ pub fn auto_approve_status() -> Result<()> {
     eprintln!("Level: {level}");
     eprintln!("Tools at this level:");
     // Show all tools included by the level
-    let all_tools = ["Read", "Glob", "Grep", "LS", "WebSearch", "WebFetch",
-        "NotebookRead", "Agent", "Skill", "TaskCreate", "TaskUpdate",
-        "TaskGet", "TaskList", "TodoRead", "ToolSearch",
-        "Edit", "Write", "NotebookEdit", "Bash"];
+    let all_tools = [
+        "Read",
+        "Glob",
+        "Grep",
+        "LS",
+        "WebSearch",
+        "WebFetch",
+        "NotebookRead",
+        "Agent",
+        "Skill",
+        "TaskCreate",
+        "TaskUpdate",
+        "TaskGet",
+        "TaskList",
+        "TodoRead",
+        "ToolSearch",
+        "Edit",
+        "Write",
+        "NotebookEdit",
+        "Bash",
+    ];
     for tool in &all_tools {
         if level.includes(tool) {
             eprintln!("  + {tool}");
         }
     }
     if let Some(ref add) = config.auto_approve_add
-        && !add.is_empty() {
-            eprintln!("\nOverrides (added):");
-            for t in add {
-                eprintln!("  + {t}");
-            }
+        && !add.is_empty()
+    {
+        eprintln!("\nOverrides (added):");
+        for t in add {
+            eprintln!("  + {t}");
         }
+    }
     if let Some(ref remove) = config.auto_approve_remove
-        && !remove.is_empty() {
-            eprintln!("\nOverrides (removed — queued despite level):");
-            for t in remove {
-                eprintln!("  - {t}");
-            }
+        && !remove.is_empty()
+    {
+        eprintln!("\nOverrides (removed — queued despite level):");
+        for t in remove {
+            eprintln!("  - {t}");
         }
+    }
     Ok(())
 }
 
 pub fn auto_approve_level(level_str: &str) -> Result<()> {
-    let level: wisphive_protocol::AutoApproveLevel = level_str.parse()
-        .map_err(|e: String| anyhow::anyhow!(e))?;
+    let level: wisphive_protocol::AutoApproveLevel =
+        level_str.parse().map_err(|e: String| anyhow::anyhow!(e))?;
     let mut config = load();
     config.auto_approve_level = Some(level);
     save(&config)?;

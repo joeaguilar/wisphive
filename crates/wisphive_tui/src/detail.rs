@@ -1,4 +1,4 @@
-use pulldown_cmark::{Event as MdEvent, Tag, TagEnd, Parser};
+use pulldown_cmark::{Event as MdEvent, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use similar::{ChangeTag, TextDiff};
@@ -25,8 +25,12 @@ pub fn render_detail_lines(req: &DecisionRequest, markdown_preview: bool) -> Vec
             }
         }
         HookEventType::Elicitation => push_elicitation_detail(&mut lines, req),
-        HookEventType::Stop | HookEventType::SubagentStop => push_event_data_detail(&mut lines, req, "Stop Reason"),
-        HookEventType::UserPromptSubmit => push_event_data_detail(&mut lines, req, "Submitted Prompt"),
+        HookEventType::Stop | HookEventType::SubagentStop => {
+            push_event_data_detail(&mut lines, req, "Stop Reason")
+        }
+        HookEventType::UserPromptSubmit => {
+            push_event_data_detail(&mut lines, req, "Submitted Prompt")
+        }
         HookEventType::ConfigChange => push_event_data_detail(&mut lines, req, "Config Change"),
         HookEventType::TeammateIdle => push_event_data_detail(&mut lines, req, "Teammate Status"),
         HookEventType::TaskCompleted => push_event_data_detail(&mut lines, req, "Task Completed"),
@@ -93,7 +97,11 @@ fn push_header(lines: &mut Vec<Line<'static>>, req: &DecisionRequest) {
     lines.push(Line::from(vec![
         Span::styled("  Time:     ", label_style),
         Span::styled(
-            format!("{} ({})", req.timestamp.format("%Y-%m-%d %H:%M:%S"), age_str),
+            format!(
+                "{} ({})",
+                req.timestamp.format("%Y-%m-%d %H:%M:%S"),
+                age_str
+            ),
             value_style,
         ),
     ]));
@@ -104,7 +112,9 @@ fn push_bash_detail(lines: &mut Vec<Line<'static>>, req: &DecisionRequest) {
         lines.push(Line::from(vec![
             Span::styled(
                 "  Description: ",
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(desc.to_string(), Style::default().fg(Color::White)),
         ]));
@@ -270,12 +280,18 @@ fn push_ask_question_detail(lines: &mut Vec<Line<'static>>, req: &DecisionReques
             // "Other" option — opens text input
             lines.push(Line::from(vec![
                 Span::styled("  [O] ", option_idx_style),
-                Span::styled("Other (type response)", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "Other (type response)",
+                    Style::default().fg(Color::DarkGray),
+                ),
             ]));
         }
 
         // Multi-select indicator
-        if q.get("multiSelect").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if q.get("multiSelect")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "  (multi-select enabled)",
@@ -535,7 +551,11 @@ fn push_permission_detail(
     )));
 }
 
-fn push_action_hints(lines: &mut Vec<Line<'static>>, event_type: wisphive_protocol::HookEventType, req: &DecisionRequest) {
+fn push_action_hints(
+    lines: &mut Vec<Line<'static>>,
+    event_type: wisphive_protocol::HookEventType,
+    req: &DecisionRequest,
+) {
     use wisphive_protocol::HookEventType;
 
     lines.push(Line::from(""));
@@ -543,7 +563,9 @@ fn push_action_hints(lines: &mut Vec<Line<'static>>, event_type: wisphive_protoc
     lines.push(Line::from(""));
 
     let hint_style = Style::default().fg(Color::DarkGray);
-    let key_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let key_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
 
     let is_plan = has_plan_content(req);
 
@@ -551,8 +573,8 @@ fn push_action_hints(lines: &mut Vec<Line<'static>>, event_type: wisphive_protoc
     let is_ask_question = !is_plan
         && ((event_type == HookEventType::PermissionRequest
             && req.permission_suggestions.is_none())
-        || (req.tool_name.eq_ignore_ascii_case("askuserquestion")
-            && has_ask_questions(&req.tool_input)));
+            || (req.tool_name.eq_ignore_ascii_case("askuserquestion")
+                && has_ask_questions(&req.tool_input)));
 
     let option_count = if is_ask_question {
         req.tool_input
@@ -594,24 +616,14 @@ fn push_action_hints(lines: &mut Vec<Line<'static>>, event_type: wisphive_protoc
                 ("A/Enter", "accept (let agent stop)"),
                 ("D", "deny with feedback (continue working)"),
             ],
-            HookEventType::UserPromptSubmit | HookEventType::ConfigChange => vec![
-                ("A", "allow"),
-                ("B", "block"),
-                ("M", "block with message"),
-            ],
-            HookEventType::Elicitation => vec![
-                ("A", "accept"),
-                ("D", "decline"),
-                ("C", "cancel"),
-            ],
-            HookEventType::TeammateIdle => vec![
-                ("C", "continue with feedback"),
-                ("S", "stop teammate"),
-            ],
-            HookEventType::TaskCompleted => vec![
-                ("A", "accept"),
-                ("R", "reject with feedback"),
-            ],
+            HookEventType::UserPromptSubmit | HookEventType::ConfigChange => {
+                vec![("A", "allow"), ("B", "block"), ("M", "block with message")]
+            }
+            HookEventType::Elicitation => vec![("A", "accept"), ("D", "decline"), ("C", "cancel")],
+            HookEventType::TeammateIdle => {
+                vec![("C", "continue with feedback"), ("S", "stop teammate")]
+            }
+            HookEventType::TaskCompleted => vec![("A", "accept"), ("R", "reject with feedback")],
             _ => vec![
                 ("Y", "approve"),
                 ("N", "deny"),
@@ -758,12 +770,16 @@ fn push_markdown_lines(lines: &mut Vec<Line<'static>>, text: &str) {
             },
             MdEvent::End(tag_end) => match tag_end {
                 TagEnd::Heading(_) => {
-                    current_style = style_depth.pop().unwrap_or(Style::default().fg(Color::White));
+                    current_style = style_depth
+                        .pop()
+                        .unwrap_or(Style::default().fg(Color::White));
                     flush_spans(lines, &mut current_spans);
                     lines.push(Line::from(""));
                 }
                 TagEnd::Strong | TagEnd::Emphasis => {
-                    current_style = style_depth.pop().unwrap_or(Style::default().fg(Color::White));
+                    current_style = style_depth
+                        .pop()
+                        .unwrap_or(Style::default().fg(Color::White));
                 }
                 TagEnd::CodeBlock => {
                     in_code_block = false;
@@ -785,16 +801,10 @@ fn push_markdown_lines(lines: &mut Vec<Line<'static>>, text: &str) {
                 if in_code_block {
                     let code_style = Style::default().fg(Color::Yellow);
                     for line in text.lines() {
-                        lines.push(Line::from(Span::styled(
-                            format!("    {line}"),
-                            code_style,
-                        )));
+                        lines.push(Line::from(Span::styled(format!("    {line}"), code_style)));
                     }
                 } else {
-                    current_spans.push(Span::styled(
-                        text.to_string(),
-                        current_style,
-                    ));
+                    current_spans.push(Span::styled(text.to_string(), current_style));
                 }
             }
             MdEvent::Code(code) => {

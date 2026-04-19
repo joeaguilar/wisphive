@@ -43,12 +43,8 @@ impl AgentRegistry {
                 last_seen: now,
             };
             info!(agent_id = %info.agent_id, agent_type = %info.agent_type, "agent registered");
-            self.agents.insert(
-                agent_id,
-                AgentEntry {
-                    info: info.clone(),
-                },
-            );
+            self.agents
+                .insert(agent_id, AgentEntry { info: info.clone() });
             (info, true)
         }
     }
@@ -144,8 +140,7 @@ mod tests {
     #[test]
     fn register_new_agent_returns_is_new_true() {
         let mut reg = AgentRegistry::new();
-        let (info, is_new) =
-            reg.register("agent-1".into(), AgentType::ClaudeCode, test_project());
+        let (info, is_new) = reg.register("agent-1".into(), AgentType::ClaudeCode, test_project());
         assert!(is_new);
         assert_eq!(info.agent_id, "agent-1");
         assert_eq!(reg.len(), 1);
@@ -154,8 +149,7 @@ mod tests {
     #[test]
     fn register_same_agent_twice_returns_is_new_false() {
         let mut reg = AgentRegistry::new();
-        let (_info, is_new) =
-            reg.register("agent-1".into(), AgentType::ClaudeCode, test_project());
+        let (_info, is_new) = reg.register("agent-1".into(), AgentType::ClaudeCode, test_project());
         assert!(is_new);
 
         let (_info2, is_new2) =
@@ -167,8 +161,7 @@ mod tests {
     #[test]
     fn register_updates_last_seen_on_re_register() {
         let mut reg = AgentRegistry::new();
-        let (first_info, _) =
-            reg.register("agent-1".into(), AgentType::ClaudeCode, test_project());
+        let (first_info, _) = reg.register("agent-1".into(), AgentType::ClaudeCode, test_project());
         let first_last_seen = first_info.last_seen;
 
         // Small sleep so the clock advances

@@ -52,9 +52,7 @@ pub async fn start(web: Option<WebOptions>) -> Result<()> {
             warn!("web UI is listening on all interfaces (0.0.0.0). Ensure this is intentional.");
         }
         Some(tokio::spawn(async move {
-            if let Err(e) =
-                wisphive_web::serve(socket_path, opts.port, opts.dev, opts.host).await
-            {
+            if let Err(e) = wisphive_web::serve(socket_path, opts.port, opts.dev, opts.host).await {
                 tracing::error!("embedded web server exited: {e}");
             }
         }))

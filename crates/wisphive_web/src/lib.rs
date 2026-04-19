@@ -61,18 +61,18 @@ async fn handle_ws(ws: WebSocket, socket_path: PathBuf) {
 }
 
 /// GET /api/config — read config.json
-async fn get_config(
-    axum::extract::State(state): axum::extract::State<AppState>,
-) -> Response {
+async fn get_config(axum::extract::State(state): axum::extract::State<AppState>) -> Response {
     match std::fs::read_to_string(&state.config_path) {
         Ok(content) => (
             [(axum::http::header::CONTENT_TYPE, "application/json")],
             content,
-        ).into_response(),
+        )
+            .into_response(),
         Err(_) => (
             [(axum::http::header::CONTENT_TYPE, "application/json")],
             "{}".to_string(),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
 
@@ -90,16 +90,15 @@ async fn put_config(
         Err(e) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             format!("write failed: {e}"),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
 
 /// GET /api/web-token — bootstrap endpoint so the frontend can read the
 /// per-process bearer token. Gated by Origin + Host checks in the security
 /// middleware (it bypasses the bearer check to break the chicken-and-egg).
-async fn get_web_token(
-    axum::extract::State(state): axum::extract::State<AppState>,
-) -> Response {
+async fn get_web_token(axum::extract::State(state): axum::extract::State<AppState>) -> Response {
     let body = serde_json::json!({ "token": state.security.token() });
     (
         [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -133,7 +132,12 @@ fn build_router(state: AppState, dev_mode: bool) -> Router {
 }
 
 /// Start the web server.
-pub async fn serve(socket_path: PathBuf, port: u16, dev_mode: bool, host: [u8; 4]) -> anyhow::Result<()> {
+pub async fn serve(
+    socket_path: PathBuf,
+    port: u16,
+    dev_mode: bool,
+    host: [u8; 4],
+) -> anyhow::Result<()> {
     let home_dir = socket_path
         .parent()
         .unwrap_or(std::path::Path::new("."))

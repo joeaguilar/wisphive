@@ -32,9 +32,7 @@ use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
-use wisphive_protocol::{
-    ServerMessage, TerminalDirection, TerminalSessionMeta, TerminalStatus,
-};
+use wisphive_protocol::{ServerMessage, TerminalDirection, TerminalSessionMeta, TerminalStatus};
 
 use crate::state::StateDb;
 
@@ -261,11 +259,7 @@ impl TerminalSessionManager {
         spawn_reader_thread(session.clone(), reader, db_tx.clone());
 
         // DB batcher: drains frames into SQLite in small transactional batches.
-        tokio::spawn(run_db_batcher(
-            id,
-            db_rx,
-            self.state_db.clone(),
-        ));
+        tokio::spawn(run_db_batcher(id, db_rx, self.state_db.clone()));
 
         // Waiter: whenever the reader exits or the child dies, persist the
         // final status and broadcast TermEnded to all TUIs.
@@ -367,13 +361,7 @@ impl TerminalSessionManager {
         };
         let _ = session.bcast.send(Arc::new(frame));
         self.state_db
-            .insert_terminal_events_batch(&[(
-                id,
-                seq,
-                ts_us,
-                TerminalDirection::Resize,
-                payload,
-            )])
+            .insert_terminal_events_batch(&[(id, seq, ts_us, TerminalDirection::Resize, payload)])
             .await?;
         Ok(())
     }
@@ -514,12 +502,15 @@ fn spawn_reader_thread(
                         // Enqueue for DB batcher. If the queue fills, a
                         // blocking_send back-pressures the reader — correct:
                         // stalling briefly beats losing audit data.
-                        if db_tx.blocking_send(TermFrame {
-                            seq: frame.seq,
-                            ts_us: frame.ts_us,
-                            direction: frame.direction,
-                            bytes: frame.bytes.clone(),
-                        }).is_err() {
+                        if db_tx
+                            .blocking_send(TermFrame {
+                                seq: frame.seq,
+                                ts_us: frame.ts_us,
+                                direction: frame.direction,
+                                bytes: frame.bytes.clone(),
+                            })
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -580,9 +571,10 @@ async fn run_db_batcher(
         }
 
         if !pending.is_empty()
-            && let Err(e) = state_db.insert_terminal_events_batch(&pending).await {
-                warn!(session_id = %session_id, "batch insert failed: {e}");
-            }
+            && let Err(e) = state_db.insert_terminal_events_batch(&pending).await
+        {
+            warn!(session_id = %session_id, "batch insert failed: {e}");
+        }
         pending.clear();
     }
 }

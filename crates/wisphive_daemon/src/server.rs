@@ -54,8 +54,10 @@ impl Server {
         let state_db = Arc::new(StateDb::open(&db_path).await?);
         let process_registry = Arc::new(Mutex::new(ProcessRegistry::new()));
         let agent_registry = Arc::new(Mutex::new(AgentRegistry::new()));
-        let terminal_manager =
-            Arc::new(TerminalSessionManager::new(state_db.clone(), tui_tx.clone()));
+        let terminal_manager = Arc::new(TerminalSessionManager::new(
+            state_db.clone(),
+            tui_tx.clone(),
+        ));
 
         Ok(Self {
             config,
@@ -78,10 +80,8 @@ impl Server {
 
         // Spawn event ingest task (tails events.jsonl → decision_log)
         let events_path = self.config.home_dir.join("events.jsonl");
-        let _ingest_handle = crate::event_ingest::spawn_event_ingest(
-            events_path,
-            self.state_db.clone(),
-        );
+        let _ingest_handle =
+            crate::event_ingest::spawn_event_ingest(events_path, self.state_db.clone());
 
         let mut reap_interval = tokio::time::interval(Duration::from_secs(5));
         reap_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -89,11 +89,15 @@ impl Server {
         // Run retention on startup
         let archive_path = self.config.log_dir.join("decision_log.jsonl");
         {
-            match self.state_db.archive_and_prune(
-                &archive_path,
-                self.config.retention_max_rows,
-                self.config.retention_max_age_days,
-            ).await {
+            match self
+                .state_db
+                .archive_and_prune(
+                    &archive_path,
+                    self.config.retention_max_rows,
+                    self.config.retention_max_age_days,
+                )
+                .await
+            {
                 Ok(0) => {}
                 Ok(n) => info!(n, "startup retention: archived entries"),
                 Err(e) => warn!("startup retention failed: {e}"),
@@ -195,10 +199,7 @@ impl Server {
 
 /// Handle a single client connection. Dispatches based on the Hello handshake.
 #[allow(clippy::too_many_arguments)]
-async fn handle_connection(
-    stream: UnixStream,
-    ctx: &ConnectionContext,
-) -> Result<()> {
+async fn handle_connection(stream: UnixStream, ctx: &ConnectionContext) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
@@ -226,12 +227,8 @@ async fn handle_connection(
             writer.write_all(welcome.as_bytes()).await?;
 
             match client {
-                ClientType::Hook => {
-                    handle_hook(lines, writer, ctx).await
-                }
-                ClientType::Tui => {
-                    handle_tui(lines, writer, ctx).await
-                }
+                ClientType::Hook => handle_hook(lines, writer, ctx).await,
+                ClientType::Tui => handle_tui(lines, writer, ctx).await,
             }
         }
         _ => {
@@ -271,7 +268,11 @@ async fn handle_hook(
             // Register agent and broadcast to TUI clients (only if new)
             let (agent_info, is_new) = {
                 let mut reg = ctx.agent_registry.lock().await;
-                reg.register(agent_id.clone(), req.agent_type.clone(), req.project.clone())
+                reg.register(
+                    agent_id.clone(),
+                    req.agent_type.clone(),
+                    req.project.clone(),
+                )
             };
             if is_new {
                 let _ = ctx.tui_tx.send(ServerMessage::AgentConnected(agent_info));
@@ -307,9 +308,10 @@ async fn handle_hook(
 
             // Persist auto-approve if requested
             if rich.always_allow
-                && let Err(e) = persist_auto_approve(&req_tool_name, &config_home) {
-                    warn!("failed to persist auto-approve: {e}");
-                }
+                && let Err(e) = persist_auto_approve(&req_tool_name, &config_home)
+            {
+                warn!("failed to persist auto-approve: {e}");
+            }
 
             // Log resolution (skip audit log for Ask/defer decisions)
             if rich.decision != Decision::Ask {
@@ -340,7 +342,8 @@ async fn handle_hook(
                 reg.touch(&result.agent_id);
             }
             // Fire-and-forget: attach result to matching decision_log entry
-            match ctx.state_db
+            match ctx
+                .state_db
                 .attach_tool_result(
                     &result.agent_id,
                     &result.tool_name,
@@ -362,7 +365,11 @@ async fn handle_hook(
                 }
             }
         }
-        ClientMessage::AgentRegister { agent_id, agent_type, project } => {
+        ClientMessage::AgentRegister {
+            agent_id,
+            agent_type,
+            project,
+        } => {
             // Fire-and-forget registration (no response)
             let (info, is_new) = {
                 let mut reg = ctx.agent_registry.lock().await;
@@ -396,7 +403,9 @@ async fn handle_tui(
         let reg = ctx.agent_registry.lock().await;
         reg.snapshot()
     };
-    let agents_msg = encode(&ServerMessage::AgentsSnapshot { agents: agents_snap })?;
+    let agents_msg = encode(&ServerMessage::AgentsSnapshot {
+        agents: agents_snap,
+    })?;
     writer.write_all(agents_msg.as_bytes()).await?;
 
     // Send initial queue snapshot

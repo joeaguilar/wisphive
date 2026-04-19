@@ -141,17 +141,43 @@ impl SpawnModal {
 
     fn apply_blocks(&mut self) {
         let active = self.active_field;
-        let color = |f: SpawnField| if f == active { Color::Yellow } else { Color::DarkGray };
-        self.project.set_block(Block::default().borders(Borders::ALL)
-            .border_style(Style::default().fg(color(SpawnField::Project))).title(" Project "));
-        self.prompt.set_block(Block::default().borders(Borders::ALL)
-            .border_style(Style::default().fg(color(SpawnField::Prompt))).title(" Prompt "));
-        self.model.set_block(Block::default().borders(Borders::ALL)
-            .border_style(Style::default().fg(color(SpawnField::Model))).title(" Model "));
-        self.reasoning.set_block(Block::default().borders(Borders::ALL)
-            .border_style(Style::default().fg(color(SpawnField::Reasoning))).title(" Reasoning "));
-        self.max_turns.set_block(Block::default().borders(Borders::ALL)
-            .border_style(Style::default().fg(color(SpawnField::MaxTurns))).title(" Max Turns "));
+        let color = |f: SpawnField| {
+            if f == active {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            }
+        };
+        self.project.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(color(SpawnField::Project)))
+                .title(" Project "),
+        );
+        self.prompt.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(color(SpawnField::Prompt)))
+                .title(" Prompt "),
+        );
+        self.model.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(color(SpawnField::Model)))
+                .title(" Model "),
+        );
+        self.reasoning.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(color(SpawnField::Reasoning)))
+                .title(" Reasoning "),
+        );
+        self.max_turns.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(color(SpawnField::MaxTurns)))
+                .title(" Max Turns "),
+        );
     }
 }
 
@@ -293,7 +319,8 @@ impl Modal {
     pub fn pick_project() -> Self {
         Self {
             title: "Pick Project".into(),
-            body: "Select a project to spawn an agent (j/k navigate, Enter select, Esc cancel):".into(),
+            body: "Select a project to spawn an agent (j/k navigate, Enter select, Esc cancel):"
+                .into(),
             action: ModalAction::PickProject,
             target_id: None,
             spawn: None,
@@ -305,7 +332,9 @@ impl Modal {
     pub fn pick_project_for_terminal() -> Self {
         Self {
             title: "Open Terminal in Project".into(),
-            body: "Select a project to open a terminal in (j/k navigate, Enter select, Esc cancel):".into(),
+            body:
+                "Select a project to open a terminal in (j/k navigate, Enter select, Esc cancel):"
+                    .into(),
             action: ModalAction::PickProjectForTerminal,
             target_id: None,
             spawn: None,
@@ -317,7 +346,8 @@ impl Modal {
     pub fn confirm_ask_defer(id: Uuid) -> Self {
         Self {
             title: "Defer".into(),
-            body: "Pass to Claude's native permission prompt?\n\n  Y = defer  |  N / Esc = cancel".into(),
+            body: "Pass to Claude's native permission prompt?\n\n  Y = defer  |  N / Esc = cancel"
+                .into(),
             action: ModalAction::AskDefer,
             target_id: Some(id),
             spawn: None,

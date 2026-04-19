@@ -105,9 +105,7 @@ impl ProcessRegistry {
             .spawn()
             .context("failed to spawn claude — is it installed and on PATH?")?;
 
-        let pid = child
-            .id()
-            .context("could not get PID of spawned process")?;
+        let pid = child.id().context("could not get PID of spawned process")?;
 
         let managed = ManagedAgent {
             agent_id: agent_id.clone(),
@@ -161,10 +159,7 @@ impl ProcessRegistry {
 
     /// List all managed agent processes.
     pub fn list(&self) -> Vec<ManagedAgent> {
-        self.processes
-            .values()
-            .map(|p| p.info.clone())
-            .collect()
+        self.processes.values().map(|p| p.info.clone()).collect()
     }
 
     /// Reap any processes that have exited. Returns (agent_id, exit_code) pairs.

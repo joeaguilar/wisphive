@@ -38,12 +38,14 @@ async fn run_ingest(events_path: PathBuf, state_db: Arc<StateDb>) -> anyhow::Res
     let (tx, mut rx) = mpsc::channel::<()>(64);
 
     // Set up file watcher
-    let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-        if let Ok(event) = res
-            && matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+    let mut watcher =
+        notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+            if let Ok(event) = res
+                && matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_))
+            {
                 let _ = tx.try_send(());
             }
-    })?;
+        })?;
 
     // Watch the parent directory (file may not exist yet at startup)
     let watch_dir = events_path
@@ -97,7 +99,10 @@ async fn run_ingest(events_path: PathBuf, state_db: Arc<StateDb>) -> anyhow::Res
 /// Read all lines from events.jsonl and ingest them into the database.
 /// Returns the number of events successfully ingested.
 /// Uses INSERT OR IGNORE with a unique index on tool_use_id for deduplication.
-pub async fn reimport_all(events_path: &std::path::Path, state_db: &StateDb) -> anyhow::Result<u64> {
+pub async fn reimport_all(
+    events_path: &std::path::Path,
+    state_db: &StateDb,
+) -> anyhow::Result<u64> {
     use tokio::io::AsyncBufReadExt;
 
     if !events_path.exists() {
@@ -141,10 +146,7 @@ pub async fn ingest_line(line: &str, state_db: &StateDb) -> anyhow::Result<()> {
         .get("agent_type")
         .and_then(|v| v.as_str())
         .unwrap_or("claude_code");
-    let project = event
-        .get("project")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let project = event.get("project").and_then(|v| v.as_str()).unwrap_or("");
     let tool_name = event
         .get("tool_name")
         .and_then(|v| v.as_str())
@@ -157,12 +159,8 @@ pub async fn ingest_line(line: &str, state_db: &StateDb) -> anyhow::Result<()> {
         .get("timestamp")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let tool_use_id = event
-        .get("tool_use_id")
-        .and_then(|v| v.as_str());
-    let hook_event_name = event
-        .get("hook_event_name")
-        .and_then(|v| v.as_str());
+    let tool_use_id = event.get("tool_use_id").and_then(|v| v.as_str());
+    let hook_event_name = event.get("hook_event_name").and_then(|v| v.as_str());
 
     // Serialize agent_type as JSON string to match existing format
     let agent_type_json = format!("\"{}\"", agent_type);
@@ -232,7 +230,10 @@ mod tests {
         ingest_line(line, &db).await.unwrap();
 
         let history = db.query_history(None, 10).await.unwrap();
-        assert!(history.is_empty(), "non-auto_approved events should be skipped");
+        assert!(
+            history.is_empty(),
+            "non-auto_approved events should be skipped"
+        );
     }
 
     #[tokio::test]
@@ -294,8 +295,12 @@ mod tests {
     #[tokio::test]
     async fn reimport_all_nonexistent_file_returns_zero() {
         let db = test_db().await;
-        let count = reimport_all(std::path::Path::new("/tmp/nonexistent_wisphive_test.jsonl"), &db)
-            .await.unwrap();
+        let count = reimport_all(
+            std::path::Path::new("/tmp/nonexistent_wisphive_test.jsonl"),
+            &db,
+        )
+        .await
+        .unwrap();
         assert_eq!(count, 0);
     }
 
@@ -316,7 +321,11 @@ mod tests {
 
         // But only 1 row should be in the DB thanks to dedup
         let history = db.query_history(None, 10).await.unwrap();
-        assert_eq!(history.len(), 1, "duplicate tool_use_id events should be deduplicated");
+        assert_eq!(
+            history.len(),
+            1,
+            "duplicate tool_use_id events should be deduplicated"
+        );
     }
 
     /// Fixed #58: reimport_all no longer creates duplicates for events without tool_use_id.
@@ -340,7 +349,11 @@ mod tests {
         reimport_all(&events_path, &db).await.unwrap();
         let after_second = db.query_history(None, 100).await.unwrap();
 
-        assert_eq!(after_second.len(), 1, "reimport should be idempotent for events without tool_use_id");
+        assert_eq!(
+            after_second.len(),
+            1,
+            "reimport should be idempotent for events without tool_use_id"
+        );
     }
 
     #[tokio::test]
@@ -378,7 +391,11 @@ mod tests {
 
         // But only the auto_approved event should be in the DB
         let history = db.query_history(None, 10).await.unwrap();
-        assert_eq!(history.len(), 1, "only auto_approved events should be in the DB");
+        assert_eq!(
+            history.len(),
+            1,
+            "only auto_approved events should be in the DB"
+        );
         assert_eq!(history[0].tool_name, "Bash");
     }
 }

@@ -525,7 +525,9 @@ mod tests {
 
     #[test]
     fn round_trip_welcome() {
-        let msg = ServerMessage::Welcome { version: PROTOCOL_VERSION };
+        let msg = ServerMessage::Welcome {
+            version: PROTOCOL_VERSION,
+        };
         let encoded = encode(&msg).unwrap();
         let decoded: ServerMessage = decode(&encoded).unwrap();
         match decoded {
@@ -559,7 +561,10 @@ mod tests {
                 assert_eq!(did, id);
                 assert_eq!(decision, Decision::Approve);
                 assert_eq!(message.unwrap(), "looks good");
-                assert_eq!(updated_input.unwrap(), serde_json::json!({"command": "cargo test"}));
+                assert_eq!(
+                    updated_input.unwrap(),
+                    serde_json::json!({"command": "cargo test"})
+                );
                 assert_eq!(additional_context.unwrap(), "run tests first");
             }
             _ => panic!("unexpected variant"),
@@ -596,7 +601,9 @@ mod tests {
 
     #[test]
     fn round_trip_error() {
-        let msg = ServerMessage::Error { message: "something went wrong".into() };
+        let msg = ServerMessage::Error {
+            message: "something went wrong".into(),
+        };
         let encoded = encode(&msg).unwrap();
         let decoded: ServerMessage = decode(&encoded).unwrap();
         match decoded {
@@ -608,7 +615,10 @@ mod tests {
     #[test]
     fn round_trip_decision_resolved() {
         let id = uuid::Uuid::new_v4();
-        let msg = ServerMessage::DecisionResolved { id, decision: Decision::Deny };
+        let msg = ServerMessage::DecisionResolved {
+            id,
+            decision: Decision::Deny,
+        };
         let encoded = encode(&msg).unwrap();
         let decoded: ServerMessage = decode(&encoded).unwrap();
         match decoded {
@@ -656,7 +666,10 @@ mod tests {
         let encoded = encode(&msg).unwrap();
         let decoded: ServerMessage = decode(&encoded).unwrap();
         match decoded {
-            ServerMessage::HistoryResponse { entries, request_id } => {
+            ServerMessage::HistoryResponse {
+                entries,
+                request_id,
+            } => {
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0].tool_name, "Bash");
                 assert_eq!(request_id.unwrap(), "req-123");
@@ -714,7 +727,11 @@ mod tests {
         let encoded = encode(&msg).unwrap();
         let decoded: ClientMessage = decode(&encoded).unwrap();
         match decoded {
-            ClientMessage::Deny { id: did, message, device_id } => {
+            ClientMessage::Deny {
+                id: did,
+                message,
+                device_id,
+            } => {
                 assert_eq!(did, id);
                 assert_eq!(message.unwrap(), "too dangerous");
                 assert!(device_id.is_none());
@@ -726,11 +743,17 @@ mod tests {
     #[test]
     fn round_trip_ask() {
         let id = uuid::Uuid::new_v4();
-        let msg = ClientMessage::Ask { id, device_id: None };
+        let msg = ClientMessage::Ask {
+            id,
+            device_id: None,
+        };
         let encoded = encode(&msg).unwrap();
         let decoded: ClientMessage = decode(&encoded).unwrap();
         match decoded {
-            ClientMessage::Ask { id: did, device_id: _ } => assert_eq!(did, id),
+            ClientMessage::Ask {
+                id: did,
+                device_id: _,
+            } => assert_eq!(did, id),
             _ => panic!("unexpected variant"),
         }
     }
@@ -748,7 +771,10 @@ mod tests {
         let encoded = encode(&msg).unwrap();
         let decoded: ClientMessage = decode(&encoded).unwrap();
         match decoded {
-            ClientMessage::ApproveAll { filter, device_id: _ } => {
+            ClientMessage::ApproveAll {
+                filter,
+                device_id: _,
+            } => {
                 let f = filter.unwrap();
                 assert_eq!(f.tool_name.unwrap(), "Bash");
                 assert_eq!(f.project.unwrap(), PathBuf::from("/proj"));
@@ -760,11 +786,17 @@ mod tests {
 
     #[test]
     fn round_trip_deny_all_no_filter() {
-        let msg = ClientMessage::DenyAll { filter: None, device_id: None };
+        let msg = ClientMessage::DenyAll {
+            filter: None,
+            device_id: None,
+        };
         let encoded = encode(&msg).unwrap();
         let decoded: ClientMessage = decode(&encoded).unwrap();
         match decoded {
-            ClientMessage::DenyAll { filter, device_id: _ } => assert!(filter.is_none()),
+            ClientMessage::DenyAll {
+                filter,
+                device_id: _,
+            } => assert!(filter.is_none()),
             _ => panic!("unexpected variant"),
         }
     }
@@ -779,7 +811,11 @@ mod tests {
         let encoded = encode(&msg).unwrap();
         let decoded: ClientMessage = decode(&encoded).unwrap();
         match decoded {
-            ClientMessage::QueryHistory { agent_id, limit, request_id } => {
+            ClientMessage::QueryHistory {
+                agent_id,
+                limit,
+                request_id,
+            } => {
                 assert_eq!(agent_id.unwrap(), "cc-5");
                 assert_eq!(limit.unwrap(), 50);
                 assert_eq!(request_id.unwrap(), "qh-1");
@@ -847,7 +883,11 @@ mod tests {
         let encoded = encode(&msg).unwrap();
         let decoded: ClientMessage = decode(&encoded).unwrap();
         match decoded {
-            ClientMessage::AgentRegister { agent_id, agent_type, project } => {
+            ClientMessage::AgentRegister {
+                agent_id,
+                agent_type,
+                project,
+            } => {
                 assert_eq!(agent_id, "cc-99");
                 assert_eq!(agent_type, AgentType::Red);
                 assert_eq!(project, PathBuf::from("/home/user/project"));
@@ -951,7 +991,9 @@ mod tests {
         assert!(encoded.contains("\"type\":\"term_create\""));
         let decoded: ClientMessage = decode(&encoded).unwrap();
         match decoded {
-            ClientMessage::TermCreate { label, cols, rows, .. } => {
+            ClientMessage::TermCreate {
+                label, cols, rows, ..
+            } => {
                 assert_eq!(label.unwrap(), "shell");
                 assert_eq!(cols, 120);
                 assert_eq!(rows, 40);
@@ -967,14 +1009,18 @@ mod tests {
         let raw: &[u8] = &[0x09, 0x0a, 0x0d, 0x03, 0xe9, 0xe2, 0x98, 0x83];
         let encoded_payload = base64::engine::general_purpose::STANDARD.encode(raw);
         let id = uuid::Uuid::new_v4();
-        let msg = ClientMessage::TermInput { id, data: encoded_payload.clone() };
+        let msg = ClientMessage::TermInput {
+            id,
+            data: encoded_payload.clone(),
+        };
         let line = encode(&msg).unwrap();
         let decoded: ClientMessage = decode(&line).unwrap();
         match decoded {
             ClientMessage::TermInput { id: did, data } => {
                 assert_eq!(did, id);
-                let round_tripped =
-                    base64::engine::general_purpose::STANDARD.decode(&data).unwrap();
+                let round_tripped = base64::engine::general_purpose::STANDARD
+                    .decode(&data)
+                    .unwrap();
                 assert_eq!(round_tripped, raw);
             }
             _ => panic!("unexpected variant"),
@@ -989,8 +1035,16 @@ mod tests {
             ClientMessage::TermDetach { id },
             ClientMessage::TermClose { id, kill: true },
             ClientMessage::TermList,
-            ClientMessage::TermReplay { id, from_seq: Some(42), speed: Some(2.0) },
-            ClientMessage::TermResize { id, cols: 100, rows: 30 },
+            ClientMessage::TermReplay {
+                id,
+                from_seq: Some(42),
+                speed: Some(2.0),
+            },
+            ClientMessage::TermResize {
+                id,
+                cols: 100,
+                rows: 30,
+            },
         ] {
             let encoded = encode(&msg).unwrap();
             let _: ClientMessage = decode(&encoded).unwrap();
@@ -1010,7 +1064,9 @@ mod tests {
             }
             _ => panic!("unexpected variant"),
         }
-        let list = ServerMessage::TermListResponse { sessions: vec![meta] };
+        let list = ServerMessage::TermListResponse {
+            sessions: vec![meta],
+        };
         let encoded = encode(&list).unwrap();
         let decoded: ServerMessage = decode(&encoded).unwrap();
         assert!(matches!(decoded, ServerMessage::TermListResponse { .. }));
@@ -1031,12 +1087,20 @@ mod tests {
             data: data.clone(),
         };
         let encoded = encode(&chunk).unwrap();
-        assert_eq!(encoded.matches('\n').count(), 1, "encoding must contain exactly one newline");
+        assert_eq!(
+            encoded.matches('\n').count(),
+            1,
+            "encoding must contain exactly one newline"
+        );
         let decoded: ServerMessage = decode(&encoded).unwrap();
         match decoded {
-            ServerMessage::TermChunk { direction, data: d, .. } => {
+            ServerMessage::TermChunk {
+                direction, data: d, ..
+            } => {
                 assert_eq!(direction, TerminalDirection::Output);
-                let bytes = base64::engine::general_purpose::STANDARD.decode(&d).unwrap();
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&d)
+                    .unwrap();
                 assert_eq!(bytes, raw);
             }
             _ => panic!("unexpected variant"),
@@ -1085,7 +1149,10 @@ mod tests {
         let encoded = encode(&chunk).unwrap();
         let _: ServerMessage = decode(&encoded).unwrap();
 
-        let done = ServerMessage::TermReplayDone { id, total_events: 42 };
+        let done = ServerMessage::TermReplayDone {
+            id,
+            total_events: 42,
+        };
         let encoded = encode(&done).unwrap();
         let _: ServerMessage = decode(&encoded).unwrap();
     }
@@ -1153,7 +1220,9 @@ mod tests {
         assert!(encoded.contains("\"type\":\"web_login_failure\""));
         let decoded: ServerMessage = decode(&encoded).unwrap();
         match decoded {
-            ServerMessage::WebLoginFailure { ip, attempt_count, .. } => {
+            ServerMessage::WebLoginFailure {
+                ip, attempt_count, ..
+            } => {
                 assert_eq!(ip, "192.168.1.42");
                 assert_eq!(attempt_count, 3);
             }
@@ -1202,7 +1271,11 @@ mod tests {
         let encoded = encode(&msg).unwrap();
         let decoded: ServerMessage = decode(&encoded).unwrap();
         match decoded {
-            ServerMessage::WebReauthRequired { device_id, tool_name, .. } => {
+            ServerMessage::WebReauthRequired {
+                device_id,
+                tool_name,
+                ..
+            } => {
                 assert_eq!(device_id, "dev-3");
                 assert_eq!(tool_name, "Bash");
             }
@@ -1216,14 +1289,17 @@ mod tests {
     #[test]
     fn decode_approve_without_device_id_is_backward_compatible() {
         let id = uuid::Uuid::new_v4();
-        let legacy = format!(
-            r#"{{"type":"approve","id":"{id}","always_allow":false}}"#
-        );
+        let legacy = format!(r#"{{"type":"approve","id":"{id}","always_allow":false}}"#);
         let decoded: ClientMessage = decode(&legacy).unwrap();
         match decoded {
-            ClientMessage::Approve { id: did, device_id, .. } => {
+            ClientMessage::Approve {
+                id: did, device_id, ..
+            } => {
                 assert_eq!(did, id);
-                assert!(device_id.is_none(), "missing device_id should default to None");
+                assert!(
+                    device_id.is_none(),
+                    "missing device_id should default to None"
+                );
             }
             _ => panic!("unexpected variant"),
         }
@@ -1232,10 +1308,17 @@ mod tests {
     #[test]
     fn device_id_omitted_when_none() {
         let id = uuid::Uuid::new_v4();
-        let msg = ClientMessage::Deny { id, message: None, device_id: None };
+        let msg = ClientMessage::Deny {
+            id,
+            message: None,
+            device_id: None,
+        };
         let encoded = encode(&msg).unwrap();
         // skip_serializing_if = None → field must not appear in wire output.
-        assert!(!encoded.contains("device_id"), "wire output should omit device_id when None: {encoded}");
+        assert!(
+            !encoded.contains("device_id"),
+            "wire output should omit device_id when None: {encoded}"
+        );
     }
 
     #[test]
@@ -1244,7 +1327,9 @@ mod tests {
             client: ClientType::Hook,
             version: PROTOCOL_VERSION,
         };
-        let server_msg = ServerMessage::Welcome { version: PROTOCOL_VERSION };
+        let server_msg = ServerMessage::Welcome {
+            version: PROTOCOL_VERSION,
+        };
 
         let client_json = encode(&client_msg).unwrap();
         let server_json = encode(&server_msg).unwrap();

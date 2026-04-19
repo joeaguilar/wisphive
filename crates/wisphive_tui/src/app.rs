@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use uuid::Uuid;
 use std::collections::{HashMap, HashSet};
+use uuid::Uuid;
 
 use wisphive_protocol::{
     AgentInfo, AutoApproveLevel, DecisionRequest, HistoryEntry, TerminalSessionMeta, ToolRule,
@@ -14,14 +14,36 @@ use crate::modal::Modal;
 /// All known tools for the config toggle list.
 pub const ALL_TOOLS: &[&str] = &[
     // Read tier
-    "Read", "Glob", "Grep", "LS", "LSP", "NotebookRead",
-    "WebSearch", "WebFetch",
-    "Agent", "Skill", "ToolSearch", "AskUserQuestion",
-    "EnterPlanMode", "ExitPlanMode", "EnterWorktree", "ExitWorktree",
-    "TaskCreate", "TaskUpdate", "TaskGet", "TaskList", "TaskOutput", "TaskStop", "TodoRead",
+    "Read",
+    "Glob",
+    "Grep",
+    "LS",
+    "LSP",
+    "NotebookRead",
+    "WebSearch",
+    "WebFetch",
+    "Agent",
+    "Skill",
+    "ToolSearch",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "EnterWorktree",
+    "ExitWorktree",
+    "TaskCreate",
+    "TaskUpdate",
+    "TaskGet",
+    "TaskList",
+    "TaskOutput",
+    "TaskStop",
+    "TodoRead",
     "CronList",
     // Write tier
-    "Edit", "Write", "NotebookEdit", "CronCreate", "CronDelete",
+    "Edit",
+    "Write",
+    "NotebookEdit",
+    "CronCreate",
+    "CronDelete",
     // Execute tier
     "Bash",
 ];
@@ -31,7 +53,11 @@ pub const ALL_TOOLS: &[&str] = &[
 pub enum ConfigRow {
     Level,
     Tool(usize),
-    Rule { tool_idx: usize, rule_idx: usize, is_deny: bool },
+    Rule {
+        tool_idx: usize,
+        rule_idx: usize,
+        is_deny: bool,
+    },
     /// Toggle for event-type auto-approve (key name in config.json).
     EventToggle(&'static str),
 }
@@ -571,9 +597,18 @@ impl App {
         self.config_tool_rules = config.tool_rules.unwrap_or_default();
         // Load event toggles with defaults (Stop=false, UserPrompt=true, ConfigChange=true)
         self.config_event_toggles.clear();
-        self.config_event_toggles.insert("auto_approve_stop".into(), config.auto_approve_stop.unwrap_or(false));
-        self.config_event_toggles.insert("auto_approve_user_prompt".into(), config.auto_approve_user_prompt.unwrap_or(true));
-        self.config_event_toggles.insert("auto_approve_config_change".into(), config.auto_approve_config_change.unwrap_or(true));
+        self.config_event_toggles.insert(
+            "auto_approve_stop".into(),
+            config.auto_approve_stop.unwrap_or(false),
+        );
+        self.config_event_toggles.insert(
+            "auto_approve_user_prompt".into(),
+            config.auto_approve_user_prompt.unwrap_or(true),
+        );
+        self.config_event_toggles.insert(
+            "auto_approve_config_change".into(),
+            config.auto_approve_config_change.unwrap_or(true),
+        );
         self.config_index = 0;
         self.config_rule_input_mode = false;
         self.config_rule_buffer.clear();
@@ -594,8 +629,9 @@ impl App {
             .join("config.json");
 
         let mut config = match std::fs::read_to_string(&path) {
-            Ok(content) => serde_json::from_str::<serde_json::Value>(&content)
-                .unwrap_or(serde_json::json!({})),
+            Ok(content) => {
+                serde_json::from_str::<serde_json::Value>(&content).unwrap_or(serde_json::json!({}))
+            }
             Err(_) => serde_json::json!({}),
         };
 
@@ -610,7 +646,10 @@ impl App {
             obj.insert(
                 "auto_approve_add".into(),
                 serde_json::Value::Array(
-                    self.config_add.iter().map(|s| serde_json::Value::String(s.clone())).collect(),
+                    self.config_add
+                        .iter()
+                        .map(|s| serde_json::Value::String(s.clone()))
+                        .collect(),
                 ),
             );
         }
@@ -652,7 +691,10 @@ impl App {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap_or_default());
+        let _ = std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&config).unwrap_or_default(),
+        );
     }
 
     fn load_user_config() -> ConfigSnapshot {
@@ -756,7 +798,11 @@ impl App {
     }
 
     pub fn enter_timeline_detail_view(&mut self) {
-        if self.session_timeline.get(self.session_timeline_index).is_some() {
+        if self
+            .session_timeline
+            .get(self.session_timeline_index)
+            .is_some()
+        {
             self.history = self.session_timeline.clone();
             self.history_index = self.session_timeline_index;
             self.detail_scroll = 0;

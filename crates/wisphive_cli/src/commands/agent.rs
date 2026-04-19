@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use wisphive_protocol::{
-    ClientMessage, ClientType, ManagedAgent, ServerMessage, SpawnAgentRequest, PROTOCOL_VERSION,
+    ClientMessage, ClientType, ManagedAgent, PROTOCOL_VERSION, ServerMessage, SpawnAgentRequest,
 };
 
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
@@ -61,8 +61,7 @@ fn send_and_recv(msg: &ClientMessage) -> Result<ServerMessage> {
 
 /// Start an agent process via the daemon.
 pub async fn start(req: SpawnAgentRequest) -> Result<()> {
-    let project = std::fs::canonicalize(&req.project)
-        .unwrap_or_else(|_| req.project.clone());
+    let project = std::fs::canonicalize(&req.project).unwrap_or_else(|_| req.project.clone());
 
     // Pre-flight checks
     preflight_checks(&project)?;
@@ -119,7 +118,10 @@ pub async fn stop(agent_id: String) -> Result<()> {
     })?;
 
     match response {
-        ServerMessage::AgentExited { agent_id, exit_code } => {
+        ServerMessage::AgentExited {
+            agent_id,
+            exit_code,
+        } => {
             eprintln!(
                 "Agent {} stopped (exit code: {})",
                 agent_id,
@@ -155,24 +157,23 @@ fn preflight_checks(project: &Path) -> Result<()> {
     // 2. Check daemon is running (socket exists and PID is alive)
     let socket_path = wisphive_dir.join("wisphive.sock");
     if !socket_path.exists() {
-        anyhow::bail!(
-            "Daemon is not running (no socket found).\n  fix: wisphive daemon start"
-        );
+        anyhow::bail!("Daemon is not running (no socket found).\n  fix: wisphive daemon start");
     }
     let pid_path = wisphive_dir.join("wisphive.pid");
     if pid_path.exists()
         && let Ok(pid_str) = std::fs::read_to_string(&pid_path)
-            && let Ok(pid) = pid_str.trim().parse::<i32>() {
-                #[cfg(unix)]
-                {
-                    let alive = unsafe { libc::kill(pid, 0) } == 0;
-                    if !alive {
-                        anyhow::bail!(
-                            "Daemon is not running (stale PID file).\n  fix: wisphive daemon start"
-                        );
-                    }
-                }
+        && let Ok(pid) = pid_str.trim().parse::<i32>()
+    {
+        #[cfg(unix)]
+        {
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            if !alive {
+                anyhow::bail!(
+                    "Daemon is not running (stale PID file).\n  fix: wisphive daemon start"
+                );
             }
+        }
+    }
 
     // 3. Check hooks are installed in the project
     let settings_path = project.join(".claude").join("settings.json");
@@ -185,13 +186,14 @@ fn preflight_checks(project: &Path) -> Result<()> {
     }
     // Verify wisphive hook is actually present
     if let Ok(content) = std::fs::read_to_string(&settings_path)
-        && !content.contains("wisphive") {
-            anyhow::bail!(
-                "Wisphive hooks not installed in {}.\n  fix: wisphive hooks install --project {}",
-                project.display(),
-                project.display()
-            );
-        }
+        && !content.contains("wisphive")
+    {
+        anyhow::bail!(
+            "Wisphive hooks not installed in {}.\n  fix: wisphive hooks install --project {}",
+            project.display(),
+            project.display()
+        );
+    }
 
     Ok(())
 }
@@ -221,5 +223,8 @@ fn print_agent(agent: &ManagedAgent) {
     if let Some(ref perm) = agent.permission_mode {
         eprintln!("  PermMod: {}", perm);
     }
-    eprintln!("  Started: {}", agent.started_at.format("%Y-%m-%d %H:%M:%S UTC"));
+    eprintln!(
+        "  Started: {}",
+        agent.started_at.format("%Y-%m-%d %H:%M:%S UTC")
+    );
 }

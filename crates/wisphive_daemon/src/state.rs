@@ -97,13 +97,7 @@ type WebDeviceFullRow = (
 );
 
 /// Row shape for `web_devices` lookups that only load active-device fields.
-type WebDeviceActiveRow = (
-    String,
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-);
+type WebDeviceActiveRow = (String, String, String, Option<String>, Option<String>);
 
 /// Row shape for `web_passkeys` queries.
 type WebPasskeyRowRaw = (
@@ -259,14 +253,18 @@ impl StateDb {
             .ok();
 
         // Add hook_event_name columns (idempotent)
-        sqlx::query("ALTER TABLE pending_decisions ADD COLUMN hook_event_name TEXT DEFAULT 'PreToolUse'")
-            .execute(&self.pool)
-            .await
-            .ok();
-        sqlx::query("ALTER TABLE decision_log ADD COLUMN hook_event_name TEXT DEFAULT 'PreToolUse'")
-            .execute(&self.pool)
-            .await
-            .ok();
+        sqlx::query(
+            "ALTER TABLE pending_decisions ADD COLUMN hook_event_name TEXT DEFAULT 'PreToolUse'",
+        )
+        .execute(&self.pool)
+        .await
+        .ok();
+        sqlx::query(
+            "ALTER TABLE decision_log ADD COLUMN hook_event_name TEXT DEFAULT 'PreToolUse'",
+        )
+        .execute(&self.pool)
+        .await
+        .ok();
 
         // Add terminal_session_id columns for correlating decisions with
         // wisphive-managed terminal sessions (idempotent).
@@ -305,10 +303,12 @@ impl StateDb {
             .execute(&self.pool)
             .await
             .ok();
-        sqlx::query("ALTER TABLE terminal_sessions ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
-            .execute(&self.pool)
-            .await
-            .ok();
+        sqlx::query(
+            "ALTER TABLE terminal_sessions ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await
+        .ok();
         // Backfill sort_order for pre-migration rows so newest-first ordering
         // is preserved without user intervention. Uses -epoch-ms so lower
         // values sort first. Only touches rows that still have the default 0.
@@ -439,11 +439,9 @@ impl StateDb {
         .execute(&self.pool)
         .await?;
 
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_web_audit_at ON web_audit(at DESC)",
-        )
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_web_audit_at ON web_audit(at DESC)")
+            .execute(&self.pool)
+            .await?;
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_web_devices_revoked ON web_devices(revoked_at)",
@@ -518,7 +516,18 @@ impl StateDb {
         .fetch_optional(&self.pool)
         .await?;
 
-        if let Some((agent_id, agent_type, project, tool_name, tool_input, requested_at, tool_use_id, hook_event_name, terminal_session_id)) = row {
+        if let Some((
+            agent_id,
+            agent_type,
+            project,
+            tool_name,
+            tool_input,
+            requested_at,
+            tool_use_id,
+            hook_event_name,
+            terminal_session_id,
+        )) = row
+        {
             sqlx::query(
                 "INSERT OR IGNORE INTO decision_log (id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_use_id, hook_event_name, terminal_session_id)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -716,10 +725,10 @@ impl StateDb {
             let bytes = hash.to_le_bytes();
             // Build a UUID-shaped string from the hash (deterministic, not RFC 4122)
             uuid::Uuid::from_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3],
-                bytes[4], bytes[5], bytes[6], bytes[7],
-                0, 0, 0, 0, 0, 0, 0, 0,
-            ]).to_string()
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], 0,
+                0, 0, 0, 0, 0, 0, 0,
+            ])
+            .to_string()
         };
         sqlx::query(
             "INSERT OR IGNORE INTO decision_log
@@ -757,7 +766,8 @@ impl StateDb {
         let mut total_archived = 0u64;
 
         // Phase 1: Archive entries older than max_age_days
-        let cutoff = (chrono::Utc::now() - chrono::Duration::days(max_age_days as i64)).to_rfc3339();
+        let cutoff =
+            (chrono::Utc::now() - chrono::Duration::days(max_age_days as i64)).to_rfc3339();
         let old_rows: Vec<(String,)> = sqlx::query_as(
             "SELECT id FROM decision_log WHERE resolved_at < ? ORDER BY resolved_at ASC",
         )
@@ -776,12 +786,11 @@ impl StateDb {
 
         if count.0 as u64 > max_rows {
             let excess = count.0 as u64 - max_rows;
-            let excess_rows: Vec<(String,)> = sqlx::query_as(
-                "SELECT id FROM decision_log ORDER BY resolved_at ASC LIMIT ?",
-            )
-            .bind(excess as i64)
-            .fetch_all(&self.pool)
-            .await?;
+            let excess_rows: Vec<(String,)> =
+                sqlx::query_as("SELECT id FROM decision_log ORDER BY resolved_at ASC LIMIT ?")
+                    .bind(excess as i64)
+                    .fetch_all(&self.pool)
+                    .await?;
 
             if !excess_rows.is_empty() {
                 total_archived += self.archive_rows_by_ids(&excess_rows, archive_path).await?;
@@ -790,9 +799,10 @@ impl StateDb {
 
         // Reclaim disk space if we archived anything
         if total_archived > 0
-            && let Err(e) = sqlx::query("VACUUM").execute(&self.pool).await {
-                tracing::warn!("VACUUM after retention failed: {e}");
-            }
+            && let Err(e) = sqlx::query("VACUUM").execute(&self.pool).await
+        {
+            tracing::warn!("VACUUM after retention failed: {e}");
+        }
 
         Ok(total_archived)
     }
@@ -831,7 +841,22 @@ impl StateDb {
             let rows = query.fetch_all(&self.pool).await?;
 
             // Write all rows to archive file
-            for (id, agent_id, _agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id, hook_event_name, terminal_session_id) in &rows {
+            for (
+                id,
+                agent_id,
+                _agent_type,
+                project,
+                tool_name,
+                tool_input,
+                decision,
+                requested_at,
+                resolved_at,
+                tool_result,
+                tool_use_id,
+                hook_event_name,
+                terminal_session_id,
+            ) in &rows
+            {
                 let entry = serde_json::json!({
                     "id": id,
                     "agent_id": agent_id,
@@ -887,7 +912,16 @@ impl StateDb {
         Ok(rows
             .into_iter()
             .filter_map(
-                |(agent_id, agent_type, project, first_seen, last_seen, total, approved, denied)| {
+                |(
+                    agent_id,
+                    agent_type,
+                    project,
+                    first_seen,
+                    last_seen,
+                    total,
+                    approved,
+                    denied,
+                )| {
                     Some(wisphive_protocol::SessionSummary {
                         agent_id,
                         agent_type: serde_json::from_str(&agent_type).ok()?,
@@ -1059,14 +1093,16 @@ impl StateDb {
         .fetch_optional(&self.pool)
         .await
         .map_err(WebAuthError::from_sqlx)?;
-        Ok(row.map(|(id, name, created_at, last_seen_at, last_ip)| WebDeviceRow {
-            id,
-            name,
-            created_at,
-            last_seen_at,
-            last_ip,
-            revoked_at: None,
-        }))
+        Ok(row.map(
+            |(id, name, created_at, last_seen_at, last_ip)| WebDeviceRow {
+                id,
+                name,
+                created_at,
+                last_seen_at,
+                last_ip,
+                revoked_at: None,
+            },
+        ))
     }
 
     /// Flip `revoked_at` on a device, idempotently. A second call is a
@@ -1107,25 +1143,26 @@ impl StateDb {
     /// List all devices, newest first. Includes revoked so the UI can show
     /// history.
     pub async fn list_web_devices(&self) -> WebAuthResult<Vec<WebDeviceRow>> {
-        let rows: Vec<WebDeviceFullRow> =
-            sqlx::query_as(
-                "SELECT id, name, created_at, last_seen_at, last_ip, revoked_at
+        let rows: Vec<WebDeviceFullRow> = sqlx::query_as(
+            "SELECT id, name, created_at, last_seen_at, last_ip, revoked_at
                  FROM web_devices
                  ORDER BY created_at DESC",
-            )
-            .fetch_all(&self.pool)
-            .await
-            .map_err(WebAuthError::from_sqlx)?;
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(WebAuthError::from_sqlx)?;
         Ok(rows
             .into_iter()
-            .map(|(id, name, created_at, last_seen_at, last_ip, revoked_at)| WebDeviceRow {
-                id,
-                name,
-                created_at,
-                last_seen_at,
-                last_ip,
-                revoked_at,
-            })
+            .map(
+                |(id, name, created_at, last_seen_at, last_ip, revoked_at)| WebDeviceRow {
+                    id,
+                    name,
+                    created_at,
+                    last_seen_at,
+                    last_ip,
+                    revoked_at,
+                },
+            )
             .collect())
     }
 
@@ -1160,30 +1197,31 @@ impl StateDb {
         &self,
         device_id: &str,
     ) -> WebAuthResult<Vec<WebPasskeyRow>> {
-        let rows: Vec<WebPasskeyRowRaw> =
-            sqlx::query_as(
-                "SELECT id, device_id, public_key, sign_count, transports, created_at, last_used_at
+        let rows: Vec<WebPasskeyRowRaw> = sqlx::query_as(
+            "SELECT id, device_id, public_key, sign_count, transports, created_at, last_used_at
                  FROM web_passkeys
                  WHERE device_id = ?
                  ORDER BY created_at DESC",
-            )
-            .bind(device_id)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(WebAuthError::from_sqlx)?;
+        )
+        .bind(device_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(WebAuthError::from_sqlx)?;
         Ok(rows
             .into_iter()
-            .map(|(id, device_id, public_key, sign_count, transports, created_at, last_used_at)| {
-                WebPasskeyRow {
-                    id,
-                    device_id,
-                    public_key,
-                    sign_count,
-                    transports,
-                    created_at,
-                    last_used_at,
-                }
-            })
+            .map(
+                |(id, device_id, public_key, sign_count, transports, created_at, last_used_at)| {
+                    WebPasskeyRow {
+                        id,
+                        device_id,
+                        public_key,
+                        sign_count,
+                        transports,
+                        created_at,
+                        last_used_at,
+                    }
+                },
+            )
             .collect())
     }
 
@@ -1230,15 +1268,14 @@ impl StateDb {
     /// table.
     pub async fn list_web_audit(&self, limit: u32) -> WebAuthResult<Vec<WebAuditRow>> {
         let clamped = limit.min(1000);
-        let rows: Vec<WebAuditRowRaw> =
-            sqlx::query_as(
-                "SELECT id, at, event, device_id, ip, detail
+        let rows: Vec<WebAuditRowRaw> = sqlx::query_as(
+            "SELECT id, at, event, device_id, ip, detail
                  FROM web_audit ORDER BY id DESC LIMIT ?",
-            )
-            .bind(clamped)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(WebAuthError::from_sqlx)?;
+        )
+        .bind(clamped)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(WebAuthError::from_sqlx)?;
         Ok(rows
             .into_iter()
             .map(|(id, at, event, device_id, ip, detail)| WebAuditRow {
@@ -1280,11 +1317,7 @@ impl StateDb {
     }
 
     /// Assign (or clear, when `group` is None) the group label for a session.
-    pub async fn set_terminal_group(
-        &self,
-        id: uuid::Uuid,
-        group: Option<&str>,
-    ) -> Result<()> {
+    pub async fn set_terminal_group(&self, id: uuid::Uuid, group: Option<&str>) -> Result<()> {
         sqlx::query("UPDATE terminal_sessions SET group_name = ? WHERE id = ?")
             .bind(group)
             .bind(id.to_string())
@@ -1294,11 +1327,7 @@ impl StateDb {
     }
 
     /// Update a session's manual sort order.
-    pub async fn set_terminal_sort_order(
-        &self,
-        id: uuid::Uuid,
-        sort_order: i64,
-    ) -> Result<()> {
+    pub async fn set_terminal_sort_order(&self, id: uuid::Uuid, sort_order: i64) -> Result<()> {
         sqlx::query("UPDATE terminal_sessions SET sort_order = ? WHERE id = ?")
             .bind(sort_order)
             .bind(id.to_string())
@@ -1373,13 +1402,19 @@ impl StateDb {
             sort_order,
         ) in rows
         {
-            let Ok(id) = uuid::Uuid::parse_str(&id) else { continue };
+            let Ok(id) = uuid::Uuid::parse_str(&id) else {
+                continue;
+            };
             let args: Vec<String> = serde_json::from_str(&args_json).unwrap_or_default();
-            let Ok(started_at) = chrono::DateTime::parse_from_rfc3339(&started_at) else { continue };
+            let Ok(started_at) = chrono::DateTime::parse_from_rfc3339(&started_at) else {
+                continue;
+            };
             let ended_at = ended_at
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
                 .map(|d| d.with_timezone(&chrono::Utc));
-            let Ok(status) = status.parse::<TerminalStatus>() else { continue };
+            let Ok(status) = status.parse::<TerminalStatus>() else {
+                continue;
+            };
             out.push(TerminalSessionMeta {
                 id,
                 label,
@@ -1400,7 +1435,10 @@ impl StateDb {
     }
 
     /// Look up a single terminal session by ID.
-    pub async fn get_terminal_session(&self, id: uuid::Uuid) -> Result<Option<TerminalSessionMeta>> {
+    pub async fn get_terminal_session(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<Option<TerminalSessionMeta>> {
         // Tiny wrapper: filter list_terminal_sessions by id. For 500-row
         // cap that is cheap; avoids a duplicate query/hydration path.
         Ok(self
@@ -1457,7 +1495,9 @@ impl StateDb {
 
         let mut out = Vec::with_capacity(rows.len());
         for (seq, ts_us, dir, payload) in rows {
-            let Ok(direction) = dir.parse::<TerminalDirection>() else { continue };
+            let Ok(direction) = dir.parse::<TerminalDirection>() else {
+                continue;
+            };
             out.push((seq as u64, ts_us, direction, payload));
         }
         Ok(out)
@@ -1479,7 +1519,10 @@ impl StateDb {
 
     /// Delete terminal events older than the retention cutoff for sessions
     /// that have already ended. Metadata rows are preserved.
-    pub async fn prune_terminal_events(&self, cutoff: chrono::DateTime<chrono::Utc>) -> Result<u64> {
+    pub async fn prune_terminal_events(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64> {
         let res = sqlx::query(
             "DELETE FROM terminal_events
              WHERE session_id IN (
@@ -1495,27 +1538,48 @@ impl StateDb {
 }
 
 /// Convert raw SQL rows to HistoryEntry structs.
-fn rows_to_entries(
-    rows: Vec<DecisionLogRow>,
-) -> Vec<wisphive_protocol::HistoryEntry> {
+fn rows_to_entries(rows: Vec<DecisionLogRow>) -> Vec<wisphive_protocol::HistoryEntry> {
     rows.into_iter()
-        .filter_map(|(id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id, hook_event_name, terminal_session_id)| {
-            Some(wisphive_protocol::HistoryEntry {
-                id: id.parse().ok()?,
+        .filter_map(
+            |(
+                id,
                 agent_id,
-                agent_type: serde_json::from_str(&agent_type).ok()?,
-                project: std::path::PathBuf::from(project),
+                agent_type,
+                project,
                 tool_name,
-                tool_input: serde_json::from_str(&tool_input).unwrap_or(serde_json::Value::Null),
-                decision: serde_json::from_str(&decision).ok()?,
-                requested_at: chrono::DateTime::parse_from_rfc3339(&requested_at).ok()?.with_timezone(&chrono::Utc),
-                resolved_at: chrono::DateTime::parse_from_rfc3339(&resolved_at).ok()?.with_timezone(&chrono::Utc),
-                tool_result: tool_result.and_then(|s| serde_json::from_str(&s).ok()),
+                tool_input,
+                decision,
+                requested_at,
+                resolved_at,
+                tool_result,
                 tool_use_id,
                 hook_event_name,
-                terminal_session_id: terminal_session_id.as_deref().and_then(|s| uuid::Uuid::parse_str(s).ok()),
-            })
-        })
+                terminal_session_id,
+            )| {
+                Some(wisphive_protocol::HistoryEntry {
+                    id: id.parse().ok()?,
+                    agent_id,
+                    agent_type: serde_json::from_str(&agent_type).ok()?,
+                    project: std::path::PathBuf::from(project),
+                    tool_name,
+                    tool_input: serde_json::from_str(&tool_input)
+                        .unwrap_or(serde_json::Value::Null),
+                    decision: serde_json::from_str(&decision).ok()?,
+                    requested_at: chrono::DateTime::parse_from_rfc3339(&requested_at)
+                        .ok()?
+                        .with_timezone(&chrono::Utc),
+                    resolved_at: chrono::DateTime::parse_from_rfc3339(&resolved_at)
+                        .ok()?
+                        .with_timezone(&chrono::Utc),
+                    tool_result: tool_result.and_then(|s| serde_json::from_str(&s).ok()),
+                    tool_use_id,
+                    hook_event_name,
+                    terminal_session_id: terminal_session_id
+                        .as_deref()
+                        .and_then(|s| uuid::Uuid::parse_str(s).ok()),
+                })
+            },
+        )
         .collect()
 }
 
@@ -1546,7 +1610,11 @@ mod tests {
         }
     }
 
-    fn make_request_with_tool_use_id(tool: &str, agent_id: &str, tool_use_id: &str) -> DecisionRequest {
+    fn make_request_with_tool_use_id(
+        tool: &str,
+        agent_id: &str,
+        tool_use_id: &str,
+    ) -> DecisionRequest {
         DecisionRequest {
             id: uuid::Uuid::new_v4(),
             agent_id: agent_id.into(),
@@ -1632,7 +1700,9 @@ mod tests {
         let db = test_db().await;
         let fake_id = uuid::Uuid::new_v4();
         // Should not error — just silently does nothing
-        db.resolve_pending(fake_id, Decision::Approve).await.unwrap();
+        db.resolve_pending(fake_id, Decision::Approve)
+            .await
+            .unwrap();
         let history = db.query_history(None, 10).await.unwrap();
         assert!(history.is_empty());
     }
@@ -1727,7 +1797,18 @@ mod tests {
     #[tokio::test]
     async fn log_auto_approved_creates_entry() {
         let db = test_db().await;
-        log_auto(&db, "cc-1", "\"claude_code\"", "/muse", "Read", "{}", "2024-01-01T00:00:00Z", Some("tui-1"), Some("PreToolUse")).await;
+        log_auto(
+            &db,
+            "cc-1",
+            "\"claude_code\"",
+            "/muse",
+            "Read",
+            "{}",
+            "2024-01-01T00:00:00Z",
+            Some("tui-1"),
+            Some("PreToolUse"),
+        )
+        .await;
 
         let history = db.query_history(None, 10).await.unwrap();
         assert_eq!(history.len(), 1);
@@ -1740,11 +1821,37 @@ mod tests {
         let db = test_db().await;
 
         // Insert same event twice with same tool_use_id
-        log_auto(&db, "cc-1", "\"claude_code\"", "/muse", "Read", "{}", "2024-01-01T00:00:00Z", Some("tui-1"), Some("PreToolUse")).await;
-        log_auto(&db, "cc-1", "\"claude_code\"", "/muse", "Read", "{}", "2024-01-01T00:00:00Z", Some("tui-1"), Some("PreToolUse")).await;
+        log_auto(
+            &db,
+            "cc-1",
+            "\"claude_code\"",
+            "/muse",
+            "Read",
+            "{}",
+            "2024-01-01T00:00:00Z",
+            Some("tui-1"),
+            Some("PreToolUse"),
+        )
+        .await;
+        log_auto(
+            &db,
+            "cc-1",
+            "\"claude_code\"",
+            "/muse",
+            "Read",
+            "{}",
+            "2024-01-01T00:00:00Z",
+            Some("tui-1"),
+            Some("PreToolUse"),
+        )
+        .await;
 
         let history = db.query_history(None, 10).await.unwrap();
-        assert_eq!(history.len(), 1, "duplicate with same tool_use_id should be ignored");
+        assert_eq!(
+            history.len(),
+            1,
+            "duplicate with same tool_use_id should be ignored"
+        );
     }
 
     /// Fixed #58: Events without tool_use_id are now deduplicated via
@@ -1754,11 +1861,37 @@ mod tests {
         let db = test_db().await;
 
         // Insert same event twice with NO tool_use_id
-        log_auto(&db, "cc-1", "\"claude_code\"", "/muse", "Read", "{}", "2024-01-01T00:00:00Z", None, Some("PreToolUse")).await;
-        log_auto(&db, "cc-1", "\"claude_code\"", "/muse", "Read", "{}", "2024-01-01T00:00:00Z", None, Some("PreToolUse")).await;
+        log_auto(
+            &db,
+            "cc-1",
+            "\"claude_code\"",
+            "/muse",
+            "Read",
+            "{}",
+            "2024-01-01T00:00:00Z",
+            None,
+            Some("PreToolUse"),
+        )
+        .await;
+        log_auto(
+            &db,
+            "cc-1",
+            "\"claude_code\"",
+            "/muse",
+            "Read",
+            "{}",
+            "2024-01-01T00:00:00Z",
+            None,
+            Some("PreToolUse"),
+        )
+        .await;
 
         let history = db.query_history(None, 10).await.unwrap();
-        assert_eq!(history.len(), 1, "deterministic IDs should deduplicate events without tool_use_id");
+        assert_eq!(
+            history.len(),
+            1,
+            "deterministic IDs should deduplicate events without tool_use_id"
+        );
     }
 
     // ════════════════════════════════════════════════════════════
@@ -1774,7 +1907,10 @@ mod tests {
         db.resolve_pending(id, Decision::Approve).await.unwrap();
 
         let result = serde_json::json!({"output": "build succeeded"});
-        let matched = db.attach_tool_result("cc-1", "Bash", &result, Some("tui-456")).await.unwrap();
+        let matched = db
+            .attach_tool_result("cc-1", "Bash", &result, Some("tui-456"))
+            .await
+            .unwrap();
         assert!(matched.is_some());
         assert_eq!(matched.unwrap(), id);
 
@@ -1792,7 +1928,10 @@ mod tests {
 
         let result = serde_json::json!({"output": "ok"});
         // No tool_use_id → fuzzy match by agent_id + tool_name + recency
-        let matched = db.attach_tool_result("cc-1", "Bash", &result, None).await.unwrap();
+        let matched = db
+            .attach_tool_result("cc-1", "Bash", &result, None)
+            .await
+            .unwrap();
         assert!(matched.is_some());
     }
 
@@ -1800,7 +1939,10 @@ mod tests {
     async fn attach_tool_result_no_match() {
         let db = test_db().await;
         let result = serde_json::json!({"output": "orphan"});
-        let matched = db.attach_tool_result("cc-99", "Bash", &result, None).await.unwrap();
+        let matched = db
+            .attach_tool_result("cc-99", "Bash", &result, None)
+            .await
+            .unwrap();
         assert!(matched.is_none());
     }
 
@@ -1812,12 +1954,20 @@ mod tests {
         db.resolve_pending(req.id, Decision::Approve).await.unwrap();
 
         let r1 = serde_json::json!({"output": "first"});
-        db.attach_tool_result("cc-1", "Bash", &r1, Some("tui-789")).await.unwrap();
+        db.attach_tool_result("cc-1", "Bash", &r1, Some("tui-789"))
+            .await
+            .unwrap();
 
         // Second attach to same tool_use_id should find no match (already has result)
         let r2 = serde_json::json!({"output": "second"});
-        let matched = db.attach_tool_result("cc-1", "Bash", &r2, Some("tui-789")).await.unwrap();
-        assert!(matched.is_none(), "should not overwrite existing tool_result");
+        let matched = db
+            .attach_tool_result("cc-1", "Bash", &r2, Some("tui-789"))
+            .await
+            .unwrap();
+        assert!(
+            matched.is_none(),
+            "should not overwrite existing tool_result"
+        );
     }
 
     // ════════════════════════════════════════════════════════════
@@ -1828,8 +1978,30 @@ mod tests {
     async fn search_history_by_query() {
         let db = test_db().await;
 
-        log_auto(&db, "cc-1", "\"claude_code\"", "/muse", "Bash", "{\"command\":\"cargo build\"}", "2024-01-01T00:00:00Z", Some("a"), None).await;
-        log_auto(&db, "cc-1", "\"claude_code\"", "/muse", "Edit", "{\"file\":\"main.rs\"}", "2024-01-01T00:01:00Z", Some("b"), None).await;
+        log_auto(
+            &db,
+            "cc-1",
+            "\"claude_code\"",
+            "/muse",
+            "Bash",
+            "{\"command\":\"cargo build\"}",
+            "2024-01-01T00:00:00Z",
+            Some("a"),
+            None,
+        )
+        .await;
+        log_auto(
+            &db,
+            "cc-1",
+            "\"claude_code\"",
+            "/muse",
+            "Edit",
+            "{\"file\":\"main.rs\"}",
+            "2024-01-01T00:01:00Z",
+            Some("b"),
+            None,
+        )
+        .await;
 
         let search = wisphive_protocol::HistorySearch {
             query: Some("cargo".into()),
@@ -1844,8 +2016,30 @@ mod tests {
     async fn search_history_by_tool_name() {
         let db = test_db().await;
 
-        log_auto(&db, "cc-1", "\"claude_code\"", "/muse", "Bash", "{}", "2024-01-01T00:00:00Z", Some("a"), None).await;
-        log_auto(&db, "cc-1", "\"claude_code\"", "/muse", "Edit", "{}", "2024-01-01T00:01:00Z", Some("b"), None).await;
+        log_auto(
+            &db,
+            "cc-1",
+            "\"claude_code\"",
+            "/muse",
+            "Bash",
+            "{}",
+            "2024-01-01T00:00:00Z",
+            Some("a"),
+            None,
+        )
+        .await;
+        log_auto(
+            &db,
+            "cc-1",
+            "\"claude_code\"",
+            "/muse",
+            "Edit",
+            "{}",
+            "2024-01-01T00:01:00Z",
+            Some("b"),
+            None,
+        )
+        .await;
 
         let search = wisphive_protocol::HistorySearch {
             tool_name: Some("Edit".into()),
@@ -1860,8 +2054,30 @@ mod tests {
     async fn search_history_by_agent_id() {
         let db = test_db().await;
 
-        log_auto(&db, "cc-1", "\"claude_code\"", "/muse", "Bash", "{}", "2024-01-01T00:00:00Z", Some("a"), None).await;
-        log_auto(&db, "cc-2", "\"claude_code\"", "/rpg", "Bash", "{}", "2024-01-01T00:01:00Z", Some("b"), None).await;
+        log_auto(
+            &db,
+            "cc-1",
+            "\"claude_code\"",
+            "/muse",
+            "Bash",
+            "{}",
+            "2024-01-01T00:00:00Z",
+            Some("a"),
+            None,
+        )
+        .await;
+        log_auto(
+            &db,
+            "cc-2",
+            "\"claude_code\"",
+            "/rpg",
+            "Bash",
+            "{}",
+            "2024-01-01T00:01:00Z",
+            Some("b"),
+            None,
+        )
+        .await;
 
         let search = wisphive_protocol::HistorySearch {
             agent_id: Some("cc-2".into()),
@@ -1955,13 +2171,19 @@ mod tests {
         let projects = db.query_projects().await.unwrap();
         assert_eq!(projects.len(), 2);
 
-        let muse = projects.iter().find(|p| p.project == std::path::Path::new("/muse")).unwrap();
+        let muse = projects
+            .iter()
+            .find(|p| p.project == std::path::Path::new("/muse"))
+            .unwrap();
         assert_eq!(muse.total_calls, 2);
         assert_eq!(muse.agent_count, 2);
         assert_eq!(muse.approved, 1);
         assert_eq!(muse.denied, 1);
 
-        let rpg = projects.iter().find(|p| p.project == std::path::Path::new("/rpg")).unwrap();
+        let rpg = projects
+            .iter()
+            .find(|p| p.project == std::path::Path::new("/rpg"))
+            .unwrap();
         assert_eq!(rpg.total_calls, 1);
         assert_eq!(rpg.agent_count, 1);
     }
@@ -2033,7 +2255,9 @@ mod tests {
     async fn terminal_session_create_and_list() {
         let db = test_db().await;
         let id = uuid::Uuid::new_v4();
-        db.create_terminal_session(&make_term_meta(id)).await.unwrap();
+        db.create_terminal_session(&make_term_meta(id))
+            .await
+            .unwrap();
 
         let list = db.list_terminal_sessions().await.unwrap();
         assert_eq!(list.len(), 1);
@@ -2047,8 +2271,12 @@ mod tests {
     async fn terminal_session_end_sets_fields() {
         let db = test_db().await;
         let id = uuid::Uuid::new_v4();
-        db.create_terminal_session(&make_term_meta(id)).await.unwrap();
-        db.end_terminal_session(id, Some(0), TerminalStatus::Exited).await.unwrap();
+        db.create_terminal_session(&make_term_meta(id))
+            .await
+            .unwrap();
+        db.end_terminal_session(id, Some(0), TerminalStatus::Exited)
+            .await
+            .unwrap();
 
         let got = db.get_terminal_session(id).await.unwrap().unwrap();
         assert_eq!(got.status, TerminalStatus::Exited);
@@ -2060,12 +2288,26 @@ mod tests {
     async fn terminal_events_batch_and_replay_preserve_order_and_bytes() {
         let db = test_db().await;
         let id = uuid::Uuid::new_v4();
-        db.create_terminal_session(&make_term_meta(id)).await.unwrap();
+        db.create_terminal_session(&make_term_meta(id))
+            .await
+            .unwrap();
 
         let rows = vec![
-            (id, 1u64, 100i64, TerminalDirection::Output, b"hello\n".to_vec()),
+            (
+                id,
+                1u64,
+                100i64,
+                TerminalDirection::Output,
+                b"hello\n".to_vec(),
+            ),
             (id, 2, 200, TerminalDirection::Input, b"yes\r".to_vec()),
-            (id, 3, 300, TerminalDirection::Output, vec![0x1b, b'[', b'3', b'1', b'm']),
+            (
+                id,
+                3,
+                300,
+                TerminalDirection::Output,
+                vec![0x1b, b'[', b'3', b'1', b'm'],
+            ),
         ];
         db.insert_terminal_events_batch(&rows).await.unwrap();
 
@@ -2087,12 +2329,18 @@ mod tests {
         // Three sessions with distinct ids. Leave group/sort_order at defaults.
         let ids: Vec<uuid::Uuid> = (0..3).map(|_| uuid::Uuid::new_v4()).collect();
         for id in &ids {
-            db.create_terminal_session(&make_term_meta(*id)).await.unwrap();
+            db.create_terminal_session(&make_term_meta(*id))
+                .await
+                .unwrap();
         }
 
         // Assign the first two to a group, reorder them.
-        db.set_terminal_group(ids[0], Some("frontend")).await.unwrap();
-        db.set_terminal_group(ids[1], Some("frontend")).await.unwrap();
+        db.set_terminal_group(ids[0], Some("frontend"))
+            .await
+            .unwrap();
+        db.set_terminal_group(ids[1], Some("frontend"))
+            .await
+            .unwrap();
         db.set_terminal_sort_order(ids[0], 200).await.unwrap();
         db.set_terminal_sort_order(ids[1], 100).await.unwrap();
         db.set_terminal_sort_order(ids[2], 50).await.unwrap();
@@ -2118,7 +2366,9 @@ mod tests {
     async fn mark_running_orphaned_on_startup() {
         let db = test_db().await;
         let id = uuid::Uuid::new_v4();
-        db.create_terminal_session(&make_term_meta(id)).await.unwrap();
+        db.create_terminal_session(&make_term_meta(id))
+            .await
+            .unwrap();
         // Directly invoke the sweeper (also runs inside StateDb::open).
         db.mark_running_terminals_orphaned().await.unwrap();
         let got = db.get_terminal_session(id).await.unwrap().unwrap();
@@ -2149,26 +2399,45 @@ mod tests {
         );
 
         // Reset cascades devices/passkeys and clears the password.
-        db.insert_web_device("dev-1", "phone", "tokhash-1").await.unwrap();
-        db.insert_web_passkey("pk-1", "dev-1", b"fake-key", 0, None).await.unwrap();
+        db.insert_web_device("dev-1", "phone", "tokhash-1")
+            .await
+            .unwrap();
+        db.insert_web_passkey("pk-1", "dev-1", b"fake-key", 0, None)
+            .await
+            .unwrap();
         db.reset_web_password().await.unwrap();
         assert!(db.get_web_password_hash().await.unwrap().is_none());
         assert!(db.list_web_devices().await.unwrap().is_empty());
-        assert!(db.list_web_passkeys_for_device("dev-1").await.unwrap().is_empty());
+        assert!(
+            db.list_web_passkeys_for_device("dev-1")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn web_device_insert_find_revoke_list() {
         let db = test_db().await;
-        db.insert_web_device("dev-1", "phone", "hash-1").await.unwrap();
-        db.insert_web_device("dev-2", "laptop", "hash-2").await.unwrap();
+        db.insert_web_device("dev-1", "phone", "hash-1")
+            .await
+            .unwrap();
+        db.insert_web_device("dev-2", "laptop", "hash-2")
+            .await
+            .unwrap();
 
-        let found = db.find_web_device_by_token_hash("hash-1").await.unwrap().unwrap();
+        let found = db
+            .find_web_device_by_token_hash("hash-1")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.id, "dev-1");
         assert_eq!(found.name, "phone");
 
         // Touching updates last_seen/last_ip (smoke test).
-        db.touch_web_device("dev-1", Some("192.168.1.5")).await.unwrap();
+        db.touch_web_device("dev-1", Some("192.168.1.5"))
+            .await
+            .unwrap();
 
         // Listing returns both; order is newest-first so dev-2 comes first.
         let devices = db.list_web_devices().await.unwrap();
@@ -2176,7 +2445,12 @@ mod tests {
 
         // Revoking hides the device from token lookups and flips revoked_at.
         db.revoke_web_device("dev-1").await.unwrap();
-        assert!(db.find_web_device_by_token_hash("hash-1").await.unwrap().is_none());
+        assert!(
+            db.find_web_device_by_token_hash("hash-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
         let rev = db.list_web_devices().await.unwrap();
         let dev1 = rev.iter().find(|d| d.id == "dev-1").unwrap();
         assert!(dev1.revoked_at.is_some());
@@ -2188,27 +2462,41 @@ mod tests {
     #[tokio::test]
     async fn web_passkey_insert_and_list_cascade_deletes() {
         let db = test_db().await;
-        db.insert_web_device("dev-1", "phone", "hash-1").await.unwrap();
+        db.insert_web_device("dev-1", "phone", "hash-1")
+            .await
+            .unwrap();
         db.insert_web_passkey("pk-a", "dev-1", b"cose-a", 0, Some("[\"internal\"]"))
             .await
             .unwrap();
-        db.insert_web_passkey("pk-b", "dev-1", b"cose-b", 0, None).await.unwrap();
+        db.insert_web_passkey("pk-b", "dev-1", b"cose-b", 0, None)
+            .await
+            .unwrap();
 
         let keys = db.list_web_passkeys_for_device("dev-1").await.unwrap();
         assert_eq!(keys.len(), 2);
         assert!(keys.iter().any(|k| k.id == "pk-a"));
         assert!(keys.iter().any(|k| k.id == "pk-b"));
-        assert_eq!(keys.iter().find(|k| k.id == "pk-a").unwrap().public_key, b"cose-a");
+        assert_eq!(
+            keys.iter().find(|k| k.id == "pk-a").unwrap().public_key,
+            b"cose-a"
+        );
 
         // ON DELETE CASCADE kicks in when the device row is removed (via reset).
         db.reset_web_password().await.unwrap();
-        assert!(db.list_web_passkeys_for_device("dev-1").await.unwrap().is_empty());
+        assert!(
+            db.list_web_passkeys_for_device("dev-1")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn web_device_token_hash_is_unique() {
         let db = test_db().await;
-        db.insert_web_device("dev-1", "phone", "same-hash").await.unwrap();
+        db.insert_web_device("dev-1", "phone", "same-hash")
+            .await
+            .unwrap();
         let err = db
             .insert_web_device("dev-2", "laptop", "same-hash")
             .await
@@ -2228,9 +2516,19 @@ mod tests {
         // (because reset_web_password deletes passkeys manually first), but
         // this one will not.
         let db = test_db().await;
-        db.insert_web_device("dev-1", "phone", "hash-1").await.unwrap();
-        db.insert_web_passkey("pk-1", "dev-1", b"cose", 0, None).await.unwrap();
-        assert_eq!(db.list_web_passkeys_for_device("dev-1").await.unwrap().len(), 1);
+        db.insert_web_device("dev-1", "phone", "hash-1")
+            .await
+            .unwrap();
+        db.insert_web_passkey("pk-1", "dev-1", b"cose", 0, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.list_web_passkeys_for_device("dev-1")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
 
         sqlx::query("DELETE FROM web_devices WHERE id = ?")
             .bind("dev-1")
@@ -2239,7 +2537,10 @@ mod tests {
             .unwrap();
 
         assert!(
-            db.list_web_passkeys_for_device("dev-1").await.unwrap().is_empty(),
+            db.list_web_passkeys_for_device("dev-1")
+                .await
+                .unwrap()
+                .is_empty(),
             "ON DELETE CASCADE must reap passkeys when foreign_keys=ON"
         );
     }
@@ -2247,8 +2548,12 @@ mod tests {
     #[tokio::test]
     async fn touch_web_device_ignores_revoked_rows() {
         let db = test_db().await;
-        db.insert_web_device("dev-1", "phone", "hash-1").await.unwrap();
-        db.touch_web_device("dev-1", Some("10.0.0.1")).await.unwrap();
+        db.insert_web_device("dev-1", "phone", "hash-1")
+            .await
+            .unwrap();
+        db.touch_web_device("dev-1", Some("10.0.0.1"))
+            .await
+            .unwrap();
         let before = db
             .list_web_devices()
             .await
@@ -2260,7 +2565,9 @@ mod tests {
 
         db.revoke_web_device("dev-1").await.unwrap();
         // Attempt to touch after revocation — must be a silent no-op.
-        db.touch_web_device("dev-1", Some("10.0.0.99")).await.unwrap();
+        db.touch_web_device("dev-1", Some("10.0.0.99"))
+            .await
+            .unwrap();
 
         let after = db
             .list_web_devices()
@@ -2279,10 +2586,17 @@ mod tests {
     #[tokio::test]
     async fn web_audit_append_and_list_newest_first() {
         let db = test_db().await;
-        db.append_web_audit("login_failure", None, Some("1.2.3.4"), Some("{\"reason\":\"bad_pw\"}"))
+        db.append_web_audit(
+            "login_failure",
+            None,
+            Some("1.2.3.4"),
+            Some("{\"reason\":\"bad_pw\"}"),
+        )
+        .await
+        .unwrap();
+        db.append_web_audit("login_success", Some("dev-1"), Some("1.2.3.4"), None)
             .await
             .unwrap();
-        db.append_web_audit("login_success", Some("dev-1"), Some("1.2.3.4"), None).await.unwrap();
 
         let rows = db.list_web_audit(10).await.unwrap();
         assert_eq!(rows.len(), 2);

@@ -14,11 +14,29 @@ const SOCKET_TIMEOUT: Duration = Duration::from_secs(3);
 /// Tools that are always safe to auto-approve (read-only + orchestration).
 /// Fallback when no config.json exists. Matches the Read tier.
 const DEFAULT_AUTO_APPROVE: &[&str] = &[
-    "Read", "Glob", "Grep", "LS", "LSP", "NotebookRead",
-    "WebSearch", "WebFetch",
-    "Agent", "Skill", "ToolSearch", "AskUserQuestion",
-    "EnterPlanMode", "ExitPlanMode", "EnterWorktree", "ExitWorktree",
-    "TaskCreate", "TaskUpdate", "TaskGet", "TaskList", "TaskOutput", "TaskStop", "TodoRead",
+    "Read",
+    "Glob",
+    "Grep",
+    "LS",
+    "LSP",
+    "NotebookRead",
+    "WebSearch",
+    "WebFetch",
+    "Agent",
+    "Skill",
+    "ToolSearch",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "EnterWorktree",
+    "ExitWorktree",
+    "TaskCreate",
+    "TaskUpdate",
+    "TaskGet",
+    "TaskList",
+    "TaskOutput",
+    "TaskStop",
+    "TodoRead",
     "CronList",
 ];
 
@@ -222,10 +240,14 @@ fn format_elicitation_response(resp: &HookResponse) -> i32 {
     hook_output.insert("hookEventName".into(), serde_json::json!("Elicitation"));
     hook_output.insert("action".into(), serde_json::json!(action));
     if action == "accept"
-        && let Some(ref input) = resp.updated_input {
-            hook_output.insert("content".into(), input.clone());
-        }
-    output.insert("hookSpecificOutput".into(), serde_json::Value::Object(hook_output));
+        && let Some(ref input) = resp.updated_input
+    {
+        hook_output.insert("content".into(), input.clone());
+    }
+    output.insert(
+        "hookSpecificOutput".into(),
+        serde_json::Value::Object(hook_output),
+    );
     print!("{}", serde_json::Value::Object(output));
     0
 }
@@ -347,7 +369,13 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
             tool_input.clone()
         };
         log_auto_approved(
-            &wisphive_dir, &tool_use_id, &agent_id, &project, &tool_name, &log_input, event_type,
+            &wisphive_dir,
+            &tool_use_id,
+            &agent_id,
+            &project,
+            &tool_name,
+            &log_input,
+            event_type,
         );
         return Ok(HookResponse::simple(Decision::Approve));
     }
@@ -355,16 +383,22 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
     // Layer 4: Auto-approve check — PermissionRequests always go to daemon
     if !is_permission_request && is_auto_approved(&tool_name, &tool_input, &wisphive_dir) {
         log_auto_approved(
-            &wisphive_dir, &tool_use_id, &agent_id, &project, &tool_name, &tool_input, event_type,
+            &wisphive_dir,
+            &tool_use_id,
+            &agent_id,
+            &project,
+            &tool_name,
+            &tool_input,
+            event_type,
         );
         return Ok(HookResponse::simple(Decision::Approve));
     }
 
     // Parse permission suggestions for PermissionRequest events
     let permission_suggestions = if is_permission_request {
-        hook_event
-            .get("permission_suggestions")
-            .and_then(|v| serde_json::from_value::<Vec<wisphive_protocol::PermissionSuggestion>>(v.clone()).ok())
+        hook_event.get("permission_suggestions").and_then(|v| {
+            serde_json::from_value::<Vec<wisphive_protocol::PermissionSuggestion>>(v.clone()).ok()
+        })
     } else {
         None
     };
@@ -378,12 +412,13 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
             .get("transcript_path")
             .and_then(|v| v.as_str())
             .and_then(extract_plan_from_transcript)
-        {
-            let data = event_data.get_or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-            if let Some(obj) = data.as_object_mut() {
-                obj.insert("plan_content".into(), serde_json::Value::String(plan));
-            }
+    {
+        let data =
+            event_data.get_or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert("plan_content".into(), serde_json::Value::String(plan));
         }
+    }
 
     // Correlation with wisphive-managed terminal sessions: the daemon
     // exports WISPHIVE_TERMINAL_SESSION_ID into the PTY, which flows through
@@ -637,32 +672,35 @@ fn is_auto_approved(
     // Apply content-aware tool_rules
     if let Some(ref config) = config
         && let Some(rules) = config.get("tool_rules").and_then(|v| v.as_object())
-            && let Some(rule) = rules.get(tool_name) {
-                let input_text = tool_input_text(tool_name, tool_input);
-                let input_lower = input_text.to_lowercase();
+        && let Some(rule) = rules.get(tool_name)
+    {
+        let input_text = tool_input_text(tool_name, tool_input);
+        let input_lower = input_text.to_lowercase();
 
-                if base_approved {
-                    // Check deny_patterns — any match blocks auto-approve
-                    if let Some(patterns) = rule.get("deny_patterns").and_then(|v| v.as_array()) {
-                        for p in patterns {
-                            if let Some(pat) = p.as_str()
-                                && input_lower.contains(&pat.to_lowercase()) {
-                                    return false;
-                                }
-                        }
-                    }
-                } else {
-                    // Check allow_patterns — any match auto-approves
-                    if let Some(patterns) = rule.get("allow_patterns").and_then(|v| v.as_array()) {
-                        for p in patterns {
-                            if let Some(pat) = p.as_str()
-                                && input_lower.contains(&pat.to_lowercase()) {
-                                    return true;
-                                }
-                        }
+        if base_approved {
+            // Check deny_patterns — any match blocks auto-approve
+            if let Some(patterns) = rule.get("deny_patterns").and_then(|v| v.as_array()) {
+                for p in patterns {
+                    if let Some(pat) = p.as_str()
+                        && input_lower.contains(&pat.to_lowercase())
+                    {
+                        return false;
                     }
                 }
             }
+        } else {
+            // Check allow_patterns — any match auto-approves
+            if let Some(patterns) = rule.get("allow_patterns").and_then(|v| v.as_array()) {
+                for p in patterns {
+                    if let Some(pat) = p.as_str()
+                        && input_lower.contains(&pat.to_lowercase())
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
 
     base_approved
 }
@@ -675,15 +713,17 @@ fn check_base_approved(
 ) -> bool {
     // Check explicit additions
     if let Some(arr) = config.get("auto_approve_add").and_then(|v| v.as_array())
-        && arr.iter().any(|v| v.as_str() == Some(tool_name)) {
-            return true;
-        }
+        && arr.iter().any(|v| v.as_str() == Some(tool_name))
+    {
+        return true;
+    }
 
     // Check tiered level
     if let Some(level_str) = config.get("auto_approve_level").and_then(|v| v.as_str())
-        && let Ok(level) = level_str.parse::<wisphive_protocol::AutoApproveLevel>() {
-            return level.includes(tool_name);
-        }
+        && let Ok(level) = level_str.parse::<wisphive_protocol::AutoApproveLevel>()
+    {
+        return level.includes(tool_name);
+    }
 
     // Fallback to legacy
     legacy_auto_approved(tool_name, wisphive_dir)
@@ -694,10 +734,11 @@ fn legacy_auto_approved(tool_name: &str, wisphive_dir: &std::path::Path) -> bool
     let legacy_path = wisphive_dir.join("auto-approve.json");
     if legacy_path.exists()
         && let Ok(content) = std::fs::read_to_string(&legacy_path)
-            && let Ok(config) = serde_json::from_str::<serde_json::Value>(&content)
-                && let Some(arr) = config.get("auto_approve").and_then(|v| v.as_array()) {
-                    return arr.iter().any(|v| v.as_str() == Some(tool_name));
-                }
+        && let Ok(config) = serde_json::from_str::<serde_json::Value>(&content)
+        && let Some(arr) = config.get("auto_approve").and_then(|v| v.as_array())
+    {
+        return arr.iter().any(|v| v.as_str() == Some(tool_name));
+    }
     DEFAULT_AUTO_APPROVE.contains(&tool_name)
 }
 
@@ -737,9 +778,10 @@ fn log_auto_approved(
 /// For Bash: the `command` field. For everything else: JSON-serialized input.
 fn tool_input_text(tool_name: &str, tool_input: &serde_json::Value) -> String {
     if tool_name == "Bash"
-        && let Some(cmd) = tool_input.get("command").and_then(|v| v.as_str()) {
-            return cmd.to_string();
-        }
+        && let Some(cmd) = tool_input.get("command").and_then(|v| v.as_str())
+    {
+        return cmd.to_string();
+    }
     serde_json::to_string(tool_input).unwrap_or_default()
 }
 
@@ -856,9 +898,10 @@ fn extract_plan_from_transcript(path: &str) -> Option<String> {
         let mut text_parts = Vec::new();
         for item in content {
             if item.get("type").and_then(|v| v.as_str()) == Some("text")
-                && let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    text_parts.push(text.to_string());
-                }
+                && let Some(text) = item.get("text").and_then(|v| v.as_str())
+            {
+                text_parts.push(text.to_string());
+            }
         }
 
         if !text_parts.is_empty() {

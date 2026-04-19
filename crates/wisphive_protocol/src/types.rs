@@ -64,8 +64,7 @@ pub struct PermissionSuggestion {
 }
 
 /// The type of Claude Code hook event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum HookEventType {
     #[default]
     PreToolUse,
@@ -86,7 +85,6 @@ pub enum HookEventType {
     #[serde(other)]
     Unknown,
 }
-
 
 impl std::fmt::Display for HookEventType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -537,16 +535,32 @@ impl AutoApproveLevel {
             Self::Off => &[],
             Self::Read => &[
                 // File/content reading
-                "Read", "Glob", "Grep", "LS", "LSP", "NotebookRead",
+                "Read",
+                "Glob",
+                "Grep",
+                "LS",
+                "LSP",
+                "NotebookRead",
                 // Web (read-only)
-                "WebSearch", "WebFetch",
+                "WebSearch",
+                "WebFetch",
                 // Orchestration & planning
-                "Agent", "Skill", "ToolSearch", "AskUserQuestion",
-                "EnterPlanMode", "ExitPlanMode",
-                "EnterWorktree", "ExitWorktree",
+                "Agent",
+                "Skill",
+                "ToolSearch",
+                "AskUserQuestion",
+                "EnterPlanMode",
+                "ExitPlanMode",
+                "EnterWorktree",
+                "ExitWorktree",
                 // Task management
-                "TaskCreate", "TaskUpdate", "TaskGet", "TaskList",
-                "TaskOutput", "TaskStop", "TodoRead",
+                "TaskCreate",
+                "TaskUpdate",
+                "TaskGet",
+                "TaskList",
+                "TaskOutput",
+                "TaskStop",
+                "TodoRead",
                 // Scheduling
                 "CronList",
             ],
@@ -574,7 +588,6 @@ impl AutoApproveLevel {
     }
 }
 
-
 impl std::fmt::Display for AutoApproveLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -597,7 +610,9 @@ impl std::str::FromStr for AutoApproveLevel {
             "write" | "2" => Ok(Self::Write),
             "execute" | "exec" | "3" => Ok(Self::Execute),
             "all" | "4" => Ok(Self::All),
-            _ => Err(format!("unknown level: {s}. Valid: off, read, write, execute, all")),
+            _ => Err(format!(
+                "unknown level: {s}. Valid: off, read, write, execute, all"
+            )),
         }
     }
 }
@@ -620,17 +635,20 @@ impl DecisionFilter {
     /// Returns true if the given request matches this filter.
     pub fn matches(&self, req: &DecisionRequest) -> bool {
         if let Some(ref tool) = self.tool_name
-            && req.tool_name != *tool {
-                return false;
-            }
+            && req.tool_name != *tool
+        {
+            return false;
+        }
         if let Some(ref project) = self.project
-            && req.project != *project {
-                return false;
-            }
+            && req.project != *project
+        {
+            return false;
+        }
         if let Some(ref agent_type) = self.agent_type
-            && req.agent_type != *agent_type {
-                return false;
-            }
+            && req.agent_type != *agent_type
+        {
+            return false;
+        }
         true
     }
 }
@@ -640,7 +658,12 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn make_request(tool: &str, agent_id: &str, project: &str, agent_type: AgentType) -> DecisionRequest {
+    fn make_request(
+        tool: &str,
+        agent_id: &str,
+        project: &str,
+        agent_type: AgentType,
+    ) -> DecisionRequest {
         DecisionRequest {
             id: uuid::Uuid::new_v4(),
             agent_id: agent_id.into(),
@@ -737,7 +760,11 @@ mod tests {
         for variant in variants {
             let display = variant.to_string();
             let parsed: HookEventType = display.parse().unwrap();
-            assert_eq!(parsed, variant, "Display→FromStr failed for {:?} (display={:?})", variant, display);
+            assert_eq!(
+                parsed, variant,
+                "Display→FromStr failed for {:?} (display={:?})",
+                variant, display
+            );
         }
     }
 
@@ -853,30 +880,78 @@ mod tests {
 
     #[test]
     fn auto_approve_from_str_names() {
-        assert_eq!("off".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::Off);
-        assert_eq!("read".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::Read);
-        assert_eq!("write".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::Write);
-        assert_eq!("execute".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::Execute);
-        assert_eq!("exec".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::Execute);
-        assert_eq!("all".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::All);
+        assert_eq!(
+            "off".parse::<AutoApproveLevel>().unwrap(),
+            AutoApproveLevel::Off
+        );
+        assert_eq!(
+            "read".parse::<AutoApproveLevel>().unwrap(),
+            AutoApproveLevel::Read
+        );
+        assert_eq!(
+            "write".parse::<AutoApproveLevel>().unwrap(),
+            AutoApproveLevel::Write
+        );
+        assert_eq!(
+            "execute".parse::<AutoApproveLevel>().unwrap(),
+            AutoApproveLevel::Execute
+        );
+        assert_eq!(
+            "exec".parse::<AutoApproveLevel>().unwrap(),
+            AutoApproveLevel::Execute
+        );
+        assert_eq!(
+            "all".parse::<AutoApproveLevel>().unwrap(),
+            AutoApproveLevel::All
+        );
     }
 
     #[test]
     fn auto_approve_from_str_numbers() {
-        assert_eq!("0".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::Off);
-        assert_eq!("1".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::Read);
-        assert_eq!("2".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::Write);
-        assert_eq!("3".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::Execute);
-        assert_eq!("4".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::All);
+        assert_eq!(
+            "0".parse::<AutoApproveLevel>().unwrap(),
+            AutoApproveLevel::Off
+        );
+        assert_eq!(
+            "1".parse::<AutoApproveLevel>().unwrap(),
+            AutoApproveLevel::Read
+        );
+        assert_eq!(
+            "2".parse::<AutoApproveLevel>().unwrap(),
+            AutoApproveLevel::Write
+        );
+        assert_eq!(
+            "3".parse::<AutoApproveLevel>().unwrap(),
+            AutoApproveLevel::Execute
+        );
+        assert_eq!(
+            "4".parse::<AutoApproveLevel>().unwrap(),
+            AutoApproveLevel::All
+        );
     }
 
     #[test]
     fn auto_approve_from_str_case_insensitive() {
-        assert_eq!("OFF".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::Off);
-        assert_eq!("Read".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::Read);
-        assert_eq!("WRITE".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::Write);
-        assert_eq!("Execute".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::Execute);
-        assert_eq!("ALL".parse::<AutoApproveLevel>().unwrap(), AutoApproveLevel::All);
+        assert_eq!(
+            "OFF".parse::<AutoApproveLevel>().unwrap(),
+            AutoApproveLevel::Off
+        );
+        assert_eq!(
+            "Read".parse::<AutoApproveLevel>().unwrap(),
+            AutoApproveLevel::Read
+        );
+        assert_eq!(
+            "WRITE".parse::<AutoApproveLevel>().unwrap(),
+            AutoApproveLevel::Write
+        );
+        assert_eq!(
+            "Execute".parse::<AutoApproveLevel>().unwrap(),
+            AutoApproveLevel::Execute
+        );
+        assert_eq!(
+            "ALL".parse::<AutoApproveLevel>().unwrap(),
+            AutoApproveLevel::All
+        );
     }
 
     #[test]

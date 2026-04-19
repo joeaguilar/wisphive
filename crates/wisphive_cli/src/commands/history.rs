@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use wisphive_protocol::{
-    ClientMessage, ClientType, HistorySearch, ServerMessage, PROTOCOL_VERSION,
+    ClientMessage, ClientType, HistorySearch, PROTOCOL_VERSION, ServerMessage,
 };
 
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);

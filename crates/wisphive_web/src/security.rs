@@ -59,10 +59,7 @@ impl SecurityConfig {
             format!("http://127.0.0.1:{port}"),
             format!("http://localhost:{port}"),
         ];
-        let mut allowed_hosts = vec![
-            format!("127.0.0.1:{port}"),
-            format!("localhost:{port}"),
-        ];
+        let mut allowed_hosts = vec![format!("127.0.0.1:{port}"), format!("localhost:{port}")];
 
         if dev_mode {
             allowed_origins.push("http://localhost:5173".to_string());
@@ -92,7 +89,11 @@ impl SecurityConfig {
     /// Construct a config with an explicit token. Used for tests so we can
     /// assert exactly which token the middleware expects.
     #[cfg(test)]
-    pub fn for_test(token: String, allowed_origins: Vec<String>, allowed_hosts: Vec<String>) -> Self {
+    pub fn for_test(
+        token: String,
+        allowed_origins: Vec<String>,
+        allowed_hosts: Vec<String>,
+    ) -> Self {
         Self {
             inner: Arc::new(SecurityConfigInner {
                 token,
@@ -128,7 +129,9 @@ impl SecurityConfig {
     fn check_token(&self, headers: &HeaderMap, query: Option<&str>) -> bool {
         // Try Authorization: Bearer <token>
         if let Some(auth) = headers.get("authorization").and_then(|h| h.to_str().ok())
-            && let Some(token) = auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer "))
+            && let Some(token) = auth
+                .strip_prefix("Bearer ")
+                .or_else(|| auth.strip_prefix("bearer "))
             && constant_time_eq(token.as_bytes(), self.inner.token.as_bytes())
         {
             return true;
@@ -273,7 +276,10 @@ mod tests {
         assert_ne!(a, b);
         // base64url of 32 bytes with no padding is 43 chars.
         assert_eq!(a.len(), 43);
-        assert!(a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert!(
+            a.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        );
     }
 
     #[test]
@@ -286,7 +292,10 @@ mod tests {
     #[test]
     fn extract_query_param_parses_simple_cases() {
         assert_eq!(extract_query_param("token=abc", "token"), Some("abc"));
-        assert_eq!(extract_query_param("x=1&token=abc&y=2", "token"), Some("abc"));
+        assert_eq!(
+            extract_query_param("x=1&token=abc&y=2", "token"),
+            Some("abc")
+        );
         assert_eq!(extract_query_param("x=1&y=2", "token"), None);
     }
 

@@ -34,7 +34,9 @@ pub fn format_queue_item(req: &DecisionRequest) -> String {
     let prefix = match req.hook_event_name {
         wisphive_protocol::HookEventType::PermissionRequest => "P ",
         wisphive_protocol::HookEventType::Elicitation => "E ",
-        wisphive_protocol::HookEventType::Stop | wisphive_protocol::HookEventType::SubagentStop => "S ",
+        wisphive_protocol::HookEventType::Stop | wisphive_protocol::HookEventType::SubagentStop => {
+            "S "
+        }
         wisphive_protocol::HookEventType::UserPromptSubmit => "U ",
         wisphive_protocol::HookEventType::ConfigChange => "C ",
         wisphive_protocol::HookEventType::TeammateIdle => "T ",
@@ -75,30 +77,27 @@ fn truncate_tool_input(req: &DecisionRequest) -> String {
 
     // For non-PreToolUse events, show a meaningful summary from event_data
     let summary = match req.hook_event_name {
-        HookEventType::Stop | HookEventType::SubagentStop => {
-            req.event_data
-                .as_ref()
-                .and_then(|d| d.get("last_assistant_message"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("agent stopped")
-                .to_string()
-        }
-        HookEventType::UserPromptSubmit => {
-            req.event_data
-                .as_ref()
-                .and_then(|d| d.get("prompt"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()
-        }
-        HookEventType::ConfigChange => {
-            req.event_data
-                .as_ref()
-                .and_then(|d| d.get("file_path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("settings changed")
-                .to_string()
-        }
+        HookEventType::Stop | HookEventType::SubagentStop => req
+            .event_data
+            .as_ref()
+            .and_then(|d| d.get("last_assistant_message"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("agent stopped")
+            .to_string(),
+        HookEventType::UserPromptSubmit => req
+            .event_data
+            .as_ref()
+            .and_then(|d| d.get("prompt"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        HookEventType::ConfigChange => req
+            .event_data
+            .as_ref()
+            .and_then(|d| d.get("file_path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("settings changed")
+            .to_string(),
         _ => {
             // PreToolUse and others: show the most relevant field from tool_input
             if let Some(cmd) = req.tool_input.get("command").and_then(|v| v.as_str()) {

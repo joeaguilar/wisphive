@@ -241,7 +241,9 @@ mod tests {
             let t = generate_device_token();
             assert_eq!(t.hash_hex.len(), 64, "hash_hex must be 64 chars");
             assert!(
-                t.hash_hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                t.hash_hex
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
                 "hash_hex must be lowercase hex: {}",
                 t.hash_hex
             );

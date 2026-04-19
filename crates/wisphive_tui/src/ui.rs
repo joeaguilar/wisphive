@@ -45,7 +45,10 @@ fn draw_terminal_list_view(frame: &mut Frame, app: &App) {
             };
             let status = format!("{}", t.status);
             let line = Line::from(vec![
-                Span::styled(format!("{:<10} ", status), Style::default().fg(status_color)),
+                Span::styled(
+                    format!("{:<10} ", status),
+                    Style::default().fg(status_color),
+                ),
                 Span::styled(format!("{:<20} ", label), Style::default().fg(Color::White)),
                 Span::raw(format!("{} ", t.command)),
                 Span::styled(
@@ -69,7 +72,11 @@ fn draw_terminal_list_view(frame: &mut Frame, app: &App) {
                 .border_style(Style::default().fg(Color::Cyan))
                 .title(title),
         )
-        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("► ");
 
     let mut state = ratatui::widgets::ListState::default();
@@ -238,42 +245,79 @@ fn draw_detail_view(frame: &mut Frame, app: &App) {
             HookEventType::PermissionRequest => {
                 if let Some(ref suggestions) = req.permission_suggestions {
                     let n = suggestions.len();
-                    format!(" [1-{}]select [N]deny [M]deny+msg [?]defer [q/Esc]back [Q]uit{}", n, scroll_info)
-                } else if req.tool_input.get("questions").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty()) {
+                    format!(
+                        " [1-{}]select [N]deny [M]deny+msg [?]defer [q/Esc]back [Q]uit{}",
+                        n, scroll_info
+                    )
+                } else if req
+                    .tool_input
+                    .get("questions")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|a| !a.is_empty())
+                {
                     // AskUserQuestion: PermissionRequest without suggestions
-                    let n = req.tool_input
+                    let n = req
+                        .tool_input
                         .get("questions")
                         .and_then(|v| v.as_array())
                         .and_then(|qs| qs.first())
                         .and_then(|q| q.get("options"))
                         .and_then(|v| v.as_array())
                         .map_or(0, |o| o.len());
-                    format!(" [1-{}]select [O]ther [D]eny [M]deny+msg [q/Esc]back [Q]uit{}", n, scroll_info)
+                    format!(
+                        " [1-{}]select [O]ther [D]eny [M]deny+msg [q/Esc]back [Q]uit{}",
+                        n, scroll_info
+                    )
                 } else {
                     // ExitPlanMode / generic PermissionRequest
-                    format!(" [A/Enter]accept [D]eny [M]deny+msg [q/Esc]back [Q]uit{}", scroll_info)
+                    format!(
+                        " [A/Enter]accept [D]eny [M]deny+msg [q/Esc]back [Q]uit{}",
+                        scroll_info
+                    )
                 }
             }
             HookEventType::Stop | HookEventType::SubagentStop => {
-                format!(" [A/Enter]accept [D]deny+msg [q/Esc]back [Q]uit{}", scroll_info)
+                format!(
+                    " [A/Enter]accept [D]deny+msg [q/Esc]back [Q]uit{}",
+                    scroll_info
+                )
             }
             HookEventType::UserPromptSubmit | HookEventType::ConfigChange => {
-                format!(" [A]llow [B]lock [M]block+msg [q/Esc]back [Q]uit{}", scroll_info)
+                format!(
+                    " [A]llow [B]lock [M]block+msg [q/Esc]back [Q]uit{}",
+                    scroll_info
+                )
             }
             HookEventType::Elicitation => {
-                format!(" [A]ccept [D]ecline [C]ancel [q/Esc]back [Q]uit{}", scroll_info)
+                format!(
+                    " [A]ccept [D]ecline [C]ancel [q/Esc]back [Q]uit{}",
+                    scroll_info
+                )
             }
             HookEventType::TeammateIdle => {
-                format!(" [C]ontinue+feedback [S]top [q/Esc]back [Q]uit{}", scroll_info)
+                format!(
+                    " [C]ontinue+feedback [S]top [q/Esc]back [Q]uit{}",
+                    scroll_info
+                )
             }
             HookEventType::TaskCompleted => {
-                format!(" [A]ccept [R]eject+feedback [q/Esc]back [Q]uit{}", scroll_info)
+                format!(
+                    " [A]ccept [R]eject+feedback [q/Esc]back [Q]uit{}",
+                    scroll_info
+                )
             }
             _ => {
-                format!(" [Y]approve [N]deny [M]deny+msg [!]always [E]edit [C]context [?]defer [q/Esc]back [Q]uit{}", scroll_info)
+                format!(
+                    " [Y]approve [N]deny [M]deny+msg [!]always [E]edit [C]context [?]defer [q/Esc]back [Q]uit{}",
+                    scroll_info
+                )
             }
         };
-        let preview_indicator = if app.markdown_preview { " [P]raw" } else { " [P]review" };
+        let preview_indicator = if app.markdown_preview {
+            " [P]raw"
+        } else {
+            " [P]review"
+        };
         let bar = Paragraph::new(Line::from(Span::styled(
             format!("{bar_text}{preview_indicator}"),
             Style::default().fg(Color::White).bg(Color::DarkGray),
@@ -307,20 +351,21 @@ fn draw_history_view(frame: &mut Frame, app: &App) {
     let title = match (&app.history_agent_filter, &app.history_search_query) {
         (Some(agent), Some(query)) => format!(
             " History — agent: {} search: \"{}\" ({} entries) ",
-            agent, query, app.history.len()
+            agent,
+            query,
+            app.history.len()
         ),
         (None, Some(query)) => format!(
             " History — search: \"{}\" ({} entries) ",
-            query, app.history.len()
+            query,
+            app.history.len()
         ),
         (Some(agent), None) => format!(
             " History — agent: {} ({} entries) ",
-            agent, app.history.len()
-        ),
-        (None, None) => format!(
-            " History — all agents ({} entries) ",
+            agent,
             app.history.len()
         ),
+        (None, None) => format!(" History — all agents ({} entries) ", app.history.len()),
     };
 
     let items: Vec<ListItem> = app
@@ -357,7 +402,9 @@ fn draw_history_view(frame: &mut Frame, app: &App) {
                 result_indicator,
                 Span::styled(
                     format!("{decision_str} "),
-                    Style::default().fg(decision_color).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(decision_color)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("{:<12} ", project_name),
@@ -415,10 +462,7 @@ fn draw_history_view(frame: &mut Frame, app: &App) {
 fn draw_history_detail_view(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(frame.area());
 
     if let Some(entry) = app.selected_history_entry() {
@@ -451,10 +495,7 @@ fn draw_config_view(frame: &mut Frame, app: &App) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(frame.area());
 
     let rows = app.config_rows();
@@ -467,34 +508,46 @@ fn draw_config_view(frame: &mut Frame, app: &App) {
         match row {
             ConfigRow::Level => {
                 let level_style = if selected {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
                 };
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("{arrow} Level: "),
-                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(format!("◀ {} ▶", app.config_level), level_style),
-                    Span::styled("  (use ←/→ to change)", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        "  (use ←/→ to change)",
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 ]));
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
                     "  Tools (Space/Enter toggle, + add rule, - remove rule):",
-                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
                 )));
                 lines.push(Line::from(""));
             }
             ConfigRow::EventToggle(key) => {
-                let display_name = EVENT_TOGGLES.iter()
+                let display_name = EVENT_TOGGLES
+                    .iter()
                     .find(|(k, _)| *k == *key)
                     .map(|(_, name)| *name)
                     .unwrap_or(key);
                 let enabled = app.config_event_toggles.get(*key).copied().unwrap_or(false);
                 let checkbox = if enabled { "[x]" } else { "[ ]" };
                 let name_style = if selected {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
                 };
@@ -505,7 +558,12 @@ fn draw_config_view(frame: &mut Frame, app: &App) {
                     ),
                     Span::styled(format!("{:<20}", display_name), name_style),
                     Span::styled(
-                        if enabled { "auto-approve" } else { "review in queue" }.to_string(),
+                        if enabled {
+                            "auto-approve"
+                        } else {
+                            "review in queue"
+                        }
+                        .to_string(),
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]));
@@ -534,7 +592,9 @@ fn draw_config_view(frame: &mut Frame, app: &App) {
 
                 let checkbox = if approved { "[x]" } else { "[ ]" };
                 let name_style = if selected {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
                 };
@@ -552,13 +612,23 @@ fn draw_config_view(frame: &mut Frame, app: &App) {
                 }
                 lines.push(Line::from(spans));
             }
-            ConfigRow::Rule { tool_idx, rule_idx, is_deny } => {
+            ConfigRow::Rule {
+                tool_idx,
+                rule_idx,
+                is_deny,
+            } => {
                 let tool = ALL_TOOLS[*tool_idx];
                 let pattern = if let Some(rule) = app.config_tool_rules.get(tool) {
                     if *is_deny {
-                        rule.deny_patterns.get(*rule_idx).cloned().unwrap_or_default()
+                        rule.deny_patterns
+                            .get(*rule_idx)
+                            .cloned()
+                            .unwrap_or_default()
                     } else {
-                        rule.allow_patterns.get(*rule_idx).cloned().unwrap_or_default()
+                        rule.allow_patterns
+                            .get(*rule_idx)
+                            .cloned()
+                            .unwrap_or_default()
                     }
                 } else {
                     String::new()
@@ -571,7 +641,9 @@ fn draw_config_view(frame: &mut Frame, app: &App) {
                 };
 
                 let pat_style = if selected {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
                 };
@@ -587,7 +659,11 @@ fn draw_config_view(frame: &mut Frame, app: &App) {
 
     // If in rule input mode, show the input line
     if app.config_rule_input_mode {
-        let label = if app.config_rule_is_deny { "deny" } else { "allow" };
+        let label = if app.config_rule_is_deny {
+            "deny"
+        } else {
+            "allow"
+        };
         let tool = app.config_rule_target_tool.as_deref().unwrap_or("?");
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
@@ -631,7 +707,11 @@ fn draw_projects_explorer(frame: &mut Frame, app: &App) {
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(frame.area());
 
-    let live_count = app.project_summaries.iter().filter(|p| p.has_live_agents).count();
+    let live_count = app
+        .project_summaries
+        .iter()
+        .filter(|p| p.has_live_agents)
+        .count();
     let title = format!(
         " Projects ({} total, {} active) ",
         app.project_summaries.len(),
@@ -670,9 +750,7 @@ fn draw_projects_explorer(frame: &mut Frame, app: &App) {
             let pending = if project.pending_count > 0 {
                 Span::styled(
                     format!(" [{}!]", project.pending_count),
-                    Style::default()
-                        .fg(Color::Red)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 )
             } else {
                 Span::styled("", Style::default())
@@ -688,7 +766,10 @@ fn draw_projects_explorer(frame: &mut Frame, app: &App) {
                     format!("{}agents ", project.agent_count),
                     Style::default().fg(Color::Cyan),
                 ),
-                Span::styled(format!("{:>6} ", dur_str), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{:>6} ", dur_str),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::styled(
                     format!("{}calls ", project.total_calls),
                     Style::default().fg(Color::Yellow),
@@ -773,9 +854,7 @@ fn draw_sessions_view(frame: &mut Frame, app: &App) {
             let pending = if session.pending_count > 0 {
                 Span::styled(
                     format!(" [{}!]", session.pending_count),
-                    Style::default()
-                        .fg(Color::Red)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 )
             } else {
                 Span::styled("", Style::default())
@@ -791,7 +870,10 @@ fn draw_sessions_view(frame: &mut Frame, app: &App) {
                     format!("{:<12} ", project_name),
                     Style::default().fg(Color::Cyan),
                 ),
-                Span::styled(format!("{:>6} ", dur_str), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{:>6} ", dur_str),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::styled(
                     format!("{}calls ", session.total_calls),
                     Style::default().fg(Color::Yellow),
@@ -880,9 +962,7 @@ fn draw_session_timeline_view(frame: &mut Frame, app: &App) {
                 } else {
                     s
                 }
-            } else if let Some(path) =
-                entry.tool_input.get("file_path").and_then(|v| v.as_str())
-            {
+            } else if let Some(path) = entry.tool_input.get("file_path").and_then(|v| v.as_str()) {
                 path.to_string()
             } else {
                 String::new()
@@ -1117,7 +1197,7 @@ fn draw_picker_modal(frame: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // hint line
-            Constraint::Min(1),   // project list
+            Constraint::Min(1),    // project list
         ])
         .split(inner);
 
@@ -1202,8 +1282,9 @@ fn draw_modal(frame: &mut Frame, modal: &Modal) {
         use ratatui::layout::{Constraint, Layout};
         let chunks = Layout::vertical([
             Constraint::Length(2), // body text + blank line
-            Constraint::Min(3),   // TextArea
-        ]).split(inner);
+            Constraint::Min(3),    // TextArea
+        ])
+        .split(inner);
 
         let body = Paragraph::new(Line::from(Span::styled(
             modal.body.clone(),
@@ -1218,8 +1299,9 @@ fn draw_modal(frame: &mut Frame, modal: &Modal) {
             Constraint::Length(2), // body text
             Constraint::Length(3), // project
             Constraint::Length(3), // prompt
-            Constraint::Min(3),   // model | reasoning | max_turns
-        ]).split(inner);
+            Constraint::Min(3),    // model | reasoning | max_turns
+        ])
+        .split(inner);
 
         let body = Paragraph::new(Line::from(Span::styled(
             modal.body.clone(),

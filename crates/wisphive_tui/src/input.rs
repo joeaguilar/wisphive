@@ -20,15 +20,23 @@ pub enum InputAction {
     /// Request history from the daemon (optional agent_id filter).
     QueryHistory { agent_id: Option<String> },
     /// Search history with a query string.
-    SearchHistory { search: wisphive_protocol::HistorySearch },
+    SearchHistory {
+        search: wisphive_protocol::HistorySearch,
+    },
     /// Request a specific page of history.
-    QueryHistoryPage { agent_id: Option<String>, page: usize },
+    QueryHistoryPage {
+        agent_id: Option<String>,
+        page: usize,
+    },
     /// Deny with a feedback message for the agent.
     DenyWithMessage { id: uuid::Uuid, message: String },
     /// Approve and add tool to always-allow list.
     AlwaysAllow(uuid::Uuid),
     /// Approve with modified tool input.
-    ApproveWithInput { id: uuid::Uuid, updated_input: serde_json::Value },
+    ApproveWithInput {
+        id: uuid::Uuid,
+        updated_input: serde_json::Value,
+    },
     /// Approve with additional context injected into the agent.
     ApproveWithContext { id: uuid::Uuid, context: String },
     /// Defer to agent's native permission prompt.
@@ -42,12 +50,18 @@ pub enum InputAction {
     /// Request project summaries from the daemon.
     QueryProjects,
     /// Approve a PermissionRequest with a specific suggestion selected.
-    ApprovePermission { id: uuid::Uuid, suggestion_index: usize },
+    ApprovePermission {
+        id: uuid::Uuid,
+        suggestion_index: usize,
+    },
     // ── Terminal sessions ────────────────────────────────────────
     /// Ask the daemon for the list of terminal sessions.
     TermList,
     /// Create a new terminal session with the user's default shell.
-    TermNew { label: Option<String>, cwd: Option<std::path::PathBuf> },
+    TermNew {
+        label: Option<String>,
+        cwd: Option<std::path::PathBuf>,
+    },
     /// Attach to a terminal session.
     TermAttach { id: uuid::Uuid },
     /// Detach from a terminal session.
@@ -166,7 +180,9 @@ pub fn handle_event(app: &mut App, event: Event) -> InputAction {
                     if let Some(agent) = app.selected_agent() {
                         let agent_id = agent.agent_id.clone();
                         app.enter_history_view(Some(agent_id.clone()));
-                        InputAction::QueryHistory { agent_id: Some(agent_id) }
+                        InputAction::QueryHistory {
+                            agent_id: Some(agent_id),
+                        }
                     } else {
                         InputAction::None
                     }
@@ -313,16 +329,43 @@ fn handle_detail_input(app: &mut App, key: KeyEvent) -> InputAction {
 
     // Common keys: scroll, back, quit
     match key.code {
-        KeyCode::Esc => { app.exit_detail_view(); return InputAction::None; }
-        KeyCode::Char('q') => { app.exit_detail_view(); return InputAction::None; }
+        KeyCode::Esc => {
+            app.exit_detail_view();
+            return InputAction::None;
+        }
+        KeyCode::Char('q') => {
+            app.exit_detail_view();
+            return InputAction::None;
+        }
         KeyCode::Char('Q') => return InputAction::Quit,
-        KeyCode::Char('j') | KeyCode::Down => { app.detail_scroll = app.detail_scroll.saturating_add(1); return InputAction::None; }
-        KeyCode::Char('k') | KeyCode::Up => { app.detail_scroll = app.detail_scroll.saturating_sub(1); return InputAction::None; }
-        KeyCode::PageDown | KeyCode::Char(' ') => { app.detail_scroll = app.detail_scroll.saturating_add(20); return InputAction::None; }
-        KeyCode::PageUp => { app.detail_scroll = app.detail_scroll.saturating_sub(20); return InputAction::None; }
-        KeyCode::Char('g') => { app.detail_scroll = 0; return InputAction::None; }
-        KeyCode::Char('G') => { app.detail_scroll = usize::MAX / 2; return InputAction::None; }
-        KeyCode::Char('p') | KeyCode::Char('P') => { app.markdown_preview = !app.markdown_preview; return InputAction::None; }
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.detail_scroll = app.detail_scroll.saturating_add(1);
+            return InputAction::None;
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.detail_scroll = app.detail_scroll.saturating_sub(1);
+            return InputAction::None;
+        }
+        KeyCode::PageDown | KeyCode::Char(' ') => {
+            app.detail_scroll = app.detail_scroll.saturating_add(20);
+            return InputAction::None;
+        }
+        KeyCode::PageUp => {
+            app.detail_scroll = app.detail_scroll.saturating_sub(20);
+            return InputAction::None;
+        }
+        KeyCode::Char('g') => {
+            app.detail_scroll = 0;
+            return InputAction::None;
+        }
+        KeyCode::Char('G') => {
+            app.detail_scroll = usize::MAX / 2;
+            return InputAction::None;
+        }
+        KeyCode::Char('p') | KeyCode::Char('P') => {
+            app.markdown_preview = !app.markdown_preview;
+            return InputAction::None;
+        }
         _ => {}
     }
 
@@ -330,10 +373,12 @@ fn handle_detail_input(app: &mut App, key: KeyEvent) -> InputAction {
     let event_type = app.detail_event_type();
     match event_type {
         HookEventType::PermissionRequest => {
-            let has_suggestions = app.detail_request()
+            let has_suggestions = app
+                .detail_request()
                 .and_then(|r| r.permission_suggestions.as_ref())
                 .is_some_and(|s| !s.is_empty());
-            let is_ask = app.detail_request()
+            let is_ask = app
+                .detail_request()
                 .map(|r| has_ask_questions_input(&r.tool_input))
                 .unwrap_or(false);
             if has_suggestions {
@@ -346,7 +391,9 @@ fn handle_detail_input(app: &mut App, key: KeyEvent) -> InputAction {
             }
         }
         HookEventType::Stop | HookEventType::SubagentStop => handle_stop_keys(app, key),
-        HookEventType::UserPromptSubmit | HookEventType::ConfigChange => handle_binary_block_keys(app, key),
+        HookEventType::UserPromptSubmit | HookEventType::ConfigChange => {
+            handle_binary_block_keys(app, key)
+        }
         HookEventType::Elicitation => handle_elicitation_keys(app, key),
         HookEventType::TeammateIdle => handle_teammate_idle_keys(app, key),
         HookEventType::TaskCompleted => handle_task_completed_keys(app, key),
@@ -413,11 +460,17 @@ fn handle_permission_request_keys(app: &mut App, key: KeyEvent) -> InputAction {
         KeyCode::Char(c @ '1'..='9') => {
             if let Some(req) = app.detail_request() {
                 let idx = (c as usize) - ('1' as usize);
-                let valid = req.permission_suggestions.as_ref().is_some_and(|s| idx < s.len());
+                let valid = req
+                    .permission_suggestions
+                    .as_ref()
+                    .is_some_and(|s| idx < s.len());
                 if valid {
                     let id = req.id;
                     app.exit_detail_view();
-                    return InputAction::ApprovePermission { id, suggestion_index: idx };
+                    return InputAction::ApprovePermission {
+                        id,
+                        suggestion_index: idx,
+                    };
                 }
             }
             InputAction::None
@@ -493,25 +546,30 @@ fn handle_ask_question_keys(app: &mut App, key: KeyEvent) -> InputAction {
                 let idx = (c as usize) - ('1' as usize);
                 let questions = req.tool_input.get("questions").and_then(|v| v.as_array());
                 if let Some(qs) = questions
-                    && let Some(first_q) = qs.first() {
-                        let options = first_q.get("options").and_then(|v| v.as_array());
-                        let option_count = options.map_or(0, |o| o.len());
+                    && let Some(first_q) = qs.first()
+                {
+                    let options = first_q.get("options").and_then(|v| v.as_array());
+                    let option_count = options.map_or(0, |o| o.len());
 
-                        if idx < option_count {
-                            let question_text = first_q.get("question")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            let answer = options.unwrap()[idx]
-                                .get("label")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
+                    if idx < option_count {
+                        let question_text = first_q
+                            .get("question")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let answer = options.unwrap()[idx]
+                            .get("label")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
 
-                            let updated = build_ask_answer(&req.tool_input, question_text, answer);
-                            let id = req.id;
-                            app.exit_detail_view();
-                            return InputAction::ApproveWithInput { id, updated_input: updated };
-                        }
+                        let updated = build_ask_answer(&req.tool_input, question_text, answer);
+                        let id = req.id;
+                        app.exit_detail_view();
+                        return InputAction::ApproveWithInput {
+                            id,
+                            updated_input: updated,
+                        };
                     }
+                }
             }
             InputAction::None
         }
@@ -540,11 +598,18 @@ fn handle_ask_question_keys(app: &mut App, key: KeyEvent) -> InputAction {
 }
 
 /// Build updatedInput with the answer filled in for AskUserQuestion.
-fn build_ask_answer(tool_input: &serde_json::Value, question: &str, answer: &str) -> serde_json::Value {
+fn build_ask_answer(
+    tool_input: &serde_json::Value,
+    question: &str,
+    answer: &str,
+) -> serde_json::Value {
     let mut updated = tool_input.clone();
     if let Some(obj) = updated.as_object_mut() {
         let mut answers = serde_json::Map::new();
-        answers.insert(question.to_string(), serde_json::Value::String(answer.to_string()));
+        answers.insert(
+            question.to_string(),
+            serde_json::Value::String(answer.to_string()),
+        );
         obj.insert("answers".into(), serde_json::Value::Object(answers));
     }
     updated
@@ -606,7 +671,8 @@ fn handle_elicitation_keys(app: &mut App, key: KeyEvent) -> InputAction {
         KeyCode::Char('a') | KeyCode::Char('A') => {
             if let Some(req) = app.detail_request() {
                 // Pre-fill with schema template if available
-                let initial = req.event_data
+                let initial = req
+                    .event_data
                     .as_ref()
                     .and_then(|d| d.get("requested_schema"))
                     .map(|s| serde_json::to_string_pretty(s).unwrap_or_default())
@@ -627,7 +693,10 @@ fn handle_elicitation_keys(app: &mut App, key: KeyEvent) -> InputAction {
             if let Some(req) = app.detail_request() {
                 let id = req.id;
                 app.exit_detail_view();
-                return InputAction::DenyWithMessage { id, message: "cancel".into() };
+                return InputAction::DenyWithMessage {
+                    id,
+                    message: "cancel".into(),
+                };
             }
             InputAction::None
         }
@@ -796,13 +865,17 @@ fn handle_textarea_modal(app: &mut App, mut modal: Modal, key: KeyEvent) -> Inpu
                 ModalAction::EditInput => {
                     if let Some(id) = target_id {
                         // Try to parse as JSON; if it looks like a bare command, wrap it
-                        let updated = if let Ok(val) = serde_json::from_str::<serde_json::Value>(&buf) {
-                            val
-                        } else {
-                            serde_json::json!({ "command": buf })
-                        };
+                        let updated =
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&buf) {
+                                val
+                            } else {
+                                serde_json::json!({ "command": buf })
+                            };
                         app.exit_detail_view();
-                        InputAction::ApproveWithInput { id, updated_input: updated }
+                        InputAction::ApproveWithInput {
+                            id,
+                            updated_input: updated,
+                        }
                     } else {
                         InputAction::None
                     }
@@ -814,7 +887,8 @@ fn handle_textarea_modal(app: &mut App, mut modal: Modal, key: KeyEvent) -> Inpu
                     }
                     if let Some(id) = target_id {
                         // Build updatedInput with the typed answer
-                        let tool_input = app.detail_request()
+                        let tool_input = app
+                            .detail_request()
                             .map(|r| r.tool_input.clone())
                             .unwrap_or(serde_json::Value::Null);
                         let question_text = tool_input
@@ -826,7 +900,10 @@ fn handle_textarea_modal(app: &mut App, mut modal: Modal, key: KeyEvent) -> Inpu
                             .unwrap_or("");
                         let updated = build_ask_answer(&tool_input, question_text, &buf);
                         app.exit_detail_view();
-                        InputAction::ApproveWithInput { id, updated_input: updated }
+                        InputAction::ApproveWithInput {
+                            id,
+                            updated_input: updated,
+                        }
                     } else {
                         InputAction::None
                     }
@@ -1043,7 +1120,10 @@ fn handle_config_input(app: &mut App, key: KeyEvent) -> InputAction {
                     AutoApproveLevel::Execute,
                     AutoApproveLevel::All,
                 ];
-                let current = levels.iter().position(|l| *l == app.config_level).unwrap_or(1);
+                let current = levels
+                    .iter()
+                    .position(|l| *l == app.config_level)
+                    .unwrap_or(1);
                 let next = if key.code == KeyCode::Right {
                     (current + 1).min(levels.len() - 1)
                 } else {
@@ -1101,7 +1181,12 @@ fn handle_config_input(app: &mut App, key: KeyEvent) -> InputAction {
         }
         // Remove rule (-) — on a rule row, delete it
         KeyCode::Char('-') => {
-            if let Some(ConfigRow::Rule { tool_idx, rule_idx, is_deny }) = rows.get(app.config_index) {
+            if let Some(ConfigRow::Rule {
+                tool_idx,
+                rule_idx,
+                is_deny,
+            }) = rows.get(app.config_index)
+            {
                 let tool = ALL_TOOLS[*tool_idx].to_string();
                 let is_deny = *is_deny;
                 let rule_idx = *rule_idx;
@@ -1137,17 +1222,18 @@ fn handle_config_rule_input(app: &mut App, key: KeyEvent) -> InputAction {
         KeyCode::Enter => {
             let pattern = app.config_rule_buffer.trim().to_string();
             if !pattern.is_empty()
-                && let Some(tool) = app.config_rule_target_tool.take() {
-                    let rule = app.config_tool_rules.entry(tool).or_default();
-                    if app.config_rule_is_deny {
-                        if !rule.deny_patterns.contains(&pattern) {
-                            rule.deny_patterns.push(pattern);
-                        }
-                    } else if !rule.allow_patterns.contains(&pattern) {
-                        rule.allow_patterns.push(pattern);
+                && let Some(tool) = app.config_rule_target_tool.take()
+            {
+                let rule = app.config_tool_rules.entry(tool).or_default();
+                if app.config_rule_is_deny {
+                    if !rule.deny_patterns.contains(&pattern) {
+                        rule.deny_patterns.push(pattern);
                     }
-                    app.save_config();
+                } else if !rule.allow_patterns.contains(&pattern) {
+                    rule.allow_patterns.push(pattern);
                 }
+                app.save_config();
+            }
             app.config_rule_input_mode = false;
             app.config_rule_buffer.clear();
             InputAction::None
@@ -1343,11 +1429,7 @@ fn handle_picker_modal_input(app: &mut App, mut modal: Modal, key: KeyEvent) -> 
     }
 }
 
-fn handle_spawn_modal_input(
-    app: &mut App,
-    mut modal: Modal,
-    key: KeyEvent,
-) -> InputAction {
+fn handle_spawn_modal_input(app: &mut App, mut modal: Modal, key: KeyEvent) -> InputAction {
     let spawn = modal.spawn.as_mut().unwrap();
 
     match key.code {

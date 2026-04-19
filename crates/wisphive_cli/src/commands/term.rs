@@ -7,8 +7,8 @@
 
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -19,8 +19,8 @@ use tokio::net::UnixStream;
 use uuid::Uuid;
 use wisphive_daemon::DaemonConfig;
 use wisphive_protocol::{
-    ClientMessage, ClientType, PROTOCOL_VERSION, ServerMessage, TerminalSessionMeta, TerminalStatus,
-    encode,
+    ClientMessage, ClientType, PROTOCOL_VERSION, ServerMessage, TerminalSessionMeta,
+    TerminalStatus, encode,
 };
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
@@ -292,7 +292,10 @@ pub async fn replay(id_str: String, speed: f32) -> Result<()> {
                     stdout.flush()?;
                 }
             }
-            ServerMessage::TermReplayDone { id: sid, total_events } if sid == id => {
+            ServerMessage::TermReplayDone {
+                id: sid,
+                total_events,
+            } if sid == id => {
                 println!("\r\n[replay complete: {total_events} events]\r");
                 return Ok(());
             }
