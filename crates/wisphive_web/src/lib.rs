@@ -1,4 +1,5 @@
 pub mod auth;
+mod reauth_ipc;
 mod security;
 pub mod tls;
 mod ws_bridge;
@@ -278,11 +279,128 @@ async fn post_auth_login(
     .into_response()
 }
 
+#[derive(Debug, Deserialize)]
+struct ReauthRequest {
+    password: String,
+}
+
+/// POST /api/auth/reauth — re-prove the account password, on success
+/// refresh this device's sudo-mode freshness in the daemon's reauth
+/// registry.
+///
+/// Gating: the security middleware has already attached an [`AuthedDevice`]
+/// by the time we get here, so the caller is a known, non-revoked device.
+/// We still require a throttle slot and a password verify on top of that —
+/// possession of a device token alone is not enough to clear the sudo gate,
+/// which is the whole point.
+///
+/// Path shape mirrors `post_auth_login` deliberately: same `LoginThrottle`
+/// pattern with explicit `record_failure` on every early return (Drop is
+/// fail-closed), same [`VERIFY_DEADLINE`] budget, same "treat missing-hash
+/// as invalid credentials" info-leak defence. The only extra step is the
+/// [`reauth_ipc::signal_mark_device_fresh`] call that tells the daemon to
+/// touch the in-memory reauth registry for this device.
+async fn post_auth_reauth(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    client_ip: ClientIp,
+    axum::Extension(device): axum::Extension<AuthedDevice>,
+    axum::Json(body): axum::Json<ReauthRequest>,
+) -> Response {
+    let security = state.security.clone();
+    let throttle = security.throttle().clone();
+    let db = security.state_db().clone();
+
+    let guard = match throttle.try_begin_attempt(client_ip.0).await {
+        Ok(g) => g,
+        Err(decision) => {
+            let retry = decision
+                .retry_after
+                .unwrap_or(Duration::from_secs(1))
+                .as_secs()
+                .max(1);
+            return (
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                [("retry-after", retry.to_string())],
+                "throttled",
+            )
+                .into_response();
+        }
+    };
+
+    let phc = match db.get_web_password_hash().await {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            guard.record_failure().await;
+            return (axum::http::StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read web password hash");
+            guard.record_failure().await;
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+            )
+                .into_response();
+        }
+    };
+
+    let password = body.password.clone();
+    let phc_owned = phc.clone();
+    let verify_handle =
+        tokio::task::spawn_blocking(move || auth::verify_password(&password, &phc_owned));
+    let verified = match tokio::time::timeout(VERIFY_DEADLINE, verify_handle).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(join_err)) => {
+            tracing::warn!(error = %join_err, "reauth verify task panicked");
+            false
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                deadline_secs = VERIFY_DEADLINE.as_secs(),
+                "reauth verify exceeded deadline"
+            );
+            false
+        }
+    };
+
+    if !verified {
+        guard.record_failure().await;
+        return (axum::http::StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+    }
+
+    // Signal the daemon so its reauth registry learns this device is
+    // fresh BEFORE we return 200. Doing the ack-before-response dance
+    // prevents a race where the browser's next Approve arrives at the
+    // daemon before the touch has landed.
+    if let Err(e) = reauth_ipc::signal_mark_device_fresh(&state.socket_path, &device.id).await {
+        tracing::warn!(device_id = %device.id, error = %e, "mark_device_fresh IPC failed");
+        guard.record_failure().await;
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not reachable",
+        )
+            .into_response();
+    }
+
+    let _ = db
+        .append_web_audit(
+            "web_reauth_success",
+            Some(&device.id.0),
+            Some(&client_ip.0.to_string()),
+            None,
+        )
+        .await;
+
+    guard.record_success().await;
+    (axum::http::StatusCode::OK, "ok").into_response()
+}
+
 fn build_router(state: AppState, dev_mode: bool) -> Router {
     let security = state.security.clone();
     let api = Router::new()
         .route("/ws", get(ws_handler))
         .route("/api/auth/login", post(post_auth_login))
+        .route("/api/auth/reauth", post(post_auth_reauth))
         .route("/api/config", get(get_config).put(put_config));
 
     let router = if dev_mode {

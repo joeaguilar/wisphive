@@ -619,6 +619,398 @@ async fn tui_snapshot_reflects_pending_decisions() {
 // Shutdown
 // ════════════════════════════════════════════════════════════
 
+// ════════════════════════════════════════════════════════════
+// Sudo-mode gate (itr#218)
+// ════════════════════════════════════════════════════════════
+//
+// Web-origin approvals of sudo-class tools (Bash/Write/Edit/MultiEdit/
+// NotebookEdit/ConfigChange) are held back until the device has been
+// marked fresh via MarkDeviceFresh. TUI-origin approvals (device_id =
+// None) bypass the gate entirely. Non-sudo tools are not gated.
+
+/// Serialize an Approve wrapped in a ClientCommand envelope tagged with
+/// the given device id. Matches what ws_bridge::rewrap_with_device does
+/// for browser-origin messages; the daemon dispatch loop sees the same
+/// on-wire shape whether the sender is the ws bridge or this test.
+fn encode_web_approve(id: uuid::Uuid, device_id: &str) -> String {
+    let cmd = ClientCommand::from(ClientMessage::Approve {
+        id,
+        message: None,
+        updated_input: None,
+        always_allow: false,
+        additional_context: None,
+    })
+    .with_device_id(DeviceId::from(device_id));
+    encode(&cmd).unwrap()
+}
+
+/// Serialize an ApproveAll wrapped in a ClientCommand envelope tagged
+/// with the given device id.
+fn encode_web_approve_all(filter: Option<DecisionFilter>, device_id: &str) -> String {
+    let cmd = ClientCommand::from(ClientMessage::ApproveAll { filter })
+        .with_device_id(DeviceId::from(device_id));
+    encode(&cmd).unwrap()
+}
+
+#[tokio::test]
+async fn web_origin_bash_approve_without_fresh_reauth_emits_reauth_required() {
+    let (_tmp, config) = temp_config();
+    let socket_path = config.socket_path.clone();
+    let shutdown_tx = start_server(config).await;
+
+    // TUI + hook
+    let (mut tui_lines, mut tui_writer) = connect_as_tui(&socket_path).await;
+    let (mut hook_lines, mut hook_writer) = connect_as_hook(&socket_path).await;
+
+    // Hook submits a Bash decision.
+    let req = make_decision_request("Bash");
+    let req_id = req.id;
+    let msg = encode(&ClientMessage::DecisionRequest(req)).unwrap();
+    hook_writer.write_all(msg.as_bytes()).await.unwrap();
+    let _ = next_tui_msg(&mut tui_lines, |m| {
+        matches!(m, ServerMessage::NewDecision(_))
+    })
+    .await;
+
+    // Web device tries to approve without having reauthed.
+    let approve = encode_web_approve(req_id, "dev-phone");
+    tui_writer.write_all(approve.as_bytes()).await.unwrap();
+
+    // TUI bridge receives WebReauthRequired for the offending request.
+    let reauth = tokio::time::timeout(Duration::from_secs(2), tui_lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    match decode::<ServerMessage>(&reauth).unwrap() {
+        ServerMessage::WebReauthRequired {
+            device_id,
+            tool_name,
+            ..
+        } => {
+            assert_eq!(device_id, "dev-phone");
+            assert_eq!(tool_name, "Bash");
+        }
+        other => panic!("expected WebReauthRequired, got: {:?}", other),
+    }
+
+    // Hook must still be pending — the daemon did NOT resolve the decision.
+    let poll = tokio::time::timeout(Duration::from_millis(200), hook_lines.next_line()).await;
+    assert!(
+        poll.is_err(),
+        "hook should not have received a response while gated"
+    );
+
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn mark_device_fresh_then_approve_succeeds() {
+    let (_tmp, config) = temp_config();
+    let socket_path = config.socket_path.clone();
+    let shutdown_tx = start_server(config).await;
+
+    let (mut tui_lines, mut tui_writer) = connect_as_tui(&socket_path).await;
+    let (mut hook_lines, mut hook_writer) = connect_as_hook(&socket_path).await;
+
+    let req = make_decision_request("Bash");
+    let req_id = req.id;
+    hook_writer
+        .write_all(
+            encode(&ClientMessage::DecisionRequest(req))
+                .unwrap()
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let _ = next_tui_msg(&mut tui_lines, |m| {
+        matches!(m, ServerMessage::NewDecision(_))
+    })
+    .await;
+
+    // First approve attempt is gated.
+    tui_writer
+        .write_all(encode_web_approve(req_id, "dev-phone").as_bytes())
+        .await
+        .unwrap();
+    let _ = next_tui_msg(&mut tui_lines, |m| {
+        matches!(m, ServerMessage::WebReauthRequired { .. })
+    })
+    .await;
+
+    // Mark fresh, wait for ack.
+    let mark_fresh = encode(
+        &ClientCommand::from(ClientMessage::MarkDeviceFresh)
+            .with_device_id(DeviceId::from("dev-phone")),
+    )
+    .unwrap();
+    tui_writer.write_all(mark_fresh.as_bytes()).await.unwrap();
+    let ack = next_tui_msg(&mut tui_lines, |m| {
+        matches!(m, ServerMessage::MarkDeviceFreshAck { .. })
+    })
+    .await;
+    match ack {
+        ServerMessage::MarkDeviceFreshAck { device_id } => assert_eq!(device_id, "dev-phone"),
+        _ => unreachable!(),
+    }
+
+    // Retry approve — should now go through.
+    tui_writer
+        .write_all(encode_web_approve(req_id, "dev-phone").as_bytes())
+        .await
+        .unwrap();
+    let hook_resp = tokio::time::timeout(Duration::from_secs(2), hook_lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    match decode::<ServerMessage>(&hook_resp).unwrap() {
+        ServerMessage::DecisionResponse {
+            id,
+            decision: Decision::Approve,
+            ..
+        } => assert_eq!(id, req_id),
+        other => panic!("expected DecisionResponse(Approve), got: {:?}", other),
+    }
+
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn mark_device_fresh_without_device_id_is_noop_and_silent() {
+    let (_tmp, config) = temp_config();
+    let socket_path = config.socket_path.clone();
+    let shutdown_tx = start_server(config).await;
+
+    let (mut tui_lines, mut tui_writer) = connect_as_tui(&socket_path).await;
+
+    // Envelope with no device_id — TUI-local "reauth" has no subject, so
+    // the daemon drops it silently (no ack).
+    let msg = encode(&ClientCommand::from(ClientMessage::MarkDeviceFresh)).unwrap();
+    tui_writer.write_all(msg.as_bytes()).await.unwrap();
+
+    // We should NOT receive an ack.
+    let poll = tokio::time::timeout(Duration::from_millis(200), tui_lines.next_line()).await;
+    assert!(poll.is_err(), "device_id-less MarkDeviceFresh must not ack");
+
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn tui_origin_bash_approve_is_not_gated() {
+    let (_tmp, config) = temp_config();
+    let socket_path = config.socket_path.clone();
+    let shutdown_tx = start_server(config).await;
+
+    let (mut tui_lines, mut tui_writer) = connect_as_tui(&socket_path).await;
+    let (mut hook_lines, mut hook_writer) = connect_as_hook(&socket_path).await;
+
+    let req = make_decision_request("Bash");
+    let req_id = req.id;
+    hook_writer
+        .write_all(
+            encode(&ClientMessage::DecisionRequest(req))
+                .unwrap()
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let _ = next_tui_msg(&mut tui_lines, |m| {
+        matches!(m, ServerMessage::NewDecision(_))
+    })
+    .await;
+
+    // Bare ClientMessage = ClientCommand { device_id: None }. Local TUI
+    // bypasses the gate — this is the current trust model (see sudo_gate.rs).
+    let approve = encode(&ClientMessage::Approve {
+        id: req_id,
+        message: None,
+        updated_input: None,
+        always_allow: false,
+        additional_context: None,
+    })
+    .unwrap();
+    tui_writer.write_all(approve.as_bytes()).await.unwrap();
+
+    let hook_resp = tokio::time::timeout(Duration::from_secs(2), hook_lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        decode::<ServerMessage>(&hook_resp).unwrap(),
+        ServerMessage::DecisionResponse {
+            decision: Decision::Approve,
+            ..
+        }
+    ));
+
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn web_origin_read_tool_approve_is_not_gated() {
+    let (_tmp, config) = temp_config();
+    let socket_path = config.socket_path.clone();
+    let shutdown_tx = start_server(config).await;
+
+    let (mut tui_lines, mut tui_writer) = connect_as_tui(&socket_path).await;
+    let (mut hook_lines, mut hook_writer) = connect_as_hook(&socket_path).await;
+
+    // Read is NOT sudo-class — should pass even without fresh reauth.
+    let req = make_decision_request("Read");
+    let req_id = req.id;
+    hook_writer
+        .write_all(
+            encode(&ClientMessage::DecisionRequest(req))
+                .unwrap()
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let _ = next_tui_msg(&mut tui_lines, |m| {
+        matches!(m, ServerMessage::NewDecision(_))
+    })
+    .await;
+
+    tui_writer
+        .write_all(encode_web_approve(req_id, "dev-phone").as_bytes())
+        .await
+        .unwrap();
+
+    let hook_resp = tokio::time::timeout(Duration::from_secs(2), hook_lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        decode::<ServerMessage>(&hook_resp).unwrap(),
+        ServerMessage::DecisionResponse {
+            decision: Decision::Approve,
+            ..
+        }
+    ));
+
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn web_origin_approve_all_partitions_on_sudo_class() {
+    let (_tmp, config) = temp_config();
+    let socket_path = config.socket_path.clone();
+    let shutdown_tx = start_server(config).await;
+
+    let (mut tui_lines, mut tui_writer) = connect_as_tui(&socket_path).await;
+
+    // Two hooks: one Bash (sudo), one Read (non-sudo).
+    let (mut bash_hook_lines, mut bash_writer) = connect_as_hook(&socket_path).await;
+    let (mut read_hook_lines, mut read_writer) = connect_as_hook(&socket_path).await;
+
+    let bash_req = make_decision_request("Bash");
+    let read_req = make_decision_request("Read");
+    let bash_id = bash_req.id;
+    bash_writer
+        .write_all(
+            encode(&ClientMessage::DecisionRequest(bash_req))
+                .unwrap()
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    read_writer
+        .write_all(
+            encode(&ClientMessage::DecisionRequest(read_req))
+                .unwrap()
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    for _ in 0..2 {
+        let _ = next_tui_msg(&mut tui_lines, |m| {
+            matches!(m, ServerMessage::NewDecision(_))
+        })
+        .await;
+    }
+
+    // Web-origin approve_all without fresh reauth.
+    tui_writer
+        .write_all(encode_web_approve_all(None, "dev-phone").as_bytes())
+        .await
+        .unwrap();
+
+    // Read hook should resolve.
+    let read_resp = tokio::time::timeout(Duration::from_secs(2), read_hook_lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        decode::<ServerMessage>(&read_resp).unwrap(),
+        ServerMessage::DecisionResponse {
+            decision: Decision::Approve,
+            ..
+        }
+    ));
+
+    // Bash hook should still be pending.
+    let bash_poll =
+        tokio::time::timeout(Duration::from_millis(200), bash_hook_lines.next_line()).await;
+    assert!(bash_poll.is_err(), "Bash should have been held by the gate");
+
+    // TUI bridge should have seen exactly one WebReauthRequired, for Bash.
+    let gate_msg = next_tui_msg(&mut tui_lines, |m| {
+        matches!(m, ServerMessage::WebReauthRequired { .. })
+    })
+    .await;
+    match gate_msg {
+        ServerMessage::WebReauthRequired {
+            device_id,
+            tool_name,
+            ..
+        } => {
+            assert_eq!(device_id, "dev-phone");
+            assert_eq!(tool_name, "Bash");
+        }
+        _ => unreachable!(),
+    }
+
+    // Belt-and-suspenders: after MarkDeviceFresh + retry, bash resolves.
+    tui_writer
+        .write_all(
+            encode(
+                &ClientCommand::from(ClientMessage::MarkDeviceFresh)
+                    .with_device_id(DeviceId::from("dev-phone")),
+            )
+            .unwrap()
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let _ = next_tui_msg(&mut tui_lines, |m| {
+        matches!(m, ServerMessage::MarkDeviceFreshAck { .. })
+    })
+    .await;
+    tui_writer
+        .write_all(encode_web_approve(bash_id, "dev-phone").as_bytes())
+        .await
+        .unwrap();
+    let bash_resp = tokio::time::timeout(Duration::from_secs(2), bash_hook_lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        decode::<ServerMessage>(&bash_resp).unwrap(),
+        ServerMessage::DecisionResponse {
+            decision: Decision::Approve,
+            ..
+        }
+    ));
+
+    let _ = shutdown_tx.send(true);
+}
+
 #[tokio::test]
 async fn server_cleans_up_socket_on_shutdown() {
     let (_tmp, config) = temp_config();

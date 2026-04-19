@@ -4,12 +4,16 @@
 //! response status without standing up a real TCP listener.
 
 use std::net::{IpAddr, Ipv4Addr};
+use std::path::PathBuf;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixListener;
 use tower::ServiceExt;
 use wisphive_daemon::state::StateDb;
+use wisphive_protocol::{ClientCommand, ClientMessage, PROTOCOL_VERSION, ServerMessage, encode};
 
 use crate::auth::{generate_device_token, hash_password};
 use crate::security::{ClientIp, SecurityConfig};
@@ -316,6 +320,149 @@ async fn login_when_no_password_set_returns_401_without_leaking_state() {
     let s = String::from_utf8_lossy(&body).to_lowercase();
     assert!(!s.contains("no password"));
     assert!(!s.contains("not set"));
+}
+
+// ── /api/auth/reauth ───────────────────────────────────────────────────
+//
+// Reauth needs the security middleware to have attached an `AuthedDevice`,
+// so tests present a valid device token on every request. The "does it
+// actually mark the device fresh?" acceptance is covered end-to-end by the
+// daemon integration tests (server_integration.rs); here we cover:
+//
+// - Missing token → 401 (middleware short-circuits before reauth runs).
+// - Wrong password → 401 + throttle bump; no daemon traffic needed.
+// - Daemon unreachable → 503; we surface the IPC failure without 200-ing.
+// - Correct password + a fake daemon that acks → 200, audit row recorded.
+
+/// Spin up a toy UnixListener at `socket_path` that pretends to be the
+/// daemon for exactly one `MarkDeviceFresh` exchange. Sends a Welcome +
+/// empty AgentsSnapshot + empty QueueSnapshot (mirroring `handle_tui`'s
+/// prelude), then reads the next envelope, and, if it's MarkDeviceFresh
+/// with a device_id, replies with `MarkDeviceFreshAck`.
+///
+/// Returns the join handle so the test can await it and assert the
+/// observed device id.
+fn spawn_fake_daemon(socket_path: PathBuf) -> tokio::task::JoinHandle<Option<String>> {
+    tokio::spawn(async move {
+        let listener = UnixListener::bind(&socket_path).expect("bind fake daemon socket");
+        let (stream, _) = listener.accept().await.expect("accept fake daemon conn");
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+
+        // Hello
+        let _ = lines.next_line().await.expect("read hello");
+        let welcome = encode(&ServerMessage::Welcome {
+            version: PROTOCOL_VERSION,
+        })
+        .unwrap();
+        writer.write_all(welcome.as_bytes()).await.unwrap();
+        // handle_tui sends AgentsSnapshot + QueueSnapshot before looping; mirror
+        // that so the client-side ack-waiter has the shape it expects.
+        let agents = encode(&ServerMessage::AgentsSnapshot { agents: vec![] }).unwrap();
+        writer.write_all(agents.as_bytes()).await.unwrap();
+        let snap = encode(&ServerMessage::QueueSnapshot { items: vec![] }).unwrap();
+        writer.write_all(snap.as_bytes()).await.unwrap();
+
+        // Expect MarkDeviceFresh next.
+        let Ok(Some(text)) = lines.next_line().await else {
+            return None;
+        };
+        let cmd: ClientCommand = wisphive_protocol::decode(&text).ok()?;
+        match cmd.body {
+            ClientMessage::MarkDeviceFresh => {}
+            _ => return None,
+        }
+        let device_id = cmd.device_id.map(|d| d.0)?;
+        let ack = encode(&ServerMessage::MarkDeviceFreshAck {
+            device_id: device_id.clone(),
+        })
+        .unwrap();
+        writer.write_all(ack.as_bytes()).await.unwrap();
+        Some(device_id)
+    })
+}
+
+#[tokio::test]
+async fn reauth_without_device_token_returns_401() {
+    let r = req("POST", "/api/auth/reauth")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "password": PASSWORD }).to_string(),
+        ))
+        .unwrap();
+    let (status, _) = run(r).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn reauth_with_wrong_password_returns_401_and_bumps_throttle() {
+    let (_tmp, state) = test_state().await;
+    let (token, _id) = seed_device(state.security.state_db(), "iphone").await;
+
+    let r = req("POST", "/api/auth/reauth")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            serde_json::json!({ "password": "wrong" }).to_string(),
+        ))
+        .unwrap();
+    let (status, _) = run_with(state.clone(), r).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let loopback: IpAddr = Ipv4Addr::new(127, 0, 0, 1).into();
+    assert!(
+        state.security.throttle().peek(loopback).await.is_some(),
+        "wrong-password reauth must bump the throttle"
+    );
+}
+
+#[tokio::test]
+async fn reauth_succeeds_when_daemon_acks_mark_device_fresh() {
+    let (tmp, state) = test_state().await;
+    let (token, device_id) = seed_device(state.security.state_db(), "iphone").await;
+
+    // Stand up a fake daemon at the state's socket_path so reauth_ipc has
+    // something to talk to.
+    let fake = spawn_fake_daemon(state.socket_path.clone());
+    // Give the listener time to actually bind before the HTTP handler
+    // tries to connect.
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+    let r = req("POST", "/api/auth/reauth")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            serde_json::json!({ "password": PASSWORD }).to_string(),
+        ))
+        .unwrap();
+    let (status, _body) = run_with(state.clone(), r).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let observed = tokio::time::timeout(std::time::Duration::from_secs(2), fake)
+        .await
+        .expect("fake daemon did not finish")
+        .expect("fake daemon task panicked")
+        .expect("fake daemon did not record a device id");
+    assert_eq!(observed, device_id);
+    // tmp must outlive the socket path until we've confirmed the ack.
+    drop(tmp);
+}
+
+#[tokio::test]
+async fn reauth_returns_503_when_daemon_socket_unreachable() {
+    let (_tmp, state) = test_state().await;
+    let (token, _id) = seed_device(state.security.state_db(), "iphone").await;
+    // Do not spawn a fake daemon — state.socket_path does not exist.
+
+    let r = req("POST", "/api/auth/reauth")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            serde_json::json!({ "password": PASSWORD }).to_string(),
+        ))
+        .unwrap();
+    let (status, _) = run_with(state, r).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
 
 /// A second back-to-back login attempt from the same IP should hit the

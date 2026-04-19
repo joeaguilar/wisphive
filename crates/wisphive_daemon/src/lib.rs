@@ -7,6 +7,7 @@ pub mod registry;
 pub mod server;
 pub mod shutdown;
 pub mod state;
+pub mod sudo_gate;
 pub mod terminal;
 
 pub use config::{DaemonConfig, UserConfig};

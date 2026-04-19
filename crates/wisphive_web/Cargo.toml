@@ -34,6 +34,7 @@ uuid.workspace = true
 time.workspace = true
 libc.workspace = true
 subtle.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

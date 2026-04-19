@@ -16,6 +16,7 @@ use crate::process_registry::ProcessRegistry;
 use crate::queue::DecisionQueue;
 use crate::registry::AgentRegistry;
 use crate::state::StateDb;
+use crate::sudo_gate::ReauthRegistry;
 use crate::terminal::TerminalSessionManager;
 
 /// Shared context passed to each connection handler, replacing many individual arguments.
@@ -26,6 +27,7 @@ struct ConnectionContext {
     tui_tx: broadcast::Sender<ServerMessage>,
     state_db: Arc<StateDb>,
     terminal_manager: Arc<TerminalSessionManager>,
+    reauth: ReauthRegistry,
     hook_timeout_secs: u64,
     notifications_enabled: bool,
     home_dir: PathBuf,
@@ -41,6 +43,7 @@ pub struct Server {
     tui_tx: broadcast::Sender<ServerMessage>,
     state_db: Arc<StateDb>,
     terminal_manager: Arc<TerminalSessionManager>,
+    reauth: ReauthRegistry,
 }
 
 impl Server {
@@ -67,7 +70,18 @@ impl Server {
             tui_tx,
             state_db,
             terminal_manager,
+            reauth: ReauthRegistry::new(),
         })
+    }
+
+    /// Returns a clone of the reauth registry. Handed to the web layer so
+    /// its `/api/auth/reauth` handler can refresh devices' sudo freshness
+    /// directly when it's embedded in the same process as the daemon.
+    /// Standalone web binaries that connect over the socket use the
+    /// `MarkDeviceFresh` command instead; both code paths end up calling
+    /// [`ReauthRegistry::touch`].
+    pub fn reauth_registry(&self) -> ReauthRegistry {
+        self.reauth.clone()
     }
 
     /// Start listening for connections. Runs until shutdown signal.
@@ -156,6 +170,7 @@ impl Server {
                                 tui_tx: self.tui_tx.clone(),
                                 state_db: self.state_db.clone(),
                                 terminal_manager: self.terminal_manager.clone(),
+                                reauth: self.reauth.clone(),
                                 hook_timeout_secs: self.config.hook_timeout_secs,
                                 notifications_enabled: self.config.notifications_enabled,
                                 home_dir: self.config.home_dir.clone(),
@@ -474,15 +489,43 @@ async fn handle_tui(
                                 }
                             };
                         // Every decision arm below logs `%device_id` (None = local
-                        // TUI, implicitly trusted). The sudo-class gate that
-                        // re-checks freshness before honouring a web-origin
-                        // approve lives in itr#218's ws_bridge work and hooks
-                        // into this same `device_id`.
+                        // TUI, implicitly trusted). The Approve / ApproveAll arms
+                        // consult `ctx.reauth` before honouring web-origin
+                        // approvals of sudo-class tools (itr#218).
                         let device_id = command.device_id.clone();
                         let msg = command.body;
                         match msg {
                             ClientMessage::Approve { id, message, updated_input, always_allow, additional_context } => {
                                 info!(?device_id, %id, "approve");
+
+                                // Sudo-mode gate: if the approve is coming from
+                                // an authenticated web device, the target tool is
+                                // sudo-class, and the device's reauth grace has
+                                // lapsed, we refuse to resolve and bounce a
+                                // WebReauthRequired back on this connection so
+                                // the browser can open the sudo modal. TUI
+                                // origin approvals (device_id = None) bypass.
+                                if let Some(ref dev) = device_id {
+                                    let tool = {
+                                        let q = ctx.queue.lock().await;
+                                        q.peek(id).map(|r| r.tool_name.clone())
+                                    };
+                                    if let Some(tool_name) = tool
+                                        && crate::sudo_gate::is_sudo_tool(&tool_name)
+                                        && !ctx.reauth.is_fresh(dev).await
+                                    {
+                                        let reauth_msg = ServerMessage::WebReauthRequired {
+                                            device_id: dev.0.clone(),
+                                            tool_name: tool_name.clone(),
+                                            at: chrono::Utc::now(),
+                                        };
+                                        let encoded = encode(&reauth_msg)?;
+                                        writer.write_all(encoded.as_bytes()).await?;
+                                        debug!(%id, tool = %tool_name, device_id = %dev.0, "sudo gate: reauth required");
+                                        continue;
+                                    }
+                                }
+
                                 let rich = RichDecision {
                                     decision: Decision::Approve,
                                     message,
@@ -523,14 +566,67 @@ async fn handle_tui(
                                 // Ask/defer decisions are not persisted to the audit log
                             }
                             ClientMessage::ApproveAll { ref filter } => {
-                                let ids = {
-                                    let mut q = ctx.queue.lock().await;
-                                    q.resolve_all(filter, Decision::Approve)
-                                };
-                                info!(?device_id, count = ids.len(), "approve_all");
-                                for id in ids {
-                                    if let Err(e) = ctx.state_db.resolve_pending(id, Decision::Approve).await {
-                                        warn!("eager persist failed for {id}: {e}");
+                                // Web-origin bulk approves get the same sudo-class
+                                // treatment as single approvals: items in the
+                                // sudo-class set are held back behind a
+                                // WebReauthRequired signal while the rest
+                                // resolve. TUI-origin bulk approves are trusted
+                                // and fast-path through the original path.
+                                if let Some(ref dev) = device_id {
+                                    let matching: Vec<(uuid::Uuid, String)> = {
+                                        let q = ctx.queue.lock().await;
+                                        q.snapshot()
+                                            .into_iter()
+                                            .filter(|req| filter.as_ref().is_none_or(|f| f.matches(req)))
+                                            .map(|req| (req.id, req.tool_name))
+                                            .collect()
+                                    };
+                                    let fresh = ctx.reauth.is_fresh(dev).await;
+                                    let (gated, allowed): (Vec<_>, Vec<_>) = if fresh {
+                                        (Vec::new(), matching)
+                                    } else {
+                                        matching.into_iter().partition(|(_, t)| crate::sudo_gate::is_sudo_tool(t))
+                                    };
+
+                                    let allowed_ids: Vec<uuid::Uuid> = {
+                                        let mut q = ctx.queue.lock().await;
+                                        allowed
+                                            .iter()
+                                            .filter(|(id, _)| q.resolve(*id, RichDecision::from(Decision::Approve)))
+                                            .map(|(id, _)| *id)
+                                            .collect()
+                                    };
+                                    info!(
+                                        ?device_id,
+                                        approved = allowed_ids.len(),
+                                        gated = gated.len(),
+                                        "approve_all"
+                                    );
+                                    for id in &allowed_ids {
+                                        if let Err(e) = ctx.state_db.resolve_pending(*id, Decision::Approve).await {
+                                            warn!("eager persist failed for {id}: {e}");
+                                        }
+                                    }
+                                    for (id, tool_name) in gated {
+                                        let reauth_msg = ServerMessage::WebReauthRequired {
+                                            device_id: dev.0.clone(),
+                                            tool_name: tool_name.clone(),
+                                            at: chrono::Utc::now(),
+                                        };
+                                        let encoded = encode(&reauth_msg)?;
+                                        writer.write_all(encoded.as_bytes()).await?;
+                                        debug!(%id, tool = %tool_name, device_id = %dev.0, "sudo gate: reauth required (approve_all)");
+                                    }
+                                } else {
+                                    let ids = {
+                                        let mut q = ctx.queue.lock().await;
+                                        q.resolve_all(filter, Decision::Approve)
+                                    };
+                                    info!(?device_id, count = ids.len(), "approve_all");
+                                    for id in ids {
+                                        if let Err(e) = ctx.state_db.resolve_pending(id, Decision::Approve).await {
+                                            warn!("eager persist failed for {id}: {e}");
+                                        }
                                     }
                                 }
                             }
@@ -956,6 +1052,25 @@ async fn handle_tui(
                                         }
                                     }
                                 });
+                            }
+                            ClientMessage::MarkDeviceFresh => {
+                                // Only authenticated web origins can refresh sudo
+                                // timers — the envelope's device_id is filled in
+                                // by the web crate's short-lived sender
+                                // (post_auth_reauth), never by the browser. A
+                                // payload without a device_id is dropped so a
+                                // local TUI bug can't accidentally elevate any
+                                // phantom device.
+                                if let Some(ref dev) = device_id {
+                                    ctx.reauth.touch(dev).await;
+                                    info!(device_id = %dev.0, "device marked fresh for sudo-mode");
+                                    let ack = encode(&ServerMessage::MarkDeviceFreshAck {
+                                        device_id: dev.0.clone(),
+                                    })?;
+                                    writer.write_all(ack.as_bytes()).await?;
+                                } else {
+                                    warn!("mark_device_fresh without device_id; ignoring");
+                                }
                             }
                             ClientMessage::ApprovePermission { id, suggestion_index, message } => {
                                 info!(?device_id, %id, suggestion_index, "approve_permission");

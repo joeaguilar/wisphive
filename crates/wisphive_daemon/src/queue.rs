@@ -96,6 +96,15 @@ impl DecisionQueue {
         self.pending_items.clone()
     }
 
+    /// Look up a pending request by id without removing it. Used by the
+    /// sudo gate, which needs to see a decision's tool_name before deciding
+    /// whether to let an approve through — if the decision has already been
+    /// resolved or never existed, this returns `None` and the caller falls
+    /// back to `resolve`'s "unknown decision" path.
+    pub fn peek(&self, id: Uuid) -> Option<&DecisionRequest> {
+        self.pending_items.iter().find(|r| r.id == id)
+    }
+
     /// Number of pending decisions.
     pub fn len(&self) -> usize {
         self.pending_items.len()

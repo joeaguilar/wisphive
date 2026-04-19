@@ -242,6 +242,19 @@ pub enum ClientMessage {
     /// neighbors) to avoid rewriting sibling rows on each drag.
     #[serde(rename = "term_reorder")]
     TermReorder { id: Uuid, sort_order: i64 },
+
+    /// Mark the originating web device as freshly reauthenticated, resetting
+    /// its sudo-mode TTL. Emitted by `wisphive_web::post_auth_reauth` after
+    /// a successful password re-entry; the daemon reads `device_id` from the
+    /// [`ClientCommand`] envelope (never from the payload) and touches its
+    /// reauth registry. See `wisphive_daemon::sudo_gate` for the policy.
+    ///
+    /// No body fields: there's nothing the client needs to say beyond "I
+    /// just reauthed." Device attribution is end-to-end spoof-proof because
+    /// the envelope's `device_id` is set by `ws_bridge::rewrap_with_device`
+    /// / the reauth route's short-lived sender — the browser can't forge it.
+    #[serde(rename = "mark_device_fresh")]
+    MarkDeviceFresh,
 }
 
 /// Envelope wrapping a [`ClientMessage`] with per-connection client context.
@@ -419,6 +432,14 @@ pub enum ServerMessage {
         tool_name: String,
         at: chrono::DateTime<chrono::Utc>,
     },
+
+    /// Daemon acknowledges it has processed a [`ClientMessage::MarkDeviceFresh`]
+    /// for `device_id`. The HTTP `/api/auth/reauth` handler waits for this
+    /// before returning 200 to the browser — otherwise a racing follow-up
+    /// approve could arrive at the daemon before the registry update has
+    /// landed and still trip the sudo gate.
+    #[serde(rename = "mark_device_fresh_ack")]
+    MarkDeviceFreshAck { device_id: String },
 
     // ── Terminal sessions ─────────────────────────────────────────────
     /// Confirms a terminal session was created and delivers its metadata.
@@ -1313,6 +1334,36 @@ mod tests {
                 assert_eq!(device_id, "dev-3");
                 assert_eq!(tool_name, "Bash");
             }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_mark_device_fresh_envelope() {
+        // MarkDeviceFresh carries no body fields; attribution is on the envelope.
+        let cmd = ClientCommand::from(ClientMessage::MarkDeviceFresh)
+            .with_device_id(DeviceId::from("dev-4"));
+        let encoded = encode(&cmd).unwrap();
+        assert!(encoded.contains("\"type\":\"mark_device_fresh\""));
+        assert!(encoded.contains("\"device_id\":\"dev-4\""));
+        let decoded: ClientCommand = decode(&encoded).unwrap();
+        assert!(matches!(decoded.body, ClientMessage::MarkDeviceFresh));
+        assert_eq!(
+            decoded.device_id.as_ref().map(|d| d.0.as_str()),
+            Some("dev-4")
+        );
+    }
+
+    #[test]
+    fn round_trip_mark_device_fresh_ack() {
+        let msg = ServerMessage::MarkDeviceFreshAck {
+            device_id: "dev-5".into(),
+        };
+        let encoded = encode(&msg).unwrap();
+        assert!(encoded.contains("\"type\":\"mark_device_fresh_ack\""));
+        let decoded: ServerMessage = decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::MarkDeviceFreshAck { device_id } => assert_eq!(device_id, "dev-5"),
             _ => panic!("unexpected variant"),
         }
     }
