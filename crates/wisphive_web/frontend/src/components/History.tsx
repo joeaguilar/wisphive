@@ -1,21 +1,11 @@
 import { useEffect, useState } from "react";
 import type { HistoryEntry } from "../types/protocol";
-import { ToolContent } from "./ToolContent";
+import { HistoryEntryItem } from "./HistoryEntryItem";
 
 interface HistoryProps {
   entries: HistoryEntry[];
   onLoad: (agentId?: string) => void;
   onSearch: (query: string) => void;
-}
-
-function decisionBadge(decision: string) {
-  const d = decision.replace(/"/g, "");
-  const cls = d === "approve" ? "badge-approve" : d === "deny" ? "badge-deny" : "badge-defer";
-  return <span className={`decision-badge ${cls}`}>{d.toUpperCase()}</span>;
-}
-
-function formatTime(ts: string) {
-  return new Date(ts).toLocaleString();
 }
 
 export function History({ entries, onLoad, onSearch }: HistoryProps) {
@@ -61,36 +51,13 @@ export function History({ entries, onLoad, onSearch }: HistoryProps) {
       ) : (
         <div className="history-list">
           {entries.map((entry) => (
-            <div key={entry.id} className="history-item" onClick={() => setExpandedId(expandedId === entry.id ? null : entry.id)}>
-              <div className="history-item-row">
-                {decisionBadge(entry.decision)}
-                <span className="tool-name">{entry.tool_name}</span>
-                <span
-                  className="agent-link"
-                  onClick={(e) => { e.stopPropagation(); setAgentFilter(entry.agent_id); }}
-                >
-                  {entry.agent_id.slice(0, 16)}
-                </span>
-                <span className="time-ago">{formatTime(entry.resolved_at)}</span>
-                {entry.tool_result && <span className="result-indicator">+</span>}
-              </div>
-              {expandedId === entry.id && (
-                <div className="history-detail">
-                  <div className="detail-meta">
-                    <div><strong>Agent:</strong> {entry.agent_id}</div>
-                    <div><strong>Project:</strong> {entry.project}</div>
-                    <div><strong>Requested:</strong> {formatTime(entry.requested_at)}</div>
-                    <div><strong>Resolved:</strong> {formatTime(entry.resolved_at)}</div>
-                  </div>
-                  <ToolContent
-                    toolName={entry.tool_name}
-                    toolInput={entry.tool_input}
-                    hookEventName={entry.hook_event_name}
-                    toolResult={entry.tool_result}
-                  />
-                </div>
-              )}
-            </div>
+            <HistoryEntryItem
+              key={entry.id}
+              entry={entry}
+              expanded={expandedId === entry.id}
+              onToggle={() => setExpandedId(expandedId === entry.id ? null : entry.id)}
+              onAgentClick={(aid) => setAgentFilter(aid)}
+            />
           ))}
         </div>
       )}

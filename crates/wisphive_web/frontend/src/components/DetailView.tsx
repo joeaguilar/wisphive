@@ -3,6 +3,7 @@ import type { DecisionRequest } from "../types/protocol";
 import { TextModal, ConfirmModal } from "./Modal";
 import { ToolContent } from "./ToolContent";
 import { MarkdownText } from "./MarkdownText";
+import { CopyButton } from "./CopyButton";
 
 interface DetailViewProps {
   request: DecisionRequest;
@@ -19,11 +20,31 @@ export function DetailView({ request, onApprove, onDeny }: DetailViewProps) {
   const tool_input = rawInput ?? {};
   const planContent = typeof event_data?.plan_content === "string" ? event_data.plan_content : null;
 
+  const buildFullText = (): string => {
+    const lines: string[] = [];
+    lines.push(`Tool: ${tool_name}`);
+    if (hook_event_name) lines.push(`Event: ${hook_event_name}`);
+    lines.push(`Agent: ${agent_id}`);
+    lines.push(`Project: ${project}`);
+    lines.push(`Time: ${new Date(timestamp).toISOString()}`);
+    if (planContent) {
+      lines.push("", "--- Plan ---", planContent);
+    }
+    if (rawInput && Object.keys(rawInput).length > 0) {
+      lines.push("", "--- Tool Input ---", JSON.stringify(rawInput, null, 2));
+    }
+    if (event_data && Object.keys(event_data).length > 0) {
+      lines.push("", "--- Event Data ---", JSON.stringify(event_data, null, 2));
+    }
+    return lines.join("\n");
+  };
+
   return (
     <div className="detail-view">
       <div className="detail-header">
         <h2>{tool_name}</h2>
         <span className="event-badge">{hook_event_name}</span>
+        <CopyButton value={buildFullText} label="Copy All" title="Copy full message to clipboard" className="copy-btn-header" />
       </div>
 
       <div className="detail-meta">

@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { CopyButton } from "./CopyButton";
 
 // Heuristic: detect markdown-ish formatting worth offering a rendered view for.
 function looksLikeMarkdown(text: string): boolean {
@@ -85,28 +86,36 @@ export function MarkdownText({ text, className }: MarkdownTextProps) {
   const [view, setView] = useState<"rendered" | "raw">(isMarkdown ? "rendered" : "raw");
 
   if (!isMarkdown) {
-    return <pre className={className ?? "code-block"}>{text}</pre>;
+    return (
+      <div className="code-block-wrap">
+        <CopyButton value={text} className="copy-btn-overlay" />
+        <pre className={className ?? "code-block"}>{text}</pre>
+      </div>
+    );
   }
 
   return (
     <div className="md-text">
-      <div className="md-tabs" role="tablist">
+      <div className="md-tabs" role="tablist" onClick={(e) => e.stopPropagation()}>
         <button
+          type="button"
           role="tab"
           aria-selected={view === "rendered"}
           className={`md-tab ${view === "rendered" ? "active" : ""}`}
-          onClick={() => setView("rendered")}
+          onClick={(e) => { e.stopPropagation(); setView("rendered"); }}
         >
           Rendered
         </button>
         <button
+          type="button"
           role="tab"
           aria-selected={view === "raw"}
           className={`md-tab ${view === "raw" ? "active" : ""}`}
-          onClick={() => setView("raw")}
+          onClick={(e) => { e.stopPropagation(); setView("raw"); }}
         >
           Raw
         </button>
+        <CopyButton value={text} className="copy-btn-tab" title="Copy markdown source" />
       </div>
       {view === "rendered" ? (
         <div

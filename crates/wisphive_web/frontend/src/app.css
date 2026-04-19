@@ -651,7 +651,6 @@ pre.code-block, pre.plan-content {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: var(--space-sm) var(--space-md);
-  cursor: pointer;
 }
 
 .history-item:hover { background: var(--bg-card-hover); }
@@ -661,6 +660,9 @@ pre.code-block, pre.plan-content {
   align-items: center;
   gap: var(--space-sm);
 }
+.history-item-toggle { cursor: pointer; }
+.history-item-toggle:hover { color: var(--text); }
+.history-item-toggle:focus-visible { outline: 1px solid var(--cyan); outline-offset: 2px; }
 
 .decision-badge {
   font-size: 10px;
@@ -1569,3 +1571,39 @@ kbd {
   border-top: 1px solid var(--border);
   padding-top: var(--space-sm);
 }
+
+/* Copy buttons */
+.copy-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  padding: 2px 10px;
+  font-size: 11px;
+  font-family: inherit;
+  cursor: pointer;
+  border-radius: 3px;
+  transition: border-color 0.1s, color 0.1s, background 0.1s;
+}
+.copy-btn:hover { border-color: var(--cyan); color: var(--text); }
+.copy-btn:active { background: var(--border); }
+
+.copy-btn-header { margin-left: auto; }
+
+.code-block-wrap {
+  position: relative;
+}
+.copy-btn-overlay {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  background: #1a1a1a;
+  z-index: 1;
+  opacity: 0.65;
+  transition: opacity 0.1s;
+}
+.code-block-wrap:hover .copy-btn-overlay,
+.copy-btn-overlay:hover,
+.copy-btn-overlay:focus-visible { opacity: 1; }
+
+.copy-btn-tab { margin-left: auto; }
+

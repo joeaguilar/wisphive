@@ -1,5 +1,6 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import type { HistoryEntry, SessionSummary } from "../types/protocol";
+import { HistoryEntryItem } from "./HistoryEntryItem";
 
 interface SessionsProps {
   sessions: SessionSummary[];
@@ -22,7 +23,9 @@ function duration(first: string, last: string): string {
 }
 
 export function Sessions({ sessions, timeline, selectedAgent, onLoad, onSelectAgent, onLoadTimeline, onRefreshTimeline }: SessionsProps) {
+  const [expandedId, setExpandedId] = useState<string | null>(null);
   useEffect(() => { onLoad(); }, [onLoad]);
+  useEffect(() => { setExpandedId(null); }, [selectedAgent]);
 
   if (selectedAgent) {
     return (
@@ -40,20 +43,15 @@ export function Sessions({ sessions, timeline, selectedAgent, onLoad, onSelectAg
           <div className="history-empty">No timeline entries</div>
         ) : (
           <div className="history-list">
-            {timeline.map((entry) => {
-              const d = entry.decision.replace(/"/g, "");
-              const cls = d === "approve" ? "badge-approve" : d === "deny" ? "badge-deny" : "badge-defer";
-              return (
-                <div key={entry.id} className="history-item">
-                  <div className="history-item-row">
-                    <span className={`decision-badge ${cls}`}>{d.toUpperCase()}</span>
-                    <span className="tool-name">{entry.tool_name}</span>
-                    <span className="time-ago">{new Date(entry.resolved_at).toLocaleTimeString()}</span>
-                    {entry.tool_result && <span className="result-indicator">+</span>}
-                  </div>
-                </div>
-              );
-            })}
+            {timeline.map((entry) => (
+              <HistoryEntryItem
+                key={entry.id}
+                entry={entry}
+                expanded={expandedId === entry.id}
+                onToggle={() => setExpandedId(expandedId === entry.id ? null : entry.id)}
+                showAgent={false}
+              />
+            ))}
           </div>
         )}
       </div>

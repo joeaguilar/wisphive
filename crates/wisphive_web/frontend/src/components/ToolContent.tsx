@@ -3,6 +3,16 @@
  * Used by both DetailView (live queue) and History (resolved entries).
  */
 import { MarkdownText } from "./MarkdownText";
+import { CopyButton } from "./CopyButton";
+
+function CodeBlock({ text, className }: { text: string; className?: string }) {
+  return (
+    <div className="code-block-wrap">
+      <CopyButton value={text} className="copy-btn-overlay" />
+      <pre className={className ?? "code-block"}>{text}</pre>
+    </div>
+  );
+}
 
 // Simple diff renderer — split old/new into lines and show unified view
 function DiffView({ oldStr, newStr }: { oldStr: string; newStr: string }) {
@@ -67,7 +77,7 @@ export function ToolContent({ toolName, toolInput, hookEventName, eventData, too
               ?? (typeof input.last_assistant_message === "string"
                 ? (input.last_assistant_message as string)
                 : null);
-            return msg ? <MarkdownText text={msg} /> : <pre className="code-block">(no message)</pre>;
+            return msg ? <MarkdownText text={msg} /> : <CodeBlock text="(no message)" />;
           })()}
           {stopHookActive !== null && (
             <div className="field-row"><strong>Stop hook active:</strong> {String(stopHookActive)}</div>
@@ -148,7 +158,7 @@ export function ToolContent({ toolName, toolInput, hookEventName, eventData, too
         )}
         <div className="detail-section">
           <h3>Command</h3>
-          <pre className="code-block code-bash">{command || JSON.stringify(input, null, 2)}</pre>
+          <CodeBlock text={command || JSON.stringify(input, null, 2)} className="code-block code-bash" />
         </div>
         <ToolResultSection result={toolResult} />
       </>
@@ -167,7 +177,7 @@ export function ToolContent({ toolName, toolInput, hookEventName, eventData, too
         ) : (
           <div className="detail-section">
             <h3>Tool Input</h3>
-            <pre className="code-block">{JSON.stringify(input, null, 2)}</pre>
+            <CodeBlock text={JSON.stringify(input, null, 2)} />
           </div>
         )}
         <ToolResultSection result={toolResult} />
@@ -181,7 +191,7 @@ export function ToolContent({ toolName, toolInput, hookEventName, eventData, too
         {filePath && <div className="file-path">{filePath}</div>}
         <div className="detail-section">
           <h3>Content (new file)</h3>
-          <pre className="code-block">{content || JSON.stringify(input, null, 2)}</pre>
+          <CodeBlock text={content || JSON.stringify(input, null, 2)} />
         </div>
         <ToolResultSection result={toolResult} />
       </>
@@ -229,12 +239,12 @@ export function ToolContent({ toolName, toolInput, hookEventName, eventData, too
       {hasInput ? (
         <div className="detail-section">
           <h3>Tool Input</h3>
-          <pre className="code-block">{JSON.stringify(input, null, 2)}</pre>
+          <CodeBlock text={JSON.stringify(input, null, 2)} />
         </div>
       ) : eventData ? (
         <div className="detail-section">
           <h3>Event Data</h3>
-          <pre className="code-block">{JSON.stringify(eventData, null, 2)}</pre>
+          <CodeBlock text={JSON.stringify(eventData, null, 2)} />
         </div>
       ) : null}
       <ToolResultSection result={toolResult} />
@@ -247,7 +257,7 @@ function ToolResultSection({ result }: { result?: Record<string, unknown> | null
   return (
     <div className="detail-section">
       <h3>Tool Result</h3>
-      <pre className="code-block">{JSON.stringify(result, null, 2)}</pre>
+      <CodeBlock text={JSON.stringify(result, null, 2)} />
     </div>
   );
 }
