@@ -1275,13 +1275,14 @@ kbd {
   min-height: 0;
   display: grid;
   grid-template-rows: auto 1fr;
+  overflow: auto;
 }
 
 .terminals-terminal-slot {
   grid-row: 2 / 3;
   min-height: 0;
   min-width: 0;
-  overflow: hidden;
+  overflow: auto;
   display: flex;
   flex-direction: column;
 }
