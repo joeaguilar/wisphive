@@ -1080,6 +1080,7 @@ mod tests {
     }
 
     /// Shorthand for tests: call log_auto_approved with positional args.
+    #[allow(clippy::too_many_arguments)]
     async fn log_auto(
         db: &StateDb,
         agent_id: &str,
@@ -1470,13 +1471,13 @@ mod tests {
         let projects = db.query_projects().await.unwrap();
         assert_eq!(projects.len(), 2);
 
-        let muse = projects.iter().find(|p| p.project == std::path::PathBuf::from("/muse")).unwrap();
+        let muse = projects.iter().find(|p| p.project == std::path::Path::new("/muse")).unwrap();
         assert_eq!(muse.total_calls, 2);
         assert_eq!(muse.agent_count, 2);
         assert_eq!(muse.approved, 1);
         assert_eq!(muse.denied, 1);
 
-        let rpg = projects.iter().find(|p| p.project == std::path::PathBuf::from("/rpg")).unwrap();
+        let rpg = projects.iter().find(|p| p.project == std::path::Path::new("/rpg")).unwrap();
         assert_eq!(rpg.total_calls, 1);
         assert_eq!(rpg.agent_count, 1);
     }
