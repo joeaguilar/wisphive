@@ -30,7 +30,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::extract::{FromRequestParts, Request, State};
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use wisphive_daemon::state::{StateDb, WebDeviceRow};
@@ -195,13 +195,33 @@ impl SecurityConfig {
         &self.inner.throttle
     }
 
-    fn check_host(&self, headers: &HeaderMap) -> bool {
-        let Some(host) = headers.get("host").and_then(|h| h.to_str().ok()) else {
-            // HTTP/1.1 requires a Host header; its absence is suspicious on
-            // its own. Reject rather than silently allow.
+    /// Resolve the effective host for this request and compare against
+    /// [`SecurityConfigInner::allowed_hosts`].
+    ///
+    /// HTTP/1.1 carries the host in the `Host:` header. HTTP/2 (which
+    /// axum_server negotiates by default once TLS is on via ALPN) drops
+    /// `Host` on the wire entirely and puts the authority on the `:authority`
+    /// pseudo-header. hyper surfaces that through `request.uri().authority()`
+    /// but does NOT synthesize a `Host:` header for handlers to read.
+    ///
+    /// Before this fix we only looked at the `Host:` header and would 403
+    /// every h2 request including every browser on a modern Chrome / Safari
+    /// — a nasty latent bug that stayed hidden while the server was plain
+    /// HTTP (no ALPN → no h2 → Host always present). The TLS swap in
+    /// itr#214 flipped it on.
+    fn check_host(&self, headers: &HeaderMap, uri: &Uri) -> bool {
+        let candidate = headers
+            .get("host")
+            .and_then(|h| h.to_str().ok())
+            .map(str::to_owned)
+            .or_else(|| uri.authority().map(|a| a.to_string()));
+        let Some(host) = candidate else {
+            // Neither a Host header nor an :authority pseudo-header is a
+            // genuinely malformed request; reject rather than silently
+            // allow. HTTP/1.1 requires Host, and HTTP/2 requires :authority.
             return false;
         };
-        self.inner.allowed_hosts.iter().any(|h| h == host)
+        self.inner.allowed_hosts.contains(&host)
     }
 
     fn check_origin(&self, headers: &HeaderMap) -> bool {
@@ -256,7 +276,7 @@ pub async fn security_middleware(
     let uri = req.uri().clone();
     let path = uri.path();
 
-    if !security.check_host(&headers) {
+    if !security.check_host(&headers, &uri) {
         tracing::warn!(
             ?path,
             host = ?headers.get("host"),
@@ -284,6 +304,33 @@ pub async fn security_middleware(
     {
         let ip = ClientIp(ci.0.ip());
         req.extensions_mut().insert(ip);
+    }
+
+    // Setup-required gate. If no web password has been persisted yet, any
+    // `/api/*` or `/ws` request (except the discovery endpoint) returns
+    // 503 — the SPA is expected to have hit `/api/auth/status` first and
+    // routed the user to a setup page rather than a login form. Reaching
+    // this gate with password_set=false means the client got confused, so
+    // a hard error is correct.
+    //
+    // Doing a DB lookup on every gated request is cheap (SQLite, same pool
+    // the rest of the handler uses, ~microseconds). If it ever shows up on
+    // a profile, replace with an AtomicBool cached in `SecurityConfig` that
+    // itr#215's `/api/auth/setup` handler flips to `password_set = true`
+    // on successful bootstrap.
+    let is_gated_api_path = path == "/ws" || path.starts_with("/api/");
+    if is_gated_api_path && !path_bypasses_setup_gate(path) {
+        match security.state_db().get_web_password_hash().await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                tracing::warn!(?path, "rejecting request: setup-required (no web password)");
+                return setup_required_response();
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "setup-required probe failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+            }
+        }
     }
 
     if path_requires_device_token(path) {
@@ -326,7 +373,10 @@ pub async fn security_middleware(
 
 /// Which paths require a device token. `/api/auth/login` is the credential
 /// bootstrap — it's origin+host-gated and throttled, but obviously can't
-/// require a device token since it's how you GET one.
+/// require a device token since it's how you GET one. `/api/auth/status` is
+/// the setup-discovery surface hit by the frontend before it knows whether
+/// to show Login vs Setup; it intentionally leaks whether a password has
+/// been set, so guarding it with a token would be silly.
 ///
 /// `/api/web-token` is the retired per-process bootstrap route. We
 /// deliberately exempt it from the gate even though the router no longer
@@ -339,10 +389,40 @@ pub(crate) fn path_requires_device_token(path: &str) -> bool {
     if path == "/ws" {
         return true;
     }
-    if path == "/api/auth/login" || path == "/api/web-token" {
+    if path == "/api/auth/login" || path == "/api/auth/status" || path == "/api/web-token" {
         return false;
     }
     path.starts_with("/api/")
+}
+
+/// Canonical 503 response for setup-required mode. Body is JSON so the SPA
+/// can machine-detect the case without string-matching on the text body;
+/// `error` is a stable discriminant while `message` is for humans reading
+/// a network-tab response.
+fn setup_required_response() -> Response {
+    let body = serde_json::json!({
+        "error": "setup_required",
+        "message": "Web UI has no password set; complete setup first."
+    })
+    .to_string();
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
+}
+
+/// Whether `path` is exempt from the setup-required gate.
+///
+/// In setup-required mode (no web password set yet), every `/api/*` and
+/// `/ws` request must be refused with 503 — *except* the bootstrap
+/// discovery surface. `/api/auth/status` is the one endpoint the frontend
+/// hits before it knows there's a password; it has to answer honestly so
+/// the SPA can redirect to the setup page. Once itr#215 lands, the setup
+/// endpoint itself (`/api/auth/setup`, POST-only) will join this list.
+fn path_bypasses_setup_gate(path: &str) -> bool {
+    path == "/api/auth/status"
 }
 
 /// Read a presented token from `Authorization: Bearer <raw>` or `?token=<raw>`.
@@ -387,13 +467,26 @@ mod tests {
         assert!(path_requires_device_token("/ws"));
         assert!(path_requires_device_token("/api/config"));
         assert!(path_requires_device_token("/api/devices"));
+        assert!(path_requires_device_token("/api/me"));
         assert!(!path_requires_device_token("/api/auth/login"));
+        // Setup-discovery endpoint is public: the SPA hits it before it
+        // knows whether to show Login or Setup.
+        assert!(!path_requires_device_token("/api/auth/status"));
         // Retired bootstrap route is exempt so the router's fallback
         // can 404 cleanly instead of the gate 401-ing first.
         assert!(!path_requires_device_token("/api/web-token"));
         assert!(!path_requires_device_token("/"));
         assert!(!path_requires_device_token("/index.html"));
         assert!(!path_requires_device_token("/assets/foo.js"));
+    }
+
+    #[test]
+    fn path_bypasses_setup_gate_rules() {
+        assert!(path_bypasses_setup_gate("/api/auth/status"));
+        assert!(!path_bypasses_setup_gate("/api/auth/login"));
+        assert!(!path_bypasses_setup_gate("/api/config"));
+        assert!(!path_bypasses_setup_gate("/api/devices"));
+        assert!(!path_bypasses_setup_gate("/ws"));
     }
 
     #[test]
@@ -423,6 +516,47 @@ mod tests {
             extract_presented_token(&headers, Some("token=query-token")).as_deref(),
             Some("query-token")
         );
+    }
+
+    /// HTTP/2 drops the `Host:` header on the wire — the authority lives on
+    /// the `:authority` pseudo-header, surfaced via `request.uri().authority()`.
+    /// `check_host` MUST accept that path or every browser on a modern TLS
+    /// stack gets 403'd once we flip on `axum_server` (which negotiates h2
+    /// via ALPN by default).
+    #[tokio::test]
+    async fn check_host_accepts_http2_authority_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("wisphive.db");
+        let db = StateDb::open(db_path.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        let security = SecurityConfig::for_test(
+            vec!["https://127.0.0.1:3199".to_string()],
+            vec!["127.0.0.1:3199".to_string()],
+            db,
+        );
+
+        // HTTP/2-style: no Host header, authority baked into the URI. A real
+        // hyper request for an h2 upstream gives us exactly this shape.
+        let headers = HeaderMap::new();
+        let uri: Uri = "https://127.0.0.1:3199/api/auth/status".parse().unwrap();
+        assert!(security.check_host(&headers, &uri));
+
+        // HTTP/1.1-style: Host header present, URI is path-only.
+        let mut h11_headers = HeaderMap::new();
+        h11_headers.insert("host", "127.0.0.1:3199".parse().unwrap());
+        let h11_uri: Uri = "/api/auth/status".parse().unwrap();
+        assert!(security.check_host(&h11_headers, &h11_uri));
+
+        // Neither header nor authority: rejected.
+        let empty_headers = HeaderMap::new();
+        let empty_uri: Uri = "/api/auth/status".parse().unwrap();
+        assert!(!security.check_host(&empty_headers, &empty_uri));
+
+        // Mismatched authority: rejected (sanity — :authority can't be a
+        // rebind escape hatch).
+        let evil_uri: Uri = "https://evil.example/api/auth/status".parse().unwrap();
+        assert!(!security.check_host(&HeaderMap::new(), &evil_uri));
     }
 
     #[test]

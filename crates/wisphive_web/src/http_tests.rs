@@ -292,10 +292,20 @@ async fn login_with_wrong_password_returns_401_and_bumps_throttle() {
     );
 }
 
+/// Pre-itr#214 contract: login-when-no-password returned 401 to avoid
+/// leaking "setup-required" state via the credential endpoint. Post-
+/// itr#214 that's superseded by the setup-required gate: the SPA is
+/// *supposed* to learn setup state from `/api/auth/status` and 503 from
+/// the gate is the machine-readable signal that login shouldn't even be
+/// attempted yet. So the contract on this path is now:
+///
+///   - Setup-required mode: 503 `setup_required` (the gate's response),
+///     NOT the handler's 401. The frontend has to distinguish "no
+///     account" from "wrong password" and the gate is how it does so.
+///   - The handler's body is still non-leaky — it's never reached, so
+///     `no password` / `not set` cannot appear in the wire bytes.
 #[tokio::test]
-async fn login_when_no_password_set_returns_401_without_leaking_state() {
-    // Don't use the default test_state helper — start from a fresh DB with
-    // no password row so the handler's "no hash" branch is exercised.
+async fn login_when_no_password_set_returns_503_setup_required() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("wisphive.db");
     let db = StateDb::open(db_path.to_string_lossy().as_ref())
@@ -315,11 +325,12 @@ async fn login_when_no_password_set_returns_401_without_leaking_state() {
         .body(Body::from(body.to_string()))
         .unwrap();
     let (status, body) = run_with(state, r).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    // Body must not mention "no password set" or similar — info leak.
-    let s = String::from_utf8_lossy(&body).to_lowercase();
-    assert!(!s.contains("no password"));
-    assert!(!s.contains("not set"));
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    // The body is JSON with a stable `error: setup_required` discriminant;
+    // the old "no password" / "not set" substring test doesn't apply to
+    // the gate's response, which never narrates the DB state in prose.
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["error"], "setup_required");
 }
 
 // ── /api/auth/reauth ───────────────────────────────────────────────────
@@ -503,4 +514,283 @@ async fn second_attempt_during_lockout_returns_429_with_retry_after() {
         .to_string();
     let n: u64 = retry.parse().expect("Retry-After should be an integer");
     assert!(n >= 1, "Retry-After should be at least 1 second, got {n}");
+}
+
+// ── /api/auth/status ───────────────────────────────────────────────────
+
+/// The SPA hits /api/auth/status before it knows whether to render a login
+/// form, so it MUST be reachable without a device token — and the response
+/// MUST tell the truth about whether a password is set.
+#[tokio::test]
+async fn auth_status_reports_password_set_true_when_seeded() {
+    // test_state seeds the password in test_db.
+    let (_tmp, state) = test_state().await;
+    let r = req("GET", "/api/auth/status").body(Body::empty()).unwrap();
+    let (status, body) = run_with(state, r).await;
+    assert_eq!(status, StatusCode::OK);
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["password_set"], serde_json::Value::Bool(true));
+    assert_eq!(parsed["setup_required"], serde_json::Value::Bool(false));
+}
+
+#[tokio::test]
+async fn auth_status_reports_setup_required_on_fresh_host() {
+    // Hand-built state with no password set — exercises the setup-required
+    // branch without going through the login handler.
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("wisphive.db");
+    let db = StateDb::open(db_path.to_string_lossy().as_ref())
+        .await
+        .unwrap();
+    let security =
+        SecurityConfig::for_test(vec![ORIGIN.to_string()], vec![HOST.to_string()], db.clone());
+    let state = AppState {
+        socket_path: tmp.path().join("wisphive.sock"),
+        config_path: tmp.path().join("config.json"),
+        security,
+    };
+    let r = req("GET", "/api/auth/status").body(Body::empty()).unwrap();
+    let (status, body) = run_with(state, r).await;
+    assert_eq!(status, StatusCode::OK);
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["password_set"], serde_json::Value::Bool(false));
+    assert_eq!(parsed["setup_required"], serde_json::Value::Bool(true));
+}
+
+#[tokio::test]
+async fn auth_status_requires_no_bearer() {
+    // Same assertion as above but explicit: /api/auth/status is the one
+    // path that MUST NOT 401 on missing token, or the setup bootstrap
+    // fundamentally breaks.
+    let r = req("GET", "/api/auth/status").body(Body::empty()).unwrap();
+    let (status, _) = run(r).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+// ── setup-required gate ────────────────────────────────────────────────
+
+/// Fresh host with no web password: every /api/* route except
+/// /api/auth/status must 503. This is the "don't let the UI leak into a
+/// login flow before setup" rail.
+#[tokio::test]
+async fn setup_required_blocks_protected_api_routes_with_503() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("wisphive.db");
+    let db = StateDb::open(db_path.to_string_lossy().as_ref())
+        .await
+        .unwrap();
+    let security =
+        SecurityConfig::for_test(vec![ORIGIN.to_string()], vec![HOST.to_string()], db.clone());
+    let state = AppState {
+        socket_path: tmp.path().join("wisphive.sock"),
+        config_path: tmp.path().join("config.json"),
+        security,
+    };
+
+    // Token-gated endpoint — the setup gate must fire *before* the token
+    // check, or the operator sees 401 and assumes a credential problem
+    // rather than an uninitialized host.
+    let r = req("GET", "/api/config").body(Body::empty()).unwrap();
+    let (status, body) = run_with(state.clone(), r).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["error"], "setup_required");
+
+    // /api/auth/login should also 503 in setup-required mode: there IS no
+    // password, so returning the handler's usual 401 would be misleading
+    // ("wrong credentials" vs "no credentials exist yet"). The SPA is
+    // expected to route to /setup based on /api/auth/status first.
+    let r = req("POST", "/api/auth/login")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "password": "x" }).to_string(),
+        ))
+        .unwrap();
+    let (status, _) = run_with(state.clone(), r).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// Static content and `/api/auth/status` must still be reachable in
+/// setup-required mode — otherwise the browser hitting `/` hangs before
+/// it has anything to bootstrap from.
+#[tokio::test]
+async fn setup_required_lets_auth_status_through() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("wisphive.db");
+    let db = StateDb::open(db_path.to_string_lossy().as_ref())
+        .await
+        .unwrap();
+    let security =
+        SecurityConfig::for_test(vec![ORIGIN.to_string()], vec![HOST.to_string()], db.clone());
+    let state = AppState {
+        socket_path: tmp.path().join("wisphive.sock"),
+        config_path: tmp.path().join("config.json"),
+        security,
+    };
+    let r = req("GET", "/api/auth/status").body(Body::empty()).unwrap();
+    let (status, _) = run_with(state, r).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+// ── /api/auth/logout ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn logout_revokes_device_and_next_request_401s() {
+    let (_tmp, state) = test_state().await;
+    let (token, device_id) = seed_device(state.security.state_db(), "iphone").await;
+
+    // Logout with the token — expect 200, audit row, and the device row
+    // flipped to revoked.
+    let r = req("POST", "/api/auth/logout")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = run_with(state.clone(), r).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Confirm the DB row is revoked.
+    let devices = state.security.state_db().list_web_devices().await.unwrap();
+    let found = devices.iter().find(|d| d.id == device_id).unwrap();
+    assert!(
+        found.revoked_at.is_some(),
+        "logout must flip revoked_at on the device row"
+    );
+
+    // A follow-up request with the same token must come back as 401 —
+    // the middleware's lookup filters revoked rows, so a revoked token is
+    // indistinguishable from an unknown one (same 401 response).
+    let r2 = req("GET", "/api/config")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let (s2, _) = run_with(state, r2).await;
+    assert_eq!(s2, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn logout_without_token_returns_401() {
+    let r = req("POST", "/api/auth/logout").body(Body::empty()).unwrap();
+    let (status, _) = run(r).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ── /api/me ────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn me_returns_authenticated_device_identity() {
+    let (_tmp, state) = test_state().await;
+    let (token, device_id) = seed_device(state.security.state_db(), "laptop-work").await;
+
+    let r = req("GET", "/api/me")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = run_with(state, r).await;
+    assert_eq!(status, StatusCode::OK);
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["device_id"].as_str().unwrap(), device_id);
+    assert_eq!(parsed["device_name"].as_str().unwrap(), "laptop-work");
+}
+
+#[tokio::test]
+async fn me_without_token_returns_401() {
+    let r = req("GET", "/api/me").body(Body::empty()).unwrap();
+    let (status, _) = run(r).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ── /api/devices + /api/devices/{id}/revoke ────────────────────────────
+
+#[tokio::test]
+async fn devices_lists_both_active_and_revoked() {
+    let (_tmp, state) = test_state().await;
+    let (token, _) = seed_device(state.security.state_db(), "iphone").await;
+    let (_, other_id) = seed_device(state.security.state_db(), "old-laptop").await;
+    state
+        .security
+        .state_db()
+        .revoke_web_device(&other_id)
+        .await
+        .unwrap();
+
+    let r = req("GET", "/api/devices")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = run_with(state, r).await;
+    assert_eq!(status, StatusCode::OK);
+    let parsed: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed.len(), 2, "list should include revoked devices");
+    let revoked = parsed
+        .iter()
+        .find(|d| d["id"].as_str() == Some(other_id.as_str()))
+        .unwrap();
+    assert!(
+        !revoked["revoked_at"].is_null(),
+        "revoked device must report revoked_at in the JSON"
+    );
+}
+
+#[tokio::test]
+async fn devices_revoke_other_device() {
+    let (_tmp, state) = test_state().await;
+    let (actor_token, _) = seed_device(state.security.state_db(), "laptop").await;
+    let (victim_token, victim_id) = seed_device(state.security.state_db(), "phone").await;
+
+    // Actor revokes the victim.
+    let r = req("POST", &format!("/api/devices/{victim_id}/revoke"))
+        .header("authorization", format!("Bearer {actor_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = run_with(state.clone(), r).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Victim's token should now be dead.
+    let r2 = req("GET", "/api/config")
+        .header("authorization", format!("Bearer {victim_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let (s2, _) = run_with(state.clone(), r2).await;
+    assert_eq!(s2, StatusCode::UNAUTHORIZED);
+
+    // Actor's token should still work — revocation is per-device, not
+    // per-account.
+    let r3 = req("GET", "/api/config")
+        .header("authorization", format!("Bearer {actor_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let (s3, _) = run_with(state, r3).await;
+    assert_eq!(s3, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn devices_revoke_is_idempotent() {
+    let (_tmp, state) = test_state().await;
+    let (actor_token, _) = seed_device(state.security.state_db(), "laptop").await;
+    let (_, victim_id) = seed_device(state.security.state_db(), "phone").await;
+
+    for _ in 0..2 {
+        let r = req("POST", &format!("/api/devices/{victim_id}/revoke"))
+            .header("authorization", format!("Bearer {actor_token}"))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = run_with(state.clone(), r).await;
+        assert_eq!(status, StatusCode::OK, "idempotent revoke must stay 200");
+    }
+}
+
+#[tokio::test]
+async fn devices_revoke_without_token_returns_401() {
+    let r = req("POST", "/api/devices/some-id/revoke")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = run(r).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn devices_list_without_token_returns_401() {
+    let r = req("GET", "/api/devices").body(Body::empty()).unwrap();
+    let (status, _) = run(r).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }

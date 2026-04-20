@@ -395,12 +395,163 @@ async fn post_auth_reauth(
     (axum::http::StatusCode::OK, "ok").into_response()
 }
 
+/// GET /api/auth/status — unauthenticated setup-discovery surface.
+///
+/// Returns `{ password_set, setup_required }`. The frontend hits this
+/// before knowing whether to render a login form or a setup page. It's the
+/// *only* path that bypasses both the device-token gate AND the
+/// setup-required gate; see [`crate::security::path_bypasses_setup_gate`].
+///
+/// Intentionally leaks whether a password exists. That's the whole point —
+/// the caller is about to decide which bootstrap flow to run, and lying
+/// here would force us to ship the decision via a cache-buster on the
+/// frontend build, which is worse.
+async fn get_auth_status(axum::extract::State(state): axum::extract::State<AppState>) -> Response {
+    let password_set = match state.security.state_db().get_web_password_hash().await {
+        Ok(opt) => opt.is_some(),
+        Err(e) => {
+            tracing::warn!(error = %e, "auth_status: password-hash probe failed");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+            )
+                .into_response();
+        }
+    };
+    axum::Json(serde_json::json!({
+        "password_set": password_set,
+        "setup_required": !password_set,
+    }))
+    .into_response()
+}
+
+/// POST /api/auth/logout — revoke the caller's own device.
+///
+/// Gated by the security middleware, so reaching this handler means
+/// `device` is the verified caller. Revocation is idempotent (`UPDATE …
+/// WHERE revoked_at IS NULL`); after we return 200 the next request with
+/// the same token fails at `find_web_device_by_token_hash` and comes back
+/// as 401.
+///
+/// We intentionally don't require a password here: logout is a *retracting*
+/// action, not a *trust-elevating* one (unlike reauth). The sudo gate is
+/// where password re-proof belongs.
+async fn post_auth_logout(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    client_ip: ClientIp,
+    axum::Extension(device): axum::Extension<AuthedDevice>,
+) -> Response {
+    let db = state.security.state_db().clone();
+    if let Err(e) = db.revoke_web_device(&device.id.0).await {
+        tracing::warn!(error = %e, device_id = %device.id, "logout revoke failed");
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "revoke failed",
+        )
+            .into_response();
+    }
+    let _ = db
+        .append_web_audit(
+            "web_logout",
+            Some(&device.id.0),
+            Some(&client_ip.0.to_string()),
+            None,
+        )
+        .await;
+    (axum::http::StatusCode::OK, "ok").into_response()
+}
+
+/// GET /api/me — identify the authenticated device.
+///
+/// The middleware has already attached an `AuthedDevice`; just echo it
+/// back as JSON. Used by the SPA to fill in "logged in as <device_name>"
+/// banners without round-tripping through `/api/devices`.
+async fn get_me(axum::Extension(device): axum::Extension<AuthedDevice>) -> Response {
+    axum::Json(serde_json::json!({
+        "device_id": device.id.0,
+        "device_name": device.name,
+    }))
+    .into_response()
+}
+
+/// GET /api/devices — list every device ever enrolled, newest first.
+///
+/// Includes revoked devices so the UI can show history (the `revoked_at`
+/// field is how it disambiguates). Any device that has a valid token can
+/// see the full list — there's no "admin" tier in the current model; a
+/// paired device is a paired device.
+async fn get_devices(axum::extract::State(state): axum::extract::State<AppState>) -> Response {
+    match state.security.state_db().list_web_devices().await {
+        Ok(devices) => {
+            let json: Vec<serde_json::Value> = devices
+                .into_iter()
+                .map(|d| {
+                    serde_json::json!({
+                        "id": d.id,
+                        "name": d.name,
+                        "created_at": d.created_at,
+                        "last_seen_at": d.last_seen_at,
+                        "last_ip": d.last_ip,
+                        "revoked_at": d.revoked_at,
+                    })
+                })
+                .collect();
+            axum::Json(json).into_response()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "list_web_devices failed");
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "list failed").into_response()
+        }
+    }
+}
+
+/// POST /api/devices/{id}/revoke — revoke any device by id.
+///
+/// Revoking `device.id.0` (i.e. yourself) is allowed and behaves the same
+/// as `/api/auth/logout` from the DB's perspective — the UX case is
+/// "I lost my phone, revoke it from my laptop" which means arbitrary-id
+/// revocation has to work.
+///
+/// The audit row records the *actor* device in `device_id` and the
+/// *target* device id in `detail` so forensics can reconstruct who
+/// revoked whom.
+async fn post_revoke_device(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    client_ip: ClientIp,
+    axum::Extension(actor): axum::Extension<AuthedDevice>,
+    axum::extract::Path(target_id): axum::extract::Path<String>,
+) -> Response {
+    let db = state.security.state_db().clone();
+    if let Err(e) = db.revoke_web_device(&target_id).await {
+        tracing::warn!(error = %e, target = %target_id, "revoke_web_device failed");
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "revoke failed",
+        )
+            .into_response();
+    }
+    let _ = db
+        .append_web_audit(
+            "web_device_revoke",
+            Some(&actor.id.0),
+            Some(&client_ip.0.to_string()),
+            Some(&target_id),
+        )
+        .await;
+    (axum::http::StatusCode::OK, "ok").into_response()
+}
+
 fn build_router(state: AppState, dev_mode: bool) -> Router {
     let security = state.security.clone();
     let api = Router::new()
         .route("/ws", get(ws_handler))
+        .route("/api/auth/status", get(get_auth_status))
         .route("/api/auth/login", post(post_auth_login))
+        .route("/api/auth/logout", post(post_auth_logout))
         .route("/api/auth/reauth", post(post_auth_reauth))
+        .route("/api/me", get(get_me))
+        .route("/api/devices", get(get_devices))
+        .route("/api/devices/{id}/revoke", post(post_revoke_device))
         .route("/api/config", get(get_config).put(put_config));
 
     let router = if dev_mode {
@@ -421,6 +572,17 @@ fn build_router(state: AppState, dev_mode: bool) -> Router {
 }
 
 /// Start the web server.
+///
+/// Production (`dev_mode = false`): serves HTTPS via `axum_server` + the
+/// self-signed ECDSA cert from [`crate::tls::ensure_cert`]. The fingerprint
+/// and every LAN URL we'd accept are logged at startup so the operator can
+/// pin the cert out-of-band.
+///
+/// Dev (`dev_mode = true`): serves plain HTTP. Vite runs the UI at
+/// `http://localhost:5173` and the browser connects to `ws://.../ws`;
+/// dragging the user through self-signed-TLS trust in dev on top of the
+/// normal Vite workflow isn't worth the pain. The CORS layer in
+/// `build_router` already opens things up for that setup.
 pub async fn serve(
     socket_path: PathBuf,
     port: u16,
@@ -453,12 +615,32 @@ pub async fn serve(
     let addr = SocketAddr::from((host, port));
     info!(%addr, dev_mode, "web server starting");
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
+    if dev_mode {
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await?;
+    } else {
+        // Production: serve HTTPS with the ECDSA cert we manage under
+        // ~/.wisphive/. `ensure_cert` is synchronous and already does its
+        // own flock serialization, so concurrent `wisphive daemon start`
+        // + `wisphive web` invocations can't clobber each other's keys.
+        let cert = tls::ensure_cert(&home_dir, bind_host)?;
+        info!(
+            fingerprint = %cert.fingerprint_sha256,
+            "web TLS cert ready"
+        );
+        for url in tls::enumerate_lan_urls(bind_host, port) {
+            info!(%url, "web listening");
+        }
+        let tls_config =
+            axum_server::tls_rustls::RustlsConfig::from_pem(cert.cert_pem, cert.key_pem).await?;
+        axum_server::bind_rustls(addr, tls_config)
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+            .await?;
+    }
     Ok(())
 }
 

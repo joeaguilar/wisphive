@@ -419,8 +419,13 @@ fn main() -> anyhow::Result<()> {
                                     }
                                 }
                             };
+                            // Dev mode stays http (Vite serves the UI over
+                            // http and dragging the user through self-signed
+                            // TLS isn't worth it); prod is https.
+                            let scheme = if web_dev { "http" } else { "https" };
                             eprintln!(
-                                "Wisphive Web: http://{}:{}{}",
+                                "Wisphive Web: {}://{}:{}{}",
+                                scheme,
                                 if host_octets == [0, 0, 0, 0] {
                                     "0.0.0.0".to_string()
                                 } else {
@@ -505,7 +510,11 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("  WebSocket: http://{host}:{port}/ws");
                 eprintln!("  Run `cd crates/wisphive_web/frontend && npm run dev` for the UI");
             } else {
-                eprintln!("Wisphive Web: http://{host}:{port}");
+                // Production mode serves HTTPS via axum_server; the cert is
+                // self-signed so the browser warns on first visit. The
+                // daemon log emits the SHA-256 fingerprint at startup so
+                // operators can pin out-of-band.
+                eprintln!("Wisphive Web: https://{host}:{port}");
                 if host_octets == [0, 0, 0, 0] {
                     // Show local IP for LAN access
                     if let Ok(output) = std::process::Command::new("ipconfig")
@@ -516,7 +525,7 @@ fn main() -> anyhow::Result<()> {
                     {
                         let ip = ip.trim();
                         if !ip.is_empty() {
-                            eprintln!("  LAN:      http://{ip}:{port}");
+                            eprintln!("  LAN:      https://{ip}:{port}");
                         }
                     }
                 }
