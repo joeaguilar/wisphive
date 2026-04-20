@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useWisphive } from "./hooks/useWisphive";
 import { useKeyboard } from "./hooks/useKeyboard";
+import { useAuth } from "./hooks/useAuth";
 import { Queue } from "./components/Queue";
 import { DetailView } from "./components/DetailView";
 import { History } from "./components/History";
@@ -10,11 +11,36 @@ import { Agents } from "./components/Agents";
 import { SpawnModal } from "./components/SpawnModal";
 import { ConfigView } from "./components/Config";
 import { Terminals } from "./components/Terminals";
+import { Login } from "./components/Login";
 import "./app.css";
 
 type View = "queue" | "history" | "sessions" | "projects" | "agents" | "config" | "terminals";
 
 function App() {
+  const auth = useAuth();
+
+  // Gate the entire shell behind auth — mounting useWisphive before we
+  // have a token means the WS hook churns against the bearer-gated /ws
+  // endpoint for no reason. Hooks must run unconditionally, so split the
+  // authenticated shell into its own component.
+  if (auth.phase === "loading") {
+    return <div className="app-loading">Loading…</div>;
+  }
+  if (auth.phase !== "authed") {
+    return (
+      <Login
+        phase={auth.phase}
+        error={auth.error}
+        onLogin={auth.login}
+        onClearError={auth.clearError}
+        onRefreshStatus={auth.refreshStatus}
+      />
+    );
+  }
+  return <AuthedApp onLogout={auth.logout} />;
+}
+
+function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
   const {
     connected, queue, agents, projects, history, agentTimeline, sessionTimeline, sessions, terminals,
     approve, deny, spawnAgent, queryProjects, queryHistory, queryAgentTimeline, querySessionTimeline, searchHistory, querySessions,
@@ -116,6 +142,9 @@ function App() {
         </button>
         <button className="spawn-btn" onClick={() => setShowSpawn(true)}>
           + Spawn Agent
+        </button>
+        <button className="logout-btn" onClick={() => void onLogout()}>
+          Sign out
         </button>
         <div className="sidebar-agents">
           <h3>Agents ({agents.length})</h3>

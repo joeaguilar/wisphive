@@ -10,7 +10,7 @@ import type {
   SpawnAgentRequest,
   TerminalSessionMeta,
 } from "../types/protocol";
-import { getWebToken } from "../api";
+import { apiFetch, clearWebToken, getWebToken, subscribeAuthChange } from "../api";
 
 export interface WisphiveState {
   connected: boolean;
@@ -50,6 +50,7 @@ const CHANNEL_SESSION = "session";
 
 export function useWisphive() {
   const wsRef = useRef<WebSocket | null>(null);
+  const wsEverOpenedRef = useRef<boolean>(false);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const terminalHandlersRef = useRef<Map<string, TerminalOutputHandler>>(new Map());
   const [state, setState] = useState<WisphiveState>({
@@ -195,17 +196,23 @@ export function useWisphive() {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
     // Daemon requires a bearer token on /ws. Browsers can't set custom
-    // headers on WebSocket constructors, so we pass it as ?token=. If the
-    // token fetch fails the socket will 401 and trigger a reconnect.
-    const token = await getWebToken();
-    const url = token
-      ? `${WS_BASE}${WS_BASE.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}`
-      : WS_BASE;
+    // headers on WebSocket constructors, so we pass it as ?token=.
+    // If no token is present (logged out, Login not yet submitted), don't
+    // dial at all — we'd just trigger a thrashing reconnect loop against
+    // an auth-gated endpoint. The auth-change subscription below picks
+    // the connection back up once a token appears.
+    const token = getWebToken();
+    if (!token) {
+      setState((prev) => ({ ...prev, connected: false }));
+      return;
+    }
+    const url = `${WS_BASE}${WS_BASE.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}`;
 
     const ws = new WebSocket(url);
     wsRef.current = ws;
 
     ws.onopen = () => {
+      wsEverOpenedRef.current = true;
       if ("Notification" in window && Notification.permission === "default") {
         Notification.requestPermission();
       }
@@ -215,8 +222,34 @@ export function useWisphive() {
       handleMessage(event.data);
     };
 
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
       setState((prev) => ({ ...prev, connected: false }));
+      // 1008 (policy violation) and the 4xxx user-range codes are what
+      // the bridge sends when auth fails; 4401 is our "unauthorized"
+      // convention. Drop the local token so App re-gates to Login rather
+      // than hammering /ws in a reconnect loop.
+      if (ev.code === 1008 || ev.code === 4401 || ev.code === 4403) {
+        clearWebToken();
+        return;
+      }
+      // A 401 on the upgrade request manifests as code 1006 (abnormal
+      // closure) because the upgrade never completes. Can't tell that
+      // apart from a transient network blip just from the close event,
+      // so when we close before ever receiving a message, probe /api/me
+      // — apiFetch's 401 side effect will clear the token on its own if
+      // the server rejects us. If /api/me is fine, fall through to the
+      // normal reconnect path.
+      if (ev.code === 1006 && !wsEverOpenedRef.current && getWebToken()) {
+        void (async () => {
+          try {
+            // apiFetch clears the token on 401/403 via its side effect,
+            // which fires the auth-change listener and tears us down.
+            await apiFetch("/api/me");
+          } catch {
+            // Network error; leave it to the normal reconnect timer.
+          }
+        })();
+      }
       // eslint-disable-next-line react-hooks/immutability
       reconnectTimer.current = setTimeout(connect, 2000);
     };
@@ -232,6 +265,22 @@ export function useWisphive() {
       clearTimeout(reconnectTimer.current);
       wsRef.current?.close();
     };
+  }, [connect]);
+
+  // Re-dial when a token first appears (post-login) or tear down when it
+  // disappears (logout / 401). Cheap to subscribe; fires rarely.
+  useEffect(() => {
+    return subscribeAuthChange(() => {
+      const hasToken = !!getWebToken();
+      if (hasToken && wsRef.current?.readyState !== WebSocket.OPEN) {
+        clearTimeout(reconnectTimer.current);
+        void connect();
+      } else if (!hasToken) {
+        clearTimeout(reconnectTimer.current);
+        wsRef.current?.close();
+        wsRef.current = null;
+      }
+    });
   }, [connect]);
 
   const send = useCallback((msg: ClientMessage) => {
