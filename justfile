@@ -97,6 +97,16 @@ hooks-status:
 bootstrap: install hooks-install hooks-enable
     @echo "Wisphive ready. Run 'just daemon' in one terminal and 'just tui' in another."
 
+# One-shot: build frontend, rebuild+install binaries, restart daemon with web UI.
+# Browse to https://localhost:3100 (self-signed — accept the cert warning).
+all host="127.0.0.1" port="3100":
+    cd crates/wisphive_web/frontend && npm install && npm run build
+    ./install.sh
+    -wisphive daemon stop
+    wisphive hooks install --project .
+    @echo "Starting: https://{{host}}:{{port}}"
+    wisphive daemon start --host {{host}} --port {{port}}
+
 # Rebuild + reinstall + restart daemon (dev iteration)
 reinstall:
     ./install.sh
