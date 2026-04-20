@@ -634,18 +634,28 @@ pub(crate) async fn maybe_open_browser(
         return;
     }
 
-    // Hostname: loopback binds open `127.0.0.1` (stable, no DNS fallbacks);
-    // non-loopback binds likely mean `0.0.0.0` / LAN and we can't know
-    // which of the host's IPs the operator actually wants to hit, so we
-    // also fall back to 127.0.0.1 for the auto-open. Operators who want
-    // to browse from another machine can do so manually from the banner.
-    let host_for_url = if host == [0, 0, 0, 0] {
-        "127.0.0.1".to_string()
-    } else {
-        format!("{}.{}.{}.{}", host[0], host[1], host[2], host[3])
-    };
+    // Always auto-open against loopback. A specific `--host <lan-ip>` bind
+    // would otherwise produce a URL whose hostname isn't in the self-signed
+    // TLS cert's SAN list (only `127.0.0.1` + `::1` + `localhost` are there
+    // today; LAN IP SANs land with itr#270) — the tab would greet the
+    // operator with a cert-hostname-mismatch error instead of the setup
+    // screen. 127.0.0.1 is guaranteed to route to this machine, is always
+    // in the SAN, and the startup banner already prints the LAN URL for
+    // manual copy when the operator does want to browse from elsewhere.
+    let host_for_url = "127.0.0.1";
+    let _ = host; // bind still dictates listener; kept for future LAN-aware open
     let scheme = if dev { "http" } else { "https" };
     let url = format!("{scheme}://{host_for_url}:{port}/");
+    // Defense-in-depth against future ?query= being added: the URL must
+    // stay in an alphabet that's safe to pass to platform-specific
+    // openers (macOS `open`, Linux `xdg-open`, Windows `cmd /C start`).
+    // Today's format can't produce anything else, but asserting makes
+    // the invariant load-bearing.
+    debug_assert!(
+        url.chars()
+            .all(|c| c.is_ascii_alphanumeric() || ".:/-".contains(c)),
+        "auto-open URL contains unexpected characters: {url}"
+    );
 
     match open::that_detached(&url) {
         Ok(_) => tracing::info!(%url, "first-run: opened browser to Wisphive setup"),
