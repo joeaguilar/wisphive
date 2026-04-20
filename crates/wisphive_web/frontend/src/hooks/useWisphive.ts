@@ -32,8 +32,16 @@ export type TerminalOutputHandler = (
   bytes: Uint8Array,
 ) => void;
 
+// Match the page's protocol so an HTTPS-served page uses wss://. itr#214
+// flipped the backend to TLS in production (via axum_server::bind_rustls),
+// and browsers refuse mixed-content: a page loaded over https:// cannot
+// open a plain ws:// socket without being blocked. Dev mode still serves
+// plain HTTP, so http:// pages get ws://. VITE_WS_URL remains the escape
+// hatch for split-host dev setups where the Vite page and the WS backend
+// are on different origins entirely.
 const WS_BASE =
-  import.meta.env.VITE_WS_URL || `ws://${window.location.host}/ws`;
+  import.meta.env.VITE_WS_URL ||
+  `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}/ws`;
 
 // Well-known request_id prefixes for routing responses
 const CHANNEL_HISTORY = "history";
