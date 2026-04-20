@@ -26,10 +26,15 @@ fn db_path() -> PathBuf {
     wisphive_home().join("wisphive.db")
 }
 
+/// Open the state DB in client mode. CLI admin commands share the DB with
+/// a possibly-running daemon, so we must skip the daemon-only startup
+/// hook that flips `running` PTY rows to `orphaned` — running it from the
+/// CLI would corrupt a live daemon's terminal session state (itr#215
+/// review sec#5).
 async fn open_db() -> Result<StateDb> {
     let path = db_path();
     let s = path.to_string_lossy();
-    StateDb::open(&s)
+    StateDb::open_client(&s)
         .await
         .with_context(|| format!("opening state db at {s}"))
 }
@@ -50,15 +55,15 @@ fn prompt_password_twice() -> Result<Option<String>> {
     Ok(Some(first))
 }
 
-/// Ask for typed confirmation. Returns `true` only if the operator types
-/// `y` / `yes` (case-insensitive).
-fn confirm(prompt: &str) -> Result<bool> {
-    eprint!("{prompt} [y/N]: ");
+/// Require the operator to type `expected` literally (case-sensitive) to
+/// confirm a destructive action. Case-sensitive so a CapsLock user doesn't
+/// accidentally match and a muscle-memory `y` doesn't satisfy it either.
+fn confirm_typed(expected: &str) -> Result<bool> {
+    eprint!("Type {expected} to confirm: ");
     std::io::stderr().flush().ok();
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
-    let trimmed = line.trim().to_ascii_lowercase();
-    Ok(trimmed == "y" || trimmed == "yes")
+    Ok(line.trim() == expected)
 }
 
 /// `wisphive web set-password`
@@ -83,7 +88,7 @@ async fn persist_password(db: &StateDb, password: &str) -> Result<()> {
     let phc = auth::hash_password(password).context("hashing password")?;
     db.set_web_password(&phc)
         .await
-        .map_err(|e| anyhow::anyhow!("failed to store password hash: {e}"))?;
+        .context("storing password hash in state db")?;
     Ok(())
 }
 
@@ -98,14 +103,18 @@ pub async fn reset_password() -> Result<()> {
         "This wipes the web password, ALL trusted devices, and ALL enrolled passkeys.\n\
          The audit log is preserved. Anyone currently logged in will be forced to re-auth."
     );
-    if !confirm("Proceed?")? {
+    // Require a typed literal rather than `y/N`: review sec#2 noted that a
+    // single return keystroke (or a buffered newline from a piped stdin)
+    // could confirm a destructive wipe by accident. `RESET` is short but
+    // impossible to type unintentionally.
+    if !confirm_typed("RESET")? {
         eprintln!("aborted");
         return Ok(());
     }
     let db = open_db().await?;
     db.reset_web_password()
         .await
-        .map_err(|e| anyhow::anyhow!("failed to reset web password: {e}"))?;
+        .context("resetting web password + devices + passkeys")?;
     eprintln!("Web password + devices + passkeys wiped. Run `wisphive web set-password` to seed.");
     Ok(())
 }
@@ -118,10 +127,7 @@ pub async fn reset_password() -> Result<()> {
 /// terminal, not a pipeline.
 pub async fn devices_list() -> Result<()> {
     let db = open_db().await?;
-    let devices = db
-        .list_web_devices()
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to list devices: {e}"))?;
+    let devices = db.list_web_devices().await.context("listing web devices")?;
     if devices.is_empty() {
         eprintln!(
             "No trusted devices. Run `wisphive web set-password` then log in from a browser."
@@ -168,7 +174,7 @@ pub async fn devices_revoke(id: String) -> Result<()> {
     let db = open_db().await?;
     db.revoke_web_device(&id)
         .await
-        .map_err(|e| anyhow::anyhow!("failed to revoke device {id}: {e}"))?;
+        .with_context(|| format!("revoking device {id}"))?;
     eprintln!("Device {id} revoked (or already was).");
     Ok(())
 }
@@ -189,13 +195,15 @@ pub fn fingerprint() -> Result<()> {
             Ok(())
         }
         None => {
-            eprintln!(
-                "No TLS certificate at {}/web.cert.pem yet.\n\
-                 Start the web server once (`wisphive daemon start --web` or `wisphive web serve`) \
-                 and the cert will be minted on first run.",
+            // Return `Err` rather than `std::process::exit(1)` so the
+            // caller (`main`'s `?`) handles the exit code uniformly — and
+            // so tests can observe the failure without the process dying
+            // under them (review eff-NIT).
+            Err(anyhow::anyhow!(
+                "no TLS certificate at {}/web.cert.pem yet — start the web server once \
+                 (`wisphive daemon start --web` or `wisphive web serve`) so the cert is minted",
                 home.display()
-            );
-            std::process::exit(1);
+            ))
         }
     }
 }
@@ -210,7 +218,9 @@ mod tests {
     async fn tmp_db() -> (TempDir, StateDb) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("state.db");
-        let db = StateDb::open(path.to_str().unwrap()).await.unwrap();
+        // Tests exercise the client-mode opener so the CLI path is
+        // actually tested (not a daemon-mode open that would differ).
+        let db = StateDb::open_client(path.to_str().unwrap()).await.unwrap();
         (dir, db)
     }
 

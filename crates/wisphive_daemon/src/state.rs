@@ -178,8 +178,43 @@ pub struct StateDb {
 }
 
 impl StateDb {
-    /// Open (or create) the database at the given path.
+    /// Open (or create) the database at the given path. Call this from the
+    /// daemon process only — it runs startup hooks that are daemon-specific.
+    /// CLI callers sharing the DB must use [`Self::open_client`] instead.
     pub async fn open(path: &str) -> Result<Self> {
+        let db = Self::open_raw(path).await?;
+        // Any terminal session still marked running at daemon startup
+        // belongs to a prior daemon instance whose PTY is gone. Mark
+        // orphaned so replay still works but clients know the live stream
+        // is unreachable.
+        //
+        // CRITICAL — this MUST NOT run from non-daemon processes: a live
+        // daemon's running PTYs would all get flipped to orphaned and the
+        // daemon would continue writing events to rows the DB now considers
+        // ended. That's why the CLI uses `open_client` below.
+        db.mark_running_terminals_orphaned().await?;
+        info!("state database ready at {}", path);
+        Ok(db)
+    }
+
+    /// Open (or create) the database for a read/write client that is NOT
+    /// the daemon (CLI admin commands, migrations, tooling).
+    ///
+    /// Runs the same schema migration as [`Self::open`] — idempotent
+    /// `CREATE TABLE IF NOT EXISTS` + tolerant `ALTER TABLE ... ok()` —
+    /// but deliberately skips [`Self::mark_running_terminals_orphaned`],
+    /// which would otherwise corrupt the state of a running daemon's PTY
+    /// sessions (itr#215 review, sec#5: "CLI will corrupt daemon state").
+    pub async fn open_client(path: &str) -> Result<Self> {
+        let db = Self::open_raw(path).await?;
+        info!("state database ready (client mode) at {}", path);
+        Ok(db)
+    }
+
+    /// Shared open + migrate path used by both [`Self::open`] and
+    /// [`Self::open_client`]. Not public — callers must choose between
+    /// "daemon startup hooks" and "no startup hooks" explicitly.
+    async fn open_raw(path: &str) -> Result<Self> {
         // SQLite defaults `foreign_keys=OFF` per-connection. Enabling it on
         // the connect options applies to every pooled connection so the
         // `ON DELETE CASCADE` on web_passkeys → web_devices is actually
@@ -190,11 +225,6 @@ impl StateDb {
 
         let db = Self { pool };
         db.migrate().await?;
-        // Any terminal session still marked running at startup belongs to a
-        // prior daemon instance whose PTY is gone. Mark orphaned so replay
-        // still works but clients know the live stream is unreachable.
-        db.mark_running_terminals_orphaned().await?;
-        info!("state database ready at {}", path);
         Ok(db)
     }
 
@@ -2380,6 +2410,40 @@ mod tests {
         let got = db.get_terminal_session(id).await.unwrap().unwrap();
         assert_eq!(got.status, TerminalStatus::Orphaned);
         assert!(got.ended_at.is_some());
+    }
+
+    /// Regression (itr#215 sec#5): `open_client` MUST NOT run the
+    /// orphan-sweeper, otherwise CLI admin commands running against a
+    /// shared DB will corrupt a live daemon's terminal sessions by
+    /// flipping `running` rows to `orphaned` on every invocation.
+    ///
+    /// The test uses a file-backed DB because `:memory:` opens create a
+    /// fresh DB per connection — `open_client` and our first test handle
+    /// would see different data and the test would false-pass.
+    #[tokio::test]
+    async fn open_client_does_not_orphan_running_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let path_s = path.to_str().unwrap();
+
+        // Simulate the daemon creating a running session.
+        let daemon_db = StateDb::open(path_s).await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        daemon_db
+            .create_terminal_session(&make_term_meta(id))
+            .await
+            .unwrap();
+
+        // CLI client opens the same DB — must NOT flip running → orphaned.
+        let _client_db = StateDb::open_client(path_s).await.unwrap();
+
+        let got = daemon_db.get_terminal_session(id).await.unwrap().unwrap();
+        assert_eq!(
+            got.status,
+            TerminalStatus::Running,
+            "open_client orphaned a running session — CLI would corrupt daemon state"
+        );
+        assert!(got.ended_at.is_none());
     }
 
     // ════════════════════════════════════════════════════════════

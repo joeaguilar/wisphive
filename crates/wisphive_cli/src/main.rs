@@ -436,19 +436,14 @@ fn main() -> anyhow::Result<()> {
                         // implies "serve the web UI too".
                         let web_requested = web || web_dev || host != "127.0.0.1" || port != 3100;
                         let web_opts = if web_requested {
-                            let host_octets: [u8; 4] = match host.as_str() {
-                                "0.0.0.0" => [0, 0, 0, 0],
-                                "127.0.0.1" | "localhost" => [127, 0, 0, 1],
-                                other => {
-                                    let parts: Vec<u8> =
-                                        other.split('.').filter_map(|s| s.parse().ok()).collect();
-                                    if parts.len() == 4 {
-                                        [parts[0], parts[1], parts[2], parts[3]]
-                                    } else {
-                                        eprintln!("Invalid --host: {other}");
-                                        return Ok(());
-                                    }
-                                }
+                            // Use the same parser as `web serve` — including
+                            // the `0.0.0.0` LAN-exposure WARNING. Prior to
+                            // this the daemon-start path silently accepted
+                            // --host 0.0.0.0 while `web serve` warned, a
+                            // behavioral regression flagged in the itr#215
+                            // efficiency review (eff#1).
+                            let Some(host_octets) = parse_host_octets(&host) else {
+                                return Ok(());
                             };
                             // Dev mode stays http (Vite serves the UI over
                             // http and dragging the user through self-signed
@@ -526,29 +521,31 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Parse a dotted-quad IPv4 string into a `[u8; 4]` octet array, matching
-/// the `Command::Daemon Start --host` parser. Prints a `WARNING` on
-/// `0.0.0.0` so operators notice the exposure.
-fn parse_host_octets(host: &str) -> Result<Option<[u8; 4]>, ()> {
-    let octets = match host {
+/// Parse a dotted-quad IPv4 string into a `[u8; 4]` octet array. Shared by
+/// `wisphive web serve` and `wisphive daemon start --web`.
+///
+/// Returns `None` on invalid input — the error is already printed to
+/// stderr, so callers just need to exit cleanly. Prints a WARNING on
+/// `0.0.0.0` so operators notice the LAN exposure.
+fn parse_host_octets(host: &str) -> Option<[u8; 4]> {
+    match host {
         "0.0.0.0" => {
             eprintln!(
                 "WARNING: Web UI is exposed on all network interfaces. Ensure this is intentional."
             );
-            [0, 0, 0, 0]
+            Some([0, 0, 0, 0])
         }
-        "127.0.0.1" | "localhost" => [127, 0, 0, 1],
+        "127.0.0.1" | "localhost" => Some([127, 0, 0, 1]),
         other => {
             let parts: Vec<u8> = other.split('.').filter_map(|s| s.parse().ok()).collect();
             if parts.len() == 4 {
-                [parts[0], parts[1], parts[2], parts[3]]
+                Some([parts[0], parts[1], parts[2], parts[3]])
             } else {
                 eprintln!("Invalid host address: {other}");
-                return Ok(None);
+                None
             }
         }
-    };
-    Ok(Some(octets))
+    }
 }
 
 async fn serve_web(port: u16, host: String, dev: bool) -> anyhow::Result<()> {
@@ -558,10 +555,8 @@ async fn serve_web(port: u16, host: String, dev: bool) -> anyhow::Result<()> {
         .join(".wisphive");
     let socket_path = home.join("wisphive.sock");
 
-    let host_octets = match parse_host_octets(&host) {
-        Ok(Some(o)) => o,
-        Ok(None) => return Ok(()),
-        Err(_) => return Ok(()),
+    let Some(host_octets) = parse_host_octets(&host) else {
+        return Ok(());
     };
 
     print_startup_banner(&home, host_octets, port, dev);
