@@ -1044,6 +1044,22 @@ impl StateDb {
         Ok(())
     }
 
+    /// Atomic first-set: returns `true` iff no password existed before this
+    /// call. The onboarding endpoint uses this instead of check-then-upsert
+    /// so two concurrent first-run set-password requests can't both
+    /// "succeed" — the second race-loser sees `false` and gets a 409.
+    pub async fn try_set_initial_web_password(&self, argon2_hash: &str) -> WebAuthResult<bool> {
+        let result = sqlx::query(
+            "INSERT OR IGNORE INTO web_password (id, argon2_hash, updated_at) VALUES (1, ?, ?)",
+        )
+        .bind(argon2_hash)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await
+        .map_err(WebAuthError::from_sqlx)?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Fetch the stored web password hash, if one has been set.
     pub async fn get_web_password_hash(&self) -> WebAuthResult<Option<String>> {
         let row: Option<(String,)> =

@@ -5,9 +5,16 @@ interface Props {
   phase: UseAuth["phase"];
   error: AuthError | null;
   onLogin: UseAuth["login"];
+  onSetPassword: UseAuth["setPassword"];
   onClearError: UseAuth["clearError"];
   onRefreshStatus: UseAuth["refreshStatus"];
 }
+
+/** Minimum password length for onboarding. Must match the backend
+ * constant in `crates/wisphive_web/src/lib.rs::MIN_PASSWORD_LEN` — if
+ * they drift the UI validation fails differently than the server and the
+ * error gets blamed on the network. */
+const MIN_PASSWORD_LEN = 8;
 
 /** Derive a friendly default device name so the list in Settings/Devices
  * is recognisable ("MacBook (Chrome)") instead of a random UUID prefix.
@@ -41,13 +48,17 @@ export function Login({
   phase,
   error,
   onLogin,
+  onSetPassword,
   onClearError,
   onRefreshStatus,
 }: Props) {
   const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
   const [deviceName, setDeviceName] = useState(defaultDeviceName);
   const [submitting, setSubmitting] = useState(false);
   const [countdown, setCountdown] = useState(0);
+  const [localError, setLocalError] = useState<string | null>(null);
+  const isSetup = phase === "setup";
 
   // Drive the 429 Retry-After countdown. We trust the server-supplied value
   // and tick it down locally — cheaper than polling /api/auth/status.
@@ -74,26 +85,48 @@ export function Login({
     return () => clearInterval(interval);
   }, [error, isThrottled, onClearError]);
 
-  const disabled = submitting || countdown > 0 || phase === "setup";
+  const disabled = submitting || countdown > 0;
 
-  const onSubmit = useCallback(
+  const handleSubmit = useCallback(
     async (e: React.FormEvent) => {
       e.preventDefault();
       if (disabled || !password) return;
+      setLocalError(null);
+      if (isSetup) {
+        // Client-side floor matches the backend MIN_PASSWORD_LEN so a
+        // user with a weak password gets immediate feedback instead of
+        // a round-trip to a 400.
+        if (password.length < MIN_PASSWORD_LEN) {
+          setLocalError(`Password must be at least ${MIN_PASSWORD_LEN} characters.`);
+          return;
+        }
+        if (password !== confirm) {
+          setLocalError("Passwords do not match.");
+          return;
+        }
+      }
       setSubmitting(true);
       try {
-        const ok = await onLogin(password, deviceName);
-        // On success, wipe the password from React state immediately —
-        // React GC eventually reclaims closure-captured strings, but
-        // shortening the window is cheap belt-and-braces against memory
-        // dumps and devtools inspection. On failure, keep the field
-        // populated so the user can correct a typo.
-        if (ok) setPassword("");
+        const ok = isSetup
+          ? await onSetPassword(password, deviceName)
+          : await onLogin(password, deviceName);
+        // On success, wipe both password fields from React state
+        // immediately — React GC eventually reclaims closure-captured
+        // strings, but shortening the window is cheap belt-and-braces
+        // against memory dumps and devtools inspection. On failure,
+        // keep the main password field populated so the user can
+        // correct a typo; wipe the confirm so retry stays deliberate.
+        if (ok) {
+          setPassword("");
+          setConfirm("");
+        } else {
+          setConfirm("");
+        }
       } finally {
         setSubmitting(false);
       }
     },
-    [disabled, password, deviceName, onLogin],
+    [disabled, isSetup, password, confirm, deviceName, onLogin, onSetPassword],
   );
 
   return (
@@ -101,68 +134,90 @@ export function Login({
       <div className="login-card">
         <h1 className="login-title">wisphive</h1>
         <p className="login-subtitle">
-          {phase === "setup"
-            ? "No password is set on this host yet."
+          {isSetup
+            ? "Welcome. Set a password to finish setup."
             : "Sign in to review pending decisions."}
         </p>
 
-        {phase === "setup" ? (
-          <div className="login-setup">
-            <p>
-              Run this on the host, then return here:
-            </p>
-            <pre className="login-code">wisphive web set-password</pre>
-            <button
-              type="button"
-              className="login-refresh"
-              onClick={() => void onRefreshStatus()}
-            >
-              I've set the password
-            </button>
-          </div>
-        ) : (
-          <form onSubmit={onSubmit} className="login-form">
+        <form onSubmit={handleSubmit} className="login-form">
+          <label className="login-field">
+            <span>{isSetup ? "New password" : "Password"}</span>
+            <input
+              type="password"
+              autoComplete={isSetup ? "new-password" : "current-password"}
+              autoFocus
+              value={password}
+              onChange={(e) => {
+                setPassword(e.target.value);
+                if (localError) setLocalError(null);
+                if (error) onClearError();
+              }}
+              disabled={disabled}
+              minLength={isSetup ? MIN_PASSWORD_LEN : undefined}
+            />
+          </label>
+          {isSetup && (
             <label className="login-field">
-              <span>Password</span>
+              <span>Confirm password</span>
               <input
                 type="password"
-                autoComplete="current-password"
-                autoFocus
-                value={password}
+                autoComplete="new-password"
+                value={confirm}
                 onChange={(e) => {
-                  setPassword(e.target.value);
-                  if (error) onClearError();
+                  setConfirm(e.target.value);
+                  if (localError) setLocalError(null);
                 }}
                 disabled={disabled}
               />
             </label>
-            <label className="login-field">
-              <span>Device name</span>
-              <input
-                type="text"
-                autoComplete="off"
-                value={deviceName}
-                onChange={(e) => setDeviceName(e.target.value)}
-                disabled={disabled}
-                placeholder="e.g. MacBook (Chrome)"
-              />
-            </label>
-            {error && (
-              <div className={`login-error login-error-${error.kind}`} role="alert">
-                {error.kind === "throttled" && countdown > 0
-                  ? `Too many attempts — try again in ${countdown}s.`
-                  : error.message}
-              </div>
-            )}
-            <button
-              type="submit"
-              className="login-submit"
-              disabled={disabled || !password}
+          )}
+          <label className="login-field">
+            <span>Device name</span>
+            <input
+              type="text"
+              autoComplete="off"
+              value={deviceName}
+              onChange={(e) => setDeviceName(e.target.value)}
+              disabled={disabled}
+              placeholder="e.g. MacBook (Chrome)"
+            />
+          </label>
+          {(localError || error) && (
+            <div
+              className={`login-error login-error-${error?.kind ?? "invalid"}`}
+              role="alert"
             >
-              {submitting ? "Signing in…" : "Sign in"}
+              {localError
+                ? localError
+                : error?.kind === "throttled" && countdown > 0
+                  ? `Too many attempts — try again in ${countdown}s.`
+                  : error?.message}
+            </div>
+          )}
+          <button
+            type="submit"
+            className="login-submit"
+            disabled={disabled || !password || (isSetup && !confirm)}
+          >
+            {submitting
+              ? isSetup
+                ? "Setting password…"
+                : "Signing in…"
+              : isSetup
+                ? "Set password"
+                : "Sign in"}
+          </button>
+          {isSetup && (
+            <button
+              type="button"
+              className="login-refresh"
+              onClick={() => void onRefreshStatus()}
+              disabled={submitting}
+            >
+              I set it in a terminal — reload
             </button>
-          </form>
-        )}
+          )}
+        </form>
       </div>
     </div>
   );

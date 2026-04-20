@@ -33,6 +33,7 @@ function App() {
         phase={auth.phase}
         error={auth.error}
         onLogin={auth.login}
+        onSetPassword={auth.setPassword}
         onClearError={auth.clearError}
         onRefreshStatus={auth.refreshStatus}
       />

@@ -26,6 +26,10 @@ export interface UseAuth {
   error: AuthError | null;
   /** Submit credentials. Returns true on success. */
   login: (password: string, deviceName?: string) => Promise<boolean>;
+  /** First-run only: set the initial password and log in atomically.
+   * Returns true on success. 409 (password already set) flips phase to
+   * unauthed so the form can recover without a reload. */
+  setPassword: (password: string, deviceName?: string) => Promise<boolean>;
   logout: () => Promise<void>;
   /** Re-probe /api/auth/status (e.g. after an external password-set). */
   refreshStatus: () => Promise<void>;
@@ -164,6 +168,73 @@ export function useAuth(): UseAuth {
     [],
   );
 
+  const setPassword = useCallback(
+    async (password: string, deviceName?: string): Promise<boolean> => {
+      setError(null);
+      try {
+        const res = await apiFetch("/api/auth/set-password", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            password,
+            device_name: deviceName?.trim() || undefined,
+          }),
+        });
+        if (res.status === 200) {
+          const body = (await res.json()) as { device_id: string; token: string };
+          // Same atomic-login pattern as login(): persist token, move
+          // phase, and clear error without relying on listener ordering.
+          setWebToken(body.token);
+          setToken(body.token);
+          setPhase("authed");
+          return true;
+        }
+        if (res.status === 400) {
+          const text = await res.text();
+          setError({
+            kind: "invalid",
+            message: text || "Password does not meet requirements.",
+          });
+          return false;
+        }
+        if (res.status === 409) {
+          // Someone else set the password first (or the operator did it
+          // via CLI between page load and form submit). Flip to login
+          // phase so the same form can transition without a reload.
+          setPhase("unauthed");
+          setError({
+            kind: "invalid",
+            message: "Password is already set — sign in instead.",
+          });
+          return false;
+        }
+        if (res.status === 429) {
+          const retry = Number(res.headers.get("retry-after"));
+          const retryAfter =
+            Number.isFinite(retry) && retry > 0 ? Math.min(retry, 3600) : 30;
+          setError({
+            kind: "throttled",
+            message: "Too many attempts.",
+            retryAfter,
+          });
+          return false;
+        }
+        setError({
+          kind: "server",
+          message: `Set password failed (${res.status}).`,
+        });
+        return false;
+      } catch (e) {
+        setError({
+          kind: "network",
+          message: `Could not reach daemon: ${e instanceof Error ? e.message : String(e)}`,
+        });
+        return false;
+      }
+    },
+    [],
+  );
+
   const logout = useCallback(async () => {
     // Best-effort server-side revoke; local state is authoritative for UX.
     try {
@@ -181,6 +252,7 @@ export function useAuth(): UseAuth {
     token,
     error,
     login,
+    setPassword,
     logout,
     refreshStatus: probeStatus,
     clearError,

@@ -425,6 +425,177 @@ async fn get_auth_status(axum::extract::State(state): axum::extract::State<AppSt
     .into_response()
 }
 
+#[derive(Debug, Deserialize)]
+struct SetPasswordRequest {
+    password: String,
+    /// Matches `LoginRequest::device_name` — so the first device (the one
+    /// doing the bootstrap) gets a friendly label on the Devices list
+    /// without a follow-up rename.
+    #[serde(default)]
+    device_name: Option<String>,
+}
+
+/// Minimum password length for the onboarding endpoint. The operator sets
+/// this via the onboarding UI; enforcing a floor keeps the bar above
+/// "obviously bad" without being a full policy engine. The CLI's
+/// `wisphive web set-password` accepts anything — that's fine because the
+/// CLI requires shell access (a stronger trust signal than "browser reaches
+/// the loopback UI").
+const MIN_PASSWORD_LEN: usize = 8;
+
+/// POST /api/auth/set-password — first-run-only bootstrap over HTTP.
+///
+/// Used by the onboarding UI (itr#268) so the operator doesn't have to open
+/// a terminal and run `wisphive web set-password`. On success the handler
+/// both stores the hash AND mints a device token in the same response, so
+/// the browser transitions directly from "setup" to "authed" without a
+/// separate login round-trip.
+///
+/// The endpoint is unauthenticated (there's no token to present yet) and
+/// exempted from the setup-required gate in
+/// [`crate::security::path_bypasses_setup_gate`]. Protection surfaces are:
+/// (1) the [`LoginThrottle`] per-IP rate-limit, (2) atomic
+/// `try_set_initial_web_password` that returns `false` if a row already
+/// exists — serializing the race between two concurrent first-run attempts,
+/// (3) Origin/Host allowlist enforced upstream in `security.rs`.
+///
+/// Once a password exists the endpoint returns 409 permanently; changing or
+/// resetting goes through the CLI (`wisphive web reset-password`), which
+/// requires shell access on the daemon host.
+async fn post_auth_set_password(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    client_ip: ClientIp,
+    axum::Json(body): axum::Json<SetPasswordRequest>,
+) -> Response {
+    let security = state.security.clone();
+    let throttle = security.throttle().clone();
+    let db = security.state_db().clone();
+
+    let guard = match throttle.try_begin_attempt(client_ip.0).await {
+        Ok(g) => g,
+        Err(decision) => {
+            let retry = decision
+                .retry_after
+                .unwrap_or(Duration::from_secs(1))
+                .as_secs()
+                .max(1);
+            return (
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                [("retry-after", retry.to_string())],
+                "throttled",
+            )
+                .into_response();
+        }
+    };
+
+    if body.password.len() < MIN_PASSWORD_LEN {
+        guard.record_failure().await;
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("password must be at least {MIN_PASSWORD_LEN} characters"),
+        )
+            .into_response();
+    }
+
+    // Hash on the blocking pool — Argon2 is CPU-bound.
+    let password = body.password.clone();
+    let hash_handle = tokio::task::spawn_blocking(move || auth::hash_password(&password));
+    let phc = match tokio::time::timeout(VERIFY_DEADLINE, hash_handle).await {
+        Ok(Ok(Ok(phc))) => phc,
+        Ok(Ok(Err(e))) => {
+            tracing::warn!(error = %e, "argon2 hash failed");
+            guard.record_failure().await;
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+            )
+                .into_response();
+        }
+        Ok(Err(join_err)) => {
+            tracing::warn!(error = %join_err, "hash task panicked");
+            guard.record_failure().await;
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+            )
+                .into_response();
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                deadline_secs = VERIFY_DEADLINE.as_secs(),
+                "password hash exceeded deadline"
+            );
+            guard.record_failure().await;
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+            )
+                .into_response();
+        }
+    };
+
+    match db.try_set_initial_web_password(&phc).await {
+        Ok(true) => {} // first-run, row inserted
+        Ok(false) => {
+            // Password already set — reset flow is CLI-only. Record as a
+            // failure for throttle purposes so a script that keeps POSTing
+            // can't abuse this as a free probe.
+            guard.record_failure().await;
+            return (
+                axum::http::StatusCode::CONFLICT,
+                "password already set; use `wisphive web reset-password`",
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "try_set_initial_web_password failed");
+            guard.record_failure().await;
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+            )
+                .into_response();
+        }
+    }
+
+    // Atomically mint the first device token so the onboarding UI lands
+    // in the authenticated shell without a second round-trip. Same shape
+    // as LoginResponse so the frontend can reuse the login handler.
+    let id = uuid::Uuid::new_v4().to_string();
+    let name = body.device_name.clone().unwrap_or_else(|| {
+        let short = id.get(..8).unwrap_or("unknown");
+        format!("device-{short}")
+    });
+    let token = auth::generate_device_token();
+    if let Err(e) = db.insert_web_device(&id, &name, &token.hash_hex).await {
+        tracing::warn!(error = %e, "set-password: failed to persist device token");
+        guard.record_failure().await;
+        // The password IS set at this point — leave it; the operator can
+        // just hit /api/auth/login with the new password to recover.
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "password stored but could not record device; retry login",
+        )
+            .into_response();
+    }
+
+    let _ = db
+        .append_web_audit(
+            "web_password_set",
+            Some(&id),
+            Some(&client_ip.0.to_string()),
+            None,
+        )
+        .await;
+
+    guard.record_success().await;
+    axum::Json(LoginResponse {
+        device_id: id,
+        token: token.raw,
+    })
+    .into_response()
+}
+
 /// POST /api/auth/logout — revoke the caller's own device.
 ///
 /// Gated by the security middleware, so reaching this handler means
@@ -547,6 +718,7 @@ fn build_router(state: AppState, dev_mode: bool) -> Router {
         .route("/ws", get(ws_handler))
         .route("/api/auth/status", get(get_auth_status))
         .route("/api/auth/login", post(post_auth_login))
+        .route("/api/auth/set-password", post(post_auth_set_password))
         .route("/api/auth/logout", post(post_auth_logout))
         .route("/api/auth/reauth", post(post_auth_reauth))
         .route("/api/me", get(get_me))

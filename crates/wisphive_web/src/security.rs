@@ -394,7 +394,11 @@ pub(crate) fn path_requires_device_token(path: &str) -> bool {
     if path == "/ws" {
         return true;
     }
-    if path == "/api/auth/login" || path == "/api/auth/status" || path == "/api/web-token" {
+    if path == "/api/auth/login"
+        || path == "/api/auth/status"
+        || path == "/api/auth/set-password"
+        || path == "/api/web-token"
+    {
         return false;
     }
     path.starts_with("/api/")
@@ -422,12 +426,13 @@ fn setup_required_response() -> Response {
 ///
 /// In setup-required mode (no web password set yet), every `/api/*` and
 /// `/ws` request must be refused with 503 — *except* the bootstrap
-/// discovery surface. `/api/auth/status` is the one endpoint the frontend
-/// hits before it knows there's a password; it has to answer honestly so
-/// the SPA can redirect to the setup page. Once itr#215 lands, the setup
-/// endpoint itself (`/api/auth/setup`, POST-only) will join this list.
+/// discovery surface. `/api/auth/status` is the discovery probe; the SPA
+/// hits it before it knows there's a password and needs an honest answer
+/// to pick the setup-vs-login branch. `/api/auth/set-password` is the
+/// onboarding POST itself (itr#268) — it has no token to present and can
+/// only succeed in setup mode (internally 409s once a password exists).
 fn path_bypasses_setup_gate(path: &str) -> bool {
-    path == "/api/auth/status"
+    path == "/api/auth/status" || path == "/api/auth/set-password"
 }
 
 /// Read a presented token from `Authorization: Bearer <raw>` or `?token=<raw>`.
@@ -488,6 +493,7 @@ mod tests {
     #[test]
     fn path_bypasses_setup_gate_rules() {
         assert!(path_bypasses_setup_gate("/api/auth/status"));
+        assert!(path_bypasses_setup_gate("/api/auth/set-password"));
         assert!(!path_bypasses_setup_gate("/api/auth/login"));
         assert!(!path_bypasses_setup_gate("/api/config"));
         assert!(!path_bypasses_setup_gate("/api/devices"));

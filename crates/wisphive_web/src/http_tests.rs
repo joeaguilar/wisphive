@@ -822,3 +822,112 @@ async fn devices_list_without_token_returns_401() {
     let (status, _) = run(r).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+// ── /api/auth/set-password (itr#268) ────────────────────────────────
+
+/// Variant of test_state that leaves web_password empty — needed for
+/// first-run bootstrap tests. The shared helper pre-seeds a password so
+/// login tests have something to verify against.
+async fn test_state_no_password() -> (tempfile::TempDir, AppState) {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("wisphive.db");
+    let db = StateDb::open(db_path.to_string_lossy().as_ref())
+        .await
+        .unwrap();
+    let security =
+        SecurityConfig::for_test(vec![ORIGIN.to_string()], vec![HOST.to_string()], db.clone());
+    let socket_path = tmp.path().join("wisphive.sock");
+    let config_path = tmp.path().join("config.json");
+    (
+        tmp,
+        AppState {
+            socket_path,
+            config_path,
+            security,
+        },
+    )
+}
+
+#[tokio::test]
+async fn set_password_first_run_issues_device_token() {
+    let (_tmp, state) = test_state_no_password().await;
+    let body = r#"{"password":"hunter2-onboard","device_name":"laptop"}"#;
+    let r = req("POST", "/api/auth/set-password")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let (status, body) = run_with(state.clone(), r).await;
+    assert_eq!(status, StatusCode::OK, "first-run set-password should succeed");
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(v.get("device_id").and_then(|s| s.as_str()).is_some());
+    assert!(v.get("token").and_then(|s| s.as_str()).is_some());
+    // Password is now persisted — subsequent set attempts must fail.
+    assert!(
+        state
+            .security
+            .state_db()
+            .get_web_password_hash()
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn set_password_rejects_when_already_set() {
+    // Shared test_state() already seeds a password.
+    let (_tmp, state) = test_state().await;
+    let body = r#"{"password":"late-to-the-party"}"#;
+    let r = req("POST", "/api/auth/set-password")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let (status, _) = run_with(state, r).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "second set-password must 409 to prevent takeover"
+    );
+}
+
+#[tokio::test]
+async fn set_password_rejects_weak_password() {
+    let (_tmp, state) = test_state_no_password().await;
+    let body = r#"{"password":"short"}"#;
+    let r = req("POST", "/api/auth/set-password")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let (status, _) = run_with(state.clone(), r).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // Must NOT persist the weak password.
+    assert!(
+        state
+            .security
+            .state_db()
+            .get_web_password_hash()
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn set_password_bypasses_setup_required_gate() {
+    // Regression for the security.rs path_bypasses_setup_gate wiring —
+    // without the bypass, this would 503 under the setup-required gate
+    // instead of reaching the handler.
+    let (_tmp, state) = test_state_no_password().await;
+    let body = r#"{"password":"hunter2-onboard"}"#;
+    let r = req("POST", "/api/auth/set-password")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let (status, _) = run_with(state, r).await;
+    assert_ne!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "setup gate must bypass /api/auth/set-password"
+    );
+    assert_eq!(status, StatusCode::OK);
+}
