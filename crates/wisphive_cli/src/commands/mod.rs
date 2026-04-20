@@ -6,3 +6,4 @@ pub mod history;
 pub mod hooks;
 pub mod term;
 pub mod tui;
+pub mod web;

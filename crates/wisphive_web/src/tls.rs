@@ -507,6 +507,32 @@ fn local_hostname_local() -> Option<String> {
     }
 }
 
+/// Read the on-disk TLS cert fingerprint without minting a fresh cert.
+///
+/// Returns `Ok(None)` when the PEM file does not exist — the caller should
+/// tell the operator to start the web server once so `ensure_cert` can run.
+/// Errors propagate for other IO failures (EACCES, corrupt PEM, etc.) so
+/// the operator can see what's wrong rather than getting a silent miss.
+///
+/// This is deliberately not an `ensure_cert` caller: the fingerprint CLI
+/// runs without knowing the bind host, and passing a default (e.g.
+/// 127.0.0.1) into `ensure_cert` would trigger a SAN-drift regeneration on
+/// a cert originally minted for `0.0.0.0`, silently invalidating any
+/// fingerprint the operator already pinned.
+pub fn read_cert_fingerprint(home_dir: &Path) -> Result<Option<String>> {
+    let cert_path = home_dir.join(CERT_FILENAME);
+    let pem = match fs::read(&cert_path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(e).with_context(|| format!("reading cert {}", cert_path.display()));
+        }
+    };
+    let der = cert_der_from_pem(&pem)
+        .with_context(|| format!("no X509 block in {}", cert_path.display()))?;
+    Ok(Some(fingerprint_from_der(&der)))
+}
+
 /// Produce the list of `https://...:port` URLs we'd happily serve on. Used
 /// for the startup banner so the user knows what to type into their phone.
 pub fn enumerate_lan_urls(bind_host: IpAddr, port: u16) -> Vec<String> {
@@ -779,6 +805,31 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .expect("test_lock poisoned — a prior ensure_cert test panicked inside the critical section; check the first failure")
+    }
+
+    /// `read_cert_fingerprint` returns `Ok(None)` on a fresh home dir
+    /// (no cert) — the CLI relies on this to give the operator a pointed
+    /// "run the server once" message rather than a cryptic IO error.
+    #[test]
+    fn read_fingerprint_missing_cert_is_none() {
+        let dir = TempDir::new().unwrap();
+        let r = read_cert_fingerprint(dir.path()).unwrap();
+        assert!(r.is_none(), "empty home dir should yield None, got {r:?}");
+    }
+
+    /// Once `ensure_cert` has run, `read_cert_fingerprint` must return the
+    /// exact same fingerprint — without regenerating, and byte-for-byte.
+    /// itr#215: the `wisphive web fingerprint` CLI is pointless if it
+    /// disagrees with what the server logs at startup.
+    #[test]
+    fn read_fingerprint_matches_ensure_cert() {
+        let _guard = test_lock();
+        let dir = TempDir::new().unwrap();
+        let ensured = ensure_cert(dir.path(), IpAddr::V4(Ipv4Addr::LOCALHOST)).unwrap();
+        let read = read_cert_fingerprint(dir.path())
+            .unwrap()
+            .expect("cert should exist after ensure_cert");
+        assert_eq!(ensured.fingerprint_sha256, read);
     }
 
     /// itr#224: no `<file>.tmp` should linger after a successful run; if one

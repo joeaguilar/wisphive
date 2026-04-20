@@ -18,17 +18,10 @@ enum Command {
     /// Launch the TUI client
     Tui,
 
-    /// Launch the Web UI server
+    /// Web UI server + admin (password, devices, TLS fingerprint)
     Web {
-        /// HTTP port (default: 3100)
-        #[arg(short, long, default_value = "3100")]
-        port: u16,
-        /// Bind address (default: 127.0.0.1, use 0.0.0.0 for LAN access)
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-        /// Dev mode: only serve WebSocket, expect Vite dev server for frontend
-        #[arg(long)]
-        dev: bool,
+        #[command(subcommand)]
+        action: WebAction,
     },
 
     /// Daemon management
@@ -75,6 +68,44 @@ enum Command {
     Term {
         #[command(subcommand)]
         action: TermAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum WebAction {
+    /// Serve the Web UI (default — flags match the pre-subcommand form)
+    Serve {
+        /// HTTP port (default: 3100)
+        #[arg(short, long, default_value = "3100")]
+        port: u16,
+        /// Bind address (default: 127.0.0.1, use 0.0.0.0 for LAN access)
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Dev mode: only serve WebSocket, expect Vite dev server for frontend
+        #[arg(long)]
+        dev: bool,
+    },
+    /// Set the web admin password (prompts twice, stores Argon2id hash)
+    SetPassword,
+    /// Wipe password + every trusted device + every enrolled passkey
+    ResetPassword,
+    /// Manage trusted devices
+    Devices {
+        #[command(subcommand)]
+        action: DevicesAction,
+    },
+    /// Print the on-disk TLS certificate's SHA-256 fingerprint
+    Fingerprint,
+}
+
+#[derive(Subcommand)]
+enum DevicesAction {
+    /// List every device (active and revoked), newest first
+    List,
+    /// Revoke a device by UUID (idempotent)
+    Revoke {
+        /// Device UUID (from `devices list`)
+        id: String,
     },
 }
 
@@ -421,23 +452,13 @@ fn main() -> anyhow::Result<()> {
                             };
                             // Dev mode stays http (Vite serves the UI over
                             // http and dragging the user through self-signed
-                            // TLS isn't worth it); prod is https.
-                            let scheme = if web_dev { "http" } else { "https" };
-                            eprintln!(
-                                "Wisphive Web: {}://{}:{}{}",
-                                scheme,
-                                if host_octets == [0, 0, 0, 0] {
-                                    "0.0.0.0".to_string()
-                                } else {
-                                    host.clone()
-                                },
-                                port,
-                                if web_dev {
-                                    " (dev mode — run `npm run dev` for the UI)"
-                                } else {
-                                    ""
-                                },
-                            );
+                            // TLS isn't worth it); prod is https, and the
+                            // banner enumerates every LAN URL + fingerprint.
+                            let home = std::env::var("HOME")
+                                .map(std::path::PathBuf::from)
+                                .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+                                .join(".wisphive");
+                            print_startup_banner(&home, host_octets, port, web_dev);
                             Some(commands::daemon::WebOptions {
                                 host: host_octets,
                                 port,
@@ -478,59 +499,109 @@ fn main() -> anyhow::Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(commands::tui::run())
         }
-        Command::Web { port, host, dev } => {
-            let rt = tokio::runtime::Runtime::new()?;
-            let home = std::env::var("HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
-                .join(".wisphive");
-            let socket_path = home.join("wisphive.sock");
-
-            let host_octets: [u8; 4] = match host.as_str() {
-                "0.0.0.0" => {
-                    eprintln!(
-                        "WARNING: Web UI is exposed on all network interfaces. Ensure this is intentional."
-                    );
-                    [0, 0, 0, 0]
-                }
-                "127.0.0.1" | "localhost" => [127, 0, 0, 1],
-                other => {
-                    let parts: Vec<u8> = other.split('.').filter_map(|s| s.parse().ok()).collect();
-                    if parts.len() == 4 {
-                        [parts[0], parts[1], parts[2], parts[3]]
-                    } else {
-                        eprintln!("Invalid host address: {other}");
-                        return Ok(());
-                    }
-                }
-            };
-
-            if dev {
-                eprintln!("Wisphive Web (dev mode)");
-                eprintln!("  WebSocket: http://{host}:{port}/ws");
-                eprintln!("  Run `cd crates/wisphive_web/frontend && npm run dev` for the UI");
-            } else {
-                // Production mode serves HTTPS via axum_server; the cert is
-                // self-signed so the browser warns on first visit. The
-                // daemon log emits the SHA-256 fingerprint at startup so
-                // operators can pin out-of-band.
-                eprintln!("Wisphive Web: https://{host}:{port}");
-                if host_octets == [0, 0, 0, 0] {
-                    // Show local IP for LAN access
-                    if let Ok(output) = std::process::Command::new("ipconfig")
-                        .arg("getifaddr")
-                        .arg("en0")
-                        .output()
-                        && let Ok(ip) = String::from_utf8(output.stdout)
-                    {
-                        let ip = ip.trim();
-                        if !ip.is_empty() {
-                            eprintln!("  LAN:      https://{ip}:{port}");
-                        }
-                    }
-                }
+        Command::Web { action } => match action {
+            WebAction::Serve { port, host, dev } => {
+                let rt = tokio::runtime::Runtime::new()?;
+                rt.block_on(serve_web(port, host, dev))
             }
-            rt.block_on(wisphive_web::serve(socket_path, port, dev, host_octets))
+            WebAction::SetPassword => {
+                let rt = tokio::runtime::Runtime::new()?;
+                rt.block_on(commands::web::set_password())
+            }
+            WebAction::ResetPassword => {
+                let rt = tokio::runtime::Runtime::new()?;
+                rt.block_on(commands::web::reset_password())
+            }
+            WebAction::Devices { action } => {
+                let rt = tokio::runtime::Runtime::new()?;
+                rt.block_on(async move {
+                    match action {
+                        DevicesAction::List => commands::web::devices_list().await,
+                        DevicesAction::Revoke { id } => commands::web::devices_revoke(id).await,
+                    }
+                })
+            }
+            WebAction::Fingerprint => commands::web::fingerprint(),
+        },
+    }
+}
+
+/// Parse a dotted-quad IPv4 string into a `[u8; 4]` octet array, matching
+/// the `Command::Daemon Start --host` parser. Prints a `WARNING` on
+/// `0.0.0.0` so operators notice the exposure.
+fn parse_host_octets(host: &str) -> Result<Option<[u8; 4]>, ()> {
+    let octets = match host {
+        "0.0.0.0" => {
+            eprintln!(
+                "WARNING: Web UI is exposed on all network interfaces. Ensure this is intentional."
+            );
+            [0, 0, 0, 0]
         }
+        "127.0.0.1" | "localhost" => [127, 0, 0, 1],
+        other => {
+            let parts: Vec<u8> = other.split('.').filter_map(|s| s.parse().ok()).collect();
+            if parts.len() == 4 {
+                [parts[0], parts[1], parts[2], parts[3]]
+            } else {
+                eprintln!("Invalid host address: {other}");
+                return Ok(None);
+            }
+        }
+    };
+    Ok(Some(octets))
+}
+
+async fn serve_web(port: u16, host: String, dev: bool) -> anyhow::Result<()> {
+    let home = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+        .join(".wisphive");
+    let socket_path = home.join("wisphive.sock");
+
+    let host_octets = match parse_host_octets(&host) {
+        Ok(Some(o)) => o,
+        Ok(None) => return Ok(()),
+        Err(_) => return Ok(()),
+    };
+
+    print_startup_banner(&home, host_octets, port, dev);
+
+    wisphive_web::serve(socket_path, port, dev, host_octets).await
+}
+
+/// Emit the pre-serve banner: scheme + bind + every LAN URL the TLS cert
+/// covers + the on-disk fingerprint (in prod). Replaces the old
+/// `ipconfig getifaddr en0` probe, which only found the first wired/WiFi
+/// interface on macOS and returned nothing on Linux.
+///
+/// The banner is best-effort: a missing fingerprint (first-run before
+/// `ensure_cert` has run) or `enumerate_lan_urls` empty list should not
+/// prevent the server from starting. Errors go to stderr with a note, not
+/// a bail.
+fn print_startup_banner(home: &std::path::Path, host_octets: [u8; 4], port: u16, dev: bool) {
+    if dev {
+        let host_str = if host_octets == [0, 0, 0, 0] {
+            "0.0.0.0".to_string()
+        } else {
+            format!(
+                "{}.{}.{}.{}",
+                host_octets[0], host_octets[1], host_octets[2], host_octets[3]
+            )
+        };
+        eprintln!("Wisphive Web (dev mode)");
+        eprintln!("  WebSocket: http://{host_str}:{port}/ws");
+        eprintln!("  Run `cd crates/wisphive_web/frontend && npm run dev` for the UI");
+        return;
+    }
+
+    eprintln!("Wisphive Web (TLS):");
+    let bind_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::from(host_octets));
+    for url in wisphive_web::tls::enumerate_lan_urls(bind_ip, port) {
+        eprintln!("  {url}");
+    }
+    match wisphive_web::tls::read_cert_fingerprint(home) {
+        Ok(Some(fp)) => eprintln!("  fingerprint: {fp}"),
+        Ok(None) => eprintln!("  fingerprint: (cert will be minted on first request)"),
+        Err(e) => eprintln!("  fingerprint: (read error: {e})"),
     }
 }

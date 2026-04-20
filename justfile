@@ -47,11 +47,11 @@ tui:
 
 # Start the web UI server (production — serves embedded frontend assets)
 web port="8080" host="127.0.0.1":
-    wisphive web --host {{host}} --port {{port}}
+    wisphive web serve --host {{host}} --port {{port}}
 
 # Start the web UI in dev mode (WebSocket only — run `just frontend-dev` in another terminal)
 web-dev port="8080":
-    wisphive web --dev --port {{port}}
+    wisphive web serve --dev --port {{port}}
 
 # Start the daemon with the web UI in the same process
 daemon-web port="8080" host="127.0.0.1":
