@@ -105,7 +105,8 @@ export type ServerMessage =
   | { type: "term_ended"; id: string; exit_code?: number; status: TerminalStatus }
   | { type: "term_replay_chunk"; id: string; seq: number; ts_us: number; direction: TerminalDirection; data: string }
   | { type: "term_replay_done"; id: string; total_events: number }
-  | { type: "term_error"; id?: string; message: string };
+  | { type: "term_error"; id?: string; message: string }
+  | { type: "web_reauth_required"; device_id: string; tool_name: string; at: string };
 
 export interface ProjectSummary {
   project: string;

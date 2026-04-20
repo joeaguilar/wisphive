@@ -1786,3 +1786,37 @@ kbd {
   }
 }
 
+/* Sudo modal (itr#255) — shares error / field styling with Login so the two
+ * password surfaces feel identical. */
+.sudo-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+
+.sudo-subtitle {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--font-base);
+  line-height: 1.5;
+}
+
+.sudo-tool {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--cyan);
+  padding: 2px 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: var(--font-sm);
+}
+
+@media (max-width: 480px) {
+  .sudo-form .modal-actions {
+    flex-direction: column-reverse;
+  }
+  .sudo-form .modal-actions button {
+    width: 100%;
+  }
+}
+

@@ -22,7 +22,23 @@ export interface WisphiveState {
   sessions: SessionSummary[];
   projects: ProjectSummary[];
   terminals: TerminalSessionMeta[];
+  /** Set when the daemon refuses a sudo-class approve with
+   * `web_reauth_required`. The App renders SudoModal while this is non-null;
+   * on successful reauth the hook's `retryPendingApprove` replays the stashed
+   * approve. Null when no sudo prompt is pending. */
+  pendingReauth: PendingReauth | null;
 }
+
+export interface PendingReauth {
+  tool_name: string;
+}
+
+type ApproveOpts = {
+  message?: string;
+  updated_input?: unknown;
+  always_allow?: boolean;
+  additional_context?: string;
+};
 
 /// Callback fired when live PTY output arrives. Consumers wire this into
 /// xterm.js to render the session.
@@ -53,6 +69,11 @@ export function useWisphive() {
   const wsEverOpenedRef = useRef<boolean>(false);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const terminalHandlersRef = useRef<Map<string, TerminalOutputHandler>>(new Map());
+  // Last approve attempt, stashed so a successful reauth can replay it with
+  // the exact same (id, opts). Single-slot because the daemon's sudo gate is
+  // per-click: the browser only ever has one approve in flight at a time
+  // from the user's POV, and a fresh click clobbers the previous stash.
+  const lastApproveRef = useRef<{ id: string; opts?: ApproveOpts } | null>(null);
   const [state, setState] = useState<WisphiveState>({
     connected: false,
     queue: [],
@@ -63,6 +84,7 @@ export function useWisphive() {
     sessions: [],
     projects: [],
     terminals: [],
+    pendingReauth: null,
   });
 
   const handleMessage = useCallback((data: string) => {
@@ -182,6 +204,14 @@ export function useWisphive() {
           case "term_error":
             console.warn("Terminal error:", msg.message);
             return prev;
+
+          case "web_reauth_required":
+            // Daemon rejected a sudo-class approve from this device. App.tsx
+            // reads `pendingReauth` and mounts SudoModal; on success the
+            // modal calls retryPendingApprove which replays lastApproveRef.
+            // If a reauth is already pending, prefer the newer tool_name —
+            // it reflects whatever the user most recently clicked.
+            return { ...prev, pendingReauth: { tool_name: msg.tool_name } };
 
           default:
             return prev;
@@ -310,11 +340,45 @@ export function useWisphive() {
   }, []);
 
   const approve = useCallback(
-    (id: string, opts?: { message?: string; updated_input?: unknown; always_allow?: boolean; additional_context?: string }) => {
+    (id: string, opts?: ApproveOpts) => {
+      // Stash before sending: if the daemon bounces this with
+      // web_reauth_required, retryPendingApprove needs the exact same
+      // (id, opts) tuple to replay.
+      lastApproveRef.current = { id, opts };
       send({ type: "approve", id, ...opts });
     },
     [send],
   );
+
+  /** User cancels the sudo modal (Esc / Cancel). Clear the pending state
+   * and drop the stashed approve so a later reauth success doesn't replay
+   * a request the user chose to abandon. */
+  const dismissReauth = useCallback(() => {
+    lastApproveRef.current = null;
+    setState((prev) => ({ ...prev, pendingReauth: null }));
+  }, []);
+
+  // Mirror of queue into a ref so retryPendingApprove can check "is the
+  // request still pending?" without pulling queue into its useCallback deps
+  // (which would churn every connected component that uses the hook on
+  // every decision delta).
+  const queueRef = useRef<DecisionRequest[]>([]);
+  useEffect(() => {
+    queueRef.current = state.queue;
+  }, [state.queue]);
+
+  /** Called by SudoModal on 200 from /api/auth/reauth. Replays the stashed
+   * approve iff its request_id is still in the queue — if the request was
+   * resolved out-of-band (e.g. another client approved it) there's nothing
+   * to replay and we just close the modal. */
+  const retryPendingApprove = useCallback(() => {
+    const pending = lastApproveRef.current;
+    lastApproveRef.current = null;
+    if (pending && queueRef.current.some((r) => r.id === pending.id)) {
+      send({ type: "approve", id: pending.id, ...pending.opts });
+    }
+    setState((prev) => ({ ...prev, pendingReauth: null }));
+  }, [send]);
 
   const deny = useCallback(
     (id: string, message?: string) => {
@@ -448,6 +512,8 @@ export function useWisphive() {
     send,
     approve,
     deny,
+    dismissReauth,
+    retryPendingApprove,
     queryHistory,
     queryAgentTimeline,
     querySessionTimeline,

@@ -12,6 +12,7 @@ import { SpawnModal } from "./components/SpawnModal";
 import { ConfigView } from "./components/Config";
 import { Terminals } from "./components/Terminals";
 import { Login } from "./components/Login";
+import { SudoModal } from "./components/SudoModal";
 import "./app.css";
 
 type View = "queue" | "history" | "sessions" | "projects" | "agents" | "config" | "terminals";
@@ -43,7 +44,8 @@ function App() {
 function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
   const {
     connected, queue, agents, projects, history, agentTimeline, sessionTimeline, sessions, terminals,
-    approve, deny, spawnAgent, queryProjects, queryHistory, queryAgentTimeline, querySessionTimeline, searchHistory, querySessions,
+    pendingReauth, approve, deny, dismissReauth, retryPendingApprove,
+    spawnAgent, queryProjects, queryHistory, queryAgentTimeline, querySessionTimeline, searchHistory, querySessions,
     termList, termCreate, termAttach, termDetach, termInput, termResize, termClose, termReplay, termSetGroup, termReorder, registerTerminalHandler,
   } = useWisphive();
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -282,6 +284,14 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
           defaultProject={spawnDefaultProject}
           onSpawn={(req) => { spawnAgent(req); setShowSpawn(false); setSpawnDefaultProject(undefined); }}
           onClose={() => { setShowSpawn(false); setSpawnDefaultProject(undefined); }}
+        />
+      )}
+
+      {pendingReauth && (
+        <SudoModal
+          toolName={pendingReauth.tool_name}
+          onCancel={dismissReauth}
+          onSuccess={retryPendingApprove}
         />
       )}
     </div>
