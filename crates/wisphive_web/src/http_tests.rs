@@ -763,6 +763,34 @@ async fn devices_revoke_other_device() {
     assert_eq!(s3, StatusCode::OK);
 }
 
+/// `/api/devices/{self.id}/revoke` is the symmetric partner to
+/// `/api/auth/logout`: same effect (the caller's token gets revoked,
+/// next request 401s), different UX surface (the devices-list "remove
+/// this device" row, vs the logout button). The handler's docstring
+/// claims this works; pin it so a future "don't let a device revoke
+/// itself" overzealous-refactor regresses noisily instead of silently.
+#[tokio::test]
+async fn devices_revoke_self_ends_session() {
+    let (_tmp, state) = test_state().await;
+    let (token, device_id) = seed_device(state.security.state_db(), "mine").await;
+
+    let r = req("POST", &format!("/api/devices/{device_id}/revoke"))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = run_with(state.clone(), r).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Next request with the now-revoked token must 401 — the handler
+    // succeeded, even though the caller revoked their own credential.
+    let r2 = req("GET", "/api/config")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let (s2, _) = run_with(state, r2).await;
+    assert_eq!(s2, StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test]
 async fn devices_revoke_is_idempotent() {
     let (_tmp, state) = test_state().await;

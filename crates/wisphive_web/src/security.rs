@@ -209,19 +209,24 @@ impl SecurityConfig {
     /// — a nasty latent bug that stayed hidden while the server was plain
     /// HTTP (no ALPN → no h2 → Host always present). The TLS swap in
     /// itr#214 flipped it on.
+    ///
+    /// Disagreement policy: RFC 9113 §8.3.1 requires `Host` and `:authority`
+    /// to match exactly when both appear. hyper may or may not enforce this
+    /// upstream depending on version / h2 settings (the two reviewers of
+    /// itr#214 disagreed on its current behaviour), so we enforce it here
+    /// too. A client that wants to pass a privileged Host: while steering
+    /// TLS/SNI via a different :authority would otherwise have a narrow
+    /// bypass window.
     fn check_host(&self, headers: &HeaderMap, uri: &Uri) -> bool {
-        let candidate = headers
-            .get("host")
-            .and_then(|h| h.to_str().ok())
-            .map(str::to_owned)
-            .or_else(|| uri.authority().map(|a| a.to_string()));
-        let Some(host) = candidate else {
-            // Neither a Host header nor an :authority pseudo-header is a
-            // genuinely malformed request; reject rather than silently
-            // allow. HTTP/1.1 requires Host, and HTTP/2 requires :authority.
-            return false;
+        let header_host = headers.get("host").and_then(|h| h.to_str().ok());
+        let authority = uri.authority().map(axum::http::uri::Authority::as_str);
+        let candidate = match (header_host, authority) {
+            (Some(h), Some(a)) if h != a => return false,
+            (Some(h), _) => h,
+            (None, Some(a)) => a,
+            (None, None) => return false,
         };
-        self.inner.allowed_hosts.contains(&host)
+        self.inner.allowed_hosts.iter().any(|h| h == candidate)
     }
 
     fn check_origin(&self, headers: &HeaderMap) -> bool {
@@ -557,6 +562,31 @@ mod tests {
         // rebind escape hatch).
         let evil_uri: Uri = "https://evil.example/api/auth/status".parse().unwrap();
         assert!(!security.check_host(&HeaderMap::new(), &evil_uri));
+
+        // Host/:authority disagreement MUST be rejected even when one of
+        // the two is in the allowlist. This closes a narrow bypass where a
+        // client could steer TLS/SNI to an :authority the server trusts
+        // while presenting a Host the handler would gate on. RFC 9113 §8.3.1
+        // mandates exact match; we enforce it here defensively.
+        let mut mixed = HeaderMap::new();
+        mixed.insert("host", "127.0.0.1:3199".parse().unwrap());
+        let mismatched_uri: Uri = "https://evil.example:3199/api/auth/status".parse().unwrap();
+        assert!(
+            !security.check_host(&mixed, &mismatched_uri),
+            "disagreement between Host header and :authority must 403"
+        );
+        // Inverse: allowlisted :authority with a Host that says otherwise
+        // is equally rejected.
+        let mut evil_host = HeaderMap::new();
+        evil_host.insert("host", "evil.example:3199".parse().unwrap());
+        let good_uri: Uri = "https://127.0.0.1:3199/api/auth/status".parse().unwrap();
+        assert!(!security.check_host(&evil_host, &good_uri));
+
+        // Agreement on the allowlisted host: accepted.
+        let mut matching = HeaderMap::new();
+        matching.insert("host", "127.0.0.1:3199".parse().unwrap());
+        let matching_uri: Uri = "https://127.0.0.1:3199/api/auth/status".parse().unwrap();
+        assert!(security.check_host(&matching, &matching_uri));
     }
 
     #[test]

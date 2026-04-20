@@ -589,6 +589,20 @@ pub async fn serve(
     dev_mode: bool,
     host: [u8; 4],
 ) -> anyhow::Result<()> {
+    // Dev mode serves plain HTTP so Vite (http://localhost:5173) can talk
+    // to it without a self-signed-cert trust dance. That's fine on
+    // loopback, where the only attacker is one that already owns the
+    // host. It is NOT fine on 0.0.0.0 or any LAN address: every password,
+    // device token, and decision envelope would travel in the clear over
+    // Wi-Fi. Refuse rather than quietly do the wrong thing.
+    let bind_host: IpAddr = Ipv4Addr::from(host).into();
+    if dev_mode && !bind_host.is_loopback() {
+        anyhow::bail!(
+            "refusing to serve dev-mode (cleartext HTTP) on non-loopback bind {bind_host}:{port}; \
+             drop --web-dev or bind to 127.0.0.1"
+        );
+    }
+
     let home_dir = socket_path
         .parent()
         .unwrap_or(std::path::Path::new("."))
@@ -601,7 +615,6 @@ pub async fn serve(
     // safely.
     let state_db = StateDb::open(db_path.to_string_lossy().as_ref()).await?;
 
-    let bind_host: IpAddr = Ipv4Addr::from(host).into();
     let security = SecurityConfig::build(state_db, bind_host, port, dev_mode)?;
 
     let state = AppState {
