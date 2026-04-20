@@ -84,6 +84,11 @@ enum WebAction {
         /// Dev mode: only serve WebSocket, expect Vite dev server for frontend
         #[arg(long)]
         dev: bool,
+        /// Suppress the first-run browser auto-open (useful for headless
+        /// servers / CI / when launched from a UI wrapper that opens its own
+        /// WebView).
+        #[arg(long)]
+        no_open: bool,
     },
     /// Set the web admin password (prompts twice, stores Argon2id hash)
     SetPassword,
@@ -217,6 +222,11 @@ enum DaemonAction {
         /// Dev mode: only serve the WebSocket, expect Vite dev server for the frontend.
         #[arg(long)]
         web_dev: bool,
+        /// Suppress the first-run browser auto-open (ignored when --web is
+        /// not active). Useful for headless servers, CI, and UI wrappers
+        /// that open their own WebView.
+        #[arg(long)]
+        no_open: bool,
     },
     /// Stop the running daemon
     Stop,
@@ -431,6 +441,7 @@ fn main() -> anyhow::Result<()> {
                         host,
                         port,
                         web_dev,
+                        no_open,
                     } => {
                         // Any of --web / non-default --host / non-default --port / --web-dev
                         // implies "serve the web UI too".
@@ -458,6 +469,7 @@ fn main() -> anyhow::Result<()> {
                                 host: host_octets,
                                 port,
                                 dev: web_dev,
+                                no_open,
                             })
                         } else {
                             None
@@ -495,9 +507,14 @@ fn main() -> anyhow::Result<()> {
             rt.block_on(commands::tui::run())
         }
         Command::Web { action } => match action {
-            WebAction::Serve { port, host, dev } => {
+            WebAction::Serve {
+                port,
+                host,
+                dev,
+                no_open,
+            } => {
                 let rt = tokio::runtime::Runtime::new()?;
-                rt.block_on(serve_web(port, host, dev))
+                rt.block_on(serve_web(port, host, dev, no_open))
             }
             WebAction::SetPassword => {
                 let rt = tokio::runtime::Runtime::new()?;
@@ -548,7 +565,7 @@ fn parse_host_octets(host: &str) -> Option<[u8; 4]> {
     }
 }
 
-async fn serve_web(port: u16, host: String, dev: bool) -> anyhow::Result<()> {
+async fn serve_web(port: u16, host: String, dev: bool, no_open: bool) -> anyhow::Result<()> {
     let home = std::env::var("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
@@ -561,7 +578,83 @@ async fn serve_web(port: u16, host: String, dev: bool) -> anyhow::Result<()> {
 
     print_startup_banner(&home, host_octets, port, dev);
 
-    wisphive_web::serve(socket_path, port, dev, host_octets).await
+    // itr#267: if this is a first-run install, pop the default browser
+    // onto the SPA once the server is actually listening. The SPA decides
+    // between the Login and Onboarding screens based on /api/auth/status,
+    // so we always open the root `/` — no `?token=` in the URL, since the
+    // per-process web.token bootstrap was retired in itr#213.
+    let browser_task = if no_open {
+        None
+    } else {
+        Some(tokio::spawn(maybe_open_browser(
+            home.join("wisphive.db"),
+            host_octets,
+            port,
+            dev,
+        )))
+    };
+
+    let result = wisphive_web::serve(socket_path, port, dev, host_octets).await;
+    if let Some(h) = browser_task {
+        h.abort();
+    }
+    result
+}
+
+/// Build the user-facing URL for the web UI and (on first-run) open it in
+/// the default browser. Intentionally a no-op on failure: a missing default
+/// browser or a sandboxed CI runner should log a warning and move on, never
+/// panic or block startup.
+///
+/// Called for `wisphive web serve` and `wisphive daemon start --web`. The
+/// caller MUST have already ensured `no_open` is false before spawning
+/// this task.
+pub(crate) async fn maybe_open_browser(
+    db_path: std::path::PathBuf,
+    host: [u8; 4],
+    port: u16,
+    dev: bool,
+) {
+    // Small delay so the axum/axum-server `bind` has a chance to land
+    // before we point a browser at the port. Without this the first tab
+    // races the bind and usually reloads once — ugly but not fatal.
+    // 400ms is enough in practice and still feels instant to the human.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    // Open the same DB the web server will — WAL + connection pooling
+    // makes this safe. We hold the handle only for the first-run check.
+    let db = match wisphive_daemon::state::StateDb::open(db_path.to_string_lossy().as_ref()).await {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::warn!(error = %e, "first-run browser: failed to open state DB; skipping");
+            return;
+        }
+    };
+    if !wisphive_web::auth::is_first_run(&db).await {
+        return;
+    }
+
+    // Hostname: loopback binds open `127.0.0.1` (stable, no DNS fallbacks);
+    // non-loopback binds likely mean `0.0.0.0` / LAN and we can't know
+    // which of the host's IPs the operator actually wants to hit, so we
+    // also fall back to 127.0.0.1 for the auto-open. Operators who want
+    // to browse from another machine can do so manually from the banner.
+    let host_for_url = if host == [0, 0, 0, 0] {
+        "127.0.0.1".to_string()
+    } else {
+        format!("{}.{}.{}.{}", host[0], host[1], host[2], host[3])
+    };
+    let scheme = if dev { "http" } else { "https" };
+    let url = format!("{scheme}://{host_for_url}:{port}/");
+
+    match open::that_detached(&url) {
+        Ok(_) => tracing::info!(%url, "first-run: opened browser to Wisphive setup"),
+        Err(e) => tracing::warn!(
+            %url,
+            error = %e,
+            "first-run: failed to open default browser; visit the URL manually"
+        ),
+    }
 }
 
 /// Emit the pre-serve banner: scheme + bind + every LAN URL the TLS cert

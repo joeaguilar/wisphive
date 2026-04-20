@@ -30,6 +30,7 @@ use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 use tracing::warn;
+use wisphive_daemon::state::StateDb;
 
 // ---------------------------------------------------------------------------
 // Password hashing
@@ -75,6 +76,33 @@ pub fn verify_password(password: &str, phc: &str) -> bool {
     Argon2::default()
         .verify_password(password.as_bytes(), &parsed)
         .is_ok()
+}
+
+/// True when no web admin password has been stored — i.e. this is a fresh
+/// install and the CLI entrypoints should open a browser onto the SPA so
+/// the user is dropped straight into the setup flow (itr#267).
+///
+/// Inherently racy: a concurrent `wisphive web set-password` can flip the
+/// answer between the check and the caller acting on it. Callers must treat
+/// this as advisory — the SPA itself probes `/api/auth/status` on load and
+/// will route to Login instead of Onboarding when a password has already
+/// been set, so the race is self-healing.
+pub async fn is_first_run(db: &StateDb) -> bool {
+    match db.get_web_password_hash().await {
+        Ok(Some(_)) => false,
+        Ok(None) => true,
+        Err(e) => {
+            // Fail-closed on DB error: we'd rather NOT auto-open a browser
+            // than pop one on a corrupted / permissions-wrong DB and
+            // confuse the operator. The daemon itself will surface the
+            // real error when it tries to use the DB for anything else.
+            warn!(
+                error = %e,
+                "is_first_run: failed to read web password hash; assuming NOT first-run"
+            );
+            false
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -945,6 +973,37 @@ mod tests {
         assert_eq!(
             len, MAX_THROTTLE_ENTRIES,
             "map grew past cap to {len}; itr#229 bound regressed"
+        );
+    }
+
+    /// itr#267: first-run detection. Fresh DB → true; after
+    /// `set_web_password` → false. The CLI uses this to decide whether
+    /// to auto-open the browser on `daemon start --web`.
+    #[tokio::test]
+    async fn is_first_run_flips_after_password_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("wisphive.db");
+        let db = StateDb::open(db_path.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+
+        // Fresh install: no password → first-run.
+        assert!(is_first_run(&db).await, "fresh DB should be first-run");
+
+        // After set_web_password: first-run flips false.
+        let phc = hash_password("hunter2-test").unwrap();
+        db.set_web_password(&phc).await.unwrap();
+        assert!(
+            !is_first_run(&db).await,
+            "DB with password set should NOT be first-run"
+        );
+
+        // Reset brings it back to first-run — a reset should re-trigger
+        // the onboarding flow, which matches the UX the CLI wires up.
+        db.reset_web_password().await.unwrap();
+        assert!(
+            is_first_run(&db).await,
+            "DB after reset_web_password should be first-run again"
         );
     }
 

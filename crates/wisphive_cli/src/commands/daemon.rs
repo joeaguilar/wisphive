@@ -10,6 +10,10 @@ pub struct WebOptions {
     pub host: [u8; 4],
     pub port: u16,
     pub dev: bool,
+    /// itr#267: if `false` and the web admin password has never been set,
+    /// auto-open the default browser onto the onboarding URL once the
+    /// server is listening. CLI flag: `--no-open`.
+    pub no_open: bool,
 }
 
 /// Start the daemon in the foreground. Optionally also serve the web UI in
@@ -44,20 +48,37 @@ pub async fn start(web: Option<WebOptions>) -> Result<()> {
     // racing it here. A short retry loop inside serve() (via its socket
     // connect on each upgrade) handles that gracefully since each WebSocket
     // client opens a fresh connection per upgrade.
-    let web_handle = if let Some(opts) = web {
+    let (web_handle, browser_handle) = if let Some(opts) = web {
         let socket_path = config.socket_path.clone();
         let addr = std::net::SocketAddr::from((opts.host, opts.port));
         info!(%addr, dev = opts.dev, "starting embedded web server");
         if opts.host == [0, 0, 0, 0] {
             warn!("web UI is listening on all interfaces (0.0.0.0). Ensure this is intentional.");
         }
-        Some(tokio::spawn(async move {
-            if let Err(e) = wisphive_web::serve(socket_path, opts.port, opts.dev, opts.host).await {
+
+        // itr#267: auto-open the default browser on first-run. Fire-and-
+        // forget in its own task so a missing browser (CI, headless) can't
+        // block — or crash — daemon startup.
+        let browser = if opts.no_open {
+            None
+        } else {
+            let db_path = config.db_path.clone();
+            Some(tokio::spawn(crate::maybe_open_browser(
+                db_path, opts.host, opts.port, opts.dev,
+            )))
+        };
+
+        let host = opts.host;
+        let port = opts.port;
+        let dev = opts.dev;
+        let serve = tokio::spawn(async move {
+            if let Err(e) = wisphive_web::serve(socket_path, port, dev, host).await {
                 tracing::error!("embedded web server exited: {e}");
             }
-        }))
+        });
+        (Some(serve), browser)
     } else {
-        None
+        (None, None)
     };
 
     // Run the server (blocks until shutdown)
@@ -66,6 +87,11 @@ pub async fn start(web: Option<WebOptions>) -> Result<()> {
 
     // Stop the web task if it's still running.
     if let Some(handle) = web_handle {
+        handle.abort();
+    }
+    // And the first-run browser task, in case the user set the password
+    // between the check and the server exiting.
+    if let Some(handle) = browser_handle {
         handle.abort();
     }
 
