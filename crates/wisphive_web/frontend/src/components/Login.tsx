@@ -51,8 +51,9 @@ export function Login({
 
   // Drive the 429 Retry-After countdown. We trust the server-supplied value
   // and tick it down locally — cheaper than polling /api/auth/status.
+  const isThrottled = error?.kind === "throttled";
   useEffect(() => {
-    if (error?.kind !== "throttled" || !error.retryAfter) {
+    if (!isThrottled || !error?.retryAfter) {
       setCountdown(0);
       return;
     }
@@ -61,14 +62,17 @@ export function Login({
       setCountdown((c) => {
         if (c <= 1) {
           clearInterval(interval);
-          onClearError();
+          // Only clear the throttled error — a fresh error that arrived
+          // mid-countdown (e.g. user typed something racy) must survive.
+          // The effect's dep on `error` guarantees we see the latest.
+          if (error?.kind === "throttled") onClearError();
           return 0;
         }
         return c - 1;
       });
     }, 1000);
     return () => clearInterval(interval);
-  }, [error, onClearError]);
+  }, [error, isThrottled, onClearError]);
 
   const disabled = submitting || countdown > 0 || phase === "setup";
 
@@ -78,10 +82,13 @@ export function Login({
       if (disabled || !password) return;
       setSubmitting(true);
       try {
-        await onLogin(password, deviceName);
-        // On success the parent unmounts this component; on failure we
-        // keep the password field populated so the user can correct it
-        // (matches native form ergonomics).
+        const ok = await onLogin(password, deviceName);
+        // On success, wipe the password from React state immediately —
+        // React GC eventually reclaims closure-captured strings, but
+        // shortening the window is cheap belt-and-braces against memory
+        // dumps and devtools inspection. On failure, keep the field
+        // populated so the user can correct a typo.
+        if (ok) setPassword("");
       } finally {
         setSubmitting(false);
       }

@@ -208,6 +208,13 @@ export function useWisphive() {
     }
     const url = `${WS_BASE}${WS_BASE.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}`;
 
+    // Reset per-connection state before the dial: the 1006 stale-token
+    // probe branch below keys off "never opened on *this* socket", so
+    // carrying the flag across a logout/login within the same hook
+    // instance would skip the probe and leave us in a reconnect loop
+    // against a revoked token.
+    wsEverOpenedRef.current = false;
+
     const ws = new WebSocket(url);
     wsRef.current = ws;
 
@@ -269,6 +276,13 @@ export function useWisphive() {
 
   // Re-dial when a token first appears (post-login) or tear down when it
   // disappears (logout / 401). Cheap to subscribe; fires rarely.
+  //
+  // Load-bearing: the outer useEffect above re-runs whenever `connect`'s
+  // identity changes, which would close+reopen the socket. `connect` is
+  // a useCallback of [handleMessage], and handleMessage is a useCallback
+  // of []. If a future edit ever makes handleMessage dep on state, this
+  // hook will churn the socket on every state update. Keep handleMessage
+  // dep-free.
   useEffect(() => {
     return subscribeAuthChange(() => {
       const hasToken = !!getWebToken();
@@ -277,7 +291,13 @@ export function useWisphive() {
         void connect();
       } else if (!hasToken) {
         clearTimeout(reconnectTimer.current);
-        wsRef.current?.close();
+        // Null the close handler before tearing down: otherwise the
+        // existing onclose will fire async after logout, see a stale
+        // wsRef, and schedule a reconnect we don't want.
+        if (wsRef.current) {
+          wsRef.current.onclose = null;
+          wsRef.current.close();
+        }
         wsRef.current = null;
       }
     });

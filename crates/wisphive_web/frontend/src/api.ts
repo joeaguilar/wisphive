@@ -68,7 +68,12 @@ export function subscribeAuthChange(listener: AuthListener): () => void {
 }
 
 function notifyAuthChange(): void {
-  for (const l of authListeners) {
+  // Snapshot before iterating: a listener may (re-entrantly) call
+  // setWebToken/clearWebToken, which would mutate `authListeners` mid-
+  // iteration. Set iteration tolerates deletes but visits newly-added
+  // entries — an add-during-notify could loop indefinitely given a
+  // sufficiently hostile listener. `Array.from` sidesteps both cases.
+  for (const l of Array.from(authListeners)) {
     try {
       l();
     } catch (e) {

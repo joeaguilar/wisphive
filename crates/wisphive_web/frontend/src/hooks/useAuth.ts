@@ -60,7 +60,11 @@ export function useAuth(): UseAuth {
 
   const probeStatus = useCallback(async () => {
     try {
-      const res = await fetch("/api/auth/status");
+      // Route through apiFetch even though /api/auth/status is the one
+      // unauthenticated endpoint: keeps the "all fetch sites share the
+      // same auth-failure side effects" invariant documented in api.ts
+      // intact if this endpoint ever gains auth semantics.
+      const res = await apiFetch("/api/auth/status");
       if (!res.ok) {
         setPhase("unauthed");
         return;
@@ -114,9 +118,15 @@ export function useAuth(): UseAuth {
         });
         if (res.status === 200) {
           const body = (await res.json()) as { device_id: string; token: string };
-          // setWebToken fires the auth-change subscription, which moves
-          // phase → "authed" and mirrors `token` into local state.
+          // setWebToken fires the auth-change subscription, but also
+          // update local state directly — don't make correctness depend
+          // on listener iteration ordering, and prevent a racing render
+          // from seeing phase="unauthed" between setWebToken and the
+          // listener callback.
           setWebToken(body.token);
+          setToken(body.token);
+          setPhase("authed");
+          setError(null);
           return true;
         }
         if (res.status === 401) {
@@ -124,11 +134,17 @@ export function useAuth(): UseAuth {
           return false;
         }
         if (res.status === 429) {
-          const retry = Number(res.headers.get("retry-after") ?? "0");
+          const retry = Number(res.headers.get("retry-after"));
+          // Cap at 1 hour — a malformed or malicious upstream sending
+          // Retry-After: 999999999 would otherwise freeze the UI for
+          // decades with a valid-looking countdown. Floor at 30s keeps
+          // the throttle visible without being noise.
+          const retryAfter =
+            Number.isFinite(retry) && retry > 0 ? Math.min(retry, 3600) : 30;
           setError({
             kind: "throttled",
             message: "Too many attempts.",
-            retryAfter: Number.isFinite(retry) && retry > 0 ? retry : 30,
+            retryAfter,
           });
           return false;
         }
