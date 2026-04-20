@@ -426,9 +426,17 @@ pub enum ServerMessage {
     /// A sudo-class approve from `device_id` was rejected because the device's
     /// reauth grace window has expired. The web frontend uses this to open
     /// the sudo modal.
+    ///
+    /// `request_id` carries the id of the specific DecisionRequest that got
+    /// gated — the browser needs it to correlate the reauth with the exact
+    /// approve to retry. Without it, rapid back-to-back sudo approves race:
+    /// the browser's single-slot stash would be clobbered by the later event
+    /// and the earlier request would block until the daemon's decision
+    /// timeout fires.
     #[serde(rename = "web_reauth_required")]
     WebReauthRequired {
         device_id: String,
+        request_id: String,
         tool_name: String,
         at: chrono::DateTime<chrono::Utc>,
     },
@@ -1320,6 +1328,7 @@ mod tests {
     fn round_trip_web_reauth_required() {
         let msg = ServerMessage::WebReauthRequired {
             device_id: "dev-3".into(),
+            request_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
             tool_name: "Bash".into(),
             at: chrono::Utc::now(),
         };
@@ -1328,10 +1337,12 @@ mod tests {
         match decoded {
             ServerMessage::WebReauthRequired {
                 device_id,
+                request_id,
                 tool_name,
                 ..
             } => {
                 assert_eq!(device_id, "dev-3");
+                assert_eq!(request_id, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
                 assert_eq!(tool_name, "Bash");
             }
             _ => panic!("unexpected variant"),

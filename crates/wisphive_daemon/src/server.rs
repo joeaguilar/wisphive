@@ -516,6 +516,7 @@ async fn handle_tui(
                                     {
                                         let reauth_msg = ServerMessage::WebReauthRequired {
                                             device_id: dev.0.clone(),
+                                            request_id: id.to_string(),
                                             tool_name: tool_name.clone(),
                                             at: chrono::Utc::now(),
                                         };
@@ -610,6 +611,7 @@ async fn handle_tui(
                                     for (id, tool_name) in gated {
                                         let reauth_msg = ServerMessage::WebReauthRequired {
                                             device_id: dev.0.clone(),
+                                            request_id: id.to_string(),
                                             tool_name: tool_name.clone(),
                                             at: chrono::Utc::now(),
                                         };

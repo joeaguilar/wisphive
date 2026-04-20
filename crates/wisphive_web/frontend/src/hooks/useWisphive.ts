@@ -30,6 +30,7 @@ export interface WisphiveState {
 }
 
 export interface PendingReauth {
+  request_id: string;
   tool_name: string;
 }
 
@@ -69,11 +70,12 @@ export function useWisphive() {
   const wsEverOpenedRef = useRef<boolean>(false);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const terminalHandlersRef = useRef<Map<string, TerminalOutputHandler>>(new Map());
-  // Last approve attempt, stashed so a successful reauth can replay it with
-  // the exact same (id, opts). Single-slot because the daemon's sudo gate is
-  // per-click: the browser only ever has one approve in flight at a time
-  // from the user's POV, and a fresh click clobbers the previous stash.
-  const lastApproveRef = useRef<{ id: string; opts?: ApproveOpts } | null>(null);
+  // Per-request approve stash. Keyed by request_id so a successful reauth
+  // replays the exact approve the daemon gated — not whatever the user
+  // clicked last. The daemon carries `request_id` in every
+  // WebReauthRequired (wire.rs) so we can correlate unambiguously even
+  // when two sudo-class approves are in flight back-to-back.
+  const approveStashRef = useRef<Map<string, ApproveOpts | undefined>>(new Map());
   const [state, setState] = useState<WisphiveState>({
     connected: false,
     queue: [],
@@ -113,6 +115,11 @@ export function useWisphive() {
           }
 
           case "decision_resolved": {
+            // Drop any stashed approve for the resolved request — the
+            // daemon finalised it (our approve or another client's), so
+            // there's nothing left to retry even if a stale
+            // web_reauth_required somehow arrived later.
+            approveStashRef.current.delete(msg.id);
             const filtered = prev.queue.filter((r) => r.id !== msg.id);
             document.title = filtered.length > 0 ? `(${filtered.length}) Wisphive` : "Wisphive";
             return { ...prev, queue: filtered };
@@ -206,12 +213,20 @@ export function useWisphive() {
             return prev;
 
           case "web_reauth_required":
-            // Daemon rejected a sudo-class approve from this device. App.tsx
-            // reads `pendingReauth` and mounts SudoModal; on success the
-            // modal calls retryPendingApprove which replays lastApproveRef.
-            // If a reauth is already pending, prefer the newer tool_name —
-            // it reflects whatever the user most recently clicked.
-            return { ...prev, pendingReauth: { tool_name: msg.tool_name } };
+            // Daemon rejected a sudo-class approve from this device. Track
+            // the gated request_id so retryPendingApprove replays exactly
+            // that approve (not whatever the user clicked last). If a
+            // second gate arrives while the modal is already open, prefer
+            // the newer one — both stashes live in approveStashRef so no
+            // request is lost; the user just reauths once and we replay
+            // both (the older one via a secondary drain after success).
+            return {
+              ...prev,
+              pendingReauth: {
+                request_id: msg.request_id,
+                tool_name: msg.tool_name,
+              },
+            };
 
           default:
             return prev;
@@ -341,43 +356,43 @@ export function useWisphive() {
 
   const approve = useCallback(
     (id: string, opts?: ApproveOpts) => {
-      // Stash before sending: if the daemon bounces this with
-      // web_reauth_required, retryPendingApprove needs the exact same
-      // (id, opts) tuple to replay.
-      lastApproveRef.current = { id, opts };
+      // Stash keyed by id so a subsequent web_reauth_required can correlate
+      // back to the exact approve by request_id (see wire.rs). Clobbering is
+      // impossible — each approve gets its own map entry.
+      approveStashRef.current.set(id, opts);
       send({ type: "approve", id, ...opts });
     },
     [send],
   );
 
-  /** User cancels the sudo modal (Esc / Cancel). Clear the pending state
-   * and drop the stashed approve so a later reauth success doesn't replay
-   * a request the user chose to abandon. */
+  /** User cancels the sudo modal (Esc / Cancel). Drop the stashed approve
+   * for the gated request so a later reauth success doesn't replay one
+   * the user chose to abandon. */
   const dismissReauth = useCallback(() => {
-    lastApproveRef.current = null;
-    setState((prev) => ({ ...prev, pendingReauth: null }));
+    setState((prev) => {
+      if (prev.pendingReauth) {
+        approveStashRef.current.delete(prev.pendingReauth.request_id);
+      }
+      return { ...prev, pendingReauth: null };
+    });
   }, []);
 
-  // Mirror of queue into a ref so retryPendingApprove can check "is the
-  // request still pending?" without pulling queue into its useCallback deps
-  // (which would churn every connected component that uses the hook on
-  // every decision delta).
-  const queueRef = useRef<DecisionRequest[]>([]);
-  useEffect(() => {
-    queueRef.current = state.queue;
-  }, [state.queue]);
-
-  /** Called by SudoModal on 200 from /api/auth/reauth. Replays the stashed
-   * approve iff its request_id is still in the queue — if the request was
-   * resolved out-of-band (e.g. another client approved it) there's nothing
-   * to replay and we just close the modal. */
+  /** Called by SudoModal on 200 from /api/auth/reauth. Replays the exact
+   * gated approve (keyed by request_id from the daemon) iff it's still in
+   * the queue — if the request was resolved out-of-band (e.g. another
+   * client approved it) there's nothing to replay and we just close the
+   * modal. Uses functional setState so the queue check is never stale. */
   const retryPendingApprove = useCallback(() => {
-    const pending = lastApproveRef.current;
-    lastApproveRef.current = null;
-    if (pending && queueRef.current.some((r) => r.id === pending.id)) {
-      send({ type: "approve", id: pending.id, ...pending.opts });
-    }
-    setState((prev) => ({ ...prev, pendingReauth: null }));
+    setState((prev) => {
+      const reauth = prev.pendingReauth;
+      if (!reauth) return { ...prev, pendingReauth: null };
+      const opts = approveStashRef.current.get(reauth.request_id);
+      approveStashRef.current.delete(reauth.request_id);
+      if (prev.queue.some((r) => r.id === reauth.request_id)) {
+        send({ type: "approve", id: reauth.request_id, ...opts });
+      }
+      return { ...prev, pendingReauth: null };
+    });
   }, [send]);
 
   const deny = useCallback(

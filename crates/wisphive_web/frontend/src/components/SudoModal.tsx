@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { apiFetch } from "../api";
 import { Modal } from "./Modal";
 
@@ -24,7 +24,7 @@ interface Props {
  * sudo-class approve with `web_reauth_required`. Mirrors Login.tsx's error
  * shape and throttle countdown so the two auth surfaces feel identical.
  */
-export function SudoModal({ toolName, onCancel, onSuccess }: Props) {
+export const SudoModal = memo(function SudoModal({ toolName, onCancel, onSuccess }: Props) {
   const [password, setPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<SudoModalError | null>(null);
@@ -59,9 +59,9 @@ export function SudoModal({ toolName, onCancel, onSuccess }: Props) {
 
   const disabled = submitting || countdown > 0;
 
-  const onSubmit = useCallback(
-    async (e: React.FormEvent) => {
-      e.preventDefault();
+  const handleSubmit = useCallback(
+    async (event: React.FormEvent) => {
+      event.preventDefault();
       if (disabled || !password) return;
       setSubmitting(true);
       setError(null);
@@ -98,10 +98,10 @@ export function SudoModal({ toolName, onCancel, onSuccess }: Props) {
           return;
         }
         setError({ kind: "server", message: `Reauth failed (${res.status}).` });
-      } catch (e) {
+      } catch (err) {
         setError({
           kind: "network",
-          message: `Could not reach daemon: ${e instanceof Error ? e.message : String(e)}`,
+          message: `Could not reach daemon: ${err instanceof Error ? err.message : String(err)}`,
         });
       } finally {
         setSubmitting(false);
@@ -112,7 +112,7 @@ export function SudoModal({ toolName, onCancel, onSuccess }: Props) {
 
   return (
     <Modal title="Re-authenticate" onClose={onCancel}>
-      <form onSubmit={onSubmit} className="sudo-form">
+      <form onSubmit={handleSubmit} className="sudo-form">
         <p className="sudo-subtitle">
           Approve requires re-auth for <span className="sudo-tool">{toolName}</span>.
         </p>
@@ -152,4 +152,4 @@ export function SudoModal({ toolName, onCancel, onSuccess }: Props) {
       </form>
     </Modal>
   );
-}
+});
