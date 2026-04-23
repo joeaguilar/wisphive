@@ -193,6 +193,11 @@ async fn post_auth_login(
         }
     };
 
+    if body.password.len() > MAX_PASSWORD_LEN {
+        guard.record_failure().await;
+        return (axum::http::StatusCode::BAD_REQUEST, "password too long").into_response();
+    }
+
     // (2) Fetch stored password hash. Treat "no password set" as a failed
     // login — leaking the absence lets an attacker distinguish first-run
     // hosts (which admit any POST) from hardened ones.
@@ -327,6 +332,11 @@ async fn post_auth_reauth(
         }
     };
 
+    if body.password.len() > MAX_PASSWORD_LEN {
+        guard.record_failure().await;
+        return (axum::http::StatusCode::BAD_REQUEST, "password too long").into_response();
+    }
+
     let phc = match db.get_web_password_hash().await {
         Ok(Some(h)) => h,
         Ok(None) => {
@@ -443,6 +453,21 @@ struct SetPasswordRequest {
 /// the loopback UI").
 const MIN_PASSWORD_LEN: usize = 8;
 
+/// Hard ceiling on password length across every auth endpoint
+/// (login/reauth/set-password). Argon2's wall-time is insensitive to input
+/// length, but the blocking-pool clone + PHC library buffering isn't, and
+/// unauth-reachable endpoints must not accept arbitrary-size input. 4 KiB
+/// is ~500x longer than any human-typed password and comfortably larger
+/// than any plausible passphrase. Shared constant so the three handlers
+/// can't drift.
+const MAX_PASSWORD_LEN: usize = 4096;
+
+/// Body-size cap for the auth endpoints. The body is a single
+/// `{ password, device_name? }` JSON object — 16 KiB is far more than it
+/// can legitimately contain and well below axum's 2 MiB default. Applied
+/// per-route so long-body endpoints (config PUT) aren't affected.
+const AUTH_BODY_LIMIT: usize = 16 * 1024;
+
 /// POST /api/auth/set-password — first-run-only bootstrap over HTTP.
 ///
 /// Used by the onboarding UI (itr#268) so the operator doesn't have to open
@@ -488,8 +513,32 @@ async fn post_auth_set_password(
         }
     };
 
+    if body.password.len() > MAX_PASSWORD_LEN {
+        guard.record_failure().await;
+        // Audit even on-size rejections so a scan against the
+        // unauthenticated endpoint leaves a forensic trail — 409/400/500
+        // are otherwise silent to the operator.
+        let _ = db
+            .append_web_audit(
+                "web_password_set_denied",
+                None,
+                Some(&client_ip.0.to_string()),
+                Some("password_too_long"),
+            )
+            .await;
+        return (axum::http::StatusCode::BAD_REQUEST, "password too long").into_response();
+    }
+
     if body.password.len() < MIN_PASSWORD_LEN {
         guard.record_failure().await;
+        let _ = db
+            .append_web_audit(
+                "web_password_set_denied",
+                None,
+                Some(&client_ip.0.to_string()),
+                Some("password_too_short"),
+            )
+            .await;
         return (
             axum::http::StatusCode::BAD_REQUEST,
             format!("password must be at least {MIN_PASSWORD_LEN} characters"),
@@ -539,8 +588,18 @@ async fn post_auth_set_password(
         Ok(false) => {
             // Password already set — reset flow is CLI-only. Record as a
             // failure for throttle purposes so a script that keeps POSTing
-            // can't abuse this as a free probe.
+            // can't abuse this as a free probe. Audit the attempt — 409
+            // on this endpoint is the "someone scanned an already-
+            // provisioned host" signal worth having in forensics.
             guard.record_failure().await;
+            let _ = db
+                .append_web_audit(
+                    "web_password_set_denied",
+                    None,
+                    Some(&client_ip.0.to_string()),
+                    Some("already_set"),
+                )
+                .await;
             return (
                 axum::http::StatusCode::CONFLICT,
                 "password already set; use `wisphive web reset-password`",
@@ -550,6 +609,14 @@ async fn post_auth_set_password(
         Err(e) => {
             tracing::warn!(error = %e, "try_set_initial_web_password failed");
             guard.record_failure().await;
+            let _ = db
+                .append_web_audit(
+                    "web_password_set_denied",
+                    None,
+                    Some(&client_ip.0.to_string()),
+                    Some("db_error"),
+                )
+                .await;
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "internal error",
@@ -714,13 +781,29 @@ async fn post_revoke_device(
 
 fn build_router(state: AppState, dev_mode: bool) -> Router {
     let security = state.security.clone();
+    // Body-size cap for the three password-handling endpoints. They're
+    // unauth-reachable (login/set-password) or bearer-only (reauth) and
+    // the legitimate payload is a small JSON object — a 16 KiB cap
+    // narrows the attack surface from axum's 2 MiB default without
+    // affecting any real request.
+    let auth_body_limit =
+        || axum::extract::DefaultBodyLimit::max(AUTH_BODY_LIMIT);
     let api = Router::new()
         .route("/ws", get(ws_handler))
         .route("/api/auth/status", get(get_auth_status))
-        .route("/api/auth/login", post(post_auth_login))
-        .route("/api/auth/set-password", post(post_auth_set_password))
+        .route(
+            "/api/auth/login",
+            post(post_auth_login).layer(auth_body_limit()),
+        )
+        .route(
+            "/api/auth/set-password",
+            post(post_auth_set_password).layer(auth_body_limit()),
+        )
         .route("/api/auth/logout", post(post_auth_logout))
-        .route("/api/auth/reauth", post(post_auth_reauth))
+        .route(
+            "/api/auth/reauth",
+            post(post_auth_reauth).layer(auth_body_limit()),
+        )
         .route("/api/me", get(get_me))
         .route("/api/devices", get(get_devices))
         .route("/api/devices/{id}/revoke", post(post_revoke_device))

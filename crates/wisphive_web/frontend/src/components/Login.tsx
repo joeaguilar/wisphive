@@ -60,6 +60,22 @@ export function Login({
   const [localError, setLocalError] = useState<string | null>(null);
   const isSetup = phase === "setup";
 
+  // Clear localError whenever a fresh server error arrives (otherwise the
+  // union render below keeps showing the stale client-side validation
+  // message on top of a throttle countdown). Separate from the clear-on-
+  // keystroke path because a user might submit without touching the
+  // field again — e.g. clicking "I set it in a terminal — reload".
+  useEffect(() => {
+    if (error) setLocalError(null);
+  }, [error]);
+
+  // Reset localError on phase transitions (setup → unauthed from a 409).
+  // The union render would otherwise leak a "Passwords do not match"
+  // message onto the login form.
+  useEffect(() => {
+    setLocalError(null);
+  }, [phase]);
+
   // Drive the 429 Retry-After countdown. We trust the server-supplied value
   // and tick it down locally — cheaper than polling /api/auth/status.
   const isThrottled = error?.kind === "throttled";
@@ -113,21 +129,49 @@ export function Login({
         // On success, wipe both password fields from React state
         // immediately — React GC eventually reclaims closure-captured
         // strings, but shortening the window is cheap belt-and-braces
-        // against memory dumps and devtools inspection. On failure,
-        // keep the main password field populated so the user can
-        // correct a typo; wipe the confirm so retry stays deliberate.
+        // against memory dumps and devtools inspection.
+        //
+        // On failure, the wipe decision depends on *why* it failed.
+        // - "invalid" (wrong password, weak password) → wipe confirm to
+        //   force a deliberate retry; keep the primary field so the
+        //   user can correct a typo.
+        // - network/throttled/server → keep both fields; the user's
+        //   input is correct, the server just isn't cooperating yet.
+        // A 409 from setPassword also flips the hook's phase to
+        // unauthed — wipe the primary password there too because the
+        // typed value is a *new* password, which is not the right
+        // input for the login form the user now sees.
         if (ok) {
           setPassword("");
           setConfirm("");
-        } else {
-          setConfirm("");
         }
+        // Failure branches wipe defensively based on the outcome: the
+        // updated `error` is committed by the time the next render runs,
+        // but we read what's most recently-set via the effect below
+        // rather than trying to read the post-setState value here.
       } finally {
         setSubmitting(false);
       }
     },
     [disabled, isSetup, password, confirm, deviceName, onLogin, onSetPassword],
   );
+
+  // Selective wipe on server failure. Driven off `error` changes so the
+  // decision sees the newly-committed value, not the stale closure from
+  // handleSubmit. `invalid` (wrong/weak) → wipe confirm only (preserve
+  // primary for edit-and-retry). `conflict` (409 post-phase-flip) → wipe
+  // primary too (the typed "new password" is not a valid login input).
+  // `throttled`/`network`/`server` → touch nothing (user's input is fine,
+  // the server isn't cooperating yet).
+  useEffect(() => {
+    if (!error) return;
+    if (error.kind === "invalid") {
+      setConfirm("");
+    } else if (error.kind === "conflict") {
+      setPassword("");
+      setConfirm("");
+    }
+  }, [error]);
 
   return (
     <div className="login-root">
@@ -143,6 +187,12 @@ export function Login({
           <label className="login-field">
             <span>{isSetup ? "New password" : "Password"}</span>
             <input
+              // React re-uses the same DOM node across phase flips since
+              // the JSX shape is identical — autoFocus only fires on
+              // mount, so without a phase-keyed key the user is not
+              // refocused after a 409 setup → login transition. Keying
+              // by phase remounts the input cleanly.
+              key={`password-${phase}`}
               type="password"
               autoComplete={isSetup ? "new-password" : "current-password"}
               autoFocus
@@ -184,7 +234,12 @@ export function Login({
           </label>
           {(localError || error) && (
             <div
-              className={`login-error login-error-${error?.kind ?? "invalid"}`}
+              // When a localError is displayed, the styling should match
+              // "invalid" — we're showing client-side validation text, not
+              // echoing the server's error kind. Otherwise a stale
+              // throttle-kind `error` would style the localError div with
+              // the wrong color/border.
+              className={`login-error login-error-${localError ? "invalid" : (error?.kind ?? "invalid")}`}
               role="alert"
             >
               {localError

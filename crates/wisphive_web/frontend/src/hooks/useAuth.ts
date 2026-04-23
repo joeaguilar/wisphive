@@ -14,7 +14,12 @@ export type AuthPhase =
   | "authed";       // local token present
 
 export interface AuthError {
-  kind: "invalid" | "throttled" | "network" | "server";
+  /** `invalid`: the submitted password didn't meet the endpoint's rules
+   *  (wrong for login, too short for set-password). `conflict`: the host
+   *  is already provisioned (409 from set-password) — a distinct signal
+   *  so the UI can wipe the typed "new password" before flipping to
+   *  login mode. `throttled`/`network`/`server`: not the user's fault. */
+  kind: "invalid" | "conflict" | "throttled" | "network" | "server";
   message: string;
   /** Seconds the client must wait before retrying (429 Retry-After). */
   retryAfter?: number;
@@ -201,9 +206,11 @@ export function useAuth(): UseAuth {
           // Someone else set the password first (or the operator did it
           // via CLI between page load and form submit). Flip to login
           // phase so the same form can transition without a reload.
+          // Use the `conflict` kind so Login.tsx knows to wipe the
+          // typed "new password" (it's not a valid login input).
           setPhase("unauthed");
           setError({
-            kind: "invalid",
+            kind: "conflict",
             message: "Password is already set — sign in instead.",
           });
           return false;

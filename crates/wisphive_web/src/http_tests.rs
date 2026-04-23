@@ -913,6 +913,51 @@ async fn set_password_rejects_weak_password() {
 }
 
 #[tokio::test]
+async fn set_password_rejects_oversized_password() {
+    // Defense against DoS via Argon2 on arbitrarily-long input. The cap
+    // is 4096 characters; 10k comfortably exceeds it.
+    let (_tmp, state) = test_state_no_password().await;
+    let big = "x".repeat(10_000);
+    let body = serde_json::json!({ "password": big }).to_string();
+    let r = req("POST", "/api/auth/set-password")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let (status, _) = run_with(state.clone(), r).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // Must not persist.
+    assert!(
+        state
+            .security
+            .state_db()
+            .get_web_password_hash()
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn set_password_rejects_body_over_limit() {
+    // Body-size cap on the route (axum DefaultBodyLimit). A 32 KiB body
+    // — well under axum's 2 MiB default but well over our 16 KiB cap —
+    // should be rejected before the handler sees it.
+    let (_tmp, state) = test_state_no_password().await;
+    let huge = "x".repeat(32 * 1024);
+    let body = serde_json::json!({ "password": huge }).to_string();
+    let r = req("POST", "/api/auth/set-password")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let (status, _) = run_with(state, r).await;
+    assert_eq!(
+        status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "oversized body must 413 before reaching the handler"
+    );
+}
+
+#[tokio::test]
 async fn set_password_bypasses_setup_required_gate() {
     // Regression for the security.rs path_bypasses_setup_gate wiring —
     // without the bypass, this would 503 under the setup-required gate
