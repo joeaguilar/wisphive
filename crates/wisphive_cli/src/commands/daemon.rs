@@ -30,7 +30,14 @@ pub async fn start(web: Option<WebOptions>) -> Result<()> {
     // follow-up issue that threads live logs into the embedded web server.
     let log_store = LogStore::new(4096);
     let log_guards = logging::init(&config.log_dir, log_store.clone(), Level::WARN)?;
-    let _ = logging::prune_old_files(&config.log_dir, config.log_retention_days);
+    if let Err(e) = logging::prune_old_files(&config.log_dir, config.log_retention_days) {
+        // The subscriber is already installed, so this `warn!` reaches
+        // the file/store sinks; surface it instead of swallowing because
+        // anything other than NotFound (which the pruner already absorbs)
+        // means the operator has a broken `~/.wisphive/logs` they should
+        // see — e.g. EACCES on a hand-edited dir.
+        warn!(error = %e, "log pruning failed at startup");
+    }
 
     // Check for existing daemon
     shutdown::check_existing_daemon(&config.pid_path)?;

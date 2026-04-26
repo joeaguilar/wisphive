@@ -25,7 +25,11 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, Registry};
 
-const STORE_BROADCAST_CAPACITY: usize = 256;
+/// Per-subscriber pending capacity for the [`LogStore`] broadcast channel.
+/// Sized to match the default ring buffer capacity so a subscriber that's
+/// briefly unscheduled can still catch up to the full retained window
+/// before it starts seeing `RecvError::Lagged`.
+const STORE_BROADCAST_CAPACITY: usize = 4096;
 
 /// A single log record captured by [`StoreLayer`]. Serializable so the web
 /// bridge can ship it to the browser as-is.
@@ -79,12 +83,20 @@ impl LogStore {
         })
     }
 
+    /// Lock the inner deque, recovering from poison so a panic in one tracing
+    /// callsite never cascades into killing the daemon on the next log call.
+    /// The contained data is just `LogRecord`s — there's no invariant that
+    /// can be left "half-broken" by a panic mid-mutation.
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, VecDeque<LogRecord>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Append a record, evicting the oldest entry if the buffer is full, then
     /// fan it out to live subscribers. A send failure (no receivers) is
     /// expected and silently ignored.
     pub fn push(&self, record: LogRecord) {
         {
-            let mut guard = self.inner.lock().expect("LogStore mutex poisoned");
+            let mut guard = self.lock_inner();
             if guard.len() >= self.capacity {
                 guard.pop_front();
             }
@@ -96,7 +108,7 @@ impl LogStore {
     /// Return up to the last `n` records whose level is at least `min_level`.
     pub fn tail(&self, n: usize, min_level: Level) -> Vec<LogRecord> {
         let min = level_severity(min_level);
-        let guard = self.inner.lock().expect("LogStore mutex poisoned");
+        let guard = self.lock_inner();
         let filtered: Vec<LogRecord> = guard
             .iter()
             .filter(|r| severity(&r.level) >= min)
@@ -107,21 +119,25 @@ impl LogStore {
         filtered.into_iter().skip(start).collect()
     }
 
-    /// Subscribe to new records. Each subscriber gets its own receiver; lagging
-    /// subscribers may miss records if they fall behind by more than
-    /// [`STORE_BROADCAST_CAPACITY`].
+    /// Subscribe to new records.
+    ///
+    /// Backpressure: the channel is bounded at [`STORE_BROADCAST_CAPACITY`]
+    /// pending records *per subscriber*. Slow consumers will receive
+    /// `Err(RecvError::Lagged(n))` once they fall further behind than that;
+    /// callers MUST treat that as recoverable (skip and call `recv` again),
+    /// not as a terminal stream error.
     pub fn subscribe(&self) -> broadcast::Receiver<LogRecord> {
         self.tx.subscribe()
     }
 
     /// Current number of buffered records (for tests and diagnostics).
     pub fn len(&self) -> usize {
-        self.inner.lock().expect("LogStore mutex poisoned").len()
+        self.lock_inner().len()
     }
 
     /// `true` if the buffer is currently empty.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.lock_inner().is_empty()
     }
 }
 
@@ -165,10 +181,14 @@ impl tracing::field::Visit for FieldVisitor {
     }
 
     fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
-        if let Some(num) = serde_json::Number::from_f64(value) {
-            self.fields
-                .insert(field.name().to_string(), serde_json::Value::Number(num));
-        }
+        let v = match serde_json::Number::from_f64(value) {
+            Some(num) => serde_json::Value::Number(num),
+            // JSON has no NaN/Inf encoding; preserve the field with a string
+            // marker so a debugging session sees "the value was non-finite"
+            // rather than a silently missing field.
+            None => serde_json::Value::String(value.to_string()),
+        };
+        self.fields.insert(field.name().to_string(), v);
     }
 
     fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
@@ -234,6 +254,11 @@ pub fn init(
         .with_writer(std::io::stderr)
         .with_filter(LevelFilter::from_level(stderr_level));
 
+    // File logging is intentionally best-effort: `tracing-appender`'s
+    // non_blocking writer drops records when its bounded channel fills, and
+    // the worker thread can die without surfacing an error to us. The ring
+    // buffer + stderr layer are the durable signals; the file is for
+    // post-mortem forensics.
     let file_appender = tracing_appender::rolling::daily(log_dir, "wisphive.log");
     let (file_writer, file_guard) = tracing_appender::non_blocking(file_appender);
     let file_layer = tracing_subscriber::fmt::layer()
@@ -387,6 +412,48 @@ mod tests {
         // should be retained.
         prune_old_files(dir.path(), 365).unwrap();
         assert!(fresh.exists(), "fresh file should be retained");
+    }
+
+    #[test]
+    fn store_layer_captures_event_via_subscriber() {
+        // Locks in that `StoreLayer::on_event` + `FieldVisitor` actually wire
+        // up correctly when fed a real `tracing::Event` (rather than the
+        // synthetic `LogRecord`s the other tests use).
+        let store = LogStore::new(8);
+        let subscriber =
+            tracing_subscriber::registry().with(StoreLayer::new(store.clone()));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "test_target", count = 3u64, name = "alice", "hello");
+        });
+
+        let records = store.tail(10, Level::TRACE);
+        assert_eq!(records.len(), 1, "exactly one event should have been captured");
+        let r = &records[0];
+        assert_eq!(r.level, "INFO");
+        assert_eq!(r.target, "test_target");
+        assert_eq!(r.message, "hello");
+        assert_eq!(r.fields["count"], serde_json::json!(3));
+        assert_eq!(r.fields["name"], serde_json::json!("alice"));
+    }
+
+    #[test]
+    fn record_f64_preserves_nan_as_string_marker() {
+        let store = LogStore::new(4);
+        let subscriber =
+            tracing_subscriber::registry().with(StoreLayer::new(store.clone()));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "test_target", ratio = f64::NAN, "trouble");
+        });
+
+        let records = store.tail(10, Level::TRACE);
+        assert_eq!(records.len(), 1);
+        let ratio = &records[0].fields["ratio"];
+        assert!(
+            ratio.is_string(),
+            "non-finite f64 should be preserved as a string marker, got {ratio:?}"
+        );
     }
 
     #[test]
