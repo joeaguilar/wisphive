@@ -1,7 +1,7 @@
 use anyhow::Result;
-use tracing::{info, warn};
-use tracing_subscriber::EnvFilter;
+use tracing::{Level, info, warn};
 use wisphive_daemon::DaemonConfig;
+use wisphive_daemon::logging::{self, LogStore};
 use wisphive_daemon::server::Server;
 use wisphive_daemon::shutdown;
 
@@ -22,12 +22,15 @@ pub async fn start(web: Option<WebOptions>) -> Result<()> {
     let config = DaemonConfig::default_location();
     config.ensure_dirs()?;
 
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    // Initialize logging: stderr stays quiet (WARN by default) while a daily
+    // JSON log file under ~/.wisphive/logs and an in-memory ring buffer
+    // capture full INFO+ traffic for forensics and live tailing. The
+    // StoreLayer registered inside `init` already owns its own `Arc<LogStore>`
+    // clone; the `log_store` binding here is the hand-off point for the
+    // follow-up issue that threads live logs into the embedded web server.
+    let log_store = LogStore::new(4096);
+    let log_guards = logging::init(&config.log_dir, log_store.clone(), Level::WARN)?;
+    let _ = logging::prune_old_files(&config.log_dir, config.log_retention_days);
 
     // Check for existing daemon
     shutdown::check_existing_daemon(&config.pid_path)?;
@@ -102,6 +105,10 @@ pub async fn start(web: Option<WebOptions>) -> Result<()> {
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
+
+    // Drop the non-blocking file appender's worker guard so its background
+    // thread flushes pending log records to disk before we force-exit.
+    drop(log_guards);
 
     // Force-exit to guarantee the shell regains control. Without this, any
     // detached std::thread PTY readers or stuck spawn_blocking tasks can

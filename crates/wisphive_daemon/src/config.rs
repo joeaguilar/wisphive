@@ -24,6 +24,8 @@ pub struct DaemonConfig {
     pub retention_max_rows: u64,
     /// Maximum age in days for decision_log entries (older archived and deleted).
     pub retention_max_age_days: u64,
+    /// Maximum age in days for daemon log files in `log_dir` (older are pruned at startup).
+    pub log_retention_days: u64,
 }
 
 /// User-editable config loaded from ~/.wisphive/config.json.
@@ -53,6 +55,9 @@ pub struct UserConfig {
     /// Max age in days for decision_log entries (default: 30).
     #[serde(default)]
     pub retention_max_age_days: Option<u64>,
+    /// Max age in days for daemon log files (default: 14).
+    #[serde(default)]
+    pub log_retention_days: Option<u64>,
 }
 
 fn default_true() -> bool {
@@ -103,6 +108,12 @@ impl DaemonConfig {
             1,
             3650,
         );
+        let log_retention_days = clamp_config(
+            "log_retention_days",
+            user.log_retention_days.unwrap_or(14),
+            1,
+            3650,
+        );
 
         Self {
             socket_path: home_dir.join("wisphive.sock"),
@@ -115,6 +126,7 @@ impl DaemonConfig {
             agent_timeout_secs,
             retention_max_rows,
             retention_max_age_days,
+            log_retention_days,
             home_dir,
         }
     }

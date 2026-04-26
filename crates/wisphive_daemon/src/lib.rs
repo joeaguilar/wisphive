@@ -1,5 +1,6 @@
 pub mod config;
 pub mod event_ingest;
+pub mod logging;
 pub mod notify;
 pub mod process_registry;
 pub mod queue;
