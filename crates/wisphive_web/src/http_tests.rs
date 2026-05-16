@@ -16,6 +16,7 @@ use wisphive_daemon::state::StateDb;
 use wisphive_protocol::{ClientCommand, ClientMessage, PROTOCOL_VERSION, ServerMessage, encode};
 
 use crate::auth::{generate_device_token, hash_password};
+use crate::auth_profile::AuthProfile;
 use crate::security::{ClientIp, SecurityConfig};
 use crate::{AppState, build_router};
 
@@ -60,6 +61,7 @@ async fn test_state() -> (tempfile::TempDir, AppState) {
             socket_path,
             config_path,
             security,
+            auth_policy: AuthProfile::LocalLAN.policy(),
         },
     )
 }
@@ -317,6 +319,7 @@ async fn login_when_no_password_set_returns_503_setup_required() {
         socket_path: tmp.path().join("wisphive.sock"),
         config_path: tmp.path().join("config.json"),
         security,
+        auth_policy: AuthProfile::LocalLAN.policy(),
     };
 
     let body = serde_json::json!({ "password": "anything" });
@@ -548,6 +551,7 @@ async fn auth_status_reports_setup_required_on_fresh_host() {
         socket_path: tmp.path().join("wisphive.sock"),
         config_path: tmp.path().join("config.json"),
         security,
+        auth_policy: AuthProfile::LocalLAN.policy(),
     };
     let r = req("GET", "/api/auth/status").body(Body::empty()).unwrap();
     let (status, body) = run_with(state, r).await;
@@ -585,6 +589,7 @@ async fn setup_required_blocks_protected_api_routes_with_503() {
         socket_path: tmp.path().join("wisphive.sock"),
         config_path: tmp.path().join("config.json"),
         security,
+        auth_policy: AuthProfile::LocalLAN.policy(),
     };
 
     // Token-gated endpoint — the setup gate must fire *before* the token
@@ -626,10 +631,145 @@ async fn setup_required_lets_auth_status_through() {
         socket_path: tmp.path().join("wisphive.sock"),
         config_path: tmp.path().join("config.json"),
         security,
+        auth_policy: AuthProfile::LocalLAN.policy(),
     };
     let r = req("GET", "/api/auth/status").body(Body::empty()).unwrap();
     let (status, _) = run_with(state, r).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+// ── /api/auth/profile (itr#310) ────────────────────────────────────────
+
+/// `/api/auth/profile` is the origin-aware discovery surface. Under
+/// LocalLAN with a loopback `Origin`, the SPA should learn it CAN offer
+/// passkey enrollment on this origin.
+#[tokio::test]
+async fn auth_profile_local_lan_loopback_can_enroll() {
+    let (_tmp, state) = test_state().await;
+    let r = req("GET", "/api/auth/profile")
+        .header("origin", ORIGIN) // http://127.0.0.1:3100
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = run_with(state, r).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["profile"], "local-lan");
+    assert_eq!(v["can_enroll_passkey_on_this_origin"], true);
+    // v1 keeps both profiles at passkey_required=false (password login is
+    // always permitted).
+    assert_eq!(v["passkey_required"], false);
+    // LocalLAN's ephemeral LAN listener is enabled — phone-pair UI hangs
+    // off this bit.
+    assert_eq!(v["allow_ephemeral_listener"], true);
+}
+
+/// The load-bearing case from the spec: a phone reaching the daemon at a
+/// LAN-IP origin must get `can_enroll_passkey_on_this_origin: false` so
+/// the SPA hides the "enroll passkey" button. WebAuthn forbids IP-literal
+/// RP IDs, so silently offering the button would let the user mash it and
+/// get an opaque browser error.
+#[tokio::test]
+async fn auth_profile_local_lan_lan_ip_origin_cannot_enroll() {
+    // test_state's allowlist only contains the loopback ORIGIN, so we have
+    // to build a custom state whose allowlist accepts the LAN-IP origin
+    // (otherwise the security middleware 403s before we reach the handler).
+    let (tmp, db) = test_db().await;
+    let lan_origin = "https://192.168.1.42:8443".to_string();
+    let security = SecurityConfig::for_test(
+        vec![lan_origin.clone()],
+        vec!["192.168.1.42:8443".to_string()],
+        db.clone(),
+    );
+    let state = AppState {
+        socket_path: tmp.path().join("wisphive.sock"),
+        config_path: tmp.path().join("config.json"),
+        security,
+        auth_policy: AuthProfile::LocalLAN.policy(),
+    };
+    let r = Request::builder()
+        .method("GET")
+        .uri("/api/auth/profile")
+        .header("host", "192.168.1.42:8443")
+        .header("origin", &lan_origin)
+        .extension(ClientIp(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42))))
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = run_with(state, r).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["profile"], "local-lan");
+    assert_eq!(v["can_enroll_passkey_on_this_origin"], false);
+}
+
+/// Bearer NOT required for `/api/auth/profile` — same bootstrap-discovery
+/// guarantee as `/api/auth/status`.
+#[tokio::test]
+async fn auth_profile_requires_no_bearer() {
+    let r = req("GET", "/api/auth/profile")
+        .header("origin", ORIGIN)
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = run(r).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// `/api/auth/profile` must also bypass the setup-required gate — the
+/// onboarding screen (no password yet) reads it to decide whether the
+/// "enroll passkey" affordance is even meaningful.
+#[tokio::test]
+async fn auth_profile_reachable_in_setup_required_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("wisphive.db");
+    let db = StateDb::open(db_path.to_string_lossy().as_ref())
+        .await
+        .unwrap();
+    let security =
+        SecurityConfig::for_test(vec![ORIGIN.to_string()], vec![HOST.to_string()], db.clone());
+    let state = AppState {
+        socket_path: tmp.path().join("wisphive.sock"),
+        config_path: tmp.path().join("config.json"),
+        security,
+        auth_policy: AuthProfile::LocalLAN.policy(),
+    };
+    let r = req("GET", "/api/auth/profile")
+        .header("origin", ORIGIN)
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = run_with(state, r).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// Enterprise profile: any request origin (that passes the Origin/Host
+/// allowlist) gets the static RP ID, so `can_enroll_passkey_on_this_origin`
+/// is always `true`. UV-required and login-throttle-3 also surface through
+/// the public JSON via the related flags.
+#[tokio::test]
+async fn auth_profile_enterprise_always_can_enroll() {
+    let (tmp, db) = test_db().await;
+    let security =
+        SecurityConfig::for_test(vec![ORIGIN.to_string()], vec![HOST.to_string()], db.clone());
+    let policy = AuthProfile::Enterprise {
+        rp_id: crate::auth_profile::RpId("wisphive.example.com".to_string()),
+        rp_origin: webauthn_rs::prelude::Url::parse("https://wisphive.example.com").unwrap(),
+    }
+    .policy();
+    let state = AppState {
+        socket_path: tmp.path().join("wisphive.sock"),
+        config_path: tmp.path().join("config.json"),
+        security,
+        auth_policy: policy,
+    };
+    let r = req("GET", "/api/auth/profile")
+        .header("origin", ORIGIN)
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = run_with(state, r).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["profile"], "enterprise");
+    assert_eq!(v["can_enroll_passkey_on_this_origin"], true);
+    // Enterprise disables the ephemeral LAN listener (#271/#272 dormant).
+    assert_eq!(v["allow_ephemeral_listener"], false);
 }
 
 // ── /api/auth/logout ───────────────────────────────────────────────────
@@ -844,6 +984,7 @@ async fn test_state_no_password() -> (tempfile::TempDir, AppState) {
             socket_path,
             config_path,
             security,
+            auth_policy: AuthProfile::LocalLAN.policy(),
         },
     )
 }

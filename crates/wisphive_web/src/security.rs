@@ -37,6 +37,7 @@ use wisphive_daemon::state::{StateDb, WebDeviceRow};
 use wisphive_protocol::DeviceId;
 
 use crate::auth::{LoginThrottle, sha256_hex};
+use crate::auth_profile::AuthPolicy;
 
 /// Authenticated web device context attached to a request by the security
 /// middleware. Handlers and the ws_bridge read this from
@@ -92,6 +93,10 @@ struct SecurityConfigInner {
     allowed_hosts: Vec<String>,
     state_db: StateDb,
     throttle: LoginThrottle,
+    /// Active auth posture (itr#310). Cloned into the config so handlers
+    /// (and the future WebAuthn machinery from #311) can branch on it
+    /// without re-reading the profile from disk.
+    auth_policy: AuthPolicy,
 }
 
 impl SecurityConfig {
@@ -117,6 +122,7 @@ impl SecurityConfig {
         bind_host: IpAddr,
         port: u16,
         dev_mode: bool,
+        auth_policy: AuthPolicy,
     ) -> anyhow::Result<Self> {
         let mut allowed_origins = vec![
             format!("http://127.0.0.1:{port}"),
@@ -164,18 +170,37 @@ impl SecurityConfig {
                 allowed_hosts,
                 state_db,
                 throttle: LoginThrottle::new(),
+                auth_policy,
             }),
         })
     }
 
     /// Construct a config with explicit allowlists + an externally-owned DB.
     /// Used by tests so we can assert exact middleware behaviour without a
-    /// live TCP listener.
+    /// live TCP listener. Defaults the [`AuthPolicy`] to the LocalLAN
+    /// preset since most security tests are profile-agnostic.
     #[cfg(test)]
     pub fn for_test(
         allowed_origins: Vec<String>,
         allowed_hosts: Vec<String>,
         state_db: StateDb,
+    ) -> Self {
+        Self::for_test_with_policy(
+            allowed_origins,
+            allowed_hosts,
+            state_db,
+            crate::auth_profile::AuthProfile::LocalLAN.policy(),
+        )
+    }
+
+    /// Like [`for_test`] but lets a caller pin a non-default policy when
+    /// the test specifically asserts profile-driven behaviour.
+    #[cfg(test)]
+    pub fn for_test_with_policy(
+        allowed_origins: Vec<String>,
+        allowed_hosts: Vec<String>,
+        state_db: StateDb,
+        auth_policy: AuthPolicy,
     ) -> Self {
         Self {
             inner: Arc::new(SecurityConfigInner {
@@ -183,8 +208,16 @@ impl SecurityConfig {
                 allowed_hosts,
                 state_db,
                 throttle: LoginThrottle::new(),
+                auth_policy,
             }),
         }
+    }
+
+    /// Expose the frozen [`AuthPolicy`] so downstream handlers can branch
+    /// on it (itr#310).
+    #[allow(dead_code)]
+    pub fn auth_policy(&self) -> &AuthPolicy {
+        &self.inner.auth_policy
     }
 
     pub fn state_db(&self) -> &StateDb {
@@ -396,6 +429,7 @@ pub(crate) fn path_requires_device_token(path: &str) -> bool {
     }
     if path == "/api/auth/login"
         || path == "/api/auth/status"
+        || path == "/api/auth/profile"
         || path == "/api/auth/set-password"
         || path == "/api/web-token"
     {
@@ -432,7 +466,11 @@ fn setup_required_response() -> Response {
 /// onboarding POST itself (itr#268) — it has no token to present and can
 /// only succeed in setup mode (internally 409s once a password exists).
 fn path_bypasses_setup_gate(path: &str) -> bool {
-    path == "/api/auth/status" || path == "/api/auth/set-password"
+    // `/api/auth/profile` is part of the same bootstrap-discovery surface
+    // as `/api/auth/status` (itr#310): the SPA reads it to learn which
+    // login flows to render *before* a password is set, so the setup
+    // gate must not 503 it.
+    path == "/api/auth/status" || path == "/api/auth/profile" || path == "/api/auth/set-password"
 }
 
 /// Read a presented token from `Authorization: Bearer <raw>` or `?token=<raw>`.
@@ -482,6 +520,10 @@ mod tests {
         // Setup-discovery endpoint is public: the SPA hits it before it
         // knows whether to show Login or Setup.
         assert!(!path_requires_device_token("/api/auth/status"));
+        // itr#310: profile discovery is also public — same reason as
+        // `/api/auth/status`, the SPA needs it before the user has a
+        // token.
+        assert!(!path_requires_device_token("/api/auth/profile"));
         // Retired bootstrap route is exempt so the router's fallback
         // can 404 cleanly instead of the gate 401-ing first.
         assert!(!path_requires_device_token("/api/web-token"));
@@ -494,6 +536,10 @@ mod tests {
     fn path_bypasses_setup_gate_rules() {
         assert!(path_bypasses_setup_gate("/api/auth/status"));
         assert!(path_bypasses_setup_gate("/api/auth/set-password"));
+        // itr#310: profile bypasses the setup gate too — the SPA reads
+        // it on the onboarding page (no password yet) to decide whether
+        // to even offer the "enroll passkey" affordance.
+        assert!(path_bypasses_setup_gate("/api/auth/profile"));
         assert!(!path_bypasses_setup_gate("/api/auth/login"));
         assert!(!path_bypasses_setup_gate("/api/config"));
         assert!(!path_bypasses_setup_gate("/api/devices"));

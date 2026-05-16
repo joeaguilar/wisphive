@@ -14,6 +14,11 @@ pub struct WebOptions {
     /// auto-open the default browser onto the onboarding URL once the
     /// server is listening. CLI flag: `--no-open`.
     pub no_open: bool,
+    /// itr#310: auth/security profile (LocalLAN default; Enterprise
+    /// requires `--auth-rp-id` plus user-provided TLS cert once itr#270
+    /// lands). Resolved + validated by the CLI before this struct is
+    /// built.
+    pub auth_profile: wisphive_web::AuthProfile,
 }
 
 /// Start the daemon in the foreground. Optionally also serve the web UI in
@@ -81,8 +86,9 @@ pub async fn start(web: Option<WebOptions>) -> Result<()> {
         let host = opts.host;
         let port = opts.port;
         let dev = opts.dev;
+        let profile = opts.auth_profile;
         let serve = tokio::spawn(async move {
-            if let Err(e) = wisphive_web::serve(socket_path, port, dev, host).await {
+            if let Err(e) = wisphive_web::serve(socket_path, port, dev, host, profile).await {
                 tracing::error!("embedded web server exited: {e}");
             }
         });

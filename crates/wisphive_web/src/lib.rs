@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod auth_profile;
 mod reauth_ipc;
 mod security;
 pub mod tls;
@@ -19,6 +20,12 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 use wisphive_daemon::state::StateDb;
 
+pub use auth_profile::{AuthPolicy, AuthProfile, RpId, UvRequirement};
+// Re-export the WebAuthn `Url` type so downstream crates (notably the CLI)
+// can build `AuthProfile::Enterprise { rp_origin, .. }` without pulling
+// in `webauthn-rs` or `url` themselves.
+pub use webauthn_rs::prelude::Url;
+
 /// Hard deadline on Argon2 verify. itr#245: without it, a stalled verify
 /// pins a per-IP throttle slot for the full [`STALE_IN_FLIGHT_AGE`] (5 min)
 /// and self-DoSes the originating IP. 5 s is generous — our Argon2 params
@@ -34,6 +41,10 @@ struct AppState {
     socket_path: PathBuf,
     config_path: PathBuf,
     security: SecurityConfig,
+    /// Frozen auth/security posture (itr#310). Threaded into `AppState` so
+    /// downstream handlers can branch on `AuthPolicy` without re-deriving
+    /// it from the profile enum on every request.
+    auth_policy: AuthPolicy,
 }
 
 /// Embedded frontend assets (built by Vite into frontend/dist/).
@@ -435,6 +446,62 @@ async fn get_auth_status(axum::extract::State(state): axum::extract::State<AppSt
     .into_response()
 }
 
+/// GET /api/auth/profile — origin-aware unauthenticated discovery surface
+/// for the active [`AuthProfile`] (itr#310).
+///
+/// Bearer NOT required (the frontend has to learn the profile before it
+/// can render the login screen, and the phone-pair page sees this before
+/// it has any token). Gated by the same Origin/Host allowlist as
+/// `/api/auth/status` via the security middleware.
+///
+/// Response shape:
+/// ```json
+/// {
+///   "profile": "local-lan" | "enterprise",
+///   "can_enroll_passkey_on_this_origin": bool,
+///   "passkey_required": bool,
+///   "allow_ephemeral_listener": bool
+/// }
+/// ```
+///
+/// `can_enroll_passkey_on_this_origin` is the origin-aware bit — under
+/// LocalLAN it returns `false` for RFC1918 IP-literal origins so the SPA
+/// can hide the "enroll passkey" button on the phone (WebAuthn forbids
+/// IP RP IDs; see `auth_profile::loopback_rp_id_from_origin`).
+async fn get_auth_profile(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let policy = &state.auth_policy;
+    let can_enroll = origin_can_enroll_passkey(policy, &headers);
+    axum::Json(serde_json::json!({
+        "profile": policy.profile_str(),
+        "can_enroll_passkey_on_this_origin": can_enroll,
+        "passkey_required": policy.passkey_required,
+        "allow_ephemeral_listener": policy.allow_ephemeral_lan_listener,
+    }))
+    .into_response()
+}
+
+/// Compute `can_enroll_passkey_on_this_origin` from the request's `Origin`
+/// header, falling back to `false` if the header is missing or unparsable.
+///
+/// Falling back to `false` (rather than the policy's "default" RP ID) is
+/// intentional: a request without an `Origin` is either a same-origin
+/// top-level GET (in which case the SPA already has the policy result
+/// from a prior fetch and won't be probing again) or a non-browser caller
+/// for whom passkey enrollment isn't a meaningful answer. Either way,
+/// "no, you can't enroll here" is the safe, non-leaky default.
+fn origin_can_enroll_passkey(policy: &AuthPolicy, headers: &axum::http::HeaderMap) -> bool {
+    let Some(origin) = headers.get("origin").and_then(|h| h.to_str().ok()) else {
+        return false;
+    };
+    let Ok(origin_url) = webauthn_rs::prelude::Url::parse(origin) else {
+        return false;
+    };
+    policy.rp_id_for_origin(&origin_url).is_some()
+}
+
 #[derive(Debug, Deserialize)]
 struct SetPasswordRequest {
     password: String,
@@ -791,6 +858,7 @@ fn build_router(state: AppState, dev_mode: bool) -> Router {
     let api = Router::new()
         .route("/ws", get(ws_handler))
         .route("/api/auth/status", get(get_auth_status))
+        .route("/api/auth/profile", get(get_auth_profile))
         .route(
             "/api/auth/login",
             post(post_auth_login).layer(auth_body_limit()),
@@ -843,6 +911,7 @@ pub async fn serve(
     port: u16,
     dev_mode: bool,
     host: [u8; 4],
+    auth_profile: AuthProfile,
 ) -> anyhow::Result<()> {
     // Dev mode serves plain HTTP so Vite (http://localhost:5173) can talk
     // to it without a self-signed-cert trust dance. That's fine on
@@ -870,12 +939,29 @@ pub async fn serve(
     // safely.
     let state_db = StateDb::open(db_path.to_string_lossy().as_ref()).await?;
 
-    let security = SecurityConfig::build(state_db, bind_host, port, dev_mode)?;
+    let auth_policy = auth_profile.policy();
+    info!(
+        profile = auth_policy.profile_str(),
+        allow_self_signed = auth_policy.allow_self_signed,
+        allow_ephemeral_lan_listener = auth_policy.allow_ephemeral_lan_listener,
+        uv_requirement = ?auth_policy.uv_requirement,
+        login_throttle_threshold = auth_policy.login_throttle_threshold,
+        "auth profile selected"
+    );
+
+    // itr#310 stub — scan `web_passkeys.rp_id` for drift vs the active
+    // profile. Today this is a no-op (the rp_id column hasn't landed yet;
+    // see scan_passkey_rp_id_drift's TODO(itr#311)). Wiring it now means
+    // #311 just deletes the early return.
+    auth_profile::scan_passkey_rp_id_drift(&state_db, &auth_policy).await;
+
+    let security = SecurityConfig::build(state_db, bind_host, port, dev_mode, auth_policy.clone())?;
 
     let state = AppState {
         socket_path,
         config_path,
         security,
+        auth_policy,
     };
 
     let app = build_router(state, dev_mode);

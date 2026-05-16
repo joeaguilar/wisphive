@@ -1,6 +1,6 @@
 mod commands;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(
@@ -71,6 +71,19 @@ enum Command {
     },
 }
 
+/// CLI selector for the daemon's [`wisphive_web::AuthProfile`] (itr#310).
+/// `local-lan` is the default; `enterprise` requires `--auth-rp-id` plus
+/// (once itr#270 lands) `--tls-cert` / `--tls-key`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum AuthProfileArg {
+    /// Default; self-signed TLS OK, ephemeral LAN pairing listener
+    /// enabled, phone authenticates via device bearer.
+    LocalLan,
+    /// Operator-provided cert + real registrable domain; ephemeral LAN
+    /// listener disabled, passkey-register sudo-gated, UV required.
+    Enterprise,
+}
+
 #[derive(Subcommand)]
 enum WebAction {
     /// Serve the Web UI (default — flags match the pre-subcommand form)
@@ -89,6 +102,16 @@ enum WebAction {
         /// WebView).
         #[arg(long)]
         no_open: bool,
+        /// Auth/security posture (itr#310). `local-lan` (default) for
+        /// single-user local deploys; `enterprise` requires
+        /// `--auth-rp-id` plus a user-provided TLS cert.
+        #[arg(long, value_enum, default_value_t = AuthProfileArg::LocalLan)]
+        auth_profile: AuthProfileArg,
+        /// WebAuthn RP ID (registrable domain) for the Enterprise
+        /// profile. Required when `--auth-profile enterprise`; ignored
+        /// otherwise. Must NOT be an IP literal — WebAuthn forbids them.
+        #[arg(long)]
+        auth_rp_id: Option<String>,
     },
     /// Set the web admin password (prompts twice, stores Argon2id hash)
     SetPassword,
@@ -227,6 +250,17 @@ enum DaemonAction {
         /// that open their own WebView.
         #[arg(long)]
         no_open: bool,
+        /// Auth/security posture for the embedded web UI (itr#310).
+        /// `local-lan` (default) for single-user local deploys;
+        /// `enterprise` requires `--auth-rp-id` plus a user-provided TLS
+        /// cert.
+        #[arg(long, value_enum, default_value_t = AuthProfileArg::LocalLan)]
+        auth_profile: AuthProfileArg,
+        /// WebAuthn RP ID (registrable domain) for the Enterprise
+        /// profile. Required when `--auth-profile enterprise`; ignored
+        /// otherwise.
+        #[arg(long)]
+        auth_rp_id: Option<String>,
     },
     /// Stop the running daemon
     Stop,
@@ -442,6 +476,8 @@ fn main() -> anyhow::Result<()> {
                         port,
                         web_dev,
                         no_open,
+                        auth_profile,
+                        auth_rp_id,
                     } => {
                         // Any of --web / non-default --host / non-default --port / --web-dev
                         // implies "serve the web UI too".
@@ -456,6 +492,19 @@ fn main() -> anyhow::Result<()> {
                             let Some(host_octets) = parse_host_octets(&host) else {
                                 return Ok(());
                             };
+                            // itr#310: resolve the auth profile *before*
+                            // launching the daemon. Enterprise fail-fast
+                            // exits here with a clean stderr message so
+                            // operators don't end up with a half-bootstrapped
+                            // daemon they have to kill.
+                            let profile =
+                                match resolve_auth_profile(auth_profile, auth_rp_id.as_deref()) {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        eprintln!("{e}");
+                                        return Ok(());
+                                    }
+                                };
                             // Dev mode stays http (Vite serves the UI over
                             // http and dragging the user through self-signed
                             // TLS isn't worth it); prod is https, and the
@@ -470,6 +519,7 @@ fn main() -> anyhow::Result<()> {
                                 port,
                                 dev: web_dev,
                                 no_open,
+                                auth_profile: profile,
                             })
                         } else {
                             None
@@ -512,9 +562,18 @@ fn main() -> anyhow::Result<()> {
                 host,
                 dev,
                 no_open,
+                auth_profile,
+                auth_rp_id,
             } => {
                 let rt = tokio::runtime::Runtime::new()?;
-                rt.block_on(serve_web(port, host, dev, no_open))
+                rt.block_on(serve_web(
+                    port,
+                    host,
+                    dev,
+                    no_open,
+                    auth_profile,
+                    auth_rp_id,
+                ))
             }
             WebAction::SetPassword => {
                 let rt = tokio::runtime::Runtime::new()?;
@@ -535,6 +594,61 @@ fn main() -> anyhow::Result<()> {
             }
             WebAction::Fingerprint => commands::web::fingerprint(),
         },
+    }
+}
+
+/// Resolve the CLI's [`AuthProfileArg`] + optional `--auth-rp-id` flag
+/// into a concrete [`wisphive_web::AuthProfile`] (itr#310).
+///
+/// LocalLAN is unconditional. Enterprise is fail-fast: it requires a real
+/// registrable domain in `--auth-rp-id` AND (per the itr#270 dependency)
+/// user-provided TLS cert + key. Until itr#270 ships the `--tls-cert` /
+/// `--tls-key` flags, Enterprise selection always fails with a clear
+/// error pointing operators at the missing prerequisite.
+///
+/// Returns the error message ready to print to stderr — callers just need
+/// to exit cleanly without running the daemon.
+fn resolve_auth_profile(
+    arg: AuthProfileArg,
+    auth_rp_id: Option<&str>,
+) -> Result<wisphive_web::AuthProfile, String> {
+    match arg {
+        AuthProfileArg::LocalLan => {
+            if auth_rp_id.is_some() {
+                // Not an error — just noisy. Warn so operators don't
+                // think the flag silently took effect.
+                eprintln!(
+                    "warning: --auth-rp-id is ignored under --auth-profile local-lan \
+                     (LocalLAN uses RP ID 'localhost' for loopback origins and \
+                     no RP ID for LAN-IP origins)"
+                );
+            }
+            Ok(wisphive_web::AuthProfile::LocalLAN)
+        }
+        AuthProfileArg::Enterprise => {
+            // itr#270 dep: --tls-cert / --tls-key don't exist yet. We
+            // hard-code `false`/`false` so the validator emits the
+            // documented MissingTlsFlags message. Once #270 lands, the
+            // CLI plumbs those flags and passes their `is_some()` status
+            // here.
+            let tls_cert_provided = false;
+            let tls_key_provided = false;
+            let rp_id = wisphive_web::auth_profile::validate_enterprise_config(
+                auth_rp_id,
+                tls_cert_provided,
+                tls_key_provided,
+            )
+            .map_err(|e| e.to_string())?;
+            // RP origin is derived from the RP ID + https scheme — a
+            // conservative default that matches the "user brings a real
+            // domain" Enterprise contract. #270 will refine this once
+            // the cert's primary SAN is known.
+            let rp_origin = wisphive_web::Url::parse(&format!("https://{}", rp_id.as_str()))
+                .map_err(|e| {
+                    format!("internal: failed to derive rp_origin from --auth-rp-id: {e}")
+                })?;
+            Ok(wisphive_web::AuthProfile::Enterprise { rp_id, rp_origin })
+        }
     }
 }
 
@@ -565,7 +679,14 @@ fn parse_host_octets(host: &str) -> Option<[u8; 4]> {
     }
 }
 
-async fn serve_web(port: u16, host: String, dev: bool, no_open: bool) -> anyhow::Result<()> {
+async fn serve_web(
+    port: u16,
+    host: String,
+    dev: bool,
+    no_open: bool,
+    auth_profile: AuthProfileArg,
+    auth_rp_id: Option<String>,
+) -> anyhow::Result<()> {
     let home = std::env::var("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
@@ -574,6 +695,16 @@ async fn serve_web(port: u16, host: String, dev: bool, no_open: bool) -> anyhow:
 
     let Some(host_octets) = parse_host_octets(&host) else {
         return Ok(());
+    };
+
+    // itr#310: resolve the auth profile up front so an Enterprise misconfig
+    // fails before we start the listener.
+    let profile = match resolve_auth_profile(auth_profile, auth_rp_id.as_deref()) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return Ok(());
+        }
     };
 
     print_startup_banner(&home, host_octets, port, dev);
@@ -594,7 +725,7 @@ async fn serve_web(port: u16, host: String, dev: bool, no_open: bool) -> anyhow:
         )))
     };
 
-    let result = wisphive_web::serve(socket_path, port, dev, host_octets).await;
+    let result = wisphive_web::serve(socket_path, port, dev, host_octets, profile).await;
     if let Some(h) = browser_task {
         h.abort();
     }
