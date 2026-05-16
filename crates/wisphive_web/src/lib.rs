@@ -853,8 +853,7 @@ fn build_router(state: AppState, dev_mode: bool) -> Router {
     // the legitimate payload is a small JSON object — a 16 KiB cap
     // narrows the attack surface from axum's 2 MiB default without
     // affecting any real request.
-    let auth_body_limit =
-        || axum::extract::DefaultBodyLimit::max(AUTH_BODY_LIMIT);
+    let auth_body_limit = || axum::extract::DefaultBodyLimit::max(AUTH_BODY_LIMIT);
     let api = Router::new()
         .route("/ws", get(ws_handler))
         .route("/api/auth/status", get(get_auth_status))

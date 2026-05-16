@@ -998,7 +998,11 @@ async fn set_password_first_run_issues_device_token() {
         .body(Body::from(body))
         .unwrap();
     let (status, body) = run_with(state.clone(), r).await;
-    assert_eq!(status, StatusCode::OK, "first-run set-password should succeed");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "first-run set-password should succeed"
+    );
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(v.get("device_id").and_then(|s| s.as_str()).is_some());
     assert!(v.get("token").and_then(|s| s.as_str()).is_some());

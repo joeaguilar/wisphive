@@ -171,13 +171,17 @@ impl tracing::field::Visit for FieldVisitor {
     }
 
     fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
-        self.fields
-            .insert(field.name().to_string(), serde_json::Value::Number(value.into()));
+        self.fields.insert(
+            field.name().to_string(),
+            serde_json::Value::Number(value.into()),
+        );
     }
 
     fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-        self.fields
-            .insert(field.name().to_string(), serde_json::Value::Number(value.into()));
+        self.fields.insert(
+            field.name().to_string(),
+            serde_json::Value::Number(value.into()),
+        );
     }
 
     fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
@@ -212,7 +216,11 @@ impl<S> Layer<S> for StoreLayer
 where
     S: tracing::Subscriber,
 {
-    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
         let mut visitor = FieldVisitor::default();
         event.record(&mut visitor);
         let metadata = event.metadata();
@@ -247,8 +255,7 @@ pub fn init(
     store: Arc<LogStore>,
     stderr_level: Level,
 ) -> anyhow::Result<LogGuards> {
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     let stderr_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
@@ -284,9 +291,9 @@ pub fn init(
 /// effort — individual unlink failures are swallowed so a permission glitch on
 /// one file can't abort daemon startup.
 pub fn prune_old_files(log_dir: &Path, retention_days: u64) -> std::io::Result<()> {
-    let cutoff = match SystemTime::now().checked_sub(Duration::from_secs(
-        retention_days.saturating_mul(86_400),
-    )) {
+    let cutoff = match SystemTime::now()
+        .checked_sub(Duration::from_secs(retention_days.saturating_mul(86_400)))
+    {
         Some(t) => t,
         None => return Ok(()),
     };
@@ -420,15 +427,18 @@ mod tests {
         // up correctly when fed a real `tracing::Event` (rather than the
         // synthetic `LogRecord`s the other tests use).
         let store = LogStore::new(8);
-        let subscriber =
-            tracing_subscriber::registry().with(StoreLayer::new(store.clone()));
+        let subscriber = tracing_subscriber::registry().with(StoreLayer::new(store.clone()));
 
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!(target: "test_target", count = 3u64, name = "alice", "hello");
         });
 
         let records = store.tail(10, Level::TRACE);
-        assert_eq!(records.len(), 1, "exactly one event should have been captured");
+        assert_eq!(
+            records.len(),
+            1,
+            "exactly one event should have been captured"
+        );
         let r = &records[0];
         assert_eq!(r.level, "INFO");
         assert_eq!(r.target, "test_target");
@@ -440,8 +450,7 @@ mod tests {
     #[test]
     fn record_f64_preserves_nan_as_string_marker() {
         let store = LogStore::new(4);
-        let subscriber =
-            tracing_subscriber::registry().with(StoreLayer::new(store.clone()));
+        let subscriber = tracing_subscriber::registry().with(StoreLayer::new(store.clone()));
 
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!(target: "test_target", ratio = f64::NAN, "trouble");
