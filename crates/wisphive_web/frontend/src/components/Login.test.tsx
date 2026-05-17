@@ -36,14 +36,31 @@ import userEvent from "@testing-library/user-event";
 // Mock the two hooks so we can drive their outputs deterministically.
 // `vi.mock` is hoisted; the factories below define the *default* return
 // shape and individual tests override via `vi.mocked(...).mockReturnValue(...)`.
+// Default snapshot — extracted so the `useAuthProfile` hook mock and
+// `waitForAuthProfile` async-barrier mock can return identical shapes.
+// Individual tests override via `mockedUseAuthProfile.mockReturnValue(...)`
+// AND `mockedWaitForAuthProfile.mockResolvedValue(...)` together when
+// they care about a non-default posture (see helper below).
+import type { UseAuthProfile } from "../hooks/useAuthProfile";
+
+const DEFAULT_PROFILE_SNAPSHOT: UseAuthProfile = {
+  profile: "local-lan",
+  canEnrollPasskeyOnThisOrigin: true,
+  passkeyRequired: false,
+  allowEphemeralListener: true,
+  loaded: true,
+};
+
 vi.mock("../hooks/useAuthProfile", () => ({
-  useAuthProfile: vi.fn(() => ({
-    profile: "local-lan",
-    canEnrollPasskeyOnThisOrigin: true,
-    passkeyRequired: false,
-    allowEphemeralListener: true,
-    loaded: true,
-  })),
+  useAuthProfile: vi.fn(() => DEFAULT_PROFILE_SNAPSHOT),
+  // useAuth.setPassword now awaits waitForAuthProfile() before deciding
+  // between "authed-pending-enroll" and "authed" (sprint-1 wave-4
+  // review item #1). The mock must resolve to the same shape the hook
+  // returns so unit tests stay coherent — if a test overrides the hook
+  // but forgets to override the barrier, setPassword reads the default
+  // and the test's intent silently slips.
+  waitForAuthProfile: vi.fn(async () => DEFAULT_PROFILE_SNAPSHOT),
+  __resetAuthProfileForTesting: vi.fn(),
 }));
 
 vi.mock("../hooks/usePasskey", () => ({
@@ -57,11 +74,23 @@ vi.mock("../hooks/usePasskey", () => ({
 
 import { Login } from "./Login";
 import { useAuth } from "../hooks/useAuth";
-import { useAuthProfile } from "../hooks/useAuthProfile";
+import { useAuthProfile, waitForAuthProfile } from "../hooks/useAuthProfile";
 import { usePasskey } from "../hooks/usePasskey";
 
 const mockedUseAuthProfile = vi.mocked(useAuthProfile);
+const mockedWaitForAuthProfile = vi.mocked(waitForAuthProfile);
 const mockedUsePasskey = vi.mocked(usePasskey);
+
+/** Override both `useAuthProfile` and `waitForAuthProfile` with the same
+ * snapshot. Tests that drive the real-useAuth `AuthHarness` (M1
+ * regression) MUST use this — otherwise the hook returns one posture
+ * and the async barrier returns another, and setPassword routes through
+ * the wrong branch. */
+function setProfileSnapshot(overrides: Partial<UseAuthProfile>): void {
+  const snapshot: UseAuthProfile = { ...DEFAULT_PROFILE_SNAPSHOT, ...overrides };
+  mockedUseAuthProfile.mockReturnValue(snapshot);
+  mockedWaitForAuthProfile.mockResolvedValue(snapshot);
+}
 
 /** Build a Props bundle with sensible defaults — individual tests
  * override the bits they care about. Keeps each `render` call small
@@ -133,14 +162,11 @@ function jsonResponse(body: unknown, init?: { status?: number }): Response {
 beforeEach(() => {
   // Reset both hook mocks to the default "passkey-supported" shape so
   // each test starts from a known baseline. Tests that need a different
-  // shape override via mockReturnValue *after* this.
-  mockedUseAuthProfile.mockReturnValue({
-    profile: "local-lan",
-    canEnrollPasskeyOnThisOrigin: true,
-    passkeyRequired: false,
-    allowEphemeralListener: true,
-    loaded: true,
-  });
+  // shape override via `setProfileSnapshot({...})` *after* this — that
+  // helper updates BOTH the hook (used by render-time gating in
+  // Login.tsx) AND the async barrier (used by useAuth.setPassword) so
+  // they can't drift apart silently.
+  setProfileSnapshot(DEFAULT_PROFILE_SNAPSHOT);
   mockedUsePasskey.mockReturnValue({
     enroll: vi.fn().mockResolvedValue({ ok: true, credentialId: "cred-1" }),
     loginWithPasskey: vi
@@ -172,13 +198,7 @@ describe("Login — login-with-passkey button visibility", () => {
   });
 
   it("hides 'Sign in with a passkey' when canEnrollPasskeyOnThisOrigin=false", () => {
-    mockedUseAuthProfile.mockReturnValue({
-      profile: "local-lan",
-      canEnrollPasskeyOnThisOrigin: false,
-      passkeyRequired: false,
-      allowEphemeralListener: true,
-      loaded: true,
-    });
+    setProfileSnapshot({ canEnrollPasskeyOnThisOrigin: false });
     renderLogin({ phase: "unauthed" });
     expect(
       screen.queryByRole("button", { name: /sign in with a passkey/i }),
@@ -199,10 +219,9 @@ describe("Login — login-with-passkey button visibility", () => {
   it("hides 'Sign in with a passkey' while useAuthProfile is still loading", () => {
     // loaded=false collapses the gate — don't flash a button that might
     // disappear once the probe resolves.
-    mockedUseAuthProfile.mockReturnValue({
+    setProfileSnapshot({
       profile: null,
       canEnrollPasskeyOnThisOrigin: false,
-      passkeyRequired: false,
       allowEphemeralListener: false,
       loaded: false,
     });
@@ -504,13 +523,7 @@ describe("Login — M1 regression (real useAuth + Login stack)", () => {
     // Origin can't host enrollment — useAuth should NOT park in
     // authed-pending-enroll. Renders the harness-authed sentinel
     // directly after the set-password succeeds.
-    mockedUseAuthProfile.mockReturnValue({
-      profile: "local-lan",
-      canEnrollPasskeyOnThisOrigin: false,
-      passkeyRequired: false,
-      allowEphemeralListener: true,
-      loaded: true,
-    });
+    setProfileSnapshot({ canEnrollPasskeyOnThisOrigin: false });
     const user = userEvent.setup();
     stubAuthFetch(
       jsonResponse({ password_set: false, setup_required: true }),

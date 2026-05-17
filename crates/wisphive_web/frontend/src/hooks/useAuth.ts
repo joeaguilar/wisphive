@@ -6,7 +6,7 @@ import {
   setWebToken,
   subscribeAuthChange,
 } from "../api";
-import { useAuthProfile } from "./useAuthProfile";
+import { waitForAuthProfile } from "./useAuthProfile";
 import type { PasskeyError } from "./usePasskey";
 
 export type AuthPhase =
@@ -130,11 +130,23 @@ export function useAuth(): UseAuth {
     }
   }, [token, probeStatus]);
 
-  // useAuthProfile is consulted in `setPassword` to decide whether to
-  // park in `authed-pending-enroll` or flip straight to `authed`.
-  // Calling the hook unconditionally at the top of useAuth keeps the
-  // hook-call order stable across renders.
-  const profile = useAuthProfile();
+  // setPassword consults the auth-profile snapshot to decide whether to
+  // park in `authed-pending-enroll` or flip straight to `authed`. It uses
+  // `waitForAuthProfile()` rather than reading a `useAuthProfile()` hook
+  // value because:
+  //   1. The hook's render-time `loaded` flag is `false` until the probe
+  //      resolves. A user who clicks "Set password" before the singleton
+  //      probe finished would have seen `canEnroll=false` and skipped
+  //      the enroll-pending phase — the manual smoke during wave-4
+  //      caught exactly that race (see hooks/useAuthProfile.ts module
+  //      docstring).
+  //   2. `useAuthProfile()` here would create a second, race-prone
+  //      probe whose result could disagree with Login.tsx's own hook
+  //      instance (both pre-singleton probes were independent useStates).
+  // The singleton in hooks/useAuthProfile.ts handles both concerns: one
+  // probe per page, no duplicate fetches, and `waitForAuthProfile()` is
+  // an async barrier that resolves to the same snapshot every consumer
+  // sees.
 
   // Re-gate when api.ts clears the token (401/403 from any fetch) or
   // sets a new one (passkey login uses setWebToken directly to atomically
@@ -244,12 +256,24 @@ export function useAuth(): UseAuth {
           // `authed` once the user enrolls or skips.
           //
           // When the origin CAN'T host enrollment (LocalLAN + LAN-IP,
-          // useAuthProfile probe failed, etc.) we skip the transient
-          // state entirely — parking there would render an empty card
-          // before flipping (the enroll affordance would be hidden).
+          // probe persistently failed, etc.) we skip the transient state
+          // entirely — parking there would render an empty card before
+          // flipping (the enroll affordance would be hidden).
+          //
+          // `waitForAuthProfile()` resolves to the singleton snapshot —
+          // either the cached success from a prior subscriber's probe,
+          // the in-flight probe's eventual result, or a fresh probe if
+          // none ever ran. Either way, by the time this line returns we
+          // have the authoritative `canEnrollPasskeyOnThisOrigin` for
+          // *this* origin and aren't gambling on render-tick timing.
           setWebToken(body.token);
           setToken(body.token);
-          setPhase(profile.canEnrollPasskeyOnThisOrigin ? "authed-pending-enroll" : "authed");
+          const snapshot = await waitForAuthProfile();
+          setPhase(
+            snapshot.canEnrollPasskeyOnThisOrigin
+              ? "authed-pending-enroll"
+              : "authed",
+          );
           return true;
         }
         if (res.status === 400) {
@@ -298,10 +322,12 @@ export function useAuth(): UseAuth {
       }
     },
     // setPassword's post-success phase choice depends on the live
-    // `canEnrollPasskeyOnThisOrigin` flag. Subscribing to the full
-    // value (vs `profile` identity) keeps the callback stable when
-    // unrelated profile fields change.
-    [profile.canEnrollPasskeyOnThisOrigin],
+    // `canEnrollPasskeyOnThisOrigin` flag, but it now reads it via
+    // `waitForAuthProfile()` rather than closing over a hook value —
+    // so the callback identity doesn't need to churn on profile
+    // changes and the dep array stays empty. The async barrier handles
+    // the timing.
+    [],
   );
 
   const completeEnrollGate = useCallback(() => {
