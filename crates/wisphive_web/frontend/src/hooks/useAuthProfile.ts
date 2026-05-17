@@ -14,10 +14,16 @@
  * - Fires exactly ONCE on mount. The profile is frozen at daemon startup;
  *   re-probing on every render or every auth-change burns a request for
  *   no information gain.
- * - The `fetch` defaults already send the page's `Origin` header
- *   automatically (browsers attach it to cross-origin AND same-origin
- *   POSTs/GETs the same way), so the server's response is meaningful
- *   for *this* page load.
+ * - The hook does NOT set a custom `Origin` header (it can't — browsers
+ *   forbid scripted overrides of `Origin` for security reasons). On a
+ *   same-origin GET like this one browsers actually OMIT `Origin`
+ *   entirely (per the Fetch standard), so the backend cannot rely on it
+ *   alone. The server-side handler reads `Origin` first and falls back
+ *   to the `Host` header (always present per HTTP/1.1 + HTTP/2) to
+ *   compute `can_enroll_passkey_on_this_origin` — see
+ *   `lib.rs::origin_can_enroll_passkey`. That fallback was added in the
+ *   sprint-1 wave-4 manual smoke after the first integration run showed
+ *   the post-set-password enroll card never rendering.
  * - On network failure / non-2xx, returns `loaded=true` with
  *   `profile=null` + all booleans `false`. That collapses to "no
  *   passkey, no enroll button" — the safe, non-leaky default that

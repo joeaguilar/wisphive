@@ -781,6 +781,80 @@ async fn auth_profile_enterprise_always_can_enroll() {
     assert_eq!(v["allow_ephemeral_listener"], false);
 }
 
+/// Sprint-1 wave-4 regression: browsers OMIT `Origin` on same-origin GET
+/// requests (per the Fetch standard). The SPA's `useAuthProfile` probe
+/// is a same-origin GET, so when it first lands the request reaches the
+/// daemon with `Host` set but no `Origin`. Pre-fix, the handler returned
+/// `can_enroll_passkey_on_this_origin: false` here, the SPA never offered
+/// the "Enroll a passkey?" card after set-password, and the smoke caught
+/// it. The fix makes `origin_can_enroll_passkey` fall back to `Host` (always
+/// present) when `Origin` is missing — synthesizing an origin URL and
+/// re-running it through `rp_id_for_origin`.
+#[tokio::test]
+async fn auth_profile_host_fallback_when_origin_absent() {
+    let (_tmp, state) = test_state().await;
+    // NB: no `.header("origin", ...)`. `req()` already sets Host=127.0.0.1:3100.
+    let r = req("GET", "/api/auth/profile").body(Body::empty()).unwrap();
+    let (status, body) = run_with(state, r).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["profile"], "local-lan");
+    assert_eq!(
+        v["can_enroll_passkey_on_this_origin"], true,
+        "Origin-absent same-origin GET on loopback Host must still be enrollment-capable"
+    );
+}
+
+/// Companion to `auth_profile_host_fallback_when_origin_absent`: the Host
+/// fallback must NOT promote a LAN-IP Host to enrollment-capable under
+/// LocalLAN. Confirms the fallback runs the synthesized origin through the
+/// same policy filter — it's not a bypass, just a different way to learn
+/// the host shape.
+#[tokio::test]
+async fn auth_profile_host_fallback_respects_lan_ip_under_local_lan() {
+    let (tmp, db) = test_db().await;
+    let lan_host = "192.168.1.42:8443".to_string();
+    let security = SecurityConfig::for_test(
+        // Allowlist accepts a LAN-IP origin so the security middleware
+        // doesn't 403 before we reach the handler — same setup as
+        // `auth_profile_local_lan_lan_ip_origin_cannot_enroll`.
+        vec![format!("https://{lan_host}")],
+        vec![lan_host.clone()],
+        db.clone(),
+    );
+    let state = AppState {
+        socket_path: tmp.path().join("wisphive.sock"),
+        config_path: tmp.path().join("config.json"),
+        security,
+        auth_policy: AuthProfile::LocalLAN.policy(),
+        passkey_challenges: crate::passkey::ChallengeStore::new(),
+    };
+    let r = Request::builder()
+        .method("GET")
+        .uri("/api/auth/profile")
+        .header("host", &lan_host)
+        // Deliberately NO Origin header — exercising the same browser
+        // behaviour as the previous test but on a LAN-IP Host.
+        .extension(ClientIp(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42))))
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = run_with(state, r).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        v["can_enroll_passkey_on_this_origin"], false,
+        "LAN-IP Host under LocalLAN must remain enrollment-blocked even via the Host fallback"
+    );
+}
+
+// The "neither Origin nor Host present" case is unreachable in production:
+// `security::host_origin_gate` enforces the Host allowlist before the handler
+// runs, so a request without `Host` 403s at the middleware. The handler-level
+// fallback chain still stops cleanly at `false` if it's ever exercised
+// directly (e.g. by future unit-level callers of `origin_can_enroll_passkey`),
+// but covering that here would require a unit test on the helper function
+// rather than an end-to-end router test — declined as over-engineering.
+
 // ── /api/auth/logout ───────────────────────────────────────────────────
 
 #[tokio::test]
