@@ -36,6 +36,18 @@ just frontend-lint       # ESLint
 
 In production (`wisphive web serve` or `wisphive daemon start --web`) the Rust binary serves the embedded `dist/` assets and the WebSocket bridge from one process. In dev (`--dev`), it serves only `/ws` and expects Vite to serve the UI.
 
+Rendered agent/tool output is untrusted. Markdown-like text must be rendered as React nodes or through an audited sanitizer with a URL protocol allowlist; do not use `dangerouslySetInnerHTML` for agent-controlled content. Web device bearer tokens live in browser `localStorage`, so any XSS is device compromise.
+
+### Safety / Dependency Audit
+
+```bash
+cargo deny check advisories bans sources
+cd crates/wisphive_web/frontend && npm audit
+cd crates/wisphive_web/frontend && npm audit --omit=dev
+```
+
+Run these when touching `Cargo.lock`, frontend lockfiles, TLS/web auth, markdown rendering, or dev-server dependencies. Treat Vite dev-server advisories as relevant even though production serves embedded assets: `just frontend-dev` exposes source files if a vulnerable dev server is bound beyond loopback.
+
 ## Architecture
 
 ```
@@ -104,8 +116,9 @@ All under `~/.wisphive/`:
 - `wisphive.db` — SQLite state/audit database
 - `mode` — "active" or "off" (global kill switch)
 - `auto-approve.json` — List of tool names that skip daemon review
-- `web.token` — Per-process bearer token for the web UI (mode 0600). Regenerated on every `wisphive daemon start` / `wisphive web serve`. Required as `?token=` on `/ws` and `Authorization: Bearer` (or `?token=`) on `/api/*`. Frontend bootstraps it via `GET /api/web-token`, which is gated by Origin + Host checks but not by the bearer. Allowlists seed with `127.0.0.1:<port>` / `localhost:<port>` (plus `localhost:5173` in dev mode); extend via `WISPHIVE_WEB_ALLOWED_ORIGINS` / `WISPHIVE_WEB_ALLOWED_HOSTS` env vars when binding to `0.0.0.0`.
 - `web.cert.pem` / `web.key.pem` — Self-signed TLS cert/key for the web UI (key is mode 0600). Validity is capped at 397 days; rotation writes atomically under `web.cert.lock` (flock) with metadata in `web.cert.meta.json`. See `crates/wisphive_web/src/tls.rs`.
+
+Web auth no longer uses a `~/.wisphive/web.token` file. Raw per-device bearer tokens are issued by `/api/auth/login` or first-run `/api/auth/set-password`, stored client-side in the SPA's `localStorage` under `wisphive-web-token`, and sent as `Authorization: Bearer` for `/api/*` or `?token=` for `/ws` because browser WebSocket constructors cannot set auth headers. The server stores only SHA-256 token hashes in `web_devices`; revoked or unknown tokens both return 401. The retired `/api/web-token` route should stay 404.
 
 ## Reference Documentation
 

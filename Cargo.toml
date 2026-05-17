@@ -98,6 +98,12 @@ hostname = "0.4"
 sha2 = "0.10"
 argon2 = "0.5"
 rpassword = "7"
-webauthn-rs = "0.5"
+# itr#311: enable `conditional-ui` so `Webauthn::start_discoverable_authentication`
+# and `DiscoverableKey` are available — required for the resident-key /
+# "Login with passkey" flow with no presented `allowCredentials`. Default
+# `attestation` feature is kept on (the crate's default) so the existing
+# `webauthn-rs::prelude::Url` re-export and `AttestationConveyancePreference`
+# enum stay accessible.
+webauthn-rs = { version = "0.5", features = ["conditional-ui"] }
 time = "0.3"
 subtle = "2"

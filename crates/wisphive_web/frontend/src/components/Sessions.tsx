@@ -23,9 +23,13 @@ function duration(first: string, last: string): string {
 }
 
 export function Sessions({ sessions, timeline, selectedAgent, onLoad, onSelectAgent, onLoadTimeline, onRefreshTimeline }: SessionsProps) {
-  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<{ agentId: string | null; entryId: string | null }>({
+    agentId: null,
+    entryId: null,
+  });
+  const expandedId = expanded.agentId === selectedAgent ? expanded.entryId : null;
+  const setExpandedId = (entryId: string | null) => setExpanded({ agentId: selectedAgent, entryId });
   useEffect(() => { onLoad(); }, [onLoad]);
-  useEffect(() => { setExpandedId(null); }, [selectedAgent]);
 
   if (selectedAgent) {
     return (

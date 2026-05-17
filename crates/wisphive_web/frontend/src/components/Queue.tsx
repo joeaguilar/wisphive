@@ -1,4 +1,5 @@
 import type { DecisionRequest } from "../types/protocol";
+import { eventPrefix, inputSummary, shortProject, timeAgo } from "./queueUtils";
 
 interface QueueProps {
   items: DecisionRequest[];
@@ -6,71 +7,6 @@ interface QueueProps {
   onSelect: (id: string) => void;
   onApprove: (id: string) => void;
   onDeny: (id: string) => void;
-}
-
-export function timeAgo(timestamp: string): string {
-  const seconds = Math.floor(
-    (Date.now() - new Date(timestamp).getTime()) / 1000,
-  );
-  if (seconds < 60) return `${seconds}s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
-  return `${Math.floor(seconds / 3600)}h`;
-}
-
-// Event type prefix badges matching TUI indicators
-export function eventPrefix(eventName: string): string {
-  switch (eventName) {
-    case "PermissionRequest": return "P";
-    case "Elicitation": return "E";
-    case "Stop": case "SubagentStop": return "S";
-    case "UserPromptSubmit": return "U";
-    case "ConfigChange": return "C";
-    case "TeammateIdle": return "T";
-    case "TaskCompleted": return "D";
-    default: return "";
-  }
-}
-
-// Extract a brief summary of tool input for the queue list
-export function inputSummary(item: DecisionRequest): string | null {
-  const input = item.tool_input;
-  if (!input) return null;
-
-  // Bash: show command
-  if (typeof input.command === "string") {
-    const cmd = input.command as string;
-    return cmd.length > 80 ? cmd.slice(0, 77) + "..." : cmd;
-  }
-  // Edit: show file path
-  if (typeof input.file_path === "string") return input.file_path as string;
-  // Write: show file path
-  if (item.tool_name === "Write" && typeof input.file_path === "string") return input.file_path as string;
-  // Read/Grep/Glob: show path or pattern
-  if (typeof input.pattern === "string") return `/${input.pattern as string}/`;
-  // AskUserQuestion: show question
-  if (Array.isArray(input.questions)) {
-    const q = input.questions[0] as Record<string, unknown> | undefined;
-    if (q && typeof q.question === "string") {
-      const text = q.question as string;
-      return text.length > 80 ? text.slice(0, 77) + "..." : text;
-    }
-  }
-  // Stop: show last message
-  if (item.event_data && typeof item.event_data.last_assistant_message === "string") {
-    const msg = item.event_data.last_assistant_message as string;
-    return msg.length > 80 ? msg.slice(0, 77) + "..." : msg;
-  }
-  // Plan
-  if (item.event_data && typeof item.event_data.plan_content === "string") {
-    return "Plan ready for review";
-  }
-  return null;
-}
-
-// Extract short project name from path
-export function shortProject(project: string): string {
-  const parts = project.split("/");
-  return parts[parts.length - 1] || project;
 }
 
 export function Queue({

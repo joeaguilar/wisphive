@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import type { DecisionRequest } from "../types/protocol";
 import { DetailView } from "./DetailView";
-import { eventPrefix, inputSummary, timeAgo } from "./Queue";
+import { eventPrefix, inputSummary, timeAgo } from "./queueUtils";
 
 interface Props {
   terminalPending: DecisionRequest[];
@@ -18,14 +18,8 @@ export function TerminalQueueDock({
   onDeny,
   onJumpToQueue,
 }: Props) {
-  const [expandedId, setExpandedId] = useState<string | null>(null);
-
-  // Drop expansion if the row leaves the list (resolved server-side).
-  useEffect(() => {
-    if (expandedId && !terminalPending.some((r) => r.id === expandedId)) {
-      setExpandedId(null);
-    }
-  }, [terminalPending, expandedId]);
+  const [requestedExpandedId, setRequestedExpandedId] = useState<string | null>(null);
+  const expandedId = terminalPending.some((r) => r.id === requestedExpandedId) ? requestedExpandedId : null;
 
   if (terminalPending.length === 0 && otherPendingCount === 0) return null;
 
@@ -57,7 +51,7 @@ export function TerminalQueueDock({
           >
             <div
               className="terminal-queue-dock-row-head"
-              onClick={() => setExpandedId(isExpanded ? null : row.id)}
+              onClick={() => setRequestedExpandedId(isExpanded ? null : row.id)}
             >
               {prefix && <span className="event-prefix">{prefix}</span>}
               <span className="tool-name">{row.tool_name}</span>
