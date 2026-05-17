@@ -245,8 +245,71 @@ When both close, Wave 5 fires:
 
 Wave 1's contribution is clean — it did not introduce any of the red. The pre-existing red would have prevented Wave 1 from ever running if we'd gated entry; the agent ran the gate as instructed and reported the drift without auto-fixing (per the prohibition rule). Decision on how to clear the gate before Wave 2 is captured in `Interventions` below.
 
+### Wave 5 — itr#269 (folded into Wave 4 wrap-up, completed 2026-05-17)
+
+Per Product Owner direction at /blitz Phase 0, Wave 5's mechanical close of itr#269 was folded into Wave 4 wrap-up rather than spawning an agent for a one-line `itr close`. itr#269 closed after Chrome happy-path smoke verification confirmed #312 + #315's acceptance — no code change against #269 itself per its own bookkeeping note.
+
+### Sprint close (post-manual-smoke)
+
+Five issues closed in sequence after Product Owner's "looks good" on the Chrome happy-path verification:
+
+- itr#315 — LocalLAN smoke procedure doc + Chrome happy-path table in close-reason
+- itr#219 — WebAuthn umbrella; v1 scope cut documented (LocalLAN only; Firefox/Brave deferred to itr#324; Safari/Android out; USB-key webauthn-rs limitation tracked under itr#321)
+- itr#269 — Mechanical bookkeeping (Wave 5)
+- itr#314 — Sprint epic with all 5 stories + interventions accounted for
+
+AC text reconciliation (review item #4) applied to #219 and #314 BEFORE closing — both contained stale "both profiles" / "Android smoke" wording from the original plan that the LocalLAN-only v1 scope superseded. New ACs explicitly cite the Enterprise → itr#316 + multi-browser → itr#324 deferrals.
+
+itr#324 filed (medium) for the deferred Firefox + Brave matrix + per-browser §5 edge cases. Chrome happy-path covered in #315 close.
+
+### Sprint blitz final gate state (after all wave-4 smoke interventions)
+
+| Gate | Start of sprint | End of sprint |
+|------|-----------------|---------------|
+| cargo test --workspace | 309 passing | 367 passing (+58 net new across waves) |
+| cargo clippy --workspace -- -D warnings | clean | clean |
+| cargo fmt --all -- --check | red (10 pre-existing) | clean |
+| npm run lint (frontend) | red (7 pre-existing) | clean |
+| npm test (Vitest) | n/a (no infra) | 47 passing |
+
+### Total commits in this blitz: 13
+
+Waves 1+2 (already on `main` at handoff): `a0d6128`, `4630abc`, `dd70016`, `8357500`, `4e67206`, `96d1718`.
+
+This session:
+- `92b9379` — chore(frontend): Vitest bootstrap (W3.pre-intervention)
+- `21eb009` — feat(web): #312 frontend passkey hooks + Login.tsx
+- `b6662b2` — fix(web): #312 review M1/M2/M3 + cheap SHOULD-FIX
+- `e8817e8` — chore(docs): /docs untrack + backfill (W4.pre-intervention)
+- `c8cbcaa` — docs(plan): #315 LocalLAN smoke procedure
+- `40b58ef` — docs(sprint): Wave 3+4 outcome
+- `76a4536` — fix(web): /api/auth/profile Host fallback (W4.intervention)
+- `c3913cb` — fix(web): /api/auth/profile HTTP/2 URI authority (W4.intervention follow-up)
+- `081b9d8` — fix(web): useAuthProfile singleton + waitForAuthProfile barrier (W4.intervention-2)
+- `f0ae293` — docs(plan): USB-key webauthn-rs limitation callout
+- `caf896d` — fix(web): IP-literal None for rp_id + 308 redirect (W4.intervention-3)
+- (this commit) — docs(sprint): wave-1.md final outcome + Wave 5 close
+
+### itr ledger this sprint
+
+Closed: 310, 311, 312, 315, 269, 219, 314.
+
+Filed as follow-ups (deferred):
+- itr#316 (Enterprise smoke matrix; blocked-by 270)
+- itr#317 (rate-limit /api/auth/profile + /api/auth/status)
+- itr#318 (#310 review code-quality bundle; 9 items)
+- itr#319 (#311 review security bundle; device-row semantics, LAN port-mapping, blob versioning)
+- itr#320 (#311 review code-quality bundle; 7 items)
+- itr#321 (#312 review security bundle + wave-4 review items 2/3; retry-after taxonomy, observability, browserOpts whitelist, resident-key upgrade, ChallengeStore rate-limit + size cap)
+- itr#322 (#312 review code-quality bundle; 8 items)
+- itr#324 (full Firefox + Brave LocalLAN smoke matrix + §5 edge cases per browser)
+
+### Recommend next session
+
+Run `/sprint-review` — the sprint had 5 interventions (W3.pre, W4.pre, W4, W4-2, W4-3), which is above the friction-signal threshold for Adaptive Retro. Sprint epic is already closed; `/sprint-review` would formalize the retro + update `sprint/CURRENT`.
+
 
 
 ## Quarantine triage notes
 
-(Empty — appended if quarantine triage fires.)
+(Empty — appended if quarantine triage fires. None fired during sprint-1.)
