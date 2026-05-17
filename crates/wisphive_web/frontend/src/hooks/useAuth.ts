@@ -6,6 +6,7 @@ import {
   setWebToken,
   subscribeAuthChange,
 } from "../api";
+import { usePasskey, type PasskeyError, type PasskeyLoginResult } from "./usePasskey";
 
 export type AuthPhase =
   | "loading"       // probing /api/auth/status on first mount
@@ -35,12 +36,24 @@ export interface UseAuth {
    * Returns true on success. 409 (password already set) flips phase to
    * unauthed so the form can recover without a reload. */
   setPassword: (password: string, deviceName?: string) => Promise<boolean>;
+  /** Run the discoverable-credential passkey login ceremony. On success
+   * the new bearer is stashed through the shared auth-change event
+   * path (same as `login` / `setPassword`); the returned PasskeyLoginResult
+   * lets the caller render a passkey-specific inline error on failure
+   * without polluting the shared `AuthError` channel — passkey errors
+   * have their own taxonomy (`unsupported` / `cancelled` / etc.) that
+   * don't map onto the password-login `AuthError.kind` set. */
+  loginWithPasskey: () => Promise<PasskeyLoginResult>;
   logout: () => Promise<void>;
   /** Re-probe /api/auth/status (e.g. after an external password-set). */
   refreshStatus: () => Promise<void>;
   /** Dismiss the current error so the form can be retried cleanly. */
   clearError: () => void;
 }
+
+// Re-export PasskeyError so consumers that hold a `UseAuth` reference
+// can render passkey-specific inline errors without a second import.
+export type { PasskeyError };
 
 interface AuthStatus {
   password_set: boolean;
@@ -242,6 +255,25 @@ export function useAuth(): UseAuth {
     [],
   );
 
+  const passkey = usePasskey();
+  const loginWithPasskey = useCallback(async (): Promise<PasskeyLoginResult> => {
+    // Clear any stale password-login error so the user doesn't see a
+    // "wrong password" banner while they're going through the passkey
+    // prompt — the two surfaces share the same error region in Login.tsx.
+    setError(null);
+    const result = await passkey.loginWithPasskey();
+    if (result.ok) {
+      // usePasskey already called setWebToken on success, which fires
+      // the auth-change subscription below — but mirror the atomic-
+      // login pattern (login / setPassword) and update local state
+      // directly too so a racing render can't briefly see phase=unauthed
+      // between setWebToken and the listener callback.
+      setToken(result.token);
+      setPhase("authed");
+    }
+    return result;
+  }, [passkey]);
+
   const logout = useCallback(async () => {
     // Best-effort server-side revoke; local state is authoritative for UX.
     try {
@@ -260,6 +292,7 @@ export function useAuth(): UseAuth {
     error,
     login,
     setPassword,
+    loginWithPasskey,
     logout,
     refreshStatus: probeStatus,
     clearError,

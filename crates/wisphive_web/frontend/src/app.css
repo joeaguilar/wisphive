@@ -1761,6 +1761,35 @@ kbd {
   background: var(--bg-card-hover);
 }
 
+/* Passkey CTA above the password form (itr#312). Stacks the
+ * "Sign in with a passkey" button + a horizontal divider so the password
+ * form below stays visually subordinate but always reachable. The divider
+ * uses pseudo-elements rather than a real hr so the centred label keeps
+ * the colour-token rhythm with the rest of the card. */
+.login-passkey-cta {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+  margin-bottom: var(--space-md);
+}
+
+.login-divider {
+  display: flex;
+  align-items: center;
+  text-align: center;
+  color: var(--text-dim);
+  font-size: var(--font-sm);
+  gap: var(--space-sm);
+}
+
+.login-divider::before,
+.login-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
 /* Sidebar sign-out button (itr#217) */
 .logout-btn {
   background: transparent !important;
