@@ -440,6 +440,9 @@ After enrolling a passkey, logout, and use the password form to log back in. Wis
   - This points at the device-row semantics gap tracked under itr#319. The new device row created during enroll has no passkeys of its own; passkey login returns `enrolling_device_id` pointing at the original device — UI surfaces that consume the bearer must not stale-cache `device_id` ↔ `passkey_id`.
 - **`POST /api/auth/passkey/login/start` fires on page-load** (devtools shows it before any click):
   - Don't do this — it consumes a throttle slot and inserts a `ChallengeStore` row that reaps at 60s cadence (#311 review note 7). The current `usePasskey.loginWithPasskey` only fires on user click; if you see auto-fires, the hook has regressed.
+- **USB security key enrolls but login-with-passkey can't find it** (known v1 limitation — tracked under itr#321):
+  - webauthn-rs 0.5's `start_passkey_registration` hardcodes `require_resident_key(false)`, so USB keys MAY enroll a non-discoverable credential. The login flow uses `start_discoverable_authentication`, which only sees resident credentials. Platform passkeys (Touch ID, Windows Hello, iOS keychain) create resident credentials regardless and work fine; USB-only authenticators may not.
+  - **For LocalLAN smoke, use a platform passkey for the full round-trip.** If you specifically want to smoke a USB key, accept that the enroll-then-login flow may fail at login with `PasskeyError { kind: "server_rejected", message: "..." }` or an `unknown` kind. Document the failure mode in the result table but DO NOT count it as a sprint blocker — itr#321 captures the upstream/lower-level-API fix path.
 
 ### 8. What to capture per run
 
