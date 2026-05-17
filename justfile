@@ -73,6 +73,10 @@ frontend-build:
 frontend-lint:
     cd crates/wisphive_web/frontend && npm run lint
 
+# Run the frontend Vitest suite (jsdom + React Testing Library)
+frontend-test:
+    cd crates/wisphive_web/frontend && npm test
+
 # Install Claude Code hooks into the current project
 hooks-install:
     wisphive hooks install --project .

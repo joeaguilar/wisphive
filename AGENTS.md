@@ -32,6 +32,7 @@ just frontend-install    # npm install
 just frontend-dev        # Vite dev server on :5173 — pair with `just web-dev`
 just frontend-build      # Production build → frontend/dist/ (embedded via rust-embed)
 just frontend-lint       # ESLint
+just frontend-test       # Vitest (jsdom + @testing-library/react)
 ```
 
 In production (`wisphive web serve` or `wisphive daemon start --web`) the Rust binary serves the embedded `dist/` assets and the WebSocket bridge from one process. In dev (`--dev`), it serves only `/ws` and expects Vite to serve the UI.
