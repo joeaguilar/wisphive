@@ -1,0 +1,1131 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wisphive Security Flow Walkthrough</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101414;
+      --panel: #171d1d;
+      --panel-2: #202727;
+      --ink: #eef7f2;
+      --muted: #9fb3ad;
+      --line: #34413e;
+      --accent: #51d7a3;
+      --accent-2: #70a7ff;
+      --warn: #ffd36e;
+      --bad: #ff7a7a;
+      --ok: #61e6b1;
+      --shadow: 0 18px 50px rgba(0, 0, 0, .32);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 22% 18%, rgba(81, 215, 163, .12), transparent 28rem),
+        radial-gradient(circle at 84% 8%, rgba(112, 167, 255, .10), transparent 30rem),
+        var(--bg);
+      color: var(--ink);
+      min-height: 100vh;
+    }
+
+    button, input {
+      font: inherit;
+    }
+
+    button {
+      cursor: pointer;
+    }
+
+    .shell {
+      max-width: 1240px;
+      margin: 0 auto;
+      padding: 28px;
+    }
+
+    .hero {
+      min-height: 82vh;
+      display: grid;
+      align-items: center;
+      grid-template-columns: minmax(0, 1.05fr) minmax(320px, .95fr);
+      gap: 34px;
+      padding: 22px 0 46px;
+    }
+
+    .eyebrow {
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: .12em;
+      font-size: 12px;
+      font-weight: 800;
+      margin-bottom: 18px;
+    }
+
+    h1 {
+      font-size: clamp(42px, 7vw, 86px);
+      line-height: .96;
+      margin: 0 0 20px;
+      letter-spacing: 0;
+      max-width: 780px;
+    }
+
+    .lead {
+      color: #d5e6df;
+      font-size: clamp(18px, 2vw, 23px);
+      line-height: 1.48;
+      max-width: 760px;
+      margin: 0 0 28px;
+    }
+
+    .hero-actions {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 32px;
+    }
+
+    .btn {
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      color: var(--ink);
+      border-radius: 8px;
+      min-height: 42px;
+      padding: 10px 14px;
+      font-weight: 750;
+      transition: transform .16s ease, border-color .16s ease, background .16s ease;
+    }
+
+    .btn:hover {
+      transform: translateY(-1px);
+      border-color: var(--accent);
+    }
+
+    .btn.primary {
+      background: linear-gradient(135deg, #35b982, #5d93ff);
+      border-color: transparent;
+      color: #07110e;
+    }
+
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      max-width: 760px;
+    }
+
+    .metric {
+      border: 1px solid var(--line);
+      background: rgba(23, 29, 29, .86);
+      border-radius: 8px;
+      padding: 14px;
+    }
+
+    .metric strong {
+      display: block;
+      font-size: 28px;
+      line-height: 1;
+      margin-bottom: 8px;
+    }
+
+    .metric span {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.35;
+      display: block;
+    }
+
+    .network-stage {
+      border: 1px solid var(--line);
+      background: rgba(23, 29, 29, .8);
+      border-radius: 8px;
+      padding: 20px;
+      box-shadow: var(--shadow);
+      min-height: 520px;
+    }
+
+    .network-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+
+    .network-title h2 {
+      margin: 0;
+      font-size: 22px;
+    }
+
+    .badge {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 6px 10px;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+      background: rgba(255, 255, 255, .03);
+    }
+
+    .topology {
+      display: grid;
+      grid-template-columns: 1fr 68px 1fr;
+      gap: 12px;
+      align-items: center;
+      margin: 22px 0;
+    }
+
+    .node {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-2);
+      padding: 16px;
+      min-height: 138px;
+    }
+
+    .node .icon {
+      width: 38px;
+      height: 38px;
+      display: grid;
+      place-items: center;
+      border-radius: 8px;
+      background: rgba(81, 215, 163, .15);
+      border: 1px solid rgba(81, 215, 163, .34);
+      margin-bottom: 12px;
+      font-size: 22px;
+    }
+
+    .node h3 {
+      margin: 0 0 8px;
+      font-size: 18px;
+    }
+
+    .node p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.45;
+    }
+
+    .link {
+      height: 4px;
+      border-radius: 99px;
+      background: linear-gradient(90deg, var(--accent), var(--accent-2));
+      position: relative;
+    }
+
+    .link::after {
+      content: "";
+      position: absolute;
+      right: -2px;
+      top: -6px;
+      width: 0;
+      height: 0;
+      border-top: 8px solid transparent;
+      border-bottom: 8px solid transparent;
+      border-left: 12px solid var(--accent-2);
+    }
+
+    .flow-readout {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+      min-height: 172px;
+      background: rgba(16, 20, 20, .72);
+    }
+
+    .flow-readout h3 {
+      margin: 0 0 8px;
+      font-size: 18px;
+    }
+
+    .flow-readout p {
+      margin: 0 0 14px;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+
+    .progress {
+      height: 10px;
+      background: #0d1111;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      overflow: hidden;
+    }
+
+    .progress > span {
+      display: block;
+      height: 100%;
+      width: 17%;
+      background: linear-gradient(90deg, var(--accent), var(--accent-2));
+      transition: width .24s ease;
+    }
+
+    .step-buttons {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+      margin-top: 14px;
+    }
+
+    .step-buttons button {
+      border: 1px solid var(--line);
+      background: #111717;
+      color: var(--muted);
+      border-radius: 8px;
+      padding: 10px 8px;
+      min-height: 42px;
+    }
+
+    .step-buttons button.active {
+      color: var(--ink);
+      border-color: var(--accent);
+      background: rgba(81, 215, 163, .12);
+    }
+
+    .section {
+      padding: 58px 0;
+      border-top: 1px solid rgba(255, 255, 255, .08);
+    }
+
+    .section-head {
+      display: grid;
+      grid-template-columns: minmax(0, .9fr) minmax(280px, .55fr);
+      gap: 24px;
+      align-items: end;
+      margin-bottom: 22px;
+    }
+
+    .section h2 {
+      font-size: clamp(30px, 4vw, 52px);
+      line-height: 1.02;
+      margin: 0;
+      letter-spacing: 0;
+    }
+
+    .section-head p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.55;
+    }
+
+    .tabs {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin: 0 0 16px;
+    }
+
+    .tab {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--panel);
+      color: var(--muted);
+      padding: 10px 13px;
+      font-weight: 750;
+    }
+
+    .tab.active {
+      color: var(--ink);
+      border-color: var(--accent);
+      background: rgba(81, 215, 163, .12);
+    }
+
+    .compare {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .panel {
+      border: 1px solid var(--line);
+      background: rgba(23, 29, 29, .82);
+      border-radius: 8px;
+      padding: 18px;
+      min-height: 220px;
+    }
+
+    .panel h3 {
+      margin: 0 0 12px;
+      font-size: 20px;
+    }
+
+    .panel p, .panel li {
+      color: var(--muted);
+      line-height: 1.5;
+    }
+
+    .panel ul {
+      margin: 0;
+      padding-left: 18px;
+    }
+
+    .callout {
+      border-left: 4px solid var(--accent);
+      padding: 12px 14px;
+      background: rgba(81, 215, 163, .09);
+      border-radius: 0 8px 8px 0;
+      color: #dff9ee;
+      line-height: 1.48;
+      margin-top: 14px;
+    }
+
+    .gate-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .gate {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 8px;
+      padding: 14px;
+      min-height: 190px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .gate::before {
+      content: "";
+      position: absolute;
+      inset: 0 0 auto;
+      height: 4px;
+      background: var(--gate-color, var(--accent));
+    }
+
+    .gate strong {
+      display: block;
+      margin-bottom: 10px;
+      font-size: 17px;
+    }
+
+    .gate span {
+      display: inline-flex;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      padding: 4px 8px;
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 12px;
+    }
+
+    .gate p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.45;
+      font-size: 14px;
+    }
+
+    .scenario {
+      display: grid;
+      grid-template-columns: minmax(280px, .5fr) minmax(0, 1fr);
+      gap: 16px;
+      align-items: stretch;
+    }
+
+    .controls {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 8px;
+      padding: 18px;
+    }
+
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 0;
+      border-bottom: 1px solid rgba(255, 255, 255, .08);
+    }
+
+    .toggle-row:last-child {
+      border-bottom: 0;
+    }
+
+    .switch {
+      width: 52px;
+      height: 30px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #0b1010;
+      padding: 3px;
+      flex: 0 0 auto;
+    }
+
+    .switch span {
+      display: block;
+      width: 22px;
+      height: 22px;
+      border-radius: 999px;
+      background: var(--bad);
+      transition: transform .2s ease, background .2s ease;
+    }
+
+    .switch.on span {
+      transform: translateX(22px);
+      background: var(--ok);
+    }
+
+    .outcome {
+      border: 1px solid var(--line);
+      background: rgba(23, 29, 29, .86);
+      border-radius: 8px;
+      padding: 20px;
+      min-height: 322px;
+    }
+
+    .outcome-top {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 18px;
+    }
+
+    .score {
+      font-size: 42px;
+      font-weight: 900;
+      line-height: 1;
+    }
+
+    .score.good { color: var(--ok); }
+    .score.warn { color: var(--warn); }
+    .score.bad { color: var(--bad); }
+
+    .risk-list {
+      display: grid;
+      gap: 10px;
+    }
+
+    .risk-item {
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+      padding: 11px;
+      border: 1px solid rgba(255, 255, 255, .08);
+      border-radius: 8px;
+      background: rgba(0, 0, 0, .14);
+      color: var(--muted);
+      line-height: 1.42;
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      margin-top: 5px;
+      border-radius: 99px;
+      background: var(--bad);
+      flex: 0 0 auto;
+    }
+
+    .dot.ok { background: var(--ok); }
+    .dot.warn { background: var(--warn); }
+
+    .value-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .value-card {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 8px;
+      padding: 18px;
+      min-height: 220px;
+    }
+
+    .value-card h3 {
+      margin: 0 0 10px;
+      font-size: 20px;
+    }
+
+    .value-card p {
+      color: var(--muted);
+      line-height: 1.5;
+      margin: 0;
+    }
+
+    .value-card .big {
+      color: var(--accent);
+      font-size: 34px;
+      font-weight: 900;
+      margin-bottom: 12px;
+    }
+
+    .timeline {
+      display: grid;
+      gap: 12px;
+    }
+
+    .mile {
+      display: grid;
+      grid-template-columns: 180px minmax(0, 1fr) 120px;
+      gap: 12px;
+      align-items: center;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 8px;
+      padding: 14px;
+    }
+
+    .mile strong { color: var(--ink); }
+    .mile p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.4;
+    }
+
+    .pill {
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      padding: 7px 10px;
+      color: var(--muted);
+      text-align: center;
+      font-size: 12px;
+    }
+
+    .pill.done {
+      color: var(--ok);
+      border-color: rgba(97, 230, 177, .45);
+    }
+
+    .pill.next {
+      color: var(--warn);
+      border-color: rgba(255, 211, 110, .48);
+    }
+
+    .foot {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+      padding: 28px 0 44px;
+    }
+
+    @media (max-width: 920px) {
+      .hero,
+      .section-head,
+      .compare,
+      .scenario {
+        grid-template-columns: 1fr;
+      }
+
+      .hero {
+        min-height: auto;
+      }
+
+      .status-grid,
+      .gate-grid,
+      .value-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .topology {
+        grid-template-columns: 1fr;
+      }
+
+      .link {
+        height: 48px;
+        width: 4px;
+        justify-self: center;
+        background: linear-gradient(180deg, var(--accent), var(--accent-2));
+      }
+
+      .link::after {
+        right: -6px;
+        top: auto;
+        bottom: -2px;
+        border-left: 8px solid transparent;
+        border-right: 8px solid transparent;
+        border-top: 12px solid var(--accent-2);
+        border-bottom: 0;
+      }
+
+      .mile {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 560px) {
+      .shell { padding: 18px; }
+      .step-buttons { grid-template-columns: 1fr; }
+      .hero-actions { flex-direction: column; }
+      .btn { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="hero" id="top">
+      <div>
+        <div class="eyebrow">Stakeholder walkthrough</div>
+        <h1>Security turns Wisphive from localhost-only into a real operator surface.</h1>
+        <p class="lead">
+          The delayed work is not polish. It is the path from "use the TUI on the machine"
+          to "approve agent work from a phone on the local network without exposing the daemon."
+        </p>
+        <div class="hero-actions">
+          <button class="btn primary" data-scroll="#flow">Walk the flow</button>
+          <button class="btn" data-scroll="#value">Show real value</button>
+          <button class="btn" data-scroll="#blockers">Show ship blockers</button>
+        </div>
+        <div class="status-grid">
+          <div class="metric">
+            <strong>2.5w</strong>
+            <span>Estimated focused work for the pairing chain, before unsized security blockers.</span>
+          </div>
+          <div class="metric">
+            <strong>3-5w</strong>
+            <span>Realistic LAN-pairing ship range once blockers and smoke testing are included.</span>
+          </div>
+          <div class="metric">
+            <strong>&lt;1m</strong>
+            <span>Target time for a logged-in operator to pair an Android phone.</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="network-stage" id="flow">
+        <div class="network-title">
+          <h2>Interactive Security Flow</h2>
+          <span class="badge" id="flowBadge">Step 1 of 6</span>
+        </div>
+        <div class="topology">
+          <div class="node">
+            <div class="icon">D</div>
+            <h3>Desktop daemon</h3>
+            <p>Owns the socket, SQLite state, queue, audit log, TLS cert, and WebSocket bridge.</p>
+          </div>
+          <div class="link" aria-hidden="true"></div>
+          <div class="node">
+            <div class="icon">P</div>
+            <h3>Paired phone</h3>
+            <p>Becomes a first-class trusted device, not a shared browser token or one-off remote.</p>
+          </div>
+        </div>
+        <div class="flow-readout">
+          <h3 id="flowTitle">First-run setup</h3>
+          <p id="flowText">
+            The browser probes auth status. If no password exists, setup creates the Argon2id
+            password hash and returns the first per-device token in one step.
+          </p>
+          <div class="progress"><span id="flowProgress"></span></div>
+        </div>
+        <div class="step-buttons" id="stepButtons"></div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <h2>What changes for the user?</h2>
+        <p>
+          The current local UI is useful, but brittle for the user who leaves the laptop,
+          works from another room, or wants phone approvals during a long agent run.
+        </p>
+      </div>
+      <div class="tabs" role="tablist" aria-label="Comparison views">
+        <button class="tab active" data-tab="today">Current state</button>
+        <button class="tab" data-tab="target">Target flow</button>
+        <button class="tab" data-tab="why">Why it was delayed</button>
+      </div>
+      <div class="compare">
+        <div class="panel">
+          <h3 id="tabLeftTitle">Today: secure foundations, limited reach</h3>
+          <ul id="tabLeft"></ul>
+        </div>
+        <div class="panel">
+          <h3 id="tabRightTitle">Impact</h3>
+          <ul id="tabRight"></ul>
+          <div class="callout" id="tabCallout">
+            The product is technically safer than a naked LAN server, but still not where the stakeholder wants it:
+            phone approval is not a reliable production workflow yet.
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <h2>The security gates are the product.</h2>
+        <p>
+          These gates turn local-network exposure from "hope nobody can reach it" into a controlled
+          device lifecycle with explicit reauthentication for dangerous approvals.
+        </p>
+      </div>
+      <div class="gate-grid">
+        <div class="gate" style="--gate-color: var(--ok)">
+          <span>Implemented</span>
+          <strong>Host and Origin allowlists</strong>
+          <p>Reject DNS rebinding and malicious-page cross-origin attempts before token validation.</p>
+        </div>
+        <div class="gate" style="--gate-color: var(--ok)">
+          <span>Implemented</span>
+          <strong>Per-device bearer tokens</strong>
+          <p>Each browser gets a distinct token stored as a SHA-256 hash, so a lost device can be revoked.</p>
+        </div>
+        <div class="gate" style="--gate-color: var(--warn)">
+          <span>Planned</span>
+          <strong>Passkey-backed pairing</strong>
+          <p>Phone enrollment becomes a device-bound credential flow, not a copied secret.</p>
+        </div>
+        <div class="gate" style="--gate-color: var(--warn)">
+          <span>Planned</span>
+          <strong>Ephemeral LAN listener</strong>
+          <p>QR pairing opens one temporary LAN surface, with a different router and one active token.</p>
+        </div>
+        <div class="gate" style="--gate-color: var(--ok)">
+          <span>Implemented</span>
+          <strong>TLS and fingerprinting</strong>
+          <p>Self-signed ECDSA certs rotate safely and expose a fingerprint for operator verification.</p>
+        </div>
+        <div class="gate" style="--gate-color: var(--warn)">
+          <span>Planned</span>
+          <strong>LAN SAN filtering</strong>
+          <p>Only useful local addresses should be advertised and trusted, avoiding Docker, VPN, and unstable interfaces.</p>
+        </div>
+        <div class="gate" style="--gate-color: var(--ok)">
+          <span>Implemented</span>
+          <strong>Sudo reauth</strong>
+          <p>Web-origin approvals for Bash, Write, Edit, MultiEdit, NotebookEdit, and ConfigChange require fresh password proof.</p>
+        </div>
+        <div class="gate" style="--gate-color: var(--bad)">
+          <span>Ship blocker</span>
+          <strong>Fail-open and CORS hardening</strong>
+          <p>LAN pairing should not ship as default until the known blocker set is closed.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="blockers">
+      <div class="section-head">
+        <h2>Toggle the blockers.</h2>
+        <p>
+          The meeting story is simple: every enabled gate increases usability without changing the trust model.
+          Every missing blocker keeps LAN support experimental.
+        </p>
+      </div>
+      <div class="scenario">
+        <div class="controls" id="blockerControls"></div>
+        <div class="outcome">
+          <div class="outcome-top">
+            <div>
+              <div class="eyebrow">Release posture</div>
+              <h3 id="releaseTitle" style="margin: 0;">Experimental only</h3>
+            </div>
+            <div class="score warn" id="releaseScore">62</div>
+          </div>
+          <div class="risk-list" id="riskList"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="value">
+      <div class="section-head">
+        <h2>Where the real value is.</h2>
+        <p>
+          Security work is the unlock for the product demo, the daily workflow, and open-source credibility.
+        </p>
+      </div>
+      <div class="value-grid">
+        <div class="value-card">
+          <div class="big">Mobility</div>
+          <h3>Operators can leave the laptop.</h3>
+          <p>Long agent runs become manageable from a phone. Approve, deny, and monitor the same queue without being tied to the TUI.</p>
+        </div>
+        <div class="value-card">
+          <div class="big">Trust</div>
+          <h3>LAN access becomes intentional.</h3>
+          <p>HTTPS, allowlists, passkeys, short-lived pairing tokens, audit rows, and revocation make local-network use defensible.</p>
+        </div>
+        <div class="value-card">
+          <div class="big">Demo</div>
+          <h3>The story becomes visible.</h3>
+          <p>A stakeholder can scan a QR code, enroll a phone, see the desktop confirm pairing, then approve a real agent action.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <h2>Delivery path</h2>
+        <p>
+          Sequencing is constrained because the pairing UX depends on network identity, TLS, passkeys, and a separate LAN listener.
+        </p>
+      </div>
+      <div class="timeline">
+        <div class="mile">
+          <strong>Foundations</strong>
+          <p>TLS cert management, password setup/login, per-device tokens, throttle, device DB, WebAuthn schema, sudo reauth.</p>
+          <span class="pill done">Landed</span>
+        </div>
+        <div class="mile">
+          <strong>Stage 1</strong>
+          <p>Finish first-run onboarding route so a clean install can set password and land on the dashboard without CLI help.</p>
+          <span class="pill next">In progress</span>
+        </div>
+        <div class="mile">
+          <strong>Stage 2</strong>
+          <p>Filter SANs, add LAN IP/user cert support, build passkey handlers, arm one pairing token, show QR, finish mobile /pair.</p>
+          <span class="pill">Next</span>
+        </div>
+        <div class="mile">
+          <strong>Ship gate</strong>
+          <p>Close dev CORS, exploitable hook fail-open, and sudo-gated/rate-limited revoke before making LAN pairing a production default.</p>
+          <span class="pill">Required</span>
+        </div>
+      </div>
+    </section>
+
+    <footer class="foot">
+      Source basis: ROADMAP.md, docs/plan-mobile-device-pairing.md, and current implementation in
+      crates/wisphive_web, crates/wisphive_daemon, and crates/wisphive_protocol. Filename intentionally matches
+      the requested path: docs/securty_walkthrough_demo.html.
+    </footer>
+  </main>
+
+  <script>
+    const flowSteps = [
+      {
+        title: "First-run setup",
+        text: "The browser probes /api/auth/status. If no password exists, setup stores the Argon2id password hash and returns the first per-device token in one step.",
+        label: "Setup"
+      },
+      {
+        title: "Trusted desktop session",
+        text: "The browser stores a device token. The server stores only sha256(token), touches last_seen, and can revoke this device later without affecting others.",
+        label: "Device token"
+      },
+      {
+        title: "LAN identity is stabilized",
+        text: "Planned work filters noisy interfaces, includes the correct LAN IP in the TLS SAN, and supports user-provided certs for Tailscale or mkcert-style setups.",
+        label: "LAN TLS"
+      },
+      {
+        title: "Desktop arms pairing",
+        text: "A logged-in device reauthenticates, then /api/pair/arm creates one short-lived pairing token and starts a LAN-only ephemeral listener.",
+        label: "Arm"
+      },
+      {
+        title: "Phone scans QR",
+        text: "The phone hits /pair with the token, registers its own passkey for that origin, and receives its own device token after a race-safe single claim.",
+        label: "Pair"
+      },
+      {
+        title: "Approvals are mobile",
+        text: "The phone joins the same WebSocket queue. Sudo-class approvals still require fresh password proof before the daemon accepts them.",
+        label: "Approve"
+      }
+    ];
+
+    const tabs = {
+      today: {
+        leftTitle: "Today: secure foundations, limited reach",
+        left: [
+          "HTTPS self-signed certs, rotation, and fingerprint CLI exist.",
+          "Password setup/login and per-device bearer tokens are implemented.",
+          "Host/Origin gating protects against DNS rebinding and malicious page requests.",
+          "Sudo reauth exists for high-risk web approvals."
+        ],
+        rightTitle: "Impact",
+        right: [
+          "A browser UI is much safer than the old shared web.token model.",
+          "But phone approval is not yet a production local-network workflow.",
+          "Users are still pulled back to the desktop for the reliable path."
+        ],
+        callout: "The product has real security machinery now, but local-network usability remains incomplete until pairing lands."
+      },
+      target: {
+        leftTitle: "Target: pair a phone in under a minute",
+        left: [
+          "Desktop shows Add Device and arms a short-lived QR token.",
+          "Phone connects over HTTPS to the LAN listener and enrolls a passkey.",
+          "Desktop receives DevicePaired and the phone enters the shared queue.",
+          "Revocation kills that phone without logging out every other browser."
+        ],
+        rightTitle: "Impact",
+        right: [
+          "Operators can supervise agents away from the workstation.",
+          "The demo becomes tangible: scan, pair, approve.",
+          "Security is not hidden infrastructure; it is the reason the workflow can exist."
+        ],
+        callout: "This is the feature that makes Wisphive useful on a real local network instead of only on the host machine."
+      },
+      why: {
+        leftTitle: "Why it was delayed",
+        left: [
+          "WebAuthn RP IDs do not work like normal URLs; IP-based origins cannot be portable credentials.",
+          "The ephemeral pairing listener needs a different route policy from the primary app.",
+          "LAN cert SANs can drift when the laptop changes networks.",
+          "Known ship blockers must close before enabling a LAN listener by default."
+        ],
+        rightTitle: "Risk avoided",
+        right: [
+          "No accidental exposure of /api/config or /ws on the pairing listener.",
+          "No bearer-token-only phone enrollment as the final v1 trust model.",
+          "No misleading startup URL that the Host gate later rejects.",
+          "No default LAN posture while fail-open and dev CORS blockers remain."
+        ],
+        callout: "The delay is mostly integration risk. The planned work closes the gap between a secure local app and a safe LAN-facing product."
+      }
+    };
+
+    const blockers = [
+      {
+        id: "cors",
+        label: "Dev CORS restricted",
+        detail: "Config endpoints no longer allow Any-origin dev access."
+      },
+      {
+        id: "failopen",
+        label: "Hook fail-open hardened",
+        detail: "Induced hook errors cannot become an approval bypass."
+      },
+      {
+        id: "revoke",
+        label: "Device revoke sudo-gated",
+        detail: "Revoking devices requires fresh proof and rate limiting."
+      },
+      {
+        id: "pair",
+        label: "Ephemeral listener isolated",
+        detail: "Pairing router exposes only /pair and pair-register routes."
+      },
+      {
+        id: "webauthn",
+        label: "Passkeys complete",
+        detail: "Phone gets its own origin-scoped credential during pairing."
+      }
+    ];
+
+    const blockerState = {
+      cors: false,
+      failopen: false,
+      revoke: false,
+      pair: true,
+      webauthn: false
+    };
+
+    function setFlow(index) {
+      const step = flowSteps[index];
+      document.getElementById("flowTitle").textContent = step.title;
+      document.getElementById("flowText").textContent = step.text;
+      document.getElementById("flowBadge").textContent = `Step ${index + 1} of ${flowSteps.length}`;
+      document.getElementById("flowProgress").style.width = `${((index + 1) / flowSteps.length) * 100}%`;
+      document.querySelectorAll(".step-buttons button").forEach((button, i) => {
+        button.classList.toggle("active", i === index);
+      });
+    }
+
+    function renderSteps() {
+      const wrap = document.getElementById("stepButtons");
+      flowSteps.forEach((step, index) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = step.label;
+        button.addEventListener("click", () => setFlow(index));
+        wrap.appendChild(button);
+      });
+      setFlow(0);
+    }
+
+    function setTab(name) {
+      const data = tabs[name];
+      document.querySelectorAll(".tab").forEach((button) => {
+        button.classList.toggle("active", button.dataset.tab === name);
+      });
+      document.getElementById("tabLeftTitle").textContent = data.leftTitle;
+      document.getElementById("tabRightTitle").textContent = data.rightTitle;
+      const left = document.getElementById("tabLeft");
+      const right = document.getElementById("tabRight");
+      left.innerHTML = "";
+      right.innerHTML = "";
+      data.left.forEach((item) => left.appendChild(li(item)));
+      data.right.forEach((item) => right.appendChild(li(item)));
+      document.getElementById("tabCallout").textContent = data.callout;
+    }
+
+    function li(text) {
+      const item = document.createElement("li");
+      item.textContent = text;
+      return item;
+    }
+
+    function renderBlockers() {
+      const controls = document.getElementById("blockerControls");
+      blockers.forEach((blocker) => {
+        const row = document.createElement("div");
+        row.className = "toggle-row";
+
+        const copy = document.createElement("div");
+        const strong = document.createElement("strong");
+        strong.textContent = blocker.label;
+        const p = document.createElement("p");
+        p.textContent = blocker.detail;
+        p.style.margin = "4px 0 0";
+        p.style.color = "var(--muted)";
+        p.style.lineHeight = "1.35";
+        copy.append(strong, p);
+
+        const button = document.createElement("button");
+        button.className = `switch ${blockerState[blocker.id] ? "on" : ""}`;
+        button.type = "button";
+        button.setAttribute("aria-label", blocker.label);
+        button.innerHTML = "<span></span>";
+        button.addEventListener("click", () => {
+          blockerState[blocker.id] = !blockerState[blocker.id];
+          button.classList.toggle("on", blockerState[blocker.id]);
+          updateRelease();
+        });
+
+        row.append(copy, button);
+        controls.appendChild(row);
+      });
+      updateRelease();
+    }
+
+    function updateRelease() {
+      const enabled = Object.values(blockerState).filter(Boolean).length;
+      const score = Math.round((enabled / blockers.length) * 100);
+      const scoreEl = document.getElementById("releaseScore");
+      const titleEl = document.getElementById("releaseTitle");
+      scoreEl.textContent = score;
+      scoreEl.className = `score ${score >= 90 ? "good" : score >= 60 ? "warn" : "bad"}`;
+      titleEl.textContent = score >= 90
+        ? "Production LAN pairing"
+        : score >= 60
+          ? "Experimental only"
+          : "Do not expose on LAN";
+
+      const list = document.getElementById("riskList");
+      list.innerHTML = "";
+      blockers.forEach((blocker) => {
+        const ok = blockerState[blocker.id];
+        const item = document.createElement("div");
+        item.className = "risk-item";
+        item.innerHTML = `<span class="dot ${ok ? "ok" : "warn"}"></span><span>${ok ? "Closed: " : "Open: "}${blocker.detail}</span>`;
+        list.appendChild(item);
+      });
+    }
+
+    document.querySelectorAll("[data-scroll]").forEach((button) => {
+      button.addEventListener("click", () => {
+        document.querySelector(button.dataset.scroll).scrollIntoView({ behavior: "smooth", block: "start" });
+      });
+    });
+
+    document.querySelectorAll(".tab").forEach((button) => {
+      button.addEventListener("click", () => setTab(button.dataset.tab));
+    });
+
+    renderSteps();
+    setTab("today");
+    renderBlockers();
+  </script>
+</body>
+</html>
