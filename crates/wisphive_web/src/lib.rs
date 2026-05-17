@@ -20,7 +20,10 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 use wisphive_daemon::state::StateDb;
 
-pub use auth_profile::{AuthPolicy, AuthProfile, RpId, UvRequirement};
+pub use auth_profile::{
+    AuthPolicy, AuthProfile, EnterpriseValidationError, RpId, UvRequirement,
+    validate_enterprise_config,
+};
 // Re-export the WebAuthn `Url` type so downstream crates (notably the CLI)
 // can build `AuthProfile::Enterprise { rp_origin, .. }` without pulling
 // in `webauthn-rs` or `url` themselves.
@@ -496,7 +499,7 @@ fn origin_can_enroll_passkey(policy: &AuthPolicy, headers: &axum::http::HeaderMa
     let Some(origin) = headers.get("origin").and_then(|h| h.to_str().ok()) else {
         return false;
     };
-    let Ok(origin_url) = webauthn_rs::prelude::Url::parse(origin) else {
+    let Ok(origin_url) = Url::parse(origin) else {
         return false;
     };
     policy.rp_id_for_origin(&origin_url).is_some()

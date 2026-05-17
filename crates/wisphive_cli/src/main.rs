@@ -633,7 +633,7 @@ fn resolve_auth_profile(
             // here.
             let tls_cert_provided = false;
             let tls_key_provided = false;
-            let rp_id = wisphive_web::auth_profile::validate_enterprise_config(
+            let rp_id = wisphive_web::validate_enterprise_config(
                 auth_rp_id,
                 tls_cert_provided,
                 tls_key_provided,

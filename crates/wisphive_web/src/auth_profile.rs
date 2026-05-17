@@ -365,11 +365,14 @@ pub async fn scan_passkey_rp_id_drift(state_db: &StateDb, policy: &AuthPolicy) {
 
 /// True iff `e` is a sqlx error whose underlying SQLite message is "no
 /// such column: ..." — the specific shape we see when the `rp_id`
-/// column hasn't been added yet. Conservative match (sqlx's nested
-/// `Display` chain is the only stable surface for this).
+/// column hasn't been added yet. Matches the precise `Database` variant
+/// so we don't depend on the outer enum's `Display` formatting, which
+/// has shifted between sqlx versions in the past.
 fn is_missing_column_error(e: &sqlx::Error) -> bool {
-    let s = format!("{e}");
-    s.contains("no such column")
+    match e {
+        sqlx::Error::Database(db) => db.message().contains("no such column"),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
