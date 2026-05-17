@@ -5,6 +5,7 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -1526,5 +1527,86 @@ async fn passkey_login_finish_bumps_login_throttle_on_failure() {
     assert!(
         peek.is_some(),
         "failed passkey login must register an IP in the throttle"
+    );
+}
+
+#[tokio::test]
+async fn passkey_login_start_does_not_wipe_throttle_after_failures() {
+    // M1 regression: previously `/login/start` called `record_success`
+    // which wipes the per-IP failure counter. An attacker could climb
+    // toward lockout via `/login/finish` failures, then call `/start`
+    // past the brief initial cooldown to reset their budget and resume
+    // hammering with the same low backoff.
+    //
+    // We exercise the post-bug-fix invariant indirectly: the second
+    // failure must produce a LARGER backoff than the first (failures=2
+    // → 500ms vs failures=1 → 250ms per `backoff_for`). If `/start`
+    // wiped the entry, the second failure would re-start at 250ms and
+    // be indistinguishable from a fresh attacker.
+    //
+    // Helper that runs one (start, finish-with-bad-creds) pair.
+    async fn one_failed_finish(state: AppState) {
+        let r = req("POST", "/api/auth/passkey/login/start")
+            .header("origin", ORIGIN)
+            .body(Body::empty())
+            .unwrap();
+        let (_, body) = run_with(state.clone(), r).await;
+        let session_id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let bad = serde_json::json!({
+            "session_id": session_id,
+            "credential": {
+                "id": "dW5rbm93bg",
+                "rawId": "dW5rbm93bg",
+                "type": "public-key",
+                "extensions": {},
+                "response": {
+                    "authenticatorData": "ZmFrZQ",
+                    "clientDataJSON": "ZmFrZQ",
+                    "signature": "ZmFrZQ",
+                    "userHandle": null
+                }
+            }
+        });
+        let r = req("POST", "/api/auth/passkey/login/finish")
+            .header("origin", ORIGIN)
+            .header("content-type", "application/json")
+            .body(Body::from(bad.to_string()))
+            .unwrap();
+        let (status, _) = run_with(state, r).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    let (_tmp, state) = test_state().await;
+    let throttle = state.security.throttle().clone();
+    let loopback = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+
+    // First failure → failures=1, backoff ~250ms.
+    one_failed_finish(state.clone()).await;
+
+    // Wait past the first lockout. With the bug, the entry would be
+    // wiped on the NEXT /start. With the fix, /start preserves it via
+    // release_slot.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Second failure (this start+finish pair also exercises the path
+    // the bug ran through). After the fix, failures=2 → backoff ~500ms.
+    one_failed_finish(state.clone()).await;
+
+    // Peek the lockout window. With the fix, it's ~500ms (backoff_for(2)).
+    // With the bug, /start would have wiped between attempts, so this
+    // would be ~250ms (backoff_for(1)). Pick a threshold strictly above
+    // backoff_for(1)=250ms and well below backoff_for(2)=500ms.
+    let lockout = throttle
+        .peek(loopback)
+        .await
+        .expect("post-second-failure throttle entry must exist");
+    assert!(
+        lockout > Duration::from_millis(350),
+        "M1 regression: second failure should produce backoff_for(2)≈500ms, \
+         got {lockout:?}. If this is ≤250ms, /login/start is wiping the \
+         failure counter between attempts via record_success."
     );
 }

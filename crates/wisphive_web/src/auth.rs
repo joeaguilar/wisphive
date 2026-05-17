@@ -383,6 +383,27 @@ impl AttemptGuard {
         let mut state = self.inner.write().await;
         state.map.remove(&self.ip_key);
     }
+
+    /// Release the in-flight slot without counting the attempt as either
+    /// a failure or a success. Use for cheap bookkeeping steps that
+    /// reserved a slot but did NOT perform credential verification —
+    /// e.g. `/api/auth/passkey/login/start` which only builds a WebAuthn
+    /// challenge.
+    ///
+    /// Critical: `record_success` would `state.map.remove(&ip_key)`, which
+    /// wipes the per-IP failure counter and lockout window. An attacker
+    /// who can hit a "neutral" endpoint can otherwise climb toward the
+    /// lockout threshold on the real verify endpoint, then call the
+    /// neutral endpoint once to wipe the counter and resume hammering.
+    /// `release_slot` decrements `in_flight` only — `failures` and
+    /// `locked_until` are preserved.
+    pub async fn release_slot(mut self) {
+        self.consumed = true;
+        let mut state = self.inner.write().await;
+        if let Some(entry) = state.map.get_mut(&self.ip_key) {
+            entry.in_flight = entry.in_flight.saturating_sub(1);
+        }
+    }
 }
 
 impl Drop for AttemptGuard {

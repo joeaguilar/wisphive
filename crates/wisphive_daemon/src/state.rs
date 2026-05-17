@@ -1816,10 +1816,20 @@ async fn try_add_column(pool: &SqlitePool, table: &str, column: &str, col_def: &
     }
 }
 
-/// Match the SQLite "column already exists" message robustly across sqlx
-/// versions. SQLite itself returns the literal `duplicate column name: X`
-/// for an ALTER TABLE on a column that's already present; sqlx surfaces
-/// that as `Database` with the message unchanged.
+/// Match the SQLite "column already exists" error.
+///
+/// **Why message-match, not error-code match:** SQLite returns
+/// `SQLITE_ERROR(1)` for "duplicate column name" — but `SQLITE_ERROR(1)`
+/// is also the generic catch-all (disk full, syntax error, constraint
+/// failure without a more specific code, etc.). Matching the code alone
+/// would silently swallow unrelated errors. The English message
+/// `"duplicate column name: X"` IS the discriminator and has been
+/// stable since SQLite 3.x. The message is the contract.
+///
+/// Localized SQLite builds (extremely rare in practice — Debian, brew,
+/// MUSL, Alpine all ship the English-message build) would break this.
+/// itr#320 tracks moving to a more durable discriminator if one ever
+/// becomes available.
 fn is_duplicate_column_error(msg: &str) -> bool {
     msg.contains("duplicate column name")
 }

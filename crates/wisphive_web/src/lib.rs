@@ -164,6 +164,15 @@ struct LoginResponse {
     /// The raw bearer token — the client MUST save this; it's not retrievable
     /// from the server afterwards. The server stores only `sha256(raw)`.
     token: String,
+    /// Populated on passkey login: the device row the credential was
+    /// originally enrolled against. The SPA's "manage passkeys" UI must
+    /// query `list_web_passkeys_for_device(enrolling_device_id)` to see
+    /// the user's credentials, since `device_id` above is the fresh row
+    /// minted for this login session and has no passkeys of its own.
+    /// `None` on password login (no concept of an enrolling device).
+    /// See itr#319 for the full device-row semantics design.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enrolling_device_id: Option<String>,
 }
 
 /// POST /api/auth/login — the credential bootstrap endpoint.
@@ -302,6 +311,7 @@ async fn post_auth_login(
     axum::Json(LoginResponse {
         device_id: id,
         token: token.raw,
+        enrolling_device_id: None,
     })
     .into_response()
 }
@@ -737,6 +747,7 @@ async fn post_auth_set_password(
     axum::Json(LoginResponse {
         device_id: id,
         token: token.raw,
+        enrolling_device_id: None,
     })
     .into_response()
 }
@@ -1095,6 +1106,16 @@ async fn post_passkey_register_start(
             serde_json::Value::String(session_id),
         );
     }
+
+    let _ = db
+        .append_web_audit(
+            "passkey_register_start_ok",
+            Some(&device.id.0),
+            Some(&client_ip.0.to_string()),
+            None,
+        )
+        .await;
+
     axum::Json(payload).into_response()
 }
 
@@ -1124,6 +1145,14 @@ async fn post_passkey_register_finish(
             rp_id,
         }) => (state, device_id, rp_id),
         Some(_) => {
+            let _ = db
+                .append_web_audit(
+                    "passkey_register_failure",
+                    Some(&device.id.0),
+                    Some(&client_ip.0.to_string()),
+                    Some("wrong_session_variant"),
+                )
+                .await;
             return (
                 axum::http::StatusCode::BAD_REQUEST,
                 "session is not a register ceremony",
@@ -1131,6 +1160,14 @@ async fn post_passkey_register_finish(
                 .into_response();
         }
         None => {
+            let _ = db
+                .append_web_audit(
+                    "passkey_register_failure",
+                    Some(&device.id.0),
+                    Some(&client_ip.0.to_string()),
+                    Some("unknown_session"),
+                )
+                .await;
             return (
                 axum::http::StatusCode::BAD_REQUEST,
                 "unknown or expired session",
@@ -1343,10 +1380,23 @@ async fn post_passkey_login_start(
         )
         .await;
 
-    // Login start is a successful bookkeeping step; release the guard
-    // without counting it as a failure. The actual credential verify
-    // happens in /finish, where another throttle slot is acquired.
-    guard.record_success().await;
+    // Login start is a cheap bookkeeping step — release the in-flight
+    // slot without wiping the per-IP failure counter. `record_success`
+    // would remove the throttle entry entirely and let an attacker
+    // climbing toward lockout on /finish reset their budget by calling
+    // /start once. See `AttemptGuard::release_slot` doc.
+    guard.release_slot().await;
+
+    let _ = state
+        .security
+        .state_db()
+        .append_web_audit(
+            "passkey_login_start_ok",
+            None,
+            Some(&client_ip.0.to_string()),
+            None,
+        )
+        .await;
 
     // Flatten so the SPA can pass the body straight into
     // `navigator.credentials.get({ publicKey: body.publicKey, mediation })`.
@@ -1544,18 +1594,13 @@ async fn post_passkey_login_finish(
         tracing::warn!(error = %e, credential_id = %cred_id_b64, "update_passkey_sign_count_and_last_used failed");
     }
 
-    // Issue a fresh device token bound to the same device the
-    // credential is enrolled under. We don't create a new device row —
-    // the existing one is the legitimate target.
+    // Successful passkey login mints a fresh device row (mirroring
+    // password login's token-rotation behavior). The credential's
+    // `web_passkeys.device_id` continues to point at the original
+    // enrolling row — see itr#319's "passkey login device-row semantics"
+    // for the UX trade-off and `StateDb::find_passkeys_by_enrolling_device`
+    // for the lookup #312 uses to render passkeys per session.
     let token = auth::generate_device_token();
-    // We piggyback on `insert_web_device` would create a NEW row, which
-    // is wrong; instead update the existing device's token_hash via a
-    // direct query. We DON'T have a method for that today, so reuse
-    // the revoke + insert pattern: revoke old row (creates a tombstone
-    // for audit) then insert a new row with the same id. That would
-    // collide on the PK. So the right move is to mint a NEW device id
-    // — each successful passkey login produces a fresh device id,
-    // mirroring how password login works.
     let new_device_id = uuid::Uuid::new_v4().to_string();
     let device_name = format!("passkey-{}", stored.device_id.get(..8).unwrap_or("dev"));
     if let Err(e) = db
@@ -1584,6 +1629,11 @@ async fn post_passkey_login_finish(
     axum::Json(LoginResponse {
         device_id: new_device_id,
         token: token.raw,
+        // Surface the enrolling device so the SPA's "manage passkeys"
+        // view can list the user's credentials with
+        // `list_web_passkeys_for_device(enrolling_device_id)` — see
+        // LoginResponse doc + itr#319.
+        enrolling_device_id: Some(stored.device_id.clone()),
     })
     .into_response()
 }

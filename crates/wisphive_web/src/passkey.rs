@@ -261,6 +261,10 @@ impl ChallengeStore {
         let mut map = self.inner.lock().await;
         let entry = map.remove(session_id)?;
         if Instant::now() >= entry.expires_at {
+            // Post-expiry take is intentionally destructive: the entry
+            // is removed and `None` is returned. A caller racing the
+            // expiry boundary by microseconds will see `None` and MUST
+            // restart the ceremony — there's no peek-then-take API.
             return None;
         }
         Some(entry.state)
@@ -275,10 +279,12 @@ impl ChallengeStore {
     }
 
     /// Spawn a background tokio task that calls [`Self::evict_expired`]
-    /// every `tick`. Returns the task handle so the caller can hold on
-    /// to it (drop = abort). The default cadence (60 s) is conservative
-    /// vs the typical TTL (300 s) — a single tick is enough to keep the
-    /// map under O(in-flight) without piling up.
+    /// every `tick`. Returns the `JoinHandle` so the caller can `.abort()`
+    /// it on shutdown. Note: dropping the `JoinHandle` does NOT cancel
+    /// the spawned task — call `.abort()` explicitly if you need to stop
+    /// it. The default cadence (60 s) is conservative vs the typical TTL
+    /// (300 s) — a single tick is enough to keep the map under
+    /// O(in-flight) without piling up.
     pub fn spawn_reaper(&self, tick: Duration) -> tokio::task::JoinHandle<()> {
         let store = self.clone();
         tokio::spawn(async move {
@@ -338,9 +344,26 @@ pub fn local_lan_rp_origin(port: u16) -> anyhow::Result<Url> {
 mod tests {
     use super::*;
     use crate::auth_profile::{AuthProfile, RpId};
+    use std::sync::atomic::{AtomicU16, Ordering};
 
     fn url(s: &str) -> Url {
         Url::parse(s).expect("test url")
+    }
+
+    /// Give each test a unique port so its `(rp_id, rp_origin, ttl)`
+    /// cache key doesn't alias with another parallel test. The
+    /// `WEBAUTHN_CACHE` is process-global; without distinct keys, two
+    /// tests racing `clear_webauthn_cache_for_test` + `webauthn_for`
+    /// can stomp each other's entries. Tests that intentionally exercise
+    /// cache identity (`webauthn_for_returns_same_arc_for_same_key` etc.)
+    /// still use the same port WITHIN the test, so cache hits register.
+    fn unique_port() -> u16 {
+        static NEXT: AtomicU16 = AtomicU16::new(35_000);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn local_url() -> Url {
+        url(&format!("https://localhost:{}", unique_port()))
     }
 
     // ── ChallengeStore unit tests ──────────────────────────────────────
@@ -361,13 +384,9 @@ mod tests {
         // `Webauthn::start_discoverable_authentication`.
         let policy = AuthProfile::LocalLAN.policy();
         clear_webauthn_cache_for_test().await;
-        let w = webauthn_for(
-            &RpId("localhost".to_string()),
-            &url("https://localhost:3100"),
-            &policy,
-        )
-        .await
-        .unwrap();
+        let w = webauthn_for(&RpId("localhost".to_string()), &local_url(), &policy)
+            .await
+            .unwrap();
         let (_chal, state) = w.start_discoverable_authentication().unwrap();
 
         let session_id = store
@@ -387,13 +406,9 @@ mod tests {
         let store = ChallengeStore::new();
         let policy = AuthProfile::LocalLAN.policy();
         clear_webauthn_cache_for_test().await;
-        let w = webauthn_for(
-            &RpId("localhost".to_string()),
-            &url("https://localhost:3100"),
-            &policy,
-        )
-        .await
-        .unwrap();
+        let w = webauthn_for(&RpId("localhost".to_string()), &local_url(), &policy)
+            .await
+            .unwrap();
         let (_c, state) = w.start_discoverable_authentication().unwrap();
         let id = store
             .insert(ChallengeState::Login(state), Duration::from_secs(5))
@@ -414,13 +429,9 @@ mod tests {
         let store = ChallengeStore::new();
         let policy = AuthProfile::LocalLAN.policy();
         clear_webauthn_cache_for_test().await;
-        let w = webauthn_for(
-            &RpId("localhost".to_string()),
-            &url("https://localhost:3100"),
-            &policy,
-        )
-        .await
-        .unwrap();
+        let w = webauthn_for(&RpId("localhost".to_string()), &local_url(), &policy)
+            .await
+            .unwrap();
         let (_c, state) = w.start_discoverable_authentication().unwrap();
         let id = store
             .insert(ChallengeState::Login(state), Duration::from_millis(50))
@@ -439,13 +450,9 @@ mod tests {
         let store = ChallengeStore::new();
         let policy = AuthProfile::LocalLAN.policy();
         clear_webauthn_cache_for_test().await;
-        let w = webauthn_for(
-            &RpId("localhost".to_string()),
-            &url("https://localhost:3100"),
-            &policy,
-        )
-        .await
-        .unwrap();
+        let w = webauthn_for(&RpId("localhost".to_string()), &local_url(), &policy)
+            .await
+            .unwrap();
 
         // Insert three short-TTL entries and one long-TTL entry.
         for _ in 0..3 {
@@ -480,7 +487,10 @@ mod tests {
         let policy = AuthProfile::LocalLAN.policy();
         clear_webauthn_cache_for_test().await;
         let rp_id = RpId("localhost".to_string());
-        let origin = url("https://localhost:3100");
+        // Test asserts cache identity within ONE test: same origin
+        // value, two calls. Distinct from other tests' origins via
+        // `unique_port`, so parallel-test races can't stomp this entry.
+        let origin = local_url();
         let a = webauthn_for(&rp_id, &origin, &policy).await.unwrap();
         let b = webauthn_for(&rp_id, &origin, &policy).await.unwrap();
         assert!(
@@ -497,16 +507,15 @@ mod tests {
     async fn webauthn_for_returns_distinct_arcs_for_distinct_keys() {
         let policy = AuthProfile::LocalLAN.policy();
         clear_webauthn_cache_for_test().await;
-        let a = webauthn_for(
-            &RpId("localhost".to_string()),
-            &url("https://localhost:3100"),
-            &policy,
-        )
-        .await
-        .unwrap();
+        // The distinct-keys assertion is what we care about; keep these
+        // ports stable since the test asserts Arc inequality between
+        // them, not identity with another test's entry.
+        let a = webauthn_for(&RpId("localhost".to_string()), &local_url(), &policy)
+            .await
+            .unwrap();
         let b = webauthn_for(
             &RpId("wisphive.example.com".to_string()),
-            &url("https://wisphive.example.com"),
+            &url(&format!("https://wisphive.example.com:{}", unique_port())),
             &policy,
         )
         .await
@@ -546,13 +555,9 @@ mod tests {
         // (300s — same as our policy default, which would alias).
         policy.challenge_ttl = Duration::from_secs(125);
         clear_webauthn_cache_for_test().await;
-        let w = webauthn_for(
-            &RpId("localhost".to_string()),
-            &url("https://localhost:3100"),
-            &policy,
-        )
-        .await
-        .unwrap();
+        let w = webauthn_for(&RpId("localhost".to_string()), &local_url(), &policy)
+            .await
+            .unwrap();
 
         let user_id = uuid::Uuid::new_v4();
         let (creation, _state) = w
@@ -590,13 +595,9 @@ mod tests {
         let store = ChallengeStore::new();
         let policy = AuthProfile::LocalLAN.policy();
         clear_webauthn_cache_for_test().await;
-        let w = webauthn_for(
-            &RpId("localhost".to_string()),
-            &url("https://localhost:3100"),
-            &policy,
-        )
-        .await
-        .unwrap();
+        let w = webauthn_for(&RpId("localhost".to_string()), &local_url(), &policy)
+            .await
+            .unwrap();
         let (_c, state) = w.start_discoverable_authentication().unwrap();
         store
             .insert(ChallengeState::Login(state), Duration::from_millis(20))
