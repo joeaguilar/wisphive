@@ -100,6 +100,14 @@ type WebDeviceFullRow = (
 type WebDeviceActiveRow = (String, String, String, Option<String>, Option<String>);
 
 /// Row shape for `web_passkeys` queries.
+///
+/// Columns in declaration order: `id`, `device_id`, `public_key`, `sign_count`,
+/// `transports`, `created_at`, `last_used_at`, `aaguid`, `rp_id`. The
+/// trailing two were added by itr#311 alongside the WebAuthn handlers; new
+/// inserts populate both, older rows produced before the migration carry
+/// `aaguid IS NULL` + `rp_id = ''` (the latter is what
+/// `wisphive_web::auth_profile::scan_passkey_rp_id_drift` keys off for
+/// "re-enroll required" warnings).
 type WebPasskeyRowRaw = (
     String,
     String,
@@ -108,6 +116,8 @@ type WebPasskeyRowRaw = (
     Option<String>,
     String,
     Option<String>,
+    Option<String>,
+    String,
 );
 
 /// Row shape for `web_audit` queries.
@@ -144,6 +154,12 @@ pub struct WebDeviceRow {
 }
 
 /// A row from `web_passkeys`.
+///
+/// The `aaguid` + `rp_id` columns were added by itr#311's WebAuthn
+/// handler PR; older rows produced before the migration carry
+/// `aaguid IS NULL` + `rp_id = ""`. `wisphive_web::auth_profile::scan_passkey_rp_id_drift`
+/// keys off the empty-string sentinel at startup to warn the operator
+/// that those credentials need to be re-enrolled under the active profile.
 #[derive(Debug, Clone)]
 pub struct WebPasskeyRow {
     pub id: String,
@@ -153,6 +169,16 @@ pub struct WebPasskeyRow {
     pub transports: Option<String>,
     pub created_at: String,
     pub last_used_at: Option<String>,
+    /// Authenticator AAGUID, if the device exposed one. Many synced
+    /// passkeys (iCloud, Google Password Manager) return all-zeros or
+    /// omit the field; we store it raw so future "pretty-name the
+    /// authenticator" UI can look it up without re-parsing the credential
+    /// blob. Stored as `TEXT` to keep the column human-readable in
+    /// `sqlite3` shells.
+    pub aaguid: Option<String>,
+    /// WebAuthn RP ID under which this credential was enrolled. Empty
+    /// string for pre-migration rows.
+    pub rp_id: String,
 }
 
 /// A row from `web_audit`.
@@ -447,6 +473,15 @@ impl StateDb {
 
         // WebAuthn credentials bound to a device. Cascade-deleted so revoking
         // a device cleans up its passkeys too.
+        //
+        // itr#311: `aaguid` + `rp_id` columns added. They live in the CREATE
+        // TABLE block AND in the follow-on ALTER TABLE block below so a
+        // fresh DB lands them at creation time while older DBs (created
+        // pre-#311) get them via the idempotent ALTER. The migration is
+        // load-bearing for profile-switch detection (see
+        // `wisphive_web::auth_profile::scan_passkey_rp_id_drift`) — a row
+        // with `rp_id = ''` is treated as "enrolled under an unknown
+        // profile" and warned about at startup.
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS web_passkeys (
                 id TEXT PRIMARY KEY,
@@ -455,10 +490,26 @@ impl StateDb {
                 sign_count INTEGER NOT NULL,
                 transports TEXT,
                 created_at TEXT NOT NULL,
-                last_used_at TEXT
+                last_used_at TEXT,
+                aaguid TEXT,
+                rp_id TEXT NOT NULL DEFAULT ''
             )",
         )
         .execute(&self.pool)
+        .await?;
+
+        // itr#311 migration for already-deployed DBs that predate the
+        // `aaguid` / `rp_id` columns. SQLite's `ADD COLUMN` is fully
+        // backward-compatible (each ALTER is a single transaction) but
+        // emits `duplicate column name` on a second run — swallow that
+        // specific shape and surface anything else.
+        try_add_column(&self.pool, "web_passkeys", "aaguid", "TEXT").await?;
+        try_add_column(
+            &self.pool,
+            "web_passkeys",
+            "rp_id",
+            "TEXT NOT NULL DEFAULT ''",
+        )
         .await?;
 
         // Append-only audit log for login/enroll/revoke events.
@@ -1220,6 +1271,24 @@ impl StateDb {
 
     /// Persist a newly enrolled passkey. Returns `Duplicate` if the
     /// credential id is already enrolled.
+    ///
+    /// `aaguid` is the raw authenticator AAGUID (16 bytes formatted as a
+    /// UUID / base64url / hex string — pick a representation in the
+    /// caller and be consistent). Many synced passkeys (iCloud, Google
+    /// Password Manager) omit it or return all-zeros; pass `None` in
+    /// that case rather than substituting a placeholder.
+    ///
+    /// `rp_id` is the WebAuthn RP ID under which the credential was
+    /// enrolled. Drives the profile-switch warning in
+    /// `wisphive_web::auth_profile::scan_passkey_rp_id_drift`. Pass `""`
+    /// from tests / fixtures where the value isn't meaningful — that
+    /// matches the migration default for pre-#311 rows.
+    ///
+    /// Clippy nags about the 8-argument count; every value here is a
+    /// distinct column on a single table and a struct-based wrapper
+    /// would still serialize to the same eight bind sites. The cleanup
+    /// is wholly cosmetic — accepted as-is.
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_web_passkey(
         &self,
         id: &str,
@@ -1227,10 +1296,12 @@ impl StateDb {
         public_key: &[u8],
         sign_count: i64,
         transports_json: Option<&str>,
+        aaguid: Option<&str>,
+        rp_id: &str,
     ) -> WebAuthResult<()> {
         sqlx::query(
-            "INSERT INTO web_passkeys (id, device_id, public_key, sign_count, transports, created_at)
-             VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO web_passkeys (id, device_id, public_key, sign_count, transports, created_at, aaguid, rp_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(id)
         .bind(device_id)
@@ -1238,6 +1309,8 @@ impl StateDb {
         .bind(sign_count)
         .bind(transports_json)
         .bind(chrono::Utc::now().to_rfc3339())
+        .bind(aaguid)
+        .bind(rp_id)
         .execute(&self.pool)
         .await
         .map_err(WebAuthError::from_sqlx)?;
@@ -1250,7 +1323,7 @@ impl StateDb {
         device_id: &str,
     ) -> WebAuthResult<Vec<WebPasskeyRow>> {
         let rows: Vec<WebPasskeyRowRaw> = sqlx::query_as(
-            "SELECT id, device_id, public_key, sign_count, transports, created_at, last_used_at
+            "SELECT id, device_id, public_key, sign_count, transports, created_at, last_used_at, aaguid, rp_id
                  FROM web_passkeys
                  WHERE device_id = ?
                  ORDER BY created_at DESC",
@@ -1262,19 +1335,100 @@ impl StateDb {
         Ok(rows
             .into_iter()
             .map(
-                |(id, device_id, public_key, sign_count, transports, created_at, last_used_at)| {
-                    WebPasskeyRow {
-                        id,
-                        device_id,
-                        public_key,
-                        sign_count,
-                        transports,
-                        created_at,
-                        last_used_at,
-                    }
+                |(
+                    id,
+                    device_id,
+                    public_key,
+                    sign_count,
+                    transports,
+                    created_at,
+                    last_used_at,
+                    aaguid,
+                    rp_id,
+                )| WebPasskeyRow {
+                    id,
+                    device_id,
+                    public_key,
+                    sign_count,
+                    transports,
+                    created_at,
+                    last_used_at,
+                    aaguid,
+                    rp_id,
                 },
             )
             .collect())
+    }
+
+    /// Look up a single passkey by its credential id. Used by
+    /// `POST /api/auth/passkey/login/finish` (itr#311) to resolve the
+    /// originating device after `webauthn-rs::Webauthn::finish_discoverable_authentication`
+    /// hands us a credential ID — discoverable login flows don't know
+    /// which device they're authenticating until after the user picks a
+    /// credential, which is exactly the lookup this method backs.
+    pub async fn find_web_passkey_by_credential_id(
+        &self,
+        credential_id: &str,
+    ) -> WebAuthResult<Option<WebPasskeyRow>> {
+        let row: Option<WebPasskeyRowRaw> = sqlx::query_as(
+            "SELECT id, device_id, public_key, sign_count, transports, created_at, last_used_at, aaguid, rp_id
+                 FROM web_passkeys
+                 WHERE id = ?
+                 LIMIT 1",
+        )
+        .bind(credential_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(WebAuthError::from_sqlx)?;
+        Ok(row.map(
+            |(
+                id,
+                device_id,
+                public_key,
+                sign_count,
+                transports,
+                created_at,
+                last_used_at,
+                aaguid,
+                rp_id,
+            )| WebPasskeyRow {
+                id,
+                device_id,
+                public_key,
+                sign_count,
+                transports,
+                created_at,
+                last_used_at,
+                aaguid,
+                rp_id,
+            },
+        ))
+    }
+
+    /// Bump the sign counter and refresh `last_used_at` after a
+    /// successful passkey authentication. Called by
+    /// `POST /api/auth/passkey/login/finish` once `webauthn-rs::Webauthn::finish_discoverable_authentication`
+    /// has verified the assertion AND the caller has confirmed
+    /// `new_sign_count > stored_sign_count` (rejecting equal-or-lower
+    /// counts is mandated by WebAuthn §7.2 step 21 — a cloned credential
+    /// will replay the lower counter).
+    pub async fn update_passkey_sign_count_and_last_used(
+        &self,
+        credential_id: &str,
+        new_sign_count: i64,
+    ) -> WebAuthResult<()> {
+        sqlx::query(
+            "UPDATE web_passkeys
+             SET sign_count = ?, last_used_at = ?
+             WHERE id = ?",
+        )
+        .bind(new_sign_count)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(credential_id)
+        .execute(&self.pool)
+        .await
+        .map_err(WebAuthError::from_sqlx)?;
+        Ok(())
     }
 
     /// Append a row to the audit log. `detail` is typically JSON; anything
@@ -1633,6 +1787,41 @@ fn rows_to_entries(rows: Vec<DecisionLogRow>) -> Vec<wisphive_protocol::HistoryE
             },
         )
         .collect()
+}
+
+/// Idempotently add a column to an existing SQLite table.
+///
+/// SQLite's `ALTER TABLE ... ADD COLUMN` is the only structure change we
+/// need for forward-compatible migrations (CREATE TABLE IF NOT EXISTS does
+/// the rest). The second-run failure mode is a `Database` error whose
+/// message contains `duplicate column name` — we swallow that one shape
+/// and surface everything else.
+///
+/// Logging is at DEBUG for the already-applied case (so a noisy daemon
+/// boot doesn't grow by one INFO line per migrated column) and INFO on
+/// the first successful application (so the operator sees the upgrade
+/// pass in the journal on the first boot after deploying).
+async fn try_add_column(pool: &SqlitePool, table: &str, column: &str, col_def: &str) -> Result<()> {
+    let stmt = format!("ALTER TABLE {table} ADD COLUMN {column} {col_def}");
+    match sqlx::query(&stmt).execute(pool).await {
+        Ok(_) => {
+            info!(table, column, "added column via ALTER TABLE");
+            Ok(())
+        }
+        Err(sqlx::Error::Database(db_err)) if is_duplicate_column_error(db_err.message()) => {
+            tracing::debug!(table, column, "column already present; ALTER skipped");
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Match the SQLite "column already exists" message robustly across sqlx
+/// versions. SQLite itself returns the literal `duplicate column name: X`
+/// for an ALTER TABLE on a column that's already present; sqlx surfaces
+/// that as `Database` with the message unchanged.
+fn is_duplicate_column_error(msg: &str) -> bool {
+    msg.contains("duplicate column name")
 }
 
 #[cfg(test)]
@@ -2488,7 +2677,7 @@ mod tests {
         db.insert_web_device("dev-1", "phone", "tokhash-1")
             .await
             .unwrap();
-        db.insert_web_passkey("pk-1", "dev-1", b"fake-key", 0, None)
+        db.insert_web_passkey("pk-1", "dev-1", b"fake-key", 0, None, None, "")
             .await
             .unwrap();
         db.reset_web_password().await.unwrap();
@@ -2551,10 +2740,18 @@ mod tests {
         db.insert_web_device("dev-1", "phone", "hash-1")
             .await
             .unwrap();
-        db.insert_web_passkey("pk-a", "dev-1", b"cose-a", 0, Some("[\"internal\"]"))
-            .await
-            .unwrap();
-        db.insert_web_passkey("pk-b", "dev-1", b"cose-b", 0, None)
+        db.insert_web_passkey(
+            "pk-a",
+            "dev-1",
+            b"cose-a",
+            0,
+            Some("[\"internal\"]"),
+            Some("aaguid-a"),
+            "localhost",
+        )
+        .await
+        .unwrap();
+        db.insert_web_passkey("pk-b", "dev-1", b"cose-b", 0, None, None, "localhost")
             .await
             .unwrap();
 
@@ -2605,7 +2802,7 @@ mod tests {
         db.insert_web_device("dev-1", "phone", "hash-1")
             .await
             .unwrap();
-        db.insert_web_passkey("pk-1", "dev-1", b"cose", 0, None)
+        db.insert_web_passkey("pk-1", "dev-1", b"cose", 0, None, None, "")
             .await
             .unwrap();
         assert_eq!(

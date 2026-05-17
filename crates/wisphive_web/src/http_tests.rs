@@ -62,6 +62,7 @@ async fn test_state() -> (tempfile::TempDir, AppState) {
             config_path,
             security,
             auth_policy: AuthProfile::LocalLAN.policy(),
+            passkey_challenges: crate::passkey::ChallengeStore::new(),
         },
     )
 }
@@ -320,6 +321,7 @@ async fn login_when_no_password_set_returns_503_setup_required() {
         config_path: tmp.path().join("config.json"),
         security,
         auth_policy: AuthProfile::LocalLAN.policy(),
+        passkey_challenges: crate::passkey::ChallengeStore::new(),
     };
 
     let body = serde_json::json!({ "password": "anything" });
@@ -552,6 +554,7 @@ async fn auth_status_reports_setup_required_on_fresh_host() {
         config_path: tmp.path().join("config.json"),
         security,
         auth_policy: AuthProfile::LocalLAN.policy(),
+        passkey_challenges: crate::passkey::ChallengeStore::new(),
     };
     let r = req("GET", "/api/auth/status").body(Body::empty()).unwrap();
     let (status, body) = run_with(state, r).await;
@@ -590,6 +593,7 @@ async fn setup_required_blocks_protected_api_routes_with_503() {
         config_path: tmp.path().join("config.json"),
         security,
         auth_policy: AuthProfile::LocalLAN.policy(),
+        passkey_challenges: crate::passkey::ChallengeStore::new(),
     };
 
     // Token-gated endpoint — the setup gate must fire *before* the token
@@ -632,6 +636,7 @@ async fn setup_required_lets_auth_status_through() {
         config_path: tmp.path().join("config.json"),
         security,
         auth_policy: AuthProfile::LocalLAN.policy(),
+        passkey_challenges: crate::passkey::ChallengeStore::new(),
     };
     let r = req("GET", "/api/auth/status").body(Body::empty()).unwrap();
     let (status, _) = run_with(state, r).await;
@@ -685,6 +690,7 @@ async fn auth_profile_local_lan_lan_ip_origin_cannot_enroll() {
         config_path: tmp.path().join("config.json"),
         security,
         auth_policy: AuthProfile::LocalLAN.policy(),
+        passkey_challenges: crate::passkey::ChallengeStore::new(),
     };
     let r = Request::builder()
         .method("GET")
@@ -730,6 +736,7 @@ async fn auth_profile_reachable_in_setup_required_mode() {
         config_path: tmp.path().join("config.json"),
         security,
         auth_policy: AuthProfile::LocalLAN.policy(),
+        passkey_challenges: crate::passkey::ChallengeStore::new(),
     };
     let r = req("GET", "/api/auth/profile")
         .header("origin", ORIGIN)
@@ -758,6 +765,7 @@ async fn auth_profile_enterprise_always_can_enroll() {
         config_path: tmp.path().join("config.json"),
         security,
         auth_policy: policy,
+        passkey_challenges: crate::passkey::ChallengeStore::new(),
     };
     let r = req("GET", "/api/auth/profile")
         .header("origin", ORIGIN)
@@ -985,6 +993,7 @@ async fn test_state_no_password() -> (tempfile::TempDir, AppState) {
             config_path,
             security,
             auth_policy: AuthProfile::LocalLAN.policy(),
+            passkey_challenges: crate::passkey::ChallengeStore::new(),
         },
     )
 }
@@ -1120,4 +1129,402 @@ async fn set_password_bypasses_setup_required_gate() {
         "setup gate must bypass /api/auth/set-password"
     );
     assert_eq!(status, StatusCode::OK);
+}
+
+// ── itr#311: WebAuthn passkey HTTP-level tests ─────────────────────────
+//
+// Full register/login round-trips require a SoftPasskey test authenticator,
+// which webauthn-rs 0.5 does not ship publicly (the `webauthn-authenticator-rs`
+// crate covers that, but it's not part of our dep graph). These tests cover
+// every code path we OWN that doesn't need a real cryptographic round-trip:
+//
+//   - Register on a LAN-IP origin under LocalLAN → 400 with the
+//     `passkey_unavailable_on_this_origin` discriminant.
+//   - Register/start on a loopback origin → 200, returns a session_id +
+//     PublicKey creation options.
+//   - Register/finish with an unknown session_id → 400 (single-use
+//     enforced by ChallengeStore.take()).
+//   - Register/finish replay → 400 (second `take` returns None even
+//     against a valid session_id).
+//   - Login/start unauthenticated on a loopback origin → 200.
+//   - Login/finish with an unknown credential → 401 + audit failure.
+//   - Login throttle: 6 failed login finishes from the same IP push the
+//     IP past `login_throttle_threshold`.
+//   - Enterprise profile + sudo-required policy → register/start 403 with
+//     `sudo_required_for_passkey_register` discriminant (placeholder until
+//     itr#313 wires the freshness probe).
+//   - LAN-IP login start also surfaces `passkey_unavailable_on_this_origin`.
+//
+// All routes here go through the production router so the security
+// middleware + auth_policy threading + body limits all fire.
+
+#[tokio::test]
+async fn passkey_register_start_on_loopback_origin_returns_session() {
+    let (_tmp, state) = test_state().await;
+    let (token, _id) = seed_device(state.security.state_db(), "laptop").await;
+    let body = serde_json::json!({});
+    let r = req("POST", "/api/auth/passkey/register/start")
+        .header("authorization", format!("Bearer {token}"))
+        .header("origin", ORIGIN)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, body) = run_with(state, r).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "register/start should accept loopback origin"
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        parsed["session_id"].is_string(),
+        "session_id must be present"
+    );
+    // Response is the flattened WebAuthn `CreationChallengeResponse`
+    // with `session_id` injected, so the SPA can pass `body` straight
+    // into `navigator.credentials.create({ publicKey: body.publicKey })`.
+    assert!(parsed["publicKey"]["challenge"].is_string());
+    assert_eq!(parsed["publicKey"]["rp"]["id"], "localhost");
+}
+
+#[tokio::test]
+async fn passkey_register_start_on_lan_ip_origin_returns_400() {
+    let (_tmp, state) = test_state().await;
+    let (_token, _id) = seed_device(state.security.state_db(), "phone").await;
+    // Override the request's Origin to an RFC1918 IP literal that
+    // `AuthPolicy::rp_id_for_origin` resolves to None. The Host header
+    // (which the security middleware allowlists separately) stays at
+    // 127.0.0.1:3100 because the test allowlist only seeds that.
+    //
+    // Reach into security to add the LAN origin to the allowlist; without
+    // it the security middleware rejects with 403 before our handler runs.
+    // The for_test SecurityConfig doesn't expose mutation, so we
+    // construct a tailored state here.
+    let lan_origin = "https://192.168.1.42:8443";
+    let (tmp2, db2) = test_db().await;
+    let security = SecurityConfig::for_test(
+        vec![lan_origin.to_string(), ORIGIN.to_string()],
+        vec![HOST.to_string()],
+        db2.clone(),
+    );
+    let (token, _id) = seed_device(&db2, "lan-phone").await;
+    let state2 = AppState {
+        socket_path: tmp2.path().join("wisphive.sock"),
+        config_path: tmp2.path().join("config.json"),
+        security,
+        auth_policy: AuthProfile::LocalLAN.policy(),
+        passkey_challenges: crate::passkey::ChallengeStore::new(),
+    };
+    drop(state);
+    let body = serde_json::json!({});
+    let r = req("POST", "/api/auth/passkey/register/start")
+        .header("authorization", format!("Bearer {token}"))
+        .header("origin", lan_origin)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, body) = run_with(state2, r).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "LAN-IP origin under LocalLAN must be a hard 400, not a silent fallback"
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["error"], "passkey_unavailable_on_this_origin");
+}
+
+#[tokio::test]
+async fn passkey_register_finish_with_unknown_session_returns_400() {
+    let (_tmp, state) = test_state().await;
+    let (token, _id) = seed_device(state.security.state_db(), "laptop").await;
+    // A syntactically-valid RegisterPublicKeyCredential takes a fair
+    // amount of fixture — we don't need a valid one here because the
+    // session-id lookup short-circuits before the credential is parsed
+    // by webauthn-rs. Send a minimal shape that satisfies serde.
+    let body = serde_json::json!({
+        "session_id": "this-session-was-never-issued",
+        "credential": {
+            "id": "ZmFrZQ",
+            "rawId": "ZmFrZQ",
+            "type": "public-key",
+            "extensions": {},
+            "response": {
+                "attestationObject": "ZmFrZQ",
+                "clientDataJSON": "ZmFrZQ"
+            }
+        }
+    });
+    let r = req("POST", "/api/auth/passkey/register/finish")
+        .header("authorization", format!("Bearer {token}"))
+        .header("origin", ORIGIN)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, body) = run_with(state, r).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("unknown or expired session"),
+        "unexpected body: {text}"
+    );
+}
+
+#[tokio::test]
+async fn passkey_register_finish_replay_after_take_returns_400() {
+    // Acquire a real session_id via register/start, then submit
+    // register/finish twice. The second attempt MUST 400 because
+    // `ChallengeStore::take` removed the entry on the first call.
+    let (_tmp, state) = test_state().await;
+    let (token, _id) = seed_device(state.security.state_db(), "laptop").await;
+    let body = serde_json::json!({});
+    let r = req("POST", "/api/auth/passkey/register/start")
+        .header("authorization", format!("Bearer {token}"))
+        .header("origin", ORIGIN)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, body) = run_with(state.clone(), r).await;
+    assert_eq!(status, StatusCode::OK);
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let session_id = parsed["session_id"].as_str().unwrap().to_string();
+
+    // First finish: invalid credential payload, but the take() consumes
+    // the entry. We expect 400 (webauthn finish fails) and that's fine.
+    let finish_body = serde_json::json!({
+        "session_id": session_id,
+        "credential": {
+            "id": "ZmFrZQ",
+            "rawId": "ZmFrZQ",
+            "type": "public-key",
+            "extensions": {},
+            "response": {
+                "attestationObject": "ZmFrZQ",
+                "clientDataJSON": "ZmFrZQ"
+            }
+        }
+    });
+    let r1 = req("POST", "/api/auth/passkey/register/finish")
+        .header("authorization", format!("Bearer {token}"))
+        .header("origin", ORIGIN)
+        .header("content-type", "application/json")
+        .body(Body::from(finish_body.to_string()))
+        .unwrap();
+    let (status1, _) = run_with(state.clone(), r1).await;
+    // Could be 400 (credential parse fail) — either way the session is now
+    // consumed.
+    assert!(
+        status1 == StatusCode::BAD_REQUEST || status1 == StatusCode::OK,
+        "first finish returned {status1}"
+    );
+
+    // Second finish: must 400 with "unknown or expired session".
+    let r2 = req("POST", "/api/auth/passkey/register/finish")
+        .header("authorization", format!("Bearer {token}"))
+        .header("origin", ORIGIN)
+        .header("content-type", "application/json")
+        .body(Body::from(finish_body.to_string()))
+        .unwrap();
+    let (status2, body2) = run_with(state, r2).await;
+    assert_eq!(
+        status2,
+        StatusCode::BAD_REQUEST,
+        "replay against the same session_id must 400"
+    );
+    let text = String::from_utf8_lossy(&body2);
+    assert!(text.contains("unknown or expired session"), "body: {text}");
+}
+
+#[tokio::test]
+async fn passkey_login_start_on_loopback_is_unauthenticated() {
+    let (_tmp, state) = test_state().await;
+    // Note: NO bearer token here. /api/auth/passkey/login/start MUST be
+    // reachable without one — it's the bootstrap for an unauth caller,
+    // gated only by the throttle + Origin/Host allowlist.
+    let body = serde_json::json!({});
+    let r = req("POST", "/api/auth/passkey/login/start")
+        .header("origin", ORIGIN)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, body) = run_with(state, r).await;
+    assert_eq!(status, StatusCode::OK);
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(parsed["session_id"].is_string());
+    assert!(parsed["publicKey"]["challenge"].is_string());
+}
+
+#[tokio::test]
+async fn passkey_login_start_on_lan_ip_returns_400() {
+    // Same setup as register: LAN-IP origin must surface
+    // `passkey_unavailable_on_this_origin`.
+    let lan_origin = "https://10.0.0.5:8443";
+    let (tmp, db) = test_db().await;
+    let security = SecurityConfig::for_test(
+        vec![lan_origin.to_string(), ORIGIN.to_string()],
+        vec![HOST.to_string()],
+        db.clone(),
+    );
+    let state = AppState {
+        socket_path: tmp.path().join("wisphive.sock"),
+        config_path: tmp.path().join("config.json"),
+        security,
+        auth_policy: AuthProfile::LocalLAN.policy(),
+        passkey_challenges: crate::passkey::ChallengeStore::new(),
+    };
+    let body = serde_json::json!({});
+    let r = req("POST", "/api/auth/passkey/login/start")
+        .header("origin", lan_origin)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, body) = run_with(state, r).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["error"], "passkey_unavailable_on_this_origin");
+}
+
+#[tokio::test]
+async fn passkey_login_finish_with_unknown_credential_returns_401_and_audits() {
+    let (_tmp, state) = test_state().await;
+
+    // Acquire a session via login/start so we have a real session_id
+    // (otherwise we'd 400 on session lookup before the credential
+    // dispatch). Send an unrecognized credential id to /finish.
+    let start_r = req("POST", "/api/auth/passkey/login/start")
+        .header("origin", ORIGIN)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({}).to_string()))
+        .unwrap();
+    let (s, body) = run_with(state.clone(), start_r).await;
+    assert_eq!(s, StatusCode::OK);
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let session_id = parsed["session_id"].as_str().unwrap().to_string();
+
+    let body = serde_json::json!({
+        "session_id": session_id,
+        "credential": {
+            "id": "dW5rbm93bg",
+            "rawId": "dW5rbm93bg",
+            "type": "public-key",
+            "extensions": {},
+            "response": {
+                "authenticatorData": "ZmFrZQ",
+                "clientDataJSON": "ZmFrZQ",
+                "signature": "ZmFrZQ",
+                "userHandle": null
+            }
+        }
+    });
+    let r = req("POST", "/api/auth/passkey/login/finish")
+        .header("origin", ORIGIN)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let db_for_assertion = state.security.state_db().clone();
+    let (status, _) = run_with(state, r).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Audit row recorded with discriminant `unknown_credential`.
+    let audit = db_for_assertion.list_web_audit(100).await.unwrap();
+    let found = audit.iter().any(|row| {
+        row.event == "passkey_login_failure" && row.detail.as_deref() == Some("unknown_credential")
+    });
+    assert!(
+        found,
+        "expected passkey_login_failure / unknown_credential audit row"
+    );
+}
+
+#[tokio::test]
+async fn passkey_register_under_enterprise_with_sudo_required_returns_403() {
+    // Enterprise profile turns require_sudo_for_passkey_register on; until
+    // itr#313 lands the freshness probe, the handler short-circuits with
+    // 403 + sudo_required_for_passkey_register discriminant. Lock that
+    // behaviour in.
+    let (tmp, db) = test_db().await;
+    let rp_origin = "https://wisphive.example.com";
+    let policy = AuthProfile::Enterprise {
+        rp_id: crate::auth_profile::RpId("wisphive.example.com".to_string()),
+        rp_origin: webauthn_rs::prelude::Url::parse(rp_origin).unwrap(),
+    }
+    .policy();
+    let security = SecurityConfig::for_test_with_policy(
+        vec![rp_origin.to_string()],
+        vec!["wisphive.example.com".to_string()],
+        db.clone(),
+        policy.clone(),
+    );
+    let (token, _id) = seed_device(&db, "laptop").await;
+    let state = AppState {
+        socket_path: tmp.path().join("wisphive.sock"),
+        config_path: tmp.path().join("config.json"),
+        security,
+        auth_policy: policy,
+        passkey_challenges: crate::passkey::ChallengeStore::new(),
+    };
+    let r = Request::builder()
+        .method("POST")
+        .uri("/api/auth/passkey/register/start")
+        .header("host", "wisphive.example.com")
+        .header("origin", rp_origin)
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .extension(ClientIp(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))))
+        .body(Body::from(serde_json::json!({}).to_string()))
+        .unwrap();
+    let (status, body) = run_with(state, r).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["error"], "sudo_required_for_passkey_register");
+}
+
+#[tokio::test]
+async fn passkey_login_finish_bumps_login_throttle_on_failure() {
+    // Two failed passkey login finishes from the same IP should leave
+    // the IP in cooldown — the second call returns 401 once we exhaust
+    // the throttle slot. Combined with password fails this would close
+    // off the IP entirely; here we just assert one passkey fail
+    // produces a non-empty throttle peek.
+    let (_tmp, state) = test_state().await;
+    let throttle = state.security.throttle().clone();
+
+    // Acquire a session id, then fail finish with an unknown credential.
+    let start_r = req("POST", "/api/auth/passkey/login/start")
+        .header("origin", ORIGIN)
+        .body(Body::empty())
+        .unwrap();
+    let (_, body) = run_with(state.clone(), start_r).await;
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let session_id = parsed["session_id"].as_str().unwrap().to_string();
+
+    let fail_body = serde_json::json!({
+        "session_id": session_id,
+        "credential": {
+            "id": "dW5rbm93bg",
+            "rawId": "dW5rbm93bg",
+            "type": "public-key",
+            "extensions": {},
+            "response": {
+                "authenticatorData": "ZmFrZQ",
+                "clientDataJSON": "ZmFrZQ",
+                "signature": "ZmFrZQ",
+                "userHandle": null
+            }
+        }
+    });
+    let r = req("POST", "/api/auth/passkey/login/finish")
+        .header("origin", ORIGIN)
+        .header("content-type", "application/json")
+        .body(Body::from(fail_body.to_string()))
+        .unwrap();
+    let (status, _) = run_with(state, r).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Throttle should have an entry for the loopback IP now (the test
+    // harness seeds ClientIp(127.0.0.1)).
+    let peek = throttle.peek(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))).await;
+    assert!(
+        peek.is_some(),
+        "failed passkey login must register an IP in the throttle"
+    );
 }

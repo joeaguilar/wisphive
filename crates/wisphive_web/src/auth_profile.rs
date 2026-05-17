@@ -58,8 +58,7 @@ impl std::fmt::Display for RpId {
 /// frozen for the lifetime of the process. Switching profiles between
 /// runs may invalidate already-enrolled `web_passkeys` rows whose stored
 /// `rp_id` no longer matches the active profile — operators are warned
-/// at startup via [`scan_passkey_rp_id_drift`] (a no-op stub until
-/// itr#311 adds the `rp_id` column).
+/// at startup via [`scan_passkey_rp_id_drift`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AuthProfile {
     /// Default, opinionated for single-user local-first deploys. Self-signed
@@ -297,16 +296,19 @@ pub(crate) fn is_rfc1918(ip: Ipv4Addr) -> bool {
 /// stored RP ID no longer matches the active profile and WARN-log each
 /// mismatch so the operator knows to re-enroll.
 ///
-/// Today the `rp_id` column does NOT exist on `web_passkeys` (added by
-/// itr#311 PR-4 alongside the WebAuthn handlers). The function is wired
-/// up at startup as a no-op stub so #311's agent has a single call site
-/// to enable without re-plumbing — they just delete the early return and
-/// fill in the real query. The "no such column" tolerance means a
-/// half-merged migration won't crash the daemon.
+/// itr#311 added the `rp_id` column AND the WebAuthn handlers that
+/// populate it. Rows enrolled before the migration carry `rp_id = ""`
+/// (the column's `DEFAULT ''`) and will warn under both profiles —
+/// that's correct, since we can't tell which profile they were enrolled
+/// under and the safe answer is "re-enroll".
 ///
-/// TODO(itr#311): once `web_passkeys.rp_id` lands, swap the early return
-/// for the real `SELECT id, rp_id FROM web_passkeys` query + diff against
-/// `policy.rp_id_strategy`. Keep the no-such-column tolerance for safety.
+/// The `is_missing_column_error` guard is intentionally kept. The
+/// migration in `wisphive_daemon::state::migrate` is idempotent across
+/// daemon restarts, but a half-merged migration (e.g. an operator
+/// running a stale CLI binary against a freshly upgraded daemon, or a
+/// downgrade) could still leave the column absent at startup. Crashing
+/// the whole daemon on a missing audit column would be a worse failure
+/// mode than skipping the scan.
 pub async fn scan_passkey_rp_id_drift(state_db: &StateDb, policy: &AuthPolicy) {
     // Single raw query — sqlx returns a `Database` error with code
     // `1` (SQLITE_ERROR) and message containing "no such column" when
@@ -324,8 +326,8 @@ pub async fn scan_passkey_rp_id_drift(state_db: &StateDb, policy: &AuthPolicy) {
         Err(e) => {
             if is_missing_column_error(&e) {
                 tracing::debug!(
-                    "scan_passkey_rp_id_drift: rp_id column missing (expected pre-itr#311), \
-                     skipping drift scan"
+                    "scan_passkey_rp_id_drift: rp_id column missing \
+                     (half-merged migration?), skipping drift scan"
                 );
                 return;
             }
@@ -576,11 +578,16 @@ mod tests {
         assert!(!is_rfc1918(Ipv4Addr::LOCALHOST));
     }
 
-    // ── profile-switch scan stub ───────────────────────────────────────
+    // ── profile-switch scan ─────────────────────────────────────────────
 
-    /// `scan_passkey_rp_id_drift` must be a graceful no-op while the
-    /// `rp_id` column is missing — that's the load-bearing contract for
-    /// the stub. The TODO inside the function is the seam #311 wires up.
+    /// Half-merged-migration safety: a daemon that opens a DB whose
+    /// `web_passkeys` table predates the itr#311 ALTER (e.g. an operator
+    /// rolled back the daemon binary) must NOT crash on startup. The
+    /// `is_missing_column_error` guard inside `scan_passkey_rp_id_drift`
+    /// is what keeps that contract; simulating the missing-column shape
+    /// requires us to drop the column after `StateDb::open` ran the
+    /// migration, which SQLite doesn't natively support — so we use the
+    /// table-rename + recreate-without-column trick.
     #[tokio::test]
     async fn scan_passkey_rp_id_drift_no_ops_when_column_missing() {
         let tmp = tempfile::tempdir().unwrap();
@@ -588,20 +595,102 @@ mod tests {
         let db = StateDb::open(db_path.to_string_lossy().as_ref())
             .await
             .unwrap();
-        // Seed a device + passkey under the current (pre-#311) schema.
-        // The query inside the scan WILL hit "no such column: rp_id" and
-        // must return cleanly without panicking or logging at warn-level.
+        // Seed a device so we can FK-link a passkey row.
         db.insert_web_device("dev-1", "test", "tokhash")
             .await
             .unwrap();
-        db.insert_web_passkey("pk-1", "dev-1", b"fake-key", 0, None)
+
+        // Manually rewrite the table without the rp_id column so the
+        // scan's SELECT hits "no such column: rp_id". This is the
+        // half-merged-migration shape — `is_missing_column_error` must
+        // catch it and return cleanly. We can't just `DROP COLUMN`
+        // because SQLite < 3.35 doesn't support it on every distro the
+        // daemon might run on (and our migration deliberately doesn't
+        // require it). Sequence: rename the migrated table → create the
+        // old shape → copy back the columns that overlap.
+        let pool = db.pool();
+        sqlx::query("ALTER TABLE web_passkeys RENAME TO web_passkeys_v2")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE web_passkeys (
+                id TEXT PRIMARY KEY,
+                device_id TEXT NOT NULL REFERENCES web_devices(id) ON DELETE CASCADE,
+                public_key BLOB NOT NULL,
+                sign_count INTEGER NOT NULL,
+                transports TEXT,
+                created_at TEXT NOT NULL,
+                last_used_at TEXT
+            )",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("DROP TABLE web_passkeys_v2")
+            .execute(pool)
             .await
             .unwrap();
 
         let policy = AuthProfile::LocalLAN.policy();
-        // If the early-return path regresses (e.g. someone removes the
-        // is_missing_column_error check), this call panics. That's the
-        // assertion.
+        // If the is_missing_column_error guard regresses, this call
+        // surfaces the sqlx error and (depending on caller) panics.
+        // That's the assertion — the function must swallow the missing
+        // column shape silently.
         scan_passkey_rp_id_drift(&db, &policy).await;
+    }
+
+    /// Positive path: a row whose `rp_id` doesn't match the active
+    /// profile must trigger the warn-log. We can't easily assert on the
+    /// tracing output without pulling in a subscriber harness, so this
+    /// test instead asserts the function runs to completion under a
+    /// realistic mismatch scenario (the warn-log itself is the
+    /// load-bearing side effect; this test guards the query path that
+    /// produces it).
+    #[tokio::test]
+    async fn scan_passkey_rp_id_drift_warns_on_mismatched_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("wisphive.db");
+        let db = StateDb::open(db_path.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        db.insert_web_device("dev-1", "test", "tokhash")
+            .await
+            .unwrap();
+        // Two rows: one matching, one mismatched. Active policy is
+        // LocalLAN (expected rp_id = "localhost").
+        db.insert_web_passkey("pk-match", "dev-1", b"k1", 0, None, None, "localhost")
+            .await
+            .unwrap();
+        db.insert_web_passkey(
+            "pk-drift",
+            "dev-1",
+            b"k2",
+            0,
+            None,
+            None,
+            "wisphive.example.com",
+        )
+        .await
+        .unwrap();
+        // Plus a pre-migration row (rp_id = ""), which should also drift
+        // under LocalLAN since "" != "localhost".
+        db.insert_web_passkey("pk-legacy", "dev-1", b"k3", 0, None, None, "")
+            .await
+            .unwrap();
+
+        let policy = AuthProfile::LocalLAN.policy();
+        // Smoke: must not panic, must not return Err. The warn-log
+        // emissions are verified by manual inspection / future tracing
+        // subscriber test if one lands.
+        scan_passkey_rp_id_drift(&db, &policy).await;
+
+        // Sanity: the row whose rp_id WAS "localhost" still exists.
+        let row = db
+            .find_web_passkey_by_credential_id("pk-match")
+            .await
+            .unwrap()
+            .expect("pk-match should still exist");
+        assert_eq!(row.rp_id, "localhost");
     }
 }

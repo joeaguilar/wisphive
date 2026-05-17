@@ -32,6 +32,10 @@ argon2.workspace = true
 webauthn-rs.workspace = true
 uuid.workspace = true
 time.workspace = true
+# itr#311: RFC3339 timestamps in passkey-handler responses. `chrono` is
+# already a workspace-default dep (used by `wisphive_protocol`) so adding
+# the explicit declaration here doesn't bloat the dep graph.
+chrono.workspace = true
 libc.workspace = true
 subtle.workspace = true
 thiserror.workspace = true

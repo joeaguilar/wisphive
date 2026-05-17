@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod auth_profile;
+mod passkey;
 mod reauth_ipc;
 mod security;
 pub mod tls;
@@ -14,6 +15,7 @@ use axum::extract::WebSocketUpgrade;
 use axum::extract::ws::WebSocket;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
+use base64::Engine;
 use rust_embed::RustEmbed;
 use security::{AuthedDevice, ClientIp, SecurityConfig, security_middleware};
 use serde::{Deserialize, Serialize};
@@ -48,6 +50,12 @@ struct AppState {
     /// downstream handlers can branch on `AuthPolicy` without re-deriving
     /// it from the profile enum on every request.
     auth_policy: AuthPolicy,
+    /// In-memory pending-WebAuthn-ceremony store (itr#311). Holds the
+    /// server-side `PasskeyRegistration` / `DiscoverableAuthentication`
+    /// state between the `start` and `finish` halves of each ceremony,
+    /// keyed by an opaque 32-byte session_id. Single-use semantics +
+    /// TTL eviction live inside the store itself.
+    passkey_challenges: passkey::ChallengeStore,
 }
 
 /// Embedded frontend assets (built by Vite into frontend/dist/).
@@ -849,6 +857,737 @@ async fn post_revoke_device(
     (axum::http::StatusCode::OK, "ok").into_response()
 }
 
+// ---------------------------------------------------------------------------
+// WebAuthn passkey handlers (itr#311 / PR-4 of #219)
+// ---------------------------------------------------------------------------
+
+/// Body cap for the four passkey routes. Login finish carries a full
+/// `PublicKeyCredential` (~2 KiB on a synced Apple/Google passkey;
+/// larger on Yubikeys with long attestation chains). 32 KiB is plenty,
+/// and well below axum's 2 MiB default.
+const PASSKEY_BODY_LIMIT: usize = 32 * 1024;
+
+/// Resolve the `(rp_id, rp_origin)` pair for an incoming passkey
+/// ceremony. Returns `Ok(None)` when the policy refuses to issue
+/// credentials for this request's origin (LAN-IP under LocalLAN);
+/// callers MUST treat that as a hard 400 with the
+/// `passkey_unavailable_on_this_origin` discriminant. Returning a
+/// fallback RP ID here would re-open the silent-failure gap
+/// `AuthPolicy::rp_id_for_origin` was built to close (see itr#310
+/// review handoff).
+///
+/// LocalLAN derivation rule: the `rp_origin` MUST be
+/// `https://localhost:<port>` even when the request URL says
+/// `127.0.0.1`. `AuthPolicy::rp_id_for_origin` collapses all loopback
+/// hosts to RP ID `"localhost"`, and webauthn-rs requires `rp_origin`
+/// to match the RP ID exactly.
+///
+/// TODO(itr#270): Enterprise `rp_origin` is currently derived as
+/// `https://{rp_id}` in `wisphive_cli::resolve_auth_profile`. When
+/// `--tls-cert` lands and operators bring their own certificate, the
+/// cert's primary SAN may not match this derivation — revisit this
+/// site then. We thread the rp_origin through `AuthProfile::Enterprise`
+/// rather than rebuilding it here, so the fix is one-line once the
+/// CLI side learns the cert SAN.
+fn resolve_passkey_rp(
+    policy: &AuthPolicy,
+    bind_port: u16,
+    headers: &axum::http::HeaderMap,
+) -> Option<(auth_profile::RpId, Url)> {
+    let origin = headers.get("origin").and_then(|h| h.to_str().ok())?;
+    let origin_url = Url::parse(origin).ok()?;
+    let rp_id = policy.rp_id_for_origin(&origin_url)?;
+    // RpId = "localhost" means we're on the LocalLAN profile with a
+    // loopback origin — drive rp_origin from the bind port, NOT the
+    // request URL, so `127.0.0.1` clients still get the canonical
+    // `https://localhost:<port>` rp_origin webauthn-rs expects.
+    //
+    // For any other RP ID we're on Enterprise; the rp_origin lives on
+    // the AuthProfile (frozen at startup), but the policy doesn't
+    // expose it directly. We reconstruct it from the rp_id + scheme
+    // here as a defensive default and rely on the Enterprise startup
+    // validation to keep it in lockstep with whatever the CLI passed.
+    let rp_origin = if rp_id.as_str() == "localhost" {
+        passkey::local_lan_rp_origin(bind_port).ok()?
+    } else {
+        // Same shape as `wisphive_cli::resolve_auth_profile` produces.
+        // See the TODO(itr#270) note above.
+        let derived = format!("https://{}", rp_id.as_str());
+        Url::parse(&derived).ok()?
+    };
+    Some((rp_id, rp_origin))
+}
+
+/// Standard 400 payload when `resolve_passkey_rp` returns `None`. The
+/// discriminant is a stable machine-readable string so the SPA can
+/// branch on it without parsing the human message.
+fn passkey_unavailable_response() -> Response {
+    let body = serde_json::json!({
+        "error": "passkey_unavailable_on_this_origin",
+        "message": "Passkey enrollment is not available on this origin under the active profile. \
+                    Switch to a loopback URL (LocalLAN) or the registered domain (Enterprise)."
+    })
+    .to_string();
+    (
+        axum::http::StatusCode::BAD_REQUEST,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct PasskeyRegisterFinishRequest {
+    session_id: String,
+    credential: webauthn_rs::prelude::RegisterPublicKeyCredential,
+}
+
+#[derive(Debug, Deserialize)]
+struct PasskeyLoginFinishRequest {
+    session_id: String,
+    credential: webauthn_rs::prelude::PublicKeyCredential,
+}
+
+/// POST /api/auth/passkey/register/start — begin a new passkey
+/// enrollment for the calling authenticated device.
+///
+/// Gating: bearer-required (security middleware attaches `AuthedDevice`
+/// before we get here) + the Origin/Host allowlist + setup-required gate
+/// + (under Enterprise) sudo-fresh check on `policy.require_sudo_for_passkey_register`.
+async fn post_passkey_register_start(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    client_ip: ClientIp,
+    axum::Extension(device): axum::Extension<AuthedDevice>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let policy = state.auth_policy.clone();
+    let db = state.security.state_db().clone();
+    let bind_port = state.security.bind_port();
+
+    let Some((rp_id, rp_origin)) = resolve_passkey_rp(&policy, bind_port, &headers) else {
+        return passkey_unavailable_response();
+    };
+
+    // Enterprise sudo gate. We don't have a sync "is this device fresh"
+    // probe across the IPC boundary today, so the check is deferred to
+    // itr#313 (Enterprise device-enroll) where the daemon will surface
+    // a `CheckDeviceFresh` query. For now we surface a 503 with a stable
+    // discriminant so the SPA knows to pop the sudo modal — once #313
+    // ships this branch becomes a real freshness check.
+    if policy.require_sudo_for_passkey_register {
+        let body = serde_json::json!({
+            "error": "sudo_required_for_passkey_register",
+            "message": "Passkey enrollment under the Enterprise profile requires a fresh password \
+                        re-entry (itr#313)."
+        })
+        .to_string();
+        let _ = db
+            .append_web_audit(
+                "passkey_register_denied",
+                Some(&device.id.0),
+                Some(&client_ip.0.to_string()),
+                Some("sudo_required"),
+            )
+            .await;
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response();
+    }
+
+    let webauthn = match passkey::webauthn_for(&rp_id, &rp_origin, &policy).await {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(error = %e, "webauthn_for failed during register/start");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+            )
+                .into_response();
+        }
+    };
+
+    // Use the device id's first 16 bytes — well, just a deterministic
+    // namespaced UUIDv5 — as the WebAuthn user handle. Don't leak the
+    // raw device id bytes to the authenticator. We pick a fixed
+    // namespace UUID so the same device always produces the same user
+    // handle (lets us look up existing creds by user_id later if we
+    // ever build a "manage your passkeys" page).
+    let user_id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, device.id.0.as_bytes());
+
+    // exclude_credentials = the credential IDs already enrolled against
+    // this device. Without this, an over-eager user pressing "enroll"
+    // twice from the same authenticator would get a confusing
+    // "credential already exists" prompt instead of a clean dedupe.
+    let existing = match db.list_web_passkeys_for_device(&device.id.0).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, device_id = %device.id, "list_web_passkeys_for_device failed");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+            )
+                .into_response();
+        }
+    };
+    let exclude_credentials: Vec<webauthn_rs::prelude::CredentialID> = existing
+        .iter()
+        .filter_map(|row| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(&row.id)
+                .ok()
+                .map(Into::into)
+        })
+        .collect();
+    let exclude = if exclude_credentials.is_empty() {
+        None
+    } else {
+        Some(exclude_credentials)
+    };
+
+    let display_name = device.name.clone();
+    let username = device.id.0.clone();
+    let (creation, reg_state) =
+        match webauthn.start_passkey_registration(user_id, &username, &display_name, exclude) {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!(error = %e, "start_passkey_registration failed");
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error",
+                )
+                    .into_response();
+            }
+        };
+
+    let session_id = state
+        .passkey_challenges
+        .insert(
+            passkey::ChallengeState::Register {
+                state: reg_state,
+                device_id: device.id.0.clone(),
+                rp_id: rp_id.as_str().to_string(),
+            },
+            policy.challenge_ttl,
+        )
+        .await;
+
+    // Flatten: the SPA can pass `body` straight to
+    // `navigator.credentials.create({ publicKey: body.publicKey })`
+    // without re-nesting. `session_id` rides alongside the WebAuthn
+    // payload and is stripped before the browser-side call.
+    let mut payload = match serde_json::to_value(&creation) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "serializing CreationChallengeResponse failed");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+            )
+                .into_response();
+        }
+    };
+    if let serde_json::Value::Object(ref mut map) = payload {
+        map.insert(
+            "session_id".to_string(),
+            serde_json::Value::String(session_id),
+        );
+    }
+    axum::Json(payload).into_response()
+}
+
+/// POST /api/auth/passkey/register/finish — complete the enrollment
+/// started by `register/start`, persist the new credential, audit the
+/// enrollment.
+async fn post_passkey_register_finish(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    client_ip: ClientIp,
+    axum::Extension(device): axum::Extension<AuthedDevice>,
+    headers: axum::http::HeaderMap,
+    axum::Json(body): axum::Json<PasskeyRegisterFinishRequest>,
+) -> Response {
+    let policy = state.auth_policy.clone();
+    let db = state.security.state_db().clone();
+    let bind_port = state.security.bind_port();
+
+    let Some((rp_id, rp_origin)) = resolve_passkey_rp(&policy, bind_port, &headers) else {
+        return passkey_unavailable_response();
+    };
+
+    let stash = state.passkey_challenges.take(&body.session_id).await;
+    let (reg_state, stash_device_id, stash_rp_id) = match stash {
+        Some(passkey::ChallengeState::Register {
+            state,
+            device_id,
+            rp_id,
+        }) => (state, device_id, rp_id),
+        Some(_) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                "session is not a register ceremony",
+            )
+                .into_response();
+        }
+        None => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                "unknown or expired session",
+            )
+                .into_response();
+        }
+    };
+
+    // Cross-check: the device finishing the ceremony must be the same
+    // device that started it. Different devices presenting the same
+    // session_id would let an attacker who races the finish call bind
+    // a credential to the wrong device — the take() above already
+    // single-uses, but defense in depth.
+    if stash_device_id != device.id.0 {
+        let _ = db
+            .append_web_audit(
+                "passkey_register_failure",
+                Some(&device.id.0),
+                Some(&client_ip.0.to_string()),
+                Some("device_id_mismatch"),
+            )
+            .await;
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "session belongs to a different device",
+        )
+            .into_response();
+    }
+    if stash_rp_id != rp_id.as_str() {
+        let _ = db
+            .append_web_audit(
+                "passkey_register_failure",
+                Some(&device.id.0),
+                Some(&client_ip.0.to_string()),
+                Some("rp_id_drift"),
+            )
+            .await;
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "rp id changed between start and finish",
+        )
+            .into_response();
+    }
+
+    let webauthn = match passkey::webauthn_for(&rp_id, &rp_origin, &policy).await {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(error = %e, "webauthn_for failed during register/finish");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+            )
+                .into_response();
+        }
+    };
+
+    let passkey_obj = match webauthn.finish_passkey_registration(&body.credential, &reg_state) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "finish_passkey_registration failed");
+            let _ = db
+                .append_web_audit(
+                    "passkey_register_failure",
+                    Some(&device.id.0),
+                    Some(&client_ip.0.to_string()),
+                    Some("webauthn_finish_error"),
+                )
+                .await;
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                "credential verification failed",
+            )
+                .into_response();
+        }
+    };
+
+    let cred_id_b64 =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(passkey_obj.cred_id());
+    let serialized = match serde_json::to_vec(&passkey_obj) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "serializing Passkey failed");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+            )
+                .into_response();
+        }
+    };
+
+    // AAGUID is not surfaced publicly on `webauthn_rs::Passkey` without
+    // the `danger-credential-internals` feature flag. Store None for
+    // now; the column is nullable for exactly this reason.
+    // TODO(future): if/when we flip on danger-credential-internals (or
+    // webauthn-rs adds a public accessor), populate the real AAGUID
+    // so the future "pretty name your authenticator" UI work has
+    // something to look up.
+    let aaguid: Option<&str> = None;
+
+    if let Err(e) = db
+        .insert_web_passkey(
+            &cred_id_b64,
+            &device.id.0,
+            &serialized,
+            0,
+            None,
+            aaguid,
+            rp_id.as_str(),
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "insert_web_passkey failed");
+        let _ = db
+            .append_web_audit(
+                "passkey_register_failure",
+                Some(&device.id.0),
+                Some(&client_ip.0.to_string()),
+                Some("db_insert_error"),
+            )
+            .await;
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "could not persist credential",
+        )
+            .into_response();
+    }
+
+    let _ = db
+        .append_web_audit(
+            "passkey_register",
+            Some(&device.id.0),
+            Some(&client_ip.0.to_string()),
+            Some(&cred_id_b64),
+        )
+        .await;
+
+    axum::Json(serde_json::json!({
+        "credential_id": cred_id_b64,
+        "created_at": chrono::Utc::now().to_rfc3339(),
+    }))
+    .into_response()
+}
+
+/// POST /api/auth/passkey/login/start — begin a discoverable-credential
+/// passkey login. Unauthenticated (the whole point) but throttled via
+/// the same `LoginThrottle` as password login so brute-forcing a stolen
+/// device's biometric doesn't get free rate-limit headroom.
+async fn post_passkey_login_start(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    client_ip: ClientIp,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let policy = state.auth_policy.clone();
+    let throttle = state.security.throttle().clone();
+    let bind_port = state.security.bind_port();
+
+    let guard = match throttle.try_begin_attempt(client_ip.0).await {
+        Ok(g) => g,
+        Err(decision) => {
+            let retry = decision
+                .retry_after
+                .unwrap_or(Duration::from_secs(1))
+                .as_secs()
+                .max(1);
+            return (
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                [("retry-after", retry.to_string())],
+                "throttled",
+            )
+                .into_response();
+        }
+    };
+
+    let Some((rp_id, rp_origin)) = resolve_passkey_rp(&policy, bind_port, &headers) else {
+        guard.record_failure().await;
+        return passkey_unavailable_response();
+    };
+
+    let webauthn = match passkey::webauthn_for(&rp_id, &rp_origin, &policy).await {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(error = %e, "webauthn_for failed during login/start");
+            guard.record_failure().await;
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+            )
+                .into_response();
+        }
+    };
+
+    let (request, auth_state) = match webauthn.start_discoverable_authentication() {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!(error = %e, "start_discoverable_authentication failed");
+            guard.record_failure().await;
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+            )
+                .into_response();
+        }
+    };
+
+    let session_id = state
+        .passkey_challenges
+        .insert(
+            passkey::ChallengeState::Login(auth_state),
+            policy.challenge_ttl,
+        )
+        .await;
+
+    // Login start is a successful bookkeeping step; release the guard
+    // without counting it as a failure. The actual credential verify
+    // happens in /finish, where another throttle slot is acquired.
+    guard.record_success().await;
+
+    // Flatten so the SPA can pass the body straight into
+    // `navigator.credentials.get({ publicKey: body.publicKey, mediation })`.
+    let mut payload = match serde_json::to_value(&request) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "serializing RequestChallengeResponse failed");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+            )
+                .into_response();
+        }
+    };
+    if let serde_json::Value::Object(ref mut map) = payload {
+        map.insert(
+            "session_id".to_string(),
+            serde_json::Value::String(session_id),
+        );
+    }
+    axum::Json(payload).into_response()
+}
+
+/// POST /api/auth/passkey/login/finish — verify the assertion returned
+/// by the authenticator, look up the matching device, issue a fresh
+/// device token. Unauthenticated; rate-limited via `LoginThrottle`.
+async fn post_passkey_login_finish(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    client_ip: ClientIp,
+    headers: axum::http::HeaderMap,
+    axum::Json(body): axum::Json<PasskeyLoginFinishRequest>,
+) -> Response {
+    let policy = state.auth_policy.clone();
+    let db = state.security.state_db().clone();
+    let throttle = state.security.throttle().clone();
+    let bind_port = state.security.bind_port();
+
+    let guard = match throttle.try_begin_attempt(client_ip.0).await {
+        Ok(g) => g,
+        Err(decision) => {
+            let retry = decision
+                .retry_after
+                .unwrap_or(Duration::from_secs(1))
+                .as_secs()
+                .max(1);
+            return (
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                [("retry-after", retry.to_string())],
+                "throttled",
+            )
+                .into_response();
+        }
+    };
+
+    let Some((rp_id, rp_origin)) = resolve_passkey_rp(&policy, bind_port, &headers) else {
+        guard.record_failure().await;
+        return passkey_unavailable_response();
+    };
+
+    let stash = state.passkey_challenges.take(&body.session_id).await;
+    let auth_state = match stash {
+        Some(passkey::ChallengeState::Login(s)) => s,
+        Some(_) => {
+            guard.record_failure().await;
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                "session is not a login ceremony",
+            )
+                .into_response();
+        }
+        None => {
+            guard.record_failure().await;
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                "unknown or expired session",
+            )
+                .into_response();
+        }
+    };
+
+    let webauthn = match passkey::webauthn_for(&rp_id, &rp_origin, &policy).await {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(error = %e, "webauthn_for failed during login/finish");
+            guard.record_failure().await;
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+            )
+                .into_response();
+        }
+    };
+
+    // Identify which credential the user picked. The cred_id bytes
+    // come straight off the assertion — we base64url-encode for the DB
+    // lookup since that's how we stored it at register/finish.
+    let cred_id_bytes = body.credential.get_credential_id();
+    let cred_id_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cred_id_bytes);
+    let stored = match db.find_web_passkey_by_credential_id(&cred_id_b64).await {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            let _ = db
+                .append_web_audit(
+                    "passkey_login_failure",
+                    None,
+                    Some(&client_ip.0.to_string()),
+                    Some("unknown_credential"),
+                )
+                .await;
+            guard.record_failure().await;
+            return (axum::http::StatusCode::UNAUTHORIZED, "invalid credential").into_response();
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "find_web_passkey_by_credential_id failed");
+            guard.record_failure().await;
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+            )
+                .into_response();
+        }
+    };
+
+    let stored_passkey: webauthn_rs::prelude::Passkey = match serde_json::from_slice(
+        &stored.public_key,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, credential_id = %cred_id_b64, "deserialize stored Passkey failed");
+            guard.record_failure().await;
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "stored credential corrupt",
+            )
+                .into_response();
+        }
+    };
+
+    let discoverable: webauthn_rs::prelude::DiscoverableKey = (&stored_passkey).into();
+
+    let result = match webauthn.finish_discoverable_authentication(
+        &body.credential,
+        auth_state,
+        &[discoverable],
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "finish_discoverable_authentication failed");
+            let _ = db
+                .append_web_audit(
+                    "passkey_login_failure",
+                    Some(&stored.device_id),
+                    Some(&client_ip.0.to_string()),
+                    Some("webauthn_finish_error"),
+                )
+                .await;
+            guard.record_failure().await;
+            return (axum::http::StatusCode::UNAUTHORIZED, "invalid credential").into_response();
+        }
+    };
+
+    // WebAuthn §7.2 step 21: reject when the assertion's counter is
+    // <= the stored counter (cloned credential indicator). webauthn-rs
+    // doesn't enforce this for us in `finish_discoverable_authentication`
+    // — it surfaces the new counter and leaves the policy decision to
+    // the RP. Many synced passkeys send counter=0 always; we treat
+    // strictly-less as a failure but allow equal-to-zero (the synced
+    // case).
+    let new_counter = i64::from(result.counter());
+    if new_counter > 0 && new_counter <= stored.sign_count {
+        let _ = db
+            .append_web_audit(
+                "passkey_login_failure",
+                Some(&stored.device_id),
+                Some(&client_ip.0.to_string()),
+                Some("counter_regression"),
+            )
+            .await;
+        guard.record_failure().await;
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            "counter regression detected",
+        )
+            .into_response();
+    }
+
+    // Update the persisted counter + last_used_at; failures here are
+    // logged but don't block the login (the user already proved
+    // possession; failing the request because we couldn't update a
+    // bookkeeping column would lock them out for no security gain).
+    if let Err(e) = db
+        .update_passkey_sign_count_and_last_used(&cred_id_b64, new_counter)
+        .await
+    {
+        tracing::warn!(error = %e, credential_id = %cred_id_b64, "update_passkey_sign_count_and_last_used failed");
+    }
+
+    // Issue a fresh device token bound to the same device the
+    // credential is enrolled under. We don't create a new device row —
+    // the existing one is the legitimate target.
+    let token = auth::generate_device_token();
+    // We piggyback on `insert_web_device` would create a NEW row, which
+    // is wrong; instead update the existing device's token_hash via a
+    // direct query. We DON'T have a method for that today, so reuse
+    // the revoke + insert pattern: revoke old row (creates a tombstone
+    // for audit) then insert a new row with the same id. That would
+    // collide on the PK. So the right move is to mint a NEW device id
+    // — each successful passkey login produces a fresh device id,
+    // mirroring how password login works.
+    let new_device_id = uuid::Uuid::new_v4().to_string();
+    let device_name = format!("passkey-{}", stored.device_id.get(..8).unwrap_or("dev"));
+    if let Err(e) = db
+        .insert_web_device(&new_device_id, &device_name, &token.hash_hex)
+        .await
+    {
+        tracing::warn!(error = %e, "insert_web_device after passkey login failed");
+        guard.record_failure().await;
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "could not record device",
+        )
+            .into_response();
+    }
+
+    let _ = db
+        .append_web_audit(
+            "passkey_login_success",
+            Some(&new_device_id),
+            Some(&client_ip.0.to_string()),
+            Some(&cred_id_b64),
+        )
+        .await;
+
+    guard.record_success().await;
+    axum::Json(LoginResponse {
+        device_id: new_device_id,
+        token: token.raw,
+    })
+    .into_response()
+}
+
 fn build_router(state: AppState, dev_mode: bool) -> Router {
     let security = state.security.clone();
     // Body-size cap for the three password-handling endpoints. They're
@@ -857,6 +1596,7 @@ fn build_router(state: AppState, dev_mode: bool) -> Router {
     // narrows the attack surface from axum's 2 MiB default without
     // affecting any real request.
     let auth_body_limit = || axum::extract::DefaultBodyLimit::max(AUTH_BODY_LIMIT);
+    let passkey_body_limit = || axum::extract::DefaultBodyLimit::max(PASSKEY_BODY_LIMIT);
     let api = Router::new()
         .route("/ws", get(ws_handler))
         .route("/api/auth/status", get(get_auth_status))
@@ -873,6 +1613,27 @@ fn build_router(state: AppState, dev_mode: bool) -> Router {
         .route(
             "/api/auth/reauth",
             post(post_auth_reauth).layer(auth_body_limit()),
+        )
+        // itr#311 / PR-4 of #219: four WebAuthn passkey routes.
+        // Register routes are bearer-gated by `path_requires_device_token`
+        // (any logged-in device can enroll a new credential against
+        // itself); login routes are unauth-reachable and rate-limited
+        // via the same `LoginThrottle` as password login.
+        .route(
+            "/api/auth/passkey/register/start",
+            post(post_passkey_register_start).layer(passkey_body_limit()),
+        )
+        .route(
+            "/api/auth/passkey/register/finish",
+            post(post_passkey_register_finish).layer(passkey_body_limit()),
+        )
+        .route(
+            "/api/auth/passkey/login/start",
+            post(post_passkey_login_start).layer(passkey_body_limit()),
+        )
+        .route(
+            "/api/auth/passkey/login/finish",
+            post(post_passkey_login_finish).layer(passkey_body_limit()),
         )
         .route("/api/me", get(get_me))
         .route("/api/devices", get(get_devices))
@@ -951,19 +1712,28 @@ pub async fn serve(
         "auth profile selected"
     );
 
-    // itr#310 stub — scan `web_passkeys.rp_id` for drift vs the active
-    // profile. Today this is a no-op (the rp_id column hasn't landed yet;
-    // see scan_passkey_rp_id_drift's TODO(itr#311)). Wiring it now means
-    // #311 just deletes the early return.
+    // Scan `web_passkeys.rp_id` for drift vs the active profile. The
+    // `is_missing_column_error` guard inside the scan keeps half-merged
+    // migration scenarios from crashing the daemon (e.g. a stale CLI
+    // binary launched against a not-yet-upgraded DB).
     auth_profile::scan_passkey_rp_id_drift(&state_db, &auth_policy).await;
 
     let security = SecurityConfig::build(state_db, bind_host, port, dev_mode, auth_policy.clone())?;
+
+    let passkey_challenges = passkey::ChallengeStore::new();
+    // itr#311: drop expired ceremonies on a 60 s cadence so a hostile
+    // client starting registrations they never finish can't grow the
+    // map without bound. The handle is intentionally detached — the
+    // task only ever does `evict_expired` work and lives as long as
+    // the process.
+    let _reaper = passkey_challenges.spawn_reaper(Duration::from_secs(60));
 
     let state = AppState {
         socket_path,
         config_path,
         security,
         auth_policy,
+        passkey_challenges,
     };
 
     let app = build_router(state, dev_mode);

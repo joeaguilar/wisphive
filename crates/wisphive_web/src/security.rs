@@ -97,6 +97,13 @@ struct SecurityConfigInner {
     /// (and the future WebAuthn machinery from #311) can branch on it
     /// without re-reading the profile from disk.
     auth_policy: AuthPolicy,
+    /// TCP port the server is bound to. itr#311 needs this to derive the
+    /// LocalLAN `rp_origin` (`https://localhost:<port>`) without parsing
+    /// the request URL — `AuthPolicy::rp_id_for_origin` collapses every
+    /// loopback host to RP ID `"localhost"`, so the matching `rp_origin`
+    /// must be constructed from the configured port, not the
+    /// (potentially `127.0.0.1`-typed) request URL.
+    bind_port: u16,
 }
 
 impl SecurityConfig {
@@ -171,6 +178,7 @@ impl SecurityConfig {
                 state_db,
                 throttle: LoginThrottle::new(),
                 auth_policy,
+                bind_port: port,
             }),
         })
     }
@@ -209,8 +217,20 @@ impl SecurityConfig {
                 state_db,
                 throttle: LoginThrottle::new(),
                 auth_policy,
+                // 3100 is the production default; tests don't actually
+                // bind it so the value only feeds the rp_origin
+                // derivation in itr#311's passkey handlers.
+                bind_port: 3100,
             }),
         }
+    }
+
+    /// Port the server is bound to. Used by the itr#311 passkey
+    /// handlers to derive a canonical LocalLAN `rp_origin` without
+    /// parsing the request URL (which would let a `127.0.0.1` client
+    /// bypass the loopback-collapse contract baked into `AuthPolicy`).
+    pub fn bind_port(&self) -> u16 {
+        self.inner.bind_port
     }
 
     /// Expose the frozen [`AuthPolicy`] so downstream handlers can branch
@@ -435,6 +455,14 @@ pub(crate) fn path_requires_device_token(path: &str) -> bool {
     {
         return false;
     }
+    // itr#311: passkey login is the bootstrap for an unauth caller —
+    // exactly like password login. Both endpoints are throttled via
+    // `LoginThrottle` instead of bearer-gated. Register routes stay
+    // bearer-gated (see the falls-through-to-true below) because you
+    // can't enroll a credential against a device you don't yet own.
+    if path == "/api/auth/passkey/login/start" || path == "/api/auth/passkey/login/finish" {
+        return false;
+    }
     path.starts_with("/api/")
 }
 
@@ -527,6 +555,20 @@ mod tests {
         // Retired bootstrap route is exempt so the router's fallback
         // can 404 cleanly instead of the gate 401-ing first.
         assert!(!path_requires_device_token("/api/web-token"));
+        // itr#311: passkey login is the bootstrap for an unauth caller
+        // — same logic as password /api/auth/login. Register routes
+        // remain bearer-gated (a device must exist before passkey
+        // enrollment).
+        assert!(!path_requires_device_token("/api/auth/passkey/login/start"));
+        assert!(!path_requires_device_token(
+            "/api/auth/passkey/login/finish"
+        ));
+        assert!(path_requires_device_token(
+            "/api/auth/passkey/register/start"
+        ));
+        assert!(path_requires_device_token(
+            "/api/auth/passkey/register/finish"
+        ));
         assert!(!path_requires_device_token("/"));
         assert!(!path_requires_device_token("/index.html"));
         assert!(!path_requires_device_token("/assets/foo.js"));
@@ -544,6 +586,13 @@ mod tests {
         assert!(!path_bypasses_setup_gate("/api/config"));
         assert!(!path_bypasses_setup_gate("/api/devices"));
         assert!(!path_bypasses_setup_gate("/ws"));
+        // itr#311: passkey routes are NOT exempt from the setup gate —
+        // the operator must set a password before any passkey workflow
+        // becomes reachable.
+        assert!(!path_bypasses_setup_gate("/api/auth/passkey/login/start"));
+        assert!(!path_bypasses_setup_gate(
+            "/api/auth/passkey/register/start"
+        ));
     }
 
     #[test]
