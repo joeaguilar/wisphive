@@ -491,10 +491,11 @@ async fn get_auth_status(axum::extract::State(state): axum::extract::State<AppSt
 /// IP RP IDs; see `auth_profile::loopback_rp_id_from_origin`).
 async fn get_auth_profile(
     axum::extract::State(state): axum::extract::State<AppState>,
+    uri: axum::http::Uri,
     headers: axum::http::HeaderMap,
 ) -> Response {
     let policy = &state.auth_policy;
-    let can_enroll = origin_can_enroll_passkey(policy, &headers);
+    let can_enroll = origin_can_enroll_passkey(policy, &headers, &uri);
     axum::Json(serde_json::json!({
         "profile": policy.profile_str(),
         "can_enroll_passkey_on_this_origin": can_enroll,
@@ -505,10 +506,10 @@ async fn get_auth_profile(
 }
 
 /// Compute `can_enroll_passkey_on_this_origin` from the request's `Origin`
-/// header, with a `Host`-based fallback for browsers that suppress `Origin`
+/// header, with a host-based fallback for browsers that suppress `Origin`
 /// on same-origin GET requests.
 ///
-/// **Why the Host fallback exists.** The original implementation read only
+/// **Why the host fallback exists.** The original implementation read only
 /// `Origin` and fell back to `false` when it was absent, on the assumption
 /// that "any meaningful browser caller already had the answer from a prior
 /// fetch." That assumption was wrong: browsers (per the Fetch standard) do
@@ -518,37 +519,52 @@ async fn get_auth_profile(
 /// "Enroll a passkey?" UI never rendered, and the sprint-1 smoke caught
 /// it on the first real browser run.
 ///
-/// **Why Host is safe to use.** `Host` is mandatory per HTTP/1.1 (and the
-/// `:authority` pseudo-header is mandatory under HTTP/2 — Axum normalises
-/// both into the `Host` header), so it's always present for any real
-/// request. We synthesize an origin string from it. Scheme can't be read
-/// directly from the request because Axum strips it from the `Uri` seen
-/// by handlers, so we try `https://` first (the daemon's production
-/// posture; the only first-party HTTP path is dev-mode behind the Vite
-/// proxy, which actually still terminates TLS at the daemon) and then
-/// `http://` as a fallback. `AuthPolicy::rp_id_for_origin` already
-/// validates the host shape (LocalLAN requires loopback; Enterprise
-/// requires the configured RP origin), so synthesizing the wrong scheme
-/// can never produce a false-positive enrollment offer.
+/// **Why we read both `Uri::host` and the `Host` header.** Browsers talk
+/// HTTP/2 to HTTPS daemons by default. Under HTTP/2 the request's authority
+/// arrives in the `:authority` pseudo-header, which Hyper exposes as part
+/// of the request `Uri` — and which is **not** mirrored into the `Host`
+/// HeaderMap entry. So an HTTP/2 request with no `Origin` would have no
+/// `Host` header to fall back to either. Under HTTP/1.1 the opposite is
+/// true: the `Host` header is set and the URI seen by Axum handlers is
+/// just the path (no authority). We check both in order — URI authority
+/// first (HTTP/2 + any client that puts authority in absolute-form URIs),
+/// then the `Host` header (HTTP/1.1) — to cover both protocols.
 ///
-/// **Defaults.** Both `Origin` and `Host` missing → `false` (defense in
-/// depth against weird non-browser callers). `Origin` present but
-/// unparsable → `false` (don't quietly upgrade to Host; the caller meant
-/// something we couldn't honour).
-fn origin_can_enroll_passkey(policy: &AuthPolicy, headers: &axum::http::HeaderMap) -> bool {
+/// **Why synthesizing a scheme is safe.** `AuthPolicy::rp_id_for_origin`
+/// already validates the host shape (LocalLAN requires loopback; Enterprise
+/// requires the configured RP origin). Trying `https://` then `http://`
+/// only widens the input source, not the decision rule — synthesizing the
+/// wrong scheme can never produce a false-positive enrollment offer.
+///
+/// **Defaults.** No `Origin`, no URI authority, and no `Host` → `false`
+/// (defense in depth against weird non-browser callers, though in practice
+/// the security middleware's Host allowlist 403s such requests before they
+/// reach the handler). `Origin` present but unparsable → `false` (don't
+/// quietly upgrade to host; the caller meant something we couldn't honour).
+fn origin_can_enroll_passkey(
+    policy: &AuthPolicy,
+    headers: &axum::http::HeaderMap,
+    uri: &axum::http::Uri,
+) -> bool {
     if let Some(origin) = headers.get("origin").and_then(|h| h.to_str().ok()) {
         // Origin was set explicitly. Honour it verbatim — including the
         // "Origin present but unparsable" path which we treat as a deliberate
-        // negative answer rather than silently falling through to Host.
+        // negative answer rather than silently falling through to host.
         return Url::parse(origin)
             .ok()
             .and_then(|u| policy.rp_id_for_origin(&u))
             .is_some();
     }
 
-    // Origin absent (same-origin GET in a browser, curl without -H Origin,
-    // most synthetic-monitoring tools). Fall back to Host.
-    let Some(host) = headers.get("host").and_then(|h| h.to_str().ok()) else {
+    // Origin absent. Synthesise a host string from whichever source has it
+    // for this request's protocol. HTTP/2 puts it in the URI authority
+    // (from the `:authority` pseudo-header). HTTP/1.1 puts it in the
+    // `Host` header and leaves URI authority empty. Either is fine.
+    let host = uri
+        .authority()
+        .map(|a| a.as_str())
+        .or_else(|| headers.get("host").and_then(|h| h.to_str().ok()));
+    let Some(host) = host else {
         return false;
     };
     for scheme in ["https", "http"] {

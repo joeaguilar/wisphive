@@ -805,7 +805,36 @@ async fn auth_profile_host_fallback_when_origin_absent() {
     );
 }
 
-/// Companion to `auth_profile_host_fallback_when_origin_absent`: the Host
+/// Sprint-1 wave-4 regression #2: under HTTP/2 the request authority
+/// arrives in the `:authority` pseudo-header (which Hyper exposes through
+/// `request.uri().authority()`) and is NOT mirrored into the `Host`
+/// HeaderMap entry. Browsers default to HTTP/2 over HTTPS, so the SPA's
+/// `useAuthProfile` probe in production hits this path, not the
+/// HTTP/1.1-Host path. The handler reads URI authority first and falls
+/// back to the `Host` header — this test pins the URI-authority leg.
+#[tokio::test]
+async fn auth_profile_uri_authority_fallback_for_http2() {
+    let (_tmp, state) = test_state().await;
+    // Absolute-form URI exercises the same code path as HTTP/2: Axum/Hyper
+    // expose the authority on `request.uri().authority()`. We deliberately
+    // construct the request without a `Host` header to prove the URI
+    // authority alone is enough.
+    let r = Request::builder()
+        .method("GET")
+        .uri(format!("http://{HOST}/api/auth/profile"))
+        .extension(ClientIp(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))))
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = run_with(state, r).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        v["can_enroll_passkey_on_this_origin"], true,
+        "Origin-absent HTTP/2-shaped request with loopback URI authority must be enrollment-capable"
+    );
+}
+
+/// Companion to `auth_profile_host_fallback_when_origin_absent`: the host
 /// fallback must NOT promote a LAN-IP Host to enrollment-capable under
 /// LocalLAN. Confirms the fallback runs the synthesized origin through the
 /// same policy filter — it's not a bypass, just a different way to learn
