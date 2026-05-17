@@ -1756,10 +1756,20 @@ fn build_router(state: AppState, dev_mode: bool) -> Router {
         api.fallback(get(static_handler)).with_state(state)
     };
 
-    router.layer(axum::middleware::from_fn_with_state(
-        security,
-        security_middleware,
-    ))
+    router
+        .layer(axum::middleware::from_fn_with_state(
+            security,
+            security_middleware,
+        ))
+        // 308-redirect non-API navigation from IP-literal loopback hosts
+        // (`127.0.0.1`, `[::1]`) to `localhost`. Layered AFTER the security
+        // middleware so it runs FIRST on incoming requests (outermost
+        // layer = first to inspect). `loopback_ip_redirect` itself skips
+        // `/api/*` and `/ws`, so the security middleware below it still
+        // gates those paths normally — the redirect only fires for SPA
+        // navigation. See `security::loopback_ip_redirect` for why this
+        // exists (WebAuthn forbids IP-literal RP IDs at the browser layer).
+        .layer(axum::middleware::from_fn(security::loopback_ip_redirect))
 }
 
 /// Start the web server.

@@ -205,8 +205,27 @@ fn loopback_rp_id_from_origin(origin: &Url) -> Option<RpId> {
         url::Host::Domain(d) if d.eq_ignore_ascii_case("localhost") => {
             Some(RpId("localhost".to_string()))
         }
-        url::Host::Ipv4(ip) if ip.is_loopback() => Some(RpId("localhost".to_string())),
-        url::Host::Ipv6(ip) if ip.is_loopback() => Some(RpId("localhost".to_string())),
+        // IP literals (including loopback `127.0.0.1` / `[::1]`) are forbidden
+        // as WebAuthn RP IDs by §5.1.3 step 9, and crucially the browser-side
+        // check in `navigator.credentials.create/get` enforces this BEFORE
+        // any server-side allowlist gets a chance to weigh in. Previously
+        // we returned `Some(RpId("localhost"))` for loopback IPs, which
+        // produced `can_enroll_passkey_on_this_origin: true` on a page
+        // loaded via `https://127.0.0.1:<port>` — and then Chrome threw
+        // `SecurityError: This is an invalid domain` the moment the user
+        // clicked "Enroll passkey", because the page's effectiveDomain
+        // (`127.0.0.1`) doesn't equal the requested rp.id (`localhost`).
+        // The sprint-1 wave-4 smoke caught this.
+        //
+        // Honest answer: passkey enroll is NOT available on IP-literal
+        // origins. The SPA hides the enroll button (and the
+        // "Sign in with a passkey" button) when this returns `None`,
+        // matching the LAN-IP-under-LocalLAN case the gate exists for in
+        // the first place. The companion redirect middleware
+        // (`security::loopback_ip_redirect`) catches browser navigation
+        // to `127.0.0.1` / `[::1]` and 301s to `localhost`, so most users
+        // never even land on an IP-literal origin in practice.
+        url::Host::Ipv4(_) | url::Host::Ipv6(_) => None,
         _ => None,
     }
 }
@@ -423,26 +442,49 @@ mod tests {
     // ── rp_id_for_origin matrix (locked 2026-05-16) ────────────────────
 
     #[test]
-    fn local_lan_loopback_origins_resolve_to_localhost() {
+    fn local_lan_localhost_resolves_to_localhost() {
+        // Only the `localhost` DNS name maps to a valid RP ID — IP
+        // literals (even loopback) are forbidden by WebAuthn §5.1.3
+        // step 9 at the browser layer, so returning `Some` for them
+        // would just produce a `SecurityError` the moment the user
+        // clicked enroll. See `loopback_rp_id_from_origin` doc.
         let p = AuthProfile::LocalLAN.policy();
-        assert_eq!(
-            p.rp_id_for_origin(&url("http://127.0.0.1:3100")),
-            Some(RpId("localhost".to_string()))
-        );
         assert_eq!(
             p.rp_id_for_origin(&url("http://localhost:3100")),
             Some(RpId("localhost".to_string()))
         );
-        // url::Url canonicalizes IPv6 host inside brackets.
-        assert_eq!(
-            p.rp_id_for_origin(&url("http://[::1]:3100")),
-            Some(RpId("localhost".to_string()))
-        );
-        // https loopback works too — the scheme doesn't affect RP ID.
+        // https vs http doesn't affect RP ID — only host shape does.
         assert_eq!(
             p.rp_id_for_origin(&url("https://localhost:3100")),
             Some(RpId("localhost".to_string()))
         );
+        // No-port form (would only happen via a synthesized URL from
+        // the Host-fallback path; included for completeness).
+        assert_eq!(
+            p.rp_id_for_origin(&url("https://localhost")),
+            Some(RpId("localhost".to_string()))
+        );
+    }
+
+    #[test]
+    fn local_lan_ip_literal_loopback_resolves_to_none() {
+        // Sprint-1 wave-4 manual-smoke regression: a page loaded via
+        // `https://127.0.0.1:3100` previously had its enroll button shown
+        // (because we returned `Some(RpId("localhost"))` here) and then
+        // Chrome threw `SecurityError: This is an invalid domain` when
+        // the user actually clicked enroll — because the page's
+        // effectiveDomain (`127.0.0.1`) doesn't equal the requested
+        // rp.id (`localhost`). The honest answer is `None`: don't offer
+        // a button that will fail. The companion
+        // `security::loopback_ip_redirect` middleware catches browser
+        // navigation to these origins and 301s to `localhost` so most
+        // users never land here, but the policy answer is still load-
+        // bearing for any caller that reaches the daemon via IP literal.
+        let p = AuthProfile::LocalLAN.policy();
+        assert_eq!(p.rp_id_for_origin(&url("http://127.0.0.1:3100")), None);
+        assert_eq!(p.rp_id_for_origin(&url("https://127.0.0.1:3100")), None);
+        assert_eq!(p.rp_id_for_origin(&url("http://[::1]:3100")), None);
+        assert_eq!(p.rp_id_for_origin(&url("https://[::1]:3100")), None);
     }
 
     #[test]

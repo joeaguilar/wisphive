@@ -21,8 +21,19 @@ use crate::auth_profile::AuthProfile;
 use crate::security::{ClientIp, SecurityConfig};
 use crate::{AppState, build_router};
 
-const HOST: &str = "127.0.0.1:3100";
-const ORIGIN: &str = "http://127.0.0.1:3100";
+// HOST / ORIGIN constants intentionally use `localhost` rather than
+// `127.0.0.1` because the policy layer now (correctly) treats IP-literal
+// loopback origins as ineligible for passkey enrollment — WebAuthn forbids
+// IP-literal RP IDs at the browser layer, so honest API surfaces return
+// `can_enroll_passkey_on_this_origin: false` for `127.0.0.1` requests
+// (see `auth_profile::loopback_rp_id_from_origin`). The bulk of the test
+// suite doesn't care which loopback form is used; standardising on
+// `localhost` lets the existing assertions stay meaningful without
+// introducing a per-test override matrix. Tests that specifically
+// exercise the IP-literal behaviour use literal `127.0.0.1` strings
+// inline.
+const HOST: &str = "localhost:3100";
+const ORIGIN: &str = "http://localhost:3100";
 const PASSWORD: &str = "correct horse battery staple";
 
 /// Open an in-process SQLite DB rooted at a tempdir so each test gets an
@@ -708,6 +719,42 @@ async fn auth_profile_local_lan_lan_ip_origin_cannot_enroll() {
     assert_eq!(v["can_enroll_passkey_on_this_origin"], false);
 }
 
+/// Sprint-1 wave-4 manual smoke regression: a page loaded via
+/// `https://127.0.0.1:<port>` previously had its enroll button shown
+/// (because `loopback_rp_id_from_origin` returned `Some(RpId("localhost"))`
+/// for IPv4/IPv6 loopback) and then Chrome threw
+/// `SecurityError: This is an invalid domain` the moment the user
+/// clicked "Enroll passkey". The fix routes IP-literal loopback to
+/// `None`; this HTTP-level test pins the surfaced behaviour.
+#[tokio::test]
+async fn auth_profile_local_lan_ip_literal_loopback_cannot_enroll() {
+    let (tmp, db) = test_db().await;
+    let ip_origin = "https://127.0.0.1:3100".to_string();
+    let ip_host = "127.0.0.1:3100".to_string();
+    let security =
+        SecurityConfig::for_test(vec![ip_origin.clone()], vec![ip_host.clone()], db.clone());
+    let state = AppState {
+        socket_path: tmp.path().join("wisphive.sock"),
+        config_path: tmp.path().join("config.json"),
+        security,
+        auth_policy: AuthProfile::LocalLAN.policy(),
+        passkey_challenges: crate::passkey::ChallengeStore::new(),
+    };
+    let r = Request::builder()
+        .method("GET")
+        .uri("/api/auth/profile")
+        .header("host", &ip_host)
+        .header("origin", &ip_origin)
+        .extension(ClientIp(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))))
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = run_with(state, r).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["profile"], "local-lan");
+    assert_eq!(v["can_enroll_passkey_on_this_origin"], false);
+}
+
 /// Bearer NOT required for `/api/auth/profile` — same bootstrap-discovery
 /// guarantee as `/api/auth/status`.
 #[tokio::test]
@@ -883,6 +930,160 @@ async fn auth_profile_host_fallback_respects_lan_ip_under_local_lan() {
 // directly (e.g. by future unit-level callers of `origin_can_enroll_passkey`),
 // but covering that here would require a unit test on the helper function
 // rather than an end-to-end router test — declined as over-engineering.
+
+// ── loopback-IP → localhost redirect (sprint-1 wave-4) ─────────────────
+
+/// Browser navigation to `https://127.0.0.1:<port>/...` must 308 to
+/// `https://localhost:<port>/...` so WebAuthn doesn't fail with
+/// `SecurityError: This is an invalid domain` later. The redirect runs
+/// as an outer Axum layer (`security::loopback_ip_redirect`) on every
+/// non-/api/non-/ws path.
+#[tokio::test]
+async fn loopback_ipv4_redirects_to_localhost_on_root() {
+    let (tmp, db) = test_db().await;
+    let ip_host = "127.0.0.1:3100".to_string();
+    let security = SecurityConfig::for_test(
+        vec![format!("https://{ip_host}")],
+        vec![ip_host.clone()],
+        db.clone(),
+    );
+    let state = AppState {
+        socket_path: tmp.path().join("wisphive.sock"),
+        config_path: tmp.path().join("config.json"),
+        security,
+        auth_policy: AuthProfile::LocalLAN.policy(),
+        passkey_challenges: crate::passkey::ChallengeStore::new(),
+    };
+    let r = Request::builder()
+        .method("GET")
+        .uri("/")
+        .header("host", &ip_host)
+        .extension(ClientIp(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))))
+        .body(Body::empty())
+        .unwrap();
+    let app = build_router(state, false);
+    let res = app.oneshot(r).await.unwrap();
+    assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT);
+    let location = res.headers().get("location").expect("location header set");
+    assert_eq!(location.to_str().unwrap(), "https://localhost:3100/");
+}
+
+/// Same redirect on a deeper path with a query string — path and query
+/// must round-trip unchanged.
+#[tokio::test]
+async fn loopback_ipv4_redirect_preserves_path_and_query() {
+    let (tmp, db) = test_db().await;
+    let ip_host = "127.0.0.1:3100".to_string();
+    let security = SecurityConfig::for_test(
+        vec![format!("https://{ip_host}")],
+        vec![ip_host.clone()],
+        db.clone(),
+    );
+    let state = AppState {
+        socket_path: tmp.path().join("wisphive.sock"),
+        config_path: tmp.path().join("config.json"),
+        security,
+        auth_policy: AuthProfile::LocalLAN.policy(),
+        passkey_challenges: crate::passkey::ChallengeStore::new(),
+    };
+    let r = Request::builder()
+        .method("GET")
+        .uri("/devices?filter=active")
+        .header("host", &ip_host)
+        .extension(ClientIp(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))))
+        .body(Body::empty())
+        .unwrap();
+    let app = build_router(state, false);
+    let res = app.oneshot(r).await.unwrap();
+    assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(
+        res.headers().get("location").unwrap().to_str().unwrap(),
+        "https://localhost:3100/devices?filter=active"
+    );
+}
+
+/// IPv6 loopback `[::1]:3100` redirects to the same `localhost:3100` —
+/// IPv4 and IPv6 loopback are both WebAuthn-invalid and both need to
+/// be canonicalised.
+#[tokio::test]
+async fn loopback_ipv6_redirects_to_localhost() {
+    let (tmp, db) = test_db().await;
+    let ipv6_host = "[::1]:3100".to_string();
+    let security = SecurityConfig::for_test(
+        vec![format!("https://{ipv6_host}")],
+        vec![ipv6_host.clone()],
+        db.clone(),
+    );
+    let state = AppState {
+        socket_path: tmp.path().join("wisphive.sock"),
+        config_path: tmp.path().join("config.json"),
+        security,
+        auth_policy: AuthProfile::LocalLAN.policy(),
+        passkey_challenges: crate::passkey::ChallengeStore::new(),
+    };
+    let r = Request::builder()
+        .method("GET")
+        .uri("/")
+        .header("host", &ipv6_host)
+        .extension(ClientIp(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)))
+        .body(Body::empty())
+        .unwrap();
+    let app = build_router(state, false);
+    let res = app.oneshot(r).await.unwrap();
+    assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(
+        res.headers().get("location").unwrap().to_str().unwrap(),
+        "https://localhost:3100/"
+    );
+}
+
+/// API requests are EXEMPT from the redirect — operators and scripts
+/// hitting `https://127.0.0.1:<port>/api/auth/status` directly must
+/// continue to reach the API without being bumped to a different host.
+#[tokio::test]
+async fn loopback_ip_redirect_skips_api_paths() {
+    let (tmp, db) = test_db().await;
+    let ip_host = "127.0.0.1:3100".to_string();
+    let security = SecurityConfig::for_test(
+        vec![format!("https://{ip_host}")],
+        vec![ip_host.clone()],
+        db.clone(),
+    );
+    let state = AppState {
+        socket_path: tmp.path().join("wisphive.sock"),
+        config_path: tmp.path().join("config.json"),
+        security,
+        auth_policy: AuthProfile::LocalLAN.policy(),
+        passkey_challenges: crate::passkey::ChallengeStore::new(),
+    };
+    let r = Request::builder()
+        .method("GET")
+        .uri("/api/auth/status")
+        .header("host", &ip_host)
+        .extension(ClientIp(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))))
+        .body(Body::empty())
+        .unwrap();
+    let app = build_router(state, false);
+    let res = app.oneshot(r).await.unwrap();
+    // Direct API response, NOT a redirect.
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(res.headers().get("location").is_none());
+}
+
+/// `localhost` and other DNS hostnames must NOT redirect — only IP
+/// literals do. Verifies the redirect doesn't accidentally bounce the
+/// happy path.
+#[tokio::test]
+async fn loopback_ip_redirect_skips_localhost() {
+    let (_tmp, state) = test_state().await;
+    let r = req("GET", "/").body(Body::empty()).unwrap();
+    let app = build_router(state, false);
+    let res = app.oneshot(r).await.unwrap();
+    // Falls through to the static-asset handler — either serves
+    // index.html (200) or 404 if the embedded asset doesn't include /
+    // (still NOT a redirect). The point is the redirect didn't fire.
+    assert_ne!(res.status(), StatusCode::PERMANENT_REDIRECT);
+}
 
 // ── /api/auth/logout ───────────────────────────────────────────────────
 

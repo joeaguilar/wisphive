@@ -299,6 +299,20 @@ There should be **no** `web.token` file — per-device bearer tokens live in bro
 
 For each browser, open `https://localhost:3100`.
 
+> **Use `localhost`, not `127.0.0.1` or `[::1]`.** WebAuthn forbids
+> IP-literal RP IDs at the browser layer (§5.1.3 step 9), so the
+> passkey ceremony cannot complete on `https://127.0.0.1:3100` —
+> Chrome throws `SecurityError: This is an invalid domain` the moment
+> the user clicks "Enroll passkey". The daemon does a `308` redirect
+> from `127.0.0.1` / `[::1]` browser navigation to `localhost`
+> automatically (see `security::loopback_ip_redirect`), so most users
+> never land on an IP-literal URL. If the redirect is bypassed
+> (e.g. you pasted directly into a script that doesn't follow 3xx)
+> you'll see `can_enroll_passkey_on_this_origin: false` in
+> `/api/auth/profile` and the SPA will hide the enroll affordance —
+> the honest no-passkey-here answer rather than a button that fails
+> on click.
+
 **TLS warning + accept-and-continue per browser:**
 
 - **Chrome / Brave**: "Your connection is not private" page → click "Advanced" → "Proceed to localhost (unsafe)". Or type `thisisunsafe` anywhere on the warning page (no input field; just type with the page focused). The page reloads through the warning.
@@ -338,10 +352,11 @@ Driven by `phase === "authed-pending-enroll"` (the new `AuthPhase` from `b6662b2
 **Click "Enroll passkey":**
 
 - Frontend calls `POST /api/auth/passkey/register/start`. Response is the flattened body `{ session_id, publicKey }` (#311 review note 1) — the hook strips `session_id` and passes `{ publicKey }` to `navigator.credentials.create()`.
-- **OS dialog fires:**
-  - macOS: Touch ID prompt ("Use your Touch ID to sign in to localhost?").
-  - Windows: Windows Hello prompt (PIN / face / fingerprint).
-  - USB security key: "Insert your security key and touch it."
+- **OS dialog fires** with multiple options. For v1 LocalLAN smoke, **pick the local-device option** (NOT the QR-code option):
+  - macOS: Touch ID prompt ("Use your Touch ID to sign in to localhost?"). DO NOT pick "Use another device".
+  - Windows: Windows Hello prompt (PIN / face / fingerprint). DO NOT pick "Use a different device".
+  - USB security key: "Insert your security key and touch it." (see §7 known limitation about non-discoverable USB credentials).
+  - **QR-code / cross-device hybrid** (caBLE): the OS dialog also offers "Use another device" / "Pair with phone" which displays a WebAuthn-native QR code. **This is NOT Wisphive's phone-pairing flow** — it's the browser's native cross-device WebAuthn, which expects your phone to create a credential synced to its OS password manager (iCloud Keychain / Google Password Manager). In v1 this path is unsupported: scanning the QR with a phone will typically either fail registration outright or create a credential the daemon can't use. Wisphive's own phone-pairing flow ships under itr#283 epic (itr#271 pairing token + itr#272 phone `/pair` route), which is NOT in this sprint. **Do not test the QR option as part of this smoke** — pick the local-device option only.
 - On user verification: frontend calls `POST /api/auth/passkey/register/finish`, daemon inserts a `web_passkeys` row (with `rp_id = "localhost"`), `handleEnrollPasskey` calls `onCompleteEnrollGate()`, `useAuth` flips to `authed`, App.tsx unmounts Login, dashboard appears.
 
 **Verify:**

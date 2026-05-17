@@ -30,7 +30,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::extract::{FromRequestParts, Request, State};
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use wisphive_daemon::state::{StateDb, WebDeviceRow};
@@ -534,6 +534,149 @@ fn extract_query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// Loopback-IP → localhost redirect (sprint-1 wave-4 manual smoke)
+// ---------------------------------------------------------------------------
+
+/// Redirect non-API browser navigation away from IP-literal loopback hosts
+/// (`127.0.0.1`, `[::1]`) to the canonical `localhost` form.
+///
+/// **Why this exists.** WebAuthn forbids IP-literal RP IDs at the browser
+/// layer (§5.1.3 step 9). A user who pastes `https://127.0.0.1:<port>` into
+/// the address bar would correctly see `can_enroll_passkey_on_this_origin:
+/// false` from `/api/auth/profile` (the policy returns `None` for these
+/// origins post-fix), but they would also miss the entire passkey flow
+/// silently because the SPA would just hide the affordance with no
+/// explanation. The redirect transparently bumps them to `localhost` where
+/// passkey enrollment actually works.
+///
+/// **Scope.**
+/// - Only applies to non-`/api/*` non-`/ws` paths — operators and scripts
+///   hitting the daemon's API directly via `127.0.0.1` should continue to
+///   reach the API without redirection.
+/// - Redirect is `308 Permanent Redirect` (preserves the request method;
+///   POST stays POST under future-extensions, though in practice only GET
+///   navigation reaches this layer because every other non-API request
+///   has already been routed away above us).
+/// - Scheme is taken from the URI (HTTP/2) or hardcoded to `https` (the
+///   daemon's production posture). Anyone who wedges the daemon onto plain
+///   HTTP under a loopback IP is in an unsupported configuration; the
+///   `https` default surfaces that as a redirect-to-HTTPS hint.
+/// - Host extraction uses the same Uri-authority-then-Host-header order
+///   the auth-profile handler does (HTTP/2 puts the authority in the URI,
+///   HTTP/1.1 puts it in the Host header).
+pub async fn loopback_ip_redirect(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = request.uri().path();
+    // API and WebSocket paths bypass the redirect — they're for tooling
+    // that doesn't render UI and may legitimately want to reach the
+    // daemon via its bound IP.
+    if path.starts_with("/api/") || path == "/ws" {
+        return next.run(request).await;
+    }
+
+    // Resolve the host string the request arrived under. Same order as
+    // `lib.rs::origin_can_enroll_passkey`: URI authority first (HTTP/2),
+    // Host header second (HTTP/1.1).
+    let host = request
+        .uri()
+        .authority()
+        .map(|a| a.as_str().to_string())
+        .or_else(|| {
+            request
+                .headers()
+                .get("host")
+                .and_then(|h| h.to_str().ok())
+                .map(|s| s.to_string())
+        });
+    let Some(host) = host else {
+        return next.run(request).await;
+    };
+
+    if !is_loopback_ip_host(&host) {
+        return next.run(request).await;
+    }
+
+    // Build the redirect target — same path + query, but `localhost` swapped
+    // for the IP literal. Port (if present) is preserved.
+    let port = host_port(&host);
+    let target_host = match port {
+        Some(p) => format!("localhost:{p}"),
+        None => "localhost".to_string(),
+    };
+    let path_and_query = request
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    let location = format!("https://{target_host}{path_and_query}");
+
+    let location_header = match HeaderValue::from_str(&location) {
+        Ok(v) => v,
+        Err(_) => return next.run(request).await,
+    };
+
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = axum::http::StatusCode::PERMANENT_REDIRECT; // 308
+    response.headers_mut().insert("location", location_header);
+    response
+}
+
+/// Returns true when the host string (e.g. `127.0.0.1:3100`, `[::1]:3100`,
+/// `localhost`) is an IPv4 or IPv6 loopback literal. DNS names (including
+/// `localhost`) return false.
+fn is_loopback_ip_host(host: &str) -> bool {
+    let host_only = strip_port(host);
+    if let Ok(ipv4) = host_only.parse::<std::net::Ipv4Addr>() {
+        return ipv4.is_loopback();
+    }
+    // IPv6 host strings in URL form are wrapped in brackets: `[::1]:3100`.
+    // After `strip_port`, the brackets are still there for the IPv6 case;
+    // peel them before parsing.
+    let bare = host_only.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ipv6) = bare.parse::<std::net::Ipv6Addr>() {
+        return ipv6.is_loopback();
+    }
+    false
+}
+
+/// Strip the `:port` suffix from a host string, leaving the host portion.
+/// Handles bracketed IPv6 (`[::1]:3100` → `[::1]`) and bare hostnames
+/// (`localhost:3100` → `localhost`).
+fn strip_port(host: &str) -> &str {
+    if host.starts_with('[') {
+        // IPv6 form. Port (if any) follows the closing bracket.
+        if let Some(close) = host.find(']') {
+            // Include the closing bracket so callers can still recognise
+            // the bracketed IPv6 form; `is_loopback_ip_host` strips them
+            // before parsing.
+            &host[..=close]
+        } else {
+            host
+        }
+    } else if let Some(colon) = host.rfind(':') {
+        &host[..colon]
+    } else {
+        host
+    }
+}
+
+/// Extract the port portion from a host string, or `None` if no port is
+/// present. Handles both `localhost:3100` and `[::1]:3100`.
+fn host_port(host: &str) -> Option<&str> {
+    if host.starts_with('[') {
+        // IPv6 form: port follows the closing bracket.
+        let close = host.find(']')?;
+        let after = &host[close + 1..];
+        after.strip_prefix(':')
+    } else {
+        let colon = host.rfind(':')?;
+        Some(&host[colon + 1..])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,5 +841,53 @@ mod tests {
             extract_presented_token(&headers, None).as_deref(),
             Some("lc-token")
         );
+    }
+
+    // ── Loopback-IP redirect helpers ───────────────────────────────────
+
+    #[test]
+    fn is_loopback_ip_host_recognises_ipv4_loopback() {
+        assert!(is_loopback_ip_host("127.0.0.1"));
+        assert!(is_loopback_ip_host("127.0.0.1:3100"));
+        assert!(is_loopback_ip_host("127.255.255.254"));
+        // Non-loopback IPv4 stays false.
+        assert!(!is_loopback_ip_host("192.168.1.42"));
+        assert!(!is_loopback_ip_host("192.168.1.42:8443"));
+    }
+
+    #[test]
+    fn is_loopback_ip_host_recognises_ipv6_loopback() {
+        assert!(is_loopback_ip_host("[::1]"));
+        assert!(is_loopback_ip_host("[::1]:3100"));
+        // Non-loopback IPv6 stays false.
+        assert!(!is_loopback_ip_host("[2001:db8::1]:8443"));
+    }
+
+    #[test]
+    fn is_loopback_ip_host_returns_false_for_dns_names() {
+        // The whole point of the redirect is to bump IP literals to a
+        // DNS name. `localhost` itself must NOT trigger the redirect.
+        assert!(!is_loopback_ip_host("localhost"));
+        assert!(!is_loopback_ip_host("localhost:3100"));
+        assert!(!is_loopback_ip_host("wisphive.example.com"));
+        assert!(!is_loopback_ip_host("wisphive.example.com:443"));
+    }
+
+    #[test]
+    fn host_port_parses_both_forms() {
+        assert_eq!(host_port("localhost:3100"), Some("3100"));
+        assert_eq!(host_port("127.0.0.1:8443"), Some("8443"));
+        assert_eq!(host_port("[::1]:3100"), Some("3100"));
+        assert_eq!(host_port("localhost"), None);
+        assert_eq!(host_port("[::1]"), None);
+    }
+
+    #[test]
+    fn strip_port_handles_ipv6_brackets() {
+        assert_eq!(strip_port("localhost:3100"), "localhost");
+        assert_eq!(strip_port("127.0.0.1:3100"), "127.0.0.1");
+        assert_eq!(strip_port("[::1]:3100"), "[::1]");
+        assert_eq!(strip_port("[::1]"), "[::1]");
+        assert_eq!(strip_port("localhost"), "localhost");
     }
 }
