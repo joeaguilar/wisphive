@@ -79,6 +79,10 @@ import { apiFetch, setWebToken } from "../api";
  * - `unsupported`     — `navigator.credentials` absent OR caught `NotSupportedError`
  * - `cancelled`       — `NotAllowedError` (user cancelled OR dialog timeout)
  * - `origin_unavailable` — HTTP 400 with JSON body `error === "passkey_unavailable_on_this_origin"`
+ * - `sudo_required`   — HTTP 403 with JSON body `error === "sudo_required_for_passkey_register"`
+ *                       (Enterprise profile's pre-enroll re-auth gate; itr#313
+ *                       wires the actual sudo IPC. Until then we surface a
+ *                       friendly explanation instead of raw JSON.)
  * - `uv_failed`       — `ConstraintError` (UV requested but not met)
  * - `server_rejected` — any other 4xx/5xx. `message` is the response body verbatim.
  * - `network`         — `fetch` itself rejected (offline, CORS, etc.)
@@ -88,6 +92,7 @@ export type PasskeyErrorKind =
   | "unsupported"
   | "cancelled"
   | "origin_unavailable"
+  | "sudo_required"
   | "uv_failed"
   | "server_rejected"
   | "network"
@@ -147,6 +152,14 @@ export function base64UrlEncode(bytes: Uint8Array): string {
   }
   const b64 = btoa(binary);
   return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/** Encode an `ArrayBuffer` (the WebAuthn binary-slot type) as base64url.
+ * Sugar for `base64UrlEncode(new Uint8Array(buffer))` — the wrap was
+ * repeated 7× across the enroll/login finish-bodies. Extracted per the
+ * WET principle (abstract after 3 repetitions). */
+function bufferToB64u(buffer: ArrayBuffer): string {
+  return base64UrlEncode(new Uint8Array(buffer));
 }
 
 /** Decode a base64url string (with or without padding) to a
@@ -285,16 +298,39 @@ async function classifyHttpError(res: Response): Promise<PasskeyError> {
   const contentType = res.headers.get("content-type") ?? "";
   // Read the body once. Both branches (JSON / text) need it.
   const text = await res.text().catch(() => "");
-  if (res.status === 400 && contentType.includes("application/json")) {
+  // JSON-shaped error responses come from two known routes today
+  // (#311 review note 5):
+  //   - 400 `passkey_unavailable_on_this_origin` (origin gate)
+  //   - 403 `sudo_required_for_passkey_register` (Enterprise sudo gate)
+  // Both ship `{ error, message }`. Branching JSON-parse on BOTH status
+  // codes (not just 400) is what lets us pull out `sudo_required` —
+  // before the fix this status was falling through to the plain-text
+  // branch, where the user saw raw JSON rendered inline.
+  if (
+    (res.status === 400 || res.status === 403) &&
+    contentType.includes("application/json")
+  ) {
     try {
       const body = JSON.parse(text) as { error?: string; message?: string };
-      if (body.error === "passkey_unavailable_on_this_origin") {
+      if (res.status === 400 && body.error === "passkey_unavailable_on_this_origin") {
         return {
           kind: "origin_unavailable",
           message: body.message ?? "Passkey enrollment is not available on this origin.",
         };
       }
-      // Other JSON 400s (e.g. malformed body) — surface the message
+      if (res.status === 403 && body.error === "sudo_required_for_passkey_register") {
+        // itr#313 will wire the actual sudo re-auth IPC. Until that
+        // ships, the friendly message lives in Login.tsx::passkeyErrorText
+        // (we keep this layer message-agnostic so the discriminant is
+        // the single source of truth for rendering decisions).
+        return {
+          kind: "sudo_required",
+          message:
+            body.message ??
+            "Passkey enrollment requires re-authentication (pending itr#313).",
+        };
+      }
+      // Other JSON 4xx (e.g. malformed body) — surface the message
       // verbatim so the operator sees what the server complained about.
       return {
         kind: "server_rejected",
@@ -385,31 +421,53 @@ async function enrollImpl(): Promise<PasskeyEnrollResult> {
   const startBody = (await startRes.json()) as RegisterStartResponse;
   // Defensive destructure: the backend's flattened shape (#311) places
   // `session_id` as a sibling of `publicKey`. We pull session_id aside
-  // and hand ONLY `publicKey` (mapped to BufferSources) to the browser.
-  // Passing extra fields wouldn't fail the WebAuthn call but it'd be
-  // a needless drift from the spec shape.
-  const { session_id, publicKey } = startBody;
+  // (rename to camelCase for local use; keep `session_id` on the wire
+  // because the server expects snake_case) and hand ONLY `publicKey`
+  // (mapped to BufferSources) to the browser. Passing extra fields
+  // wouldn't fail the WebAuthn call but it'd be a needless drift from
+  // the spec shape.
+  const { session_id: sessionId, publicKey } = startBody;
 
   // (2) Convert base64url strings to ArrayBuffers/Uint8Arrays for the
   // browser API. Only the binary-typed fields need conversion; the
   // rest (rp, pubKeyCredParams, etc.) pass through untouched.
-  const browserOpts: PublicKeyCredentialCreationOptions = {
-    ...(publicKey as unknown as PublicKeyCredentialCreationOptions),
-    challenge: base64UrlDecode(publicKey.challenge),
-    user: {
-      ...(publicKey.user as unknown as PublicKeyCredentialUserEntity),
-      id: base64UrlDecode(publicKey.user.id),
-    },
-    ...(publicKey.excludeCredentials
-      ? {
-          excludeCredentials: publicKey.excludeCredentials.map((c) => ({
-            id: base64UrlDecode(c.id),
-            type: c.type as PublicKeyCredentialType,
-            ...(c.transports ? { transports: c.transports as AuthenticatorTransport[] } : {}),
-          })),
-        }
-      : {}),
-  };
+  //
+  // S(sec)1 — the `base64UrlDecode` calls below throw `InvalidCharacter`
+  // (native path) or a generic Error (fallback) on malformed base64url
+  // input. A malicious or broken server could ship a non-base64url
+  // string in `publicKey.challenge` or `publicKey.user.id`; we don't
+  // want the throw to escape as an uncaught Promise rejection (no
+  // PasskeyError taxonomy for the caller, console noise). Wrap the
+  // whole construction in a single try so any decode failure becomes a
+  // `server_rejected` with a clear message.
+  let browserOpts: PublicKeyCredentialCreationOptions;
+  try {
+    browserOpts = {
+      ...(publicKey as unknown as PublicKeyCredentialCreationOptions),
+      challenge: base64UrlDecode(publicKey.challenge),
+      user: {
+        ...(publicKey.user as unknown as PublicKeyCredentialUserEntity),
+        id: base64UrlDecode(publicKey.user.id),
+      },
+      ...(publicKey.excludeCredentials
+        ? {
+            excludeCredentials: publicKey.excludeCredentials.map((c) => ({
+              id: base64UrlDecode(c.id),
+              type: c.type as PublicKeyCredentialType,
+              ...(c.transports ? { transports: c.transports as AuthenticatorTransport[] } : {}),
+            })),
+          }
+        : {}),
+    };
+  } catch {
+    return {
+      ok: false,
+      error: {
+        kind: "server_rejected",
+        message: "Invalid response from server (could not parse passkey options).",
+      },
+    };
+  }
 
   // (3) Browser-side ceremony.
   let credential: Credential | null;
@@ -437,14 +495,16 @@ async function enrollImpl(): Promise<PasskeyEnrollResult> {
   const transports =
     typeof att.getTransports === "function" ? att.getTransports() : undefined;
   const finishBody = {
-    session_id,
+    // Wire field stays snake_case (`session_id`) per the server's
+    // RegisterFinishRequest shape — the rename is local-variable only.
+    session_id: sessionId,
     credential: {
       id: pubKeyCred.id,
-      rawId: base64UrlEncode(new Uint8Array(pubKeyCred.rawId)),
+      rawId: bufferToB64u(pubKeyCred.rawId),
       type: pubKeyCred.type,
       response: {
-        attestationObject: base64UrlEncode(new Uint8Array(att.attestationObject)),
-        clientDataJSON: base64UrlEncode(new Uint8Array(att.clientDataJSON)),
+        attestationObject: bufferToB64u(att.attestationObject),
+        clientDataJSON: bufferToB64u(att.clientDataJSON),
         ...(transports && transports.length ? { transports } : {}),
       },
       // The Rust deserialiser accepts `clientExtensionResults` OR `extensions`
@@ -505,26 +565,42 @@ async function loginWithPasskeyImpl(): Promise<PasskeyLoginResult> {
     return { ok: false, error: await classifyHttpError(startRes) };
   }
   const startBody = (await startRes.json()) as LoginStartResponse;
-  const { session_id, publicKey } = startBody;
+  // M(cq)2 rename: local camelCase, wire stays snake_case.
+  const { session_id: sessionId, publicKey } = startBody;
 
   // (2) Convert base64url → BufferSource for the browser. Discoverable-
   // credential login leaves `allowCredentials` empty (matching backend
   // `start_discoverable_authentication`); we still map any entries the
   // backend sends in future, just in case the route grows a
   // PasskeyAuthentication path later.
-  const browserOpts: PublicKeyCredentialRequestOptions = {
-    ...(publicKey as unknown as PublicKeyCredentialRequestOptions),
-    challenge: base64UrlDecode(publicKey.challenge),
-    ...(publicKey.allowCredentials
-      ? {
-          allowCredentials: publicKey.allowCredentials.map((c) => ({
-            id: base64UrlDecode(c.id),
-            type: c.type as PublicKeyCredentialType,
-            ...(c.transports ? { transports: c.transports as AuthenticatorTransport[] } : {}),
-          })),
-        }
-      : {}),
-  };
+  //
+  // S(sec)1 — same defensive wrap as the enroll path. A malformed
+  // server response that fails to decode lands as `server_rejected`
+  // rather than escaping the await as an uncaught throw.
+  let browserOpts: PublicKeyCredentialRequestOptions;
+  try {
+    browserOpts = {
+      ...(publicKey as unknown as PublicKeyCredentialRequestOptions),
+      challenge: base64UrlDecode(publicKey.challenge),
+      ...(publicKey.allowCredentials
+        ? {
+            allowCredentials: publicKey.allowCredentials.map((c) => ({
+              id: base64UrlDecode(c.id),
+              type: c.type as PublicKeyCredentialType,
+              ...(c.transports ? { transports: c.transports as AuthenticatorTransport[] } : {}),
+            })),
+          }
+        : {}),
+    };
+  } catch {
+    return {
+      ok: false,
+      error: {
+        kind: "server_rejected",
+        message: "Invalid response from server (could not parse passkey options).",
+      },
+    };
+  }
 
   // (3) Browser-side ceremony.
   let credential: Credential | null;
@@ -545,20 +621,20 @@ async function loginWithPasskeyImpl(): Promise<PasskeyLoginResult> {
   const pubKeyCred = credential as PublicKeyCredential;
   const asr = pubKeyCred.response as AuthenticatorAssertionResponse;
   const finishBody = {
-    session_id,
+    // Wire stays snake_case (`session_id`) per the server's
+    // LoginFinishRequest shape — the rename is local-variable only.
+    session_id: sessionId,
     credential: {
       id: pubKeyCred.id,
-      rawId: base64UrlEncode(new Uint8Array(pubKeyCred.rawId)),
+      rawId: bufferToB64u(pubKeyCred.rawId),
       type: pubKeyCred.type,
       response: {
-        authenticatorData: base64UrlEncode(new Uint8Array(asr.authenticatorData)),
-        clientDataJSON: base64UrlEncode(new Uint8Array(asr.clientDataJSON)),
-        signature: base64UrlEncode(new Uint8Array(asr.signature)),
+        authenticatorData: bufferToB64u(asr.authenticatorData),
+        clientDataJSON: bufferToB64u(asr.clientDataJSON),
+        signature: bufferToB64u(asr.signature),
         // `userHandle` is `ArrayBuffer | null` per the spec; the Rust
         // deserialiser treats absence as None, so we omit when null.
-        ...(asr.userHandle
-          ? { userHandle: base64UrlEncode(new Uint8Array(asr.userHandle)) }
-          : {}),
+        ...(asr.userHandle ? { userHandle: bufferToB64u(asr.userHandle) } : {}),
       },
       clientExtensionResults: pubKeyCred.getClientExtensionResults(),
     },
@@ -584,6 +660,20 @@ async function loginWithPasskeyImpl(): Promise<PasskeyLoginResult> {
     return { ok: false, error: await classifyHttpError(finishRes) };
   }
   const finishBodyJson = (await finishRes.json()) as LoginFinishResponse;
+  // S(sec)2: validate the token shape BEFORE writing it to localStorage
+  // via setWebToken. A malformed / truncated finish response that we
+  // happily stashed would leave the SPA looking authed (local token
+  // present) but every subsequent API call would 401 — the user lands
+  // in a confusing logout loop. Better to surface "try again" up front.
+  if (typeof finishBodyJson.token !== "string" || finishBodyJson.token.length === 0) {
+    return {
+      ok: false,
+      error: {
+        kind: "server_rejected",
+        message: "Login succeeded but token was missing — please try again.",
+      },
+    };
+  }
   // Stash the new bearer through the shared auth-change event path so
   // any subscriber (useAuth) re-gates the app to authed without the
   // caller wiring anything.

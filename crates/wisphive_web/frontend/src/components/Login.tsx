@@ -8,6 +8,12 @@ interface Props {
   error: AuthError | null;
   onLogin: UseAuth["login"];
   onSetPassword: UseAuth["setPassword"];
+  /** Flip useAuth's phase out of `"authed-pending-enroll"` once the user
+   * either completes or skips the post-set-password passkey enroll step.
+   * Login.tsx no longer owns a local `pendingEnroll` flag — the enroll
+   * card renders directly off `phase === "authed-pending-enroll"`, which
+   * means useAuth (not Login) controls when the App.tsx gate releases. */
+  onCompleteEnrollGate: UseAuth["completeEnrollGate"];
   onClearError: UseAuth["clearError"];
   onRefreshStatus: UseAuth["refreshStatus"];
 }
@@ -37,6 +43,12 @@ function passkeyErrorText(error: PasskeyError): string {
       return "Passkeys aren't available on this URL.";
     case "uv_failed":
       return "User verification failed on the authenticator. Try again or use a password.";
+    case "sudo_required":
+      // Enterprise profile's sudo gate (HTTP 403 `sudo_required_for_
+      // passkey_register`) — the re-auth IPC isn't wired yet (tracked
+      // as itr#313). Until that ships, a friendly explanation is far
+      // better than the raw JSON body the user used to see.
+      return "Passkey enrollment under Enterprise requires re-entering your password. This is coming soon (tracked as itr#313).";
     case "server_rejected":
       // Show the server's message verbatim. The throttle copy
       // (`"throttled"`) and counter-regression (`"counter regression
@@ -89,6 +101,7 @@ export function Login({
   error,
   onLogin,
   onSetPassword,
+  onCompleteEnrollGate,
   onClearError,
   onRefreshStatus,
 }: Props) {
@@ -98,20 +111,6 @@ export function Login({
   const [submitting, setSubmitting] = useState(false);
   const [countdown, setCountdown] = useState(0);
   const [localError, setLocalError] = useState<string | null>(null);
-  // Sub-phase that activates ONLY after `setPassword` succeeds and the
-  // origin supports passkey enrollment. While `enrolling`, the password
-  // form is replaced by the passkey enroll step. After enroll succeeds
-  // OR is skipped, `pendingEnroll` flips false and the user's existing
-  // token (set during setPassword) drives the app shell into the
-  // authed view via the parent gate in App.tsx.
-  //
-  // We hold this as local state (rather than promoting it to useAuth)
-  // because it's purely a Login.tsx UX concern: the user IS authed at
-  // the moment we enter this state — they just haven't been shown the
-  // dashboard yet. Pulling it into useAuth would either invent a new
-  // `authed+enrolling` phase (with no other consumer) or leak Login's
-  // step model into the app shell.
-  const [pendingEnroll, setPendingEnroll] = useState(false);
   // Inline passkey-error region — separate from `error` (which is the
   // password-login channel) and `localError` (client-side validation).
   // Cleared on retry/skip so the user never sees stale text alongside
@@ -119,6 +118,14 @@ export function Login({
   const [passkeyError, setPasskeyError] = useState<PasskeyError | null>(null);
   const [passkeyBusy, setPasskeyBusy] = useState<false | "enrolling" | "logging-in">(false);
   const isSetup = phase === "setup";
+  // Render the enroll card directly off the parent's phase. Previously
+  // a local `pendingEnroll` flag controlled this, but React 19 batched
+  // useAuth's setPhase("authed") with Login's setPendingEnroll(true) on
+  // the same tick — App.tsx's gate unmounted Login before the local
+  // state could render. The fix promotes the gate into useAuth (which
+  // now emits a transient `authed-pending-enroll` phase) and Login
+  // reads it as a prop, eliminating the race.
+  const isPendingEnroll = phase === "authed-pending-enroll";
   const profile = useAuthProfile();
   const passkey = usePasskey();
   const showPasskeyAffordances = profile.loaded && profile.canEnrollPasskeyOnThisOrigin;
@@ -141,30 +148,52 @@ export function Login({
 
   // Drive the 429 Retry-After countdown. We trust the server-supplied value
   // and tick it down locally — cheaper than polling /api/auth/status.
+  //
+  // Critical correctness note: a new throttled `error` object identity
+  // arrives every time the server replies (password OR passkey path
+  // share the throttle bucket — see #311 review note 4). The previous
+  // implementation depended on `error` directly, which meant a second
+  // 429 mid-countdown would reset the timer back to the full
+  // `retryAfter`. We now subscribe only to `error?.retryAfter` (the
+  // payload that actually drives the timer) and seed `setCountdown`
+  // only when starting from zero OR when the new retry-after window is
+  // *longer* than what's left (server says wait more — honour it).
   const isThrottled = error?.kind === "throttled";
+  const retryAfter = error?.retryAfter;
   useEffect(() => {
-    if (!isThrottled || !error?.retryAfter) {
+    if (!isThrottled || !retryAfter) {
       setCountdown(0);
       return;
     }
-    setCountdown(error.retryAfter);
+    setCountdown((c) => (c > 0 ? Math.max(c, retryAfter) : retryAfter));
     const interval = setInterval(() => {
       setCountdown((c) => {
-        if (c <= 1) {
+        const next = c - 1;
+        if (next <= 0) {
           clearInterval(interval);
-          // Only clear the throttled error — a fresh error that arrived
-          // mid-countdown (e.g. user typed something racy) must survive.
-          // The effect's dep on `error` guarantees we see the latest.
-          if (error?.kind === "throttled") onClearError();
+          onClearError();
           return 0;
         }
-        return c - 1;
+        return next;
       });
     }, 1000);
     return () => clearInterval(interval);
-  }, [error, isThrottled, onClearError]);
+  }, [isThrottled, retryAfter, onClearError]);
 
-  const disabled = submitting || countdown > 0;
+  // S(cq)2: clear the inline passkey error whenever the phase
+  // transitions — the enroll card vs the login form are two different
+  // surfaces, and a stale error from one shouldn't leak into the
+  // other. (Also clears stale errors when the user comes back from
+  // a Skip or an unmount of the enroll card.)
+  useEffect(() => {
+    setPasskeyError(null);
+  }, [phase]);
+
+  // `disabled` covers the password-form inputs + submit. Passkey-busy
+  // is folded in so a user clicking Sign-in-with-a-passkey can't
+  // simultaneously type a password and race two auth flows against
+  // the shared throttle bucket (#311 review note 4).
+  const disabled = submitting || countdown > 0 || passkeyBusy !== false;
 
   const handleSubmit = useCallback(
     async (e: React.FormEvent) => {
@@ -207,18 +236,11 @@ export function Login({
         if (ok) {
           setPassword("");
           setConfirm("");
-          // Post-set-password gate: if this origin supports passkey
-          // enrollment, intercept the transition to the dashboard so
-          // the user can opt into a passkey on their way through.
-          // `phase` is still `"setup"` here (the parent re-renders
-          // immediately after `setPassword` returns true, but our
-          // local state runs synchronously before that). We use
-          // `isSetup` to disambiguate — only the setup flow leads to
-          // the enroll step; password login (`!isSetup`) drops
-          // straight to the dashboard like before.
-          if (isSetup && showPasskeyAffordances) {
-            setPendingEnroll(true);
-          }
+          // Post-set-password gate: the enroll card render is now
+          // driven by `phase === "authed-pending-enroll"`, which
+          // useAuth emits when setPassword succeeds AND the active
+          // origin can host the enroll ceremony (it skips the
+          // transient state otherwise). No local state to flip here.
         }
         // Failure branches wipe defensively based on the outcome: the
         // updated `error` is committed by the time the next render runs,
@@ -228,7 +250,7 @@ export function Login({
         setSubmitting(false);
       }
     },
-    [disabled, isSetup, password, confirm, deviceName, onLogin, onSetPassword, showPasskeyAffordances],
+    [disabled, isSetup, password, confirm, deviceName, onLogin, onSetPassword],
   );
 
   // Selective wipe on server failure. Driven off `error` changes so the
@@ -261,20 +283,19 @@ export function Login({
         // would lose the failure signal.
         return;
       }
-      // Success — drop the gate and let App.tsx re-render to the
-      // authed dashboard (the token was already minted during
-      // setPassword above, so phase is `"authed"` by the time
-      // pendingEnroll flips false).
-      setPendingEnroll(false);
+      // Success — release the App.tsx gate via useAuth so the dashboard
+      // takes over. The token was already minted during setPassword;
+      // the gate just controls when Login unmounts.
+      onCompleteEnrollGate();
     } finally {
       setPasskeyBusy(false);
     }
-  }, [passkey]);
+  }, [passkey, onCompleteEnrollGate]);
 
   const handleSkipEnroll = useCallback(() => {
     setPasskeyError(null);
-    setPendingEnroll(false);
-  }, []);
+    onCompleteEnrollGate();
+  }, [onCompleteEnrollGate]);
 
   const handleLoginWithPasskey = useCallback(async () => {
     setPasskeyError(null);
@@ -298,9 +319,13 @@ export function Login({
   }, [passkey, error, onClearError]);
 
   // ── Render: passkey-enroll sub-step ────────────────────────────────
-  // Shown ONLY after a successful setPassword AND when the origin
-  // supports passkey. Skippable. Inline errors per the locked taxonomy.
-  if (pendingEnroll) {
+  // Shown when `phase === "authed-pending-enroll"` — the transient
+  // phase useAuth emits after a successful setPassword on origins that
+  // can host the enroll ceremony. useAuth skips the transient state
+  // (going straight to `authed`) on origins that can't, so we never
+  // render an empty card here. Skippable. Inline errors per the
+  // locked taxonomy.
+  if (isPendingEnroll) {
     return (
       <div className="login-root">
         <div className="login-card">
@@ -443,6 +468,10 @@ export function Login({
           <button
             type="submit"
             className="login-submit"
+            // `disabled` already folds in `passkeyBusy` (see top of
+            // component), so a race between "Sign in with a passkey"
+            // and the password submit can't double-spend the shared
+            // throttle bucket.
             disabled={disabled || !password || (isSetup && !confirm)}
           >
             {submitting

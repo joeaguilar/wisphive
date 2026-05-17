@@ -339,6 +339,55 @@ describe("usePasskey.enroll", () => {
     }
   });
 
+  // M2 fix: 403 JSON `sudo_required_for_passkey_register` MUST be
+  // pulled out as its own discriminant, NOT fall through to
+  // `server_rejected` (which is how the user used to see raw JSON in
+  // the inline error region — Enterprise's sudo gate has no recovery
+  // path until itr#313 wires the IPC).
+  it("maps HTTP 403 with sudo_required_for_passkey_register JSON → sudo_required", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      jsonResponse(
+        {
+          error: "sudo_required_for_passkey_register",
+          message: "Passkey enrollment requires re-authentication.",
+        },
+        { status: 403 },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result } = renderHook(() => usePasskey());
+    const r = await result.current.enroll();
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.kind).toBe("sudo_required");
+      // Hook surfaces the server's message verbatim; the
+      // user-facing wording is owned by Login.tsx::passkeyErrorText
+      // (tested separately).
+      expect(r.error.message).toBe("Passkey enrollment requires re-authentication.");
+    }
+  });
+
+  // Regression: a 403 that is NOT the sudo discriminant MUST still
+  // fall through to `server_rejected` (don't accidentally turn every
+  // 403 into `sudo_required`).
+  it("maps unrelated 403 JSON → server_rejected (not sudo_required)", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      jsonResponse(
+        { error: "some_other_403_reason", message: "not the sudo gate" },
+        { status: 403 },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result } = renderHook(() => usePasskey());
+    const r = await result.current.enroll();
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.kind).toBe("server_rejected");
+    }
+  });
+
   it("maps HTTP 500 (plain text) → server_rejected with body text", async () => {
     const fetchMock = vi
       .fn()
@@ -541,5 +590,94 @@ describe("usePasskey.loginWithPasskey", () => {
     if (r.ok) {
       expect(r.enrollingDeviceId).toBeUndefined();
     }
+  });
+
+  // S(cq)6: pin the conditional-spread on `userHandle`. Until this test
+  // existed every loginWithPasskey path used a fake credential with
+  // `userHandle: null`, so the encoded-userHandle branch (and its
+  // base64url encoding) was unexercised. A future refactor that
+  // broke the encoding here would have slipped through.
+  it("encodes userHandle to base64url when the authenticator returns one", async () => {
+    const userHandleBytes = new Uint8Array([7, 8, 9]);
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({
+          session_id: "s",
+          publicKey: {
+            challenge: base64UrlEncode(new Uint8Array([1])),
+            rpId: "localhost",
+            allowCredentials: [],
+            userVerification: "preferred",
+          },
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ device_id: "d", token: "t" }));
+    vi.stubGlobal("fetch", fetchMock);
+    // Build a credential with a real userHandle ArrayBuffer (not null).
+    const authData = new Uint8Array([0xaa, 0xbb, 0xcc]).buffer;
+    const clientData = new TextEncoder().encode('{"type":"webauthn.get"}').buffer;
+    const signature = new Uint8Array([0x99, 0x88, 0x77, 0x66]).buffer;
+    const credWithHandle = {
+      id: "credential-id-1",
+      rawId: new Uint8Array([1, 2, 3, 4]).buffer,
+      type: "public-key",
+      authenticatorAttachment: null,
+      getClientExtensionResults: () => ({}),
+      response: {
+        authenticatorData: authData,
+        clientDataJSON: clientData,
+        signature,
+        userHandle: userHandleBytes.buffer,
+      } as unknown as AuthenticatorAssertionResponse,
+    } as unknown as PublicKeyCredential;
+    credentials.get.mockResolvedValue(credWithHandle);
+
+    const { result } = renderHook(() => usePasskey());
+    const r = await result.current.loginWithPasskey();
+    expect(r.ok).toBe(true);
+
+    // Pull the finish POST body and assert userHandle round-trips back
+    // to the original bytes (proves base64url encoding ran on the
+    // non-null branch).
+    const finishInit = fetchMock.mock.calls[1][1] as RequestInit;
+    const finishBody = JSON.parse(finishInit.body as string);
+    expect(typeof finishBody.credential.response.userHandle).toBe("string");
+    expect(Array.from(base64UrlDecode(finishBody.credential.response.userHandle))).toEqual([
+      7, 8, 9,
+    ]);
+  });
+
+  // S(sec)2: a finish response that lacks a token (or ships an empty
+  // string) MUST fail before reaching setWebToken — otherwise the SPA
+  // appears authed (local state thinks we have a token) while every
+  // API call 401s, trapping the user in a logout loop.
+  it("rejects a finish response with a missing token (does NOT stash it)", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({
+          session_id: "s",
+          publicKey: {
+            challenge: base64UrlEncode(new Uint8Array([1])),
+            rpId: "localhost",
+            allowCredentials: [],
+            userVerification: "preferred",
+          },
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ device_id: "d", token: "" }));
+    vi.stubGlobal("fetch", fetchMock);
+    credentials.get.mockResolvedValue(fakeAssertionCredential());
+
+    const { result } = renderHook(() => usePasskey());
+    const r = await result.current.loginWithPasskey();
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.kind).toBe("server_rejected");
+      expect(r.error.message).toMatch(/token was missing/i);
+    }
+    // Token MUST NOT be stashed.
+    expect(localStorage.getItem("wisphive-web-token")).toBeNull();
   });
 });

@@ -6,13 +6,22 @@ import {
   setWebToken,
   subscribeAuthChange,
 } from "../api";
-import { usePasskey, type PasskeyError, type PasskeyLoginResult } from "./usePasskey";
+import { useAuthProfile } from "./useAuthProfile";
+import type { PasskeyError } from "./usePasskey";
 
 export type AuthPhase =
-  | "loading"       // probing /api/auth/status on first mount
-  | "setup"         // no password set on host — can't log in yet
-  | "unauthed"      // password set, no local token
-  | "authed";       // local token present
+  | "loading"                 // probing /api/auth/status on first mount
+  | "setup"                   // no password set on host — can't log in yet
+  | "unauthed"                // password set, no local token
+  | "authed-pending-enroll"   // token issued from set-password; Login.tsx
+                              // still mounted so the user can opt into
+                              // (or skip) passkey enrollment before the
+                              // app shell takes over. Transient — flips
+                              // to "authed" via `completeEnrollGate`.
+                              // Only emitted when the active origin can
+                              // host the enroll ceremony; otherwise
+                              // setPassword goes straight to "authed".
+  | "authed";                 // local token present, app shell visible
 
 export interface AuthError {
   /** `invalid`: the submitted password didn't meet the endpoint's rules
@@ -33,27 +42,36 @@ export interface UseAuth {
   /** Submit credentials. Returns true on success. */
   login: (password: string, deviceName?: string) => Promise<boolean>;
   /** First-run only: set the initial password and log in atomically.
-   * Returns true on success. 409 (password already set) flips phase to
-   * unauthed so the form can recover without a reload. */
+   * Returns true on success.
+   *
+   * Post-success phase semantics:
+   * - If the active origin CAN host a passkey ceremony (per
+   *   `useAuthProfile().canEnrollPasskeyOnThisOrigin`), phase moves to
+   *   `"authed-pending-enroll"` so the Login surface stays mounted and
+   *   can offer the optional enroll step. Call `completeEnrollGate()`
+   *   from Login.tsx once the user has enrolled OR skipped.
+   * - If the origin CAN'T host enrollment (e.g. LocalLAN on a LAN-IP),
+   *   phase moves straight to `"authed"` — parking in the transient
+   *   state would just render an empty card before flipping.
+   *
+   * 409 (password already set) flips phase to unauthed so the form can
+   * recover without a reload. */
   setPassword: (password: string, deviceName?: string) => Promise<boolean>;
-  /** Run the discoverable-credential passkey login ceremony. On success
-   * the new bearer is stashed through the shared auth-change event
-   * path (same as `login` / `setPassword`); the returned PasskeyLoginResult
-   * lets the caller render a passkey-specific inline error on failure
-   * without polluting the shared `AuthError` channel — passkey errors
-   * have their own taxonomy (`unsupported` / `cancelled` / etc.) that
-   * don't map onto the password-login `AuthError.kind` set. */
-  loginWithPasskey: () => Promise<PasskeyLoginResult>;
+  /** Flip phase from `"authed-pending-enroll"` → `"authed"`. Called by
+   * Login.tsx when the user finishes (or skips) the passkey enroll
+   * step. A no-op if called from any other phase — defensive against
+   * Login.tsx re-renders that fire the gate completion more than once.
+   *
+   * Held as a separate method (vs auto-flipping on a timer) so the
+   * UX contract is explicit: the app shell appears when the Login
+   * surface says it's done, not on a wall-clock guess. */
+  completeEnrollGate: () => void;
   logout: () => Promise<void>;
   /** Re-probe /api/auth/status (e.g. after an external password-set). */
   refreshStatus: () => Promise<void>;
   /** Dismiss the current error so the form can be retried cleanly. */
   clearError: () => void;
 }
-
-// Re-export PasskeyError so consumers that hold a `UseAuth` reference
-// can render passkey-specific inline errors without a second import.
-export type { PasskeyError };
 
 interface AuthStatus {
   password_set: boolean;
@@ -112,7 +130,15 @@ export function useAuth(): UseAuth {
     }
   }, [token, probeStatus]);
 
-  // Re-gate when api.ts clears the token (401/403 from any fetch).
+  // useAuthProfile is consulted in `setPassword` to decide whether to
+  // park in `authed-pending-enroll` or flip straight to `authed`.
+  // Calling the hook unconditionally at the top of useAuth keeps the
+  // hook-call order stable across renders.
+  const profile = useAuthProfile();
+
+  // Re-gate when api.ts clears the token (401/403 from any fetch) or
+  // sets a new one (passkey login uses setWebToken directly to atomically
+  // update the bearer through the shared event channel).
   useEffect(() => {
     return subscribeAuthChange(() => {
       const next = getWebToken();
@@ -120,6 +146,10 @@ export function useAuth(): UseAuth {
       if (!next) {
         setPhase((prev) => (prev === "setup" ? "setup" : "unauthed"));
       } else {
+        // External token arrival (e.g. usePasskey.loginWithPasskey called
+        // from Login.tsx) means the user is fully authed — the
+        // pending-enroll gate is only used for the post-set-password
+        // flow, which goes through this hook's own setPassword path.
         setPhase("authed");
         setError(null);
       }
@@ -200,11 +230,26 @@ export function useAuth(): UseAuth {
         });
         if (res.status === 200) {
           const body = (await res.json()) as { device_id: string; token: string };
-          // Same atomic-login pattern as login(): persist token, move
-          // phase, and clear error without relying on listener ordering.
+          // Persist token + update local state atomically (same pattern
+          // as `login`) BUT branch on whether the active origin can host
+          // the optional passkey enroll ceremony before deciding what
+          // phase to move to.
+          //
+          // Why the branch: setPhase + Login.tsx's local setPendingEnroll
+          // were previously batched by React 19, with the App.tsx gate
+          // unmounting Login before the local state could render the
+          // enroll card. The fix moves the gate into useAuth itself —
+          // we land in `authed-pending-enroll` (Login stays mounted) and
+          // Login.tsx calls `completeEnrollGate()` to advance to
+          // `authed` once the user enrolls or skips.
+          //
+          // When the origin CAN'T host enrollment (LocalLAN + LAN-IP,
+          // useAuthProfile probe failed, etc.) we skip the transient
+          // state entirely — parking there would render an empty card
+          // before flipping (the enroll affordance would be hidden).
           setWebToken(body.token);
           setToken(body.token);
-          setPhase("authed");
+          setPhase(profile.canEnrollPasskeyOnThisOrigin ? "authed-pending-enroll" : "authed");
           return true;
         }
         if (res.status === 400) {
@@ -252,27 +297,20 @@ export function useAuth(): UseAuth {
         return false;
       }
     },
-    [],
+    // setPassword's post-success phase choice depends on the live
+    // `canEnrollPasskeyOnThisOrigin` flag. Subscribing to the full
+    // value (vs `profile` identity) keeps the callback stable when
+    // unrelated profile fields change.
+    [profile.canEnrollPasskeyOnThisOrigin],
   );
 
-  const passkey = usePasskey();
-  const loginWithPasskey = useCallback(async (): Promise<PasskeyLoginResult> => {
-    // Clear any stale password-login error so the user doesn't see a
-    // "wrong password" banner while they're going through the passkey
-    // prompt — the two surfaces share the same error region in Login.tsx.
-    setError(null);
-    const result = await passkey.loginWithPasskey();
-    if (result.ok) {
-      // usePasskey already called setWebToken on success, which fires
-      // the auth-change subscription below — but mirror the atomic-
-      // login pattern (login / setPassword) and update local state
-      // directly too so a racing render can't briefly see phase=unauthed
-      // between setWebToken and the listener callback.
-      setToken(result.token);
-      setPhase("authed");
-    }
-    return result;
-  }, [passkey]);
+  const completeEnrollGate = useCallback(() => {
+    // Defensive guard: only advance from the transient state. If the
+    // caller fires this from any other phase (re-render, race with
+    // the auth-change listener that already moved us to "authed",
+    // tests, etc.), do nothing — the gate is one-way and idempotent.
+    setPhase((prev) => (prev === "authed-pending-enroll" ? "authed" : prev));
+  }, []);
 
   const logout = useCallback(async () => {
     // Best-effort server-side revoke; local state is authoritative for UX.
@@ -292,9 +330,16 @@ export function useAuth(): UseAuth {
     error,
     login,
     setPassword,
-    loginWithPasskey,
+    completeEnrollGate,
     logout,
     refreshStatus: probeStatus,
     clearError,
   };
 }
+
+// Re-export PasskeyError so consumers that hold a `UseAuth` reference
+// can render passkey-specific inline errors without a second import.
+// (The `loginWithPasskey` wrapper was deleted as YAGNI — Login.tsx calls
+// `usePasskey().loginWithPasskey` directly. Keeping the type re-export
+// because callers still import it from "../hooks/useAuth" for cohesion.)
+export type { PasskeyError };

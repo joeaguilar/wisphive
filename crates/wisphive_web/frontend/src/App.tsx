@@ -27,6 +27,14 @@ function App() {
   if (auth.phase === "loading") {
     return <div className="app-loading">Loading…</div>;
   }
+  // Keep Login mounted across `unauthed`, `setup`, AND the transient
+  // `authed-pending-enroll` state. The last one is what gives Login.tsx
+  // a render window to show the optional passkey-enroll card after a
+  // successful set-password (a synchronous setPhase + a local setState
+  // in Login were previously batched by React 19, unmounting Login
+  // before the enroll card could appear). Login.tsx drives the
+  // transition out of `authed-pending-enroll` by calling
+  // `auth.completeEnrollGate` once the user enrolls or skips.
   if (auth.phase !== "authed") {
     return (
       <Login
@@ -34,6 +42,7 @@ function App() {
         error={auth.error}
         onLogin={auth.login}
         onSetPassword={auth.setPassword}
+        onCompleteEnrollGate={auth.completeEnrollGate}
         onClearError={auth.clearError}
         onRefreshStatus={auth.refreshStatus}
       />

@@ -1,27 +1,32 @@
 /**
- * Login.tsx — Vitest coverage of the passkey integration (#312).
+ * Login.tsx — Vitest coverage of the passkey integration (#312) + the
+ * `authed-pending-enroll` gate wired in the itr#312 review pass.
  *
  * The component is driven by two hooks (`useAuthProfile`, `usePasskey`)
- * + four parent callbacks. We mock the hooks at the module boundary so
- * we can independently flip `canEnrollPasskeyOnThisOrigin` and the
- * enroll/login outcomes without standing up a full fetch fake. The
- * pre-existing password-form behavior (validated by manual smoke since
- * itr#217) is exercised indirectly via the "passkey UI does/doesn't
- * hide the password form" tests — the form keeps working as the
- * always-available fallback regardless of profile state.
+ * + a useAuth callback bundle. We mock the two passkey-adjacent hooks
+ * at the module boundary so we can independently flip
+ * `canEnrollPasskeyOnThisOrigin` and the enroll/login outcomes without
+ * standing up a full fetch fake. The pre-existing password-form
+ * behavior (validated by manual smoke since itr#217) is exercised
+ * indirectly via the "passkey UI does/doesn't hide the password form"
+ * tests — the form keeps working as the always-available fallback
+ * regardless of profile state.
  *
  * What this file pins:
  *   - Login-with-passkey button shown only when canEnrollPasskeyOnThisOrigin=true
  *     AND phase=unauthed (never on setup phase — no creds enrolled yet)
  *   - Login-with-passkey button hidden when canEnrollPasskeyOnThisOrigin=false
- *   - Successful setPassword + canEnrollPasskeyOnThisOrigin=true →
- *     enroll step appears; Skip + Retry transitions; success returns to
- *     authed dashboard (parent unmount).
  *   - Failed setPassword does NOT enter the enroll step.
  *   - canEnrollPasskeyOnThisOrigin=false → setPassword bypasses the
  *     enroll step entirely (returns straight to whatever the parent
  *     renders for authed).
- *   - Passkey errors render the per-kind inline message.
+ *   - Passkey errors render the per-kind inline message (including
+ *     the new `sudo_required` discriminant added in the M2 fix).
+ *   - **M1 regression**: when the component is mounted under a
+ *     real-useAuth harness (the harness this file ships), a successful
+ *     setPassword leaves the enroll card mounted instead of unmounting
+ *     Login before the local pendingEnroll flag could render. This is
+ *     the exact bug the original prop-mock test missed.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -51,6 +56,7 @@ vi.mock("../hooks/usePasskey", () => ({
 }));
 
 import { Login } from "./Login";
+import { useAuth } from "../hooks/useAuth";
 import { useAuthProfile } from "../hooks/useAuthProfile";
 import { usePasskey } from "../hooks/usePasskey";
 
@@ -59,18 +65,69 @@ const mockedUsePasskey = vi.mocked(usePasskey);
 
 /** Build a Props bundle with sensible defaults — individual tests
  * override the bits they care about. Keeps each `render` call small
- * and intention-revealing. */
+ * and intention-revealing. The default `onCompleteEnrollGate` is a
+ * `vi.fn()` so tests that don't drive a real useAuth can still assert
+ * it was called. */
 function renderLogin(overrides: Partial<React.ComponentProps<typeof Login>> = {}) {
   const defaults: React.ComponentProps<typeof Login> = {
     phase: "unauthed",
     error: null,
     onLogin: vi.fn().mockResolvedValue(true),
     onSetPassword: vi.fn().mockResolvedValue(true),
+    onCompleteEnrollGate: vi.fn(),
     onClearError: vi.fn(),
     onRefreshStatus: vi.fn().mockResolvedValue(undefined),
   };
   const props = { ...defaults, ...overrides };
   return { ...render(<Login {...props} />), props };
+}
+
+/** Real-useAuth harness — mirrors the App.tsx gate (loading → Login →
+ * AuthedApp) and threads the live useAuth bundle into Login. Used by
+ * the M1 regression test to drive the *real* phase machinery, which
+ * is where the original prop-mock tests gave us a false sense of
+ * security. The "AuthedApp" slot is a sentinel marker the test can
+ * look for to confirm the gate moved past Login (or, in the M1 case,
+ * did NOT move past it during the transient pending-enroll state). */
+function AuthHarness() {
+  const auth = useAuth();
+  if (auth.phase === "loading") {
+    return <div data-testid="harness-loading">loading</div>;
+  }
+  if (auth.phase !== "authed") {
+    return (
+      <Login
+        phase={auth.phase}
+        error={auth.error}
+        onLogin={auth.login}
+        onSetPassword={auth.setPassword}
+        onCompleteEnrollGate={auth.completeEnrollGate}
+        onClearError={auth.clearError}
+        onRefreshStatus={auth.refreshStatus}
+      />
+    );
+  }
+  return <div data-testid="harness-authed">authed dashboard</div>;
+}
+
+/** Stub `fetch` for the AuthHarness tests so useAuth can run for real
+ * without standing up a server. Each test installs the sequence of
+ * responses it needs in order: typically `/api/auth/status` (returns
+ * setup_required=true), then `/api/auth/set-password` (200 with token). */
+function stubAuthFetch(...responses: Response[]) {
+  const fetchMock = vi.fn();
+  for (const r of responses) {
+    fetchMock.mockResolvedValueOnce(r);
+  }
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
+
+function jsonResponse(body: unknown, init?: { status?: number }): Response {
+  return new Response(JSON.stringify(body), {
+    status: init?.status ?? 200,
+    headers: { "content-type": "application/json" },
+  });
 }
 
 beforeEach(() => {
@@ -90,10 +147,16 @@ beforeEach(() => {
       .fn()
       .mockResolvedValue({ ok: true, token: "t", deviceId: "d" }),
   });
+  try {
+    localStorage.removeItem("wisphive-web-token");
+  } catch {
+    /* jsdom */
+  }
 });
 
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
 });
 
 // ---------------------------------------------------------------------------
@@ -215,59 +278,64 @@ describe("Login — login-with-passkey behavior", () => {
       expect(screen.getByRole("alert")).toHaveTextContent(/counter regression detected/);
     });
   });
+
+  // M2 fix coverage — sudo_required renders the friendly itr#313 notice,
+  // never the raw JSON discriminant.
+  it("renders a friendly waiting-on-itr#313 message for sudo_required (NOT raw JSON)", async () => {
+    const user = userEvent.setup();
+    mockedUsePasskey.mockReturnValue({
+      enroll: vi.fn().mockResolvedValue({
+        ok: false,
+        error: {
+          kind: "sudo_required",
+          // The discriminant message from the hook is intentionally
+          // generic — Login.tsx::passkeyErrorText owns the user-facing
+          // text. Use a clearly-server-shaped string here so the
+          // assertion below distinguishes "renders friendly text" from
+          // "echoes hook message verbatim".
+          message: "Passkey enrollment requires re-authentication (pending itr#313).",
+        },
+      }),
+      loginWithPasskey: vi.fn(),
+    });
+    // Drive the enroll path so the sudo_required surfaces in the enroll
+    // card (where it'd actually appear in production).
+    const props = renderLogin({ phase: "authed-pending-enroll" });
+    expect(props.props.phase).toBe("authed-pending-enroll");
+    await user.click(screen.getByRole("button", { name: /^enroll passkey$/i }));
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent(/itr#313/);
+    });
+    // Belt-and-braces: the user-facing string explicitly mentions
+    // re-entering the password (the actionable explanation), and does
+    // NOT contain the raw discriminant string `sudo_required`.
+    expect(screen.getByRole("alert")).toHaveTextContent(/re-entering your password/i);
+    expect(screen.getByRole("alert").textContent).not.toMatch(/sudo_required/);
+  });
 });
 
 // ---------------------------------------------------------------------------
-// Enroll-after-set-password step
+// Enroll-after-set-password step (prop-driven view tests)
 // ---------------------------------------------------------------------------
 
-describe("Login — enroll-after-set-password step", () => {
-  it("shows the enroll step after successful setPassword when origin supports passkey", async () => {
-    const user = userEvent.setup();
-    const onSetPassword = vi.fn().mockResolvedValue(true);
-    renderLogin({ phase: "setup", onSetPassword });
-
-    await user.type(screen.getByLabelText(/new password/i), "correcthorse");
-    await user.type(screen.getByLabelText(/confirm password/i), "correcthorse");
-    await user.click(screen.getByRole("button", { name: /set password/i }));
-
-    // Enroll step renders — primary CTA + Skip both present.
-    await waitFor(() => {
-      expect(screen.getByRole("button", { name: /^enroll passkey$/i })).toBeInTheDocument();
-    });
+describe("Login — enroll-after-set-password step (prop-driven)", () => {
+  it("renders the enroll card when phase=authed-pending-enroll", () => {
+    // The card is now driven directly off the parent's phase. This
+    // mirrors what App.tsx (via useAuth) emits after a successful
+    // setPassword on an origin that can host enrollment.
+    renderLogin({ phase: "authed-pending-enroll" });
+    expect(screen.getByRole("button", { name: /^enroll passkey$/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /skip for now/i })).toBeInTheDocument();
-    // Password form is gone (replaced by the enroll card).
+    // The password form is gone (replaced by the enroll card).
     expect(screen.queryByLabelText(/new password/i)).not.toBeInTheDocument();
-  });
-
-  it("skips the enroll step when canEnrollPasskeyOnThisOrigin=false", async () => {
-    const user = userEvent.setup();
-    mockedUseAuthProfile.mockReturnValue({
-      profile: "local-lan",
-      canEnrollPasskeyOnThisOrigin: false,
-      passkeyRequired: false,
-      allowEphemeralListener: true,
-      loaded: true,
-    });
-    const onSetPassword = vi.fn().mockResolvedValue(true);
-    renderLogin({ phase: "setup", onSetPassword });
-
-    await user.type(screen.getByLabelText(/new password/i), "correcthorse");
-    await user.type(screen.getByLabelText(/confirm password/i), "correcthorse");
-    await user.click(screen.getByRole("button", { name: /set password/i }));
-
-    // Enroll step MUST NOT render — the LAN-IP origin case ends here
-    // and the parent will swap to the authed dashboard.
-    await waitFor(() => {
-      expect(onSetPassword).toHaveBeenCalled();
-    });
-    expect(
-      screen.queryByRole("button", { name: /^enroll passkey$/i }),
-    ).not.toBeInTheDocument();
   });
 
   it("does NOT show the enroll step when setPassword fails", async () => {
     const user = userEvent.setup();
+    // Failed setPassword stays in the `setup` phase — the parent's
+    // useAuth never flips to authed-pending-enroll, so the card never
+    // renders. We verify by checking the post-submit DOM still has
+    // the set-password form, not the enroll card.
     const onSetPassword = vi.fn().mockResolvedValue(false);
     renderLogin({ phase: "setup", onSetPassword });
 
@@ -281,30 +349,42 @@ describe("Login — enroll-after-set-password step", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("skip dismisses the enroll step", async () => {
+  it("Skip click calls onCompleteEnrollGate (parent flips phase to authed)", async () => {
     const user = userEvent.setup();
-    renderLogin({ phase: "setup" });
-
-    await user.type(screen.getByLabelText(/new password/i), "correcthorse");
-    await user.type(screen.getByLabelText(/confirm password/i), "correcthorse");
-    await user.click(screen.getByRole("button", { name: /set password/i }));
-
-    await waitFor(() => {
-      expect(screen.getByRole("button", { name: /^enroll passkey$/i })).toBeInTheDocument();
-    });
+    const onCompleteEnrollGate = vi.fn();
+    renderLogin({ phase: "authed-pending-enroll", onCompleteEnrollGate });
     await user.click(screen.getByRole("button", { name: /skip for now/i }));
+    expect(onCompleteEnrollGate).toHaveBeenCalledTimes(1);
+  });
 
-    // Enroll step gone; ENROLL button no longer present.
+  it("Enroll success calls onCompleteEnrollGate", async () => {
+    const user = userEvent.setup();
+    const onCompleteEnrollGate = vi.fn();
+    renderLogin({ phase: "authed-pending-enroll", onCompleteEnrollGate });
+    await user.click(screen.getByRole("button", { name: /^enroll passkey$/i }));
     await waitFor(() => {
-      expect(
-        screen.queryByRole("button", { name: /^enroll passkey$/i }),
-      ).not.toBeInTheDocument();
+      expect(onCompleteEnrollGate).toHaveBeenCalledTimes(1);
     });
-    // We DON'T re-render the password form (parent gate would have
-    // moved phase to "authed" by now in production — the local
-    // component just falls through to the unauthed render path).
-    // What we CAN assert: the test's enroll step element specifically
-    // vanished, which is the user-visible contract.
+  });
+
+  it("Enroll failure leaves the gate closed (no onCompleteEnrollGate call) and shows inline error", async () => {
+    const user = userEvent.setup();
+    const onCompleteEnrollGate = vi.fn();
+    mockedUsePasskey.mockReturnValue({
+      enroll: vi.fn().mockResolvedValue({
+        ok: false,
+        error: { kind: "cancelled", message: "Passkey prompt was cancelled or timed out." },
+      }),
+      loginWithPasskey: vi.fn(),
+    });
+    renderLogin({ phase: "authed-pending-enroll", onCompleteEnrollGate });
+    await user.click(screen.getByRole("button", { name: /^enroll passkey$/i }));
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent(/cancelled/i);
+    });
+    // User stays in the enroll step (gate not released) so they can retry or skip.
+    expect(onCompleteEnrollGate).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: /^enroll passkey$/i })).toBeInTheDocument();
   });
 
   it("retries on inline error: enroll fails → error shown → click again works", async () => {
@@ -320,31 +400,134 @@ describe("Login — enroll-after-set-password step", () => {
       enroll,
       loginWithPasskey: vi.fn(),
     });
-    renderLogin({ phase: "setup" });
-
-    await user.type(screen.getByLabelText(/new password/i), "correcthorse");
-    await user.type(screen.getByLabelText(/confirm password/i), "correcthorse");
-    await user.click(screen.getByRole("button", { name: /set password/i }));
+    const onCompleteEnrollGate = vi.fn();
+    renderLogin({ phase: "authed-pending-enroll", onCompleteEnrollGate });
 
     // First click — error renders inline; enroll step stays put so
     // the user can retry without losing context.
-    await waitFor(() => {
-      expect(screen.getByRole("button", { name: /^enroll passkey$/i })).toBeInTheDocument();
-    });
     await user.click(screen.getByRole("button", { name: /^enroll passkey$/i }));
     await waitFor(() => {
       expect(screen.getByRole("alert")).toHaveTextContent(/cancelled/i);
     });
-    // Step is still present — the button is the retry affordance.
+    expect(onCompleteEnrollGate).not.toHaveBeenCalled();
     expect(screen.getByRole("button", { name: /^enroll passkey$/i })).toBeInTheDocument();
 
-    // Second click — succeeds, step disappears.
+    // Second click — succeeds, gate released.
     await user.click(screen.getByRole("button", { name: /^enroll passkey$/i }));
     await waitFor(() => {
-      expect(
-        screen.queryByRole("button", { name: /^enroll passkey$/i }),
-      ).not.toBeInTheDocument();
+      expect(onCompleteEnrollGate).toHaveBeenCalledTimes(1);
     });
     expect(enroll).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M1 regression: enroll step DOES render with the real useAuth driving phase.
+// ---------------------------------------------------------------------------
+//
+// The original tests passed `phase: "setup"` + a mocked
+// `onSetPassword` that returned `true` without driving real auth state
+// — so the React 19 setPhase + setPendingEnroll batch race never
+// surfaced. These tests mount the full AuthHarness (real useAuth +
+// real Login) and assert that a successful set-password landing in
+// useAuth produces the enroll card on screen rather than dropping
+// straight into the authed-dashboard sentinel.
+
+describe("Login — M1 regression (real useAuth + Login stack)", () => {
+  it("after successful setPassword on a passkey-capable origin, the enroll card renders", async () => {
+    const user = userEvent.setup();
+    // First call: useAuth probes /api/auth/status. We return
+    // setup_required=true so the harness lands on phase=setup.
+    // Second call: useAuth submits /api/auth/set-password and gets
+    // back 200 with a token. useAuth should then read
+    // useAuthProfile().canEnrollPasskeyOnThisOrigin (mocked true at
+    // the top of this file) and emit phase=authed-pending-enroll —
+    // which keeps Login mounted and renders the enroll card.
+    stubAuthFetch(
+      jsonResponse({ password_set: false, setup_required: true }),
+      jsonResponse({ device_id: "dev-1", token: "tok-1" }),
+    );
+
+    render(<AuthHarness />);
+
+    // Wait for the status probe to flip the harness from loading
+    // through to the setup form.
+    await waitFor(() => {
+      expect(screen.getByLabelText(/new password/i)).toBeInTheDocument();
+    });
+
+    // Drive the form. If the bug were unfixed, the
+    // setPhase("authed") + Login's local setPendingEnroll(true) would
+    // batch — App.tsx's gate (which the harness mirrors) would
+    // unmount Login before the enroll card rendered, and we'd see
+    // the harness-authed sentinel instead.
+    await user.type(screen.getByLabelText(/new password/i), "correcthorse");
+    await user.type(screen.getByLabelText(/confirm password/i), "correcthorse");
+    await user.click(screen.getByRole("button", { name: /set password/i }));
+
+    // The enroll card MUST appear. This is the assertion the original
+    // prop-mock test failed to verify.
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /^enroll passkey$/i })).toBeInTheDocument();
+    });
+    // And the harness MUST still be in the Login surface, not the
+    // authed dashboard — the gate is held open by useAuth's
+    // `authed-pending-enroll` phase until Login calls completeEnrollGate.
+    expect(screen.queryByTestId("harness-authed")).not.toBeInTheDocument();
+  });
+
+  it("Skip from the real-stack enroll card advances harness to the authed dashboard", async () => {
+    const user = userEvent.setup();
+    stubAuthFetch(
+      jsonResponse({ password_set: false, setup_required: true }),
+      jsonResponse({ device_id: "dev-1", token: "tok-1" }),
+    );
+    render(<AuthHarness />);
+    await waitFor(() => {
+      expect(screen.getByLabelText(/new password/i)).toBeInTheDocument();
+    });
+    await user.type(screen.getByLabelText(/new password/i), "correcthorse");
+    await user.type(screen.getByLabelText(/confirm password/i), "correcthorse");
+    await user.click(screen.getByRole("button", { name: /set password/i }));
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /^enroll passkey$/i })).toBeInTheDocument();
+    });
+    // Click Skip — useAuth.completeEnrollGate flips phase to authed,
+    // the harness swaps to the dashboard sentinel.
+    await user.click(screen.getByRole("button", { name: /skip for now/i }));
+    await waitFor(() => {
+      expect(screen.getByTestId("harness-authed")).toBeInTheDocument();
+    });
+  });
+
+  it("when canEnrollPasskeyOnThisOrigin=false, setPassword skips straight to authed (no enroll card)", async () => {
+    // Origin can't host enrollment — useAuth should NOT park in
+    // authed-pending-enroll. Renders the harness-authed sentinel
+    // directly after the set-password succeeds.
+    mockedUseAuthProfile.mockReturnValue({
+      profile: "local-lan",
+      canEnrollPasskeyOnThisOrigin: false,
+      passkeyRequired: false,
+      allowEphemeralListener: true,
+      loaded: true,
+    });
+    const user = userEvent.setup();
+    stubAuthFetch(
+      jsonResponse({ password_set: false, setup_required: true }),
+      jsonResponse({ device_id: "dev-1", token: "tok-1" }),
+    );
+    render(<AuthHarness />);
+    await waitFor(() => {
+      expect(screen.getByLabelText(/new password/i)).toBeInTheDocument();
+    });
+    await user.type(screen.getByLabelText(/new password/i), "correcthorse");
+    await user.type(screen.getByLabelText(/confirm password/i), "correcthorse");
+    await user.click(screen.getByRole("button", { name: /set password/i }));
+    await waitFor(() => {
+      expect(screen.getByTestId("harness-authed")).toBeInTheDocument();
+    });
+    expect(
+      screen.queryByRole("button", { name: /^enroll passkey$/i }),
+    ).not.toBeInTheDocument();
   });
 });
