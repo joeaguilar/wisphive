@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What is Wisphive
 
-Wisphive is a multiplexed AI agent control plane that gates tool calls from AI agents (Claude Code, Red, local LLMs) through a centralized daemon. Agents request approval before executing tools; humans review and approve/deny via a TUI dashboard. Passive OS notifications alert the user when decisions are pending.
+Wisphive is a multiplexed AI agent control plane that gates tool calls from AI agents (Claude Code, Codex, Red, local LLMs) through a centralized daemon. Agents request approval before executing tools; humans review and approve/deny via a TUI dashboard. Passive OS notifications alert the user when decisions are pending.
 
 ## Build & Test Commands
 
@@ -21,7 +21,7 @@ cargo fmt --all                  # Format
 
 Prefer `just <task>` for common workflows — see `justfile` for the full list (`build`, `test`, `clippy`, `daemon`, `tui`, `web`, `web-dev`, `frontend-dev`, `frontend-build`, `bootstrap`, `reinstall`, `doctor`, `off`, etc.).
 
-Two binaries are produced: `wisphive` (CLI/daemon/TUI/web) and `wisphive-hook` (Claude Code hook subprocess).
+Two binaries are produced: `wisphive` (CLI/daemon/TUI/web) and `wisphive-hook` (Claude Code/Codex hook subprocess).
 
 ### Frontend
 
@@ -52,20 +52,20 @@ Run these when touching `Cargo.lock`, frontend lockfiles, TLS/web auth, markdown
 ## Architecture
 
 ```
-Claude Code → wisphive-hook (subprocess) → Unix socket → wisphive daemon → TUI + web UI + passive notification
+Claude Code / Codex → wisphive-hook (subprocess) → Unix socket → wisphive daemon → TUI + web UI + passive notification
 ```
 
-`wisphive-hook` is installed as both `PreToolUse` (blocks for decision) and `PostToolUse` (audit trail) in the project's `.claude/settings.json`.
+`wisphive hooks install` installs Claude hooks in `.claude/settings.json` and Codex hooks in `.codex/hooks.json`.
 
 Seven workspace crates with clear dependency flow:
 
 - **wisphive_protocol** — Shared types and newline-delimited JSON wire protocol. `DecisionRequest`, `Decision`, `ClientMessage`/`ServerMessage`, `SpawnAgentRequest`, terminal events. All other crates depend on this.
 - **wisphive_daemon** — Async Tokio server on `~/.wisphive/wisphive.sock`. Accepts hook connections (blocking until decision), TUI/web connections (bidirectional streaming via broadcast channel), persists state to SQLite (`~/.wisphive/wisphive.db`), spawns headless agents via the process registry, manages `portable-pty` terminal sessions, sends platform notifications.
-- **wisphive_hook** — Lightweight binary that runs as a Claude Code `PreToolUse` / `PostToolUse` hook. Three-layer decision logic: (1) check `~/.wisphive/mode` file, (2) auto-approve safe tools via `~/.wisphive/auto-approve.json`, (3) connect to daemon for human review. Exit codes: 0=approve, 2=deny, 1=error (fail-open).
+- **wisphive_hook** — Lightweight binary that runs as a Claude Code or Codex hook subprocess. Three-layer decision logic: (1) check `~/.wisphive/mode` file, (2) auto-approve safe tools via `~/.wisphive/auto-approve.json`, (3) connect to daemon for human review. Exit codes: 0=approve, 2=deny, 1=error (fail-open).
 - **wisphive_tui** — Ratatui terminal UI. Connects to daemon as a streaming client. Panels include queue, agents, projects, terminals. Keys: `a`/`d` approve/deny, `A`/`D` bulk, `/` filter, Tab switch panels.
 - **wisphive_web** — Axum HTTP/WebSocket server. Embeds the Vite-built React frontend via `rust-embed` and bridges browser ↔ daemon over `/ws`. Optional TLS via `rustls`/`rcgen` self-signed certs. Auth primitives in `auth.rs` (Argon2id passwords, SHA-256-hashed device tokens, per-IP login throttle, `webauthn-rs` for passkeys); request gating in `security.rs` (bearer token + Origin/Host allowlist). Can run standalone (`wisphive web serve`) or in-process with the daemon (`wisphive daemon start --web`).
-- **wisphive_cli** — Clap-based CLI (`wisphive` binary). Subcommands: `daemon {start [--web --host --port --web-dev --no-open --auth-profile --auth-rp-id], stop, status}`, `hooks {install, uninstall, enable, disable, status}`, `tui`, `web {serve [--host --port --dev --no-open --auth-profile --auth-rp-id], set-password, reset-password, devices {list, revoke <id>}, fingerprint}`, `agent {start, list, stop}`, `history {search, recent}`, `config {list, get, set, auto-approve {status, level, add, remove, reset}}`, `term {new, list, attach, replay, close}`, `doctor`, `emergency-off`. Web UI default port is `3100` (CLI) — note `justfile` uses `8080` for the `web` recipe. On first-run (no web password set), `daemon start --web` and `web serve` auto-open the default browser onto the SPA; `--no-open` suppresses this for headless servers / CI. `--auth-profile {local-lan|enterprise}` (default `local-lan`, itr#310) selects the daemon's auth/security posture; `enterprise` additionally requires `--auth-rp-id <domain>` plus user-provided TLS cert (the latter pending itr#270).
-- **wisphive_adapters** — `AgentAdapter` trait and implementations (ClaudeCode is hook-based/passive; Red and LocalLLM are stubs).
+- **wisphive_cli** — Clap-based CLI (`wisphive` binary). Subcommands: `daemon {start [--web --host --port --web-dev --no-open --auth-profile --auth-rp-id], stop, status}`, `hooks {install, uninstall, enable, disable, status}`, `tui`, `web {serve [--host --port --dev --no-open --auth-profile --auth-rp-id], set-password, reset-password, devices {list, revoke <id>}, fingerprint}`, `agent {start [--agent-type claude_code|codex], list, stop}`, `history {search, recent}`, `config {list, get, set, auto-approve {status, level, add, remove, reset}}`, `term {new, list, attach, replay, close}`, `doctor`, `emergency-off`. Web UI default port is `3100` (CLI) — note `justfile` uses `8080` for the `web` recipe. On first-run (no web password set), `daemon start --web` and `web serve` auto-open the default browser onto the SPA; `--no-open` suppresses this for headless servers / CI. `--auth-profile {local-lan|enterprise}` (default `local-lan`, itr#310) selects the daemon's auth/security posture; `enterprise` additionally requires `--auth-rp-id <domain>` plus user-provided TLS cert (the latter pending itr#270).
+- **wisphive_adapters** — `AgentAdapter` trait and implementations (Claude Code and Codex are hook-based/passive; Red and LocalLLM are stubs).
 
 ## Key Design Decisions
 
@@ -74,7 +74,7 @@ Seven workspace crates with clear dependency flow:
 - **Broadcast fan-out**: TUI clients subscribe to a `tokio::sync::broadcast` channel for real-time events.
 - **SQLite WAL crash recovery**: Pending decisions persist to disk; audit log tracks all resolutions.
 - **Passive notifications**: macOS uses `osascript display notification` (non-intrusive banner); Linux uses `notify-send`. Notifications are informational only — all tool input fields are shown so users have context when switching to the TUI to respond. Notifications do NOT resolve decisions; only the TUI does.
-- **Permissions management**: `wisphive hooks install` adds Claude Code permissions (Bash, Edit, Write, NotebookEdit) to `.claude/settings.json` so Claude Code auto-allows tools that Wisphive gates (eliminates double-prompt). `wisphive hooks uninstall` removes them.
+- **Permissions management**: `wisphive hooks install` adds Claude Code permissions (Bash, Edit, Write, NotebookEdit) to `.claude/settings.json` so Claude Code auto-allows tools that Wisphive gates (eliminates double-prompt). Codex hooks are installed in `.codex/hooks.json`; Codex `PermissionRequest` is used for native approvals instead of a permissions allowlist.
 
 ## Claude Code Hook Response Format
 

@@ -1,5 +1,6 @@
 mod adapter;
 pub mod claude_code;
+pub mod codex;
 pub mod local_llm;
 pub mod red;
 

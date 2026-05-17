@@ -5,6 +5,7 @@ interface SpawnModalProps {
   projects: string[];
   defaultProject?: string;
   onSpawn: (req: {
+    agent_type?: "claude_code" | "codex";
     project: string;
     prompt: string;
     model?: string;
@@ -15,6 +16,7 @@ interface SpawnModalProps {
 }
 
 export function SpawnModal({ projects, defaultProject, onSpawn, onClose }: SpawnModalProps) {
+  const [agentType, setAgentType] = useState<"claude_code" | "codex">("claude_code");
   const [project, setProject] = useState(defaultProject || "");
   const [prompt, setPrompt] = useState("");
   const [model, setModel] = useState("");
@@ -29,6 +31,7 @@ export function SpawnModal({ projects, defaultProject, onSpawn, onClose }: Spawn
   const handleSubmit = () => {
     if (!project.trim() || !prompt.trim()) return;
     onSpawn({
+      agent_type: agentType,
       project: project.trim(),
       prompt: prompt.trim(),
       model: model.trim() || undefined,
@@ -66,6 +69,14 @@ export function SpawnModal({ projects, defaultProject, onSpawn, onClose }: Spawn
         </label>
 
         <div className="spawn-options">
+          <label>
+            <span>Agent</span>
+            <select value={agentType} onChange={(e) => setAgentType(e.target.value as "claude_code" | "codex")}>
+              <option value="claude_code">Claude Code</option>
+              <option value="codex">Codex</option>
+            </select>
+          </label>
+
           <label>
             <span>Model</span>
             <select value={model} onChange={(e) => setModel(e.target.value)}>

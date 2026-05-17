@@ -102,66 +102,28 @@ pub fn run(project: Option<PathBuf>) -> Result<()> {
 
     // ── 5. Project hooks ──
 
-    let settings_path = project.join(".claude").join("settings.json");
-    if settings_path.exists() {
-        let content = std::fs::read_to_string(&settings_path).unwrap_or_default();
-        if let Ok(settings) = serde_json::from_str::<serde_json::Value>(&content) {
-            let has_hook = settings
-                .get("hooks")
-                .and_then(|h| h.get("PreToolUse"))
-                .and_then(|arr| arr.as_array())
-                .is_some_and(|arr| {
-                    arr.iter().any(|rule| {
-                        // Check nested format
-                        rule.get("hooks")
-                            .and_then(|h| h.as_array())
-                            .is_some_and(|hooks| {
-                                hooks.iter().any(|hook| {
-                                    hook.get("command")
-                                        .and_then(|v| v.as_str())
-                                        .is_some_and(|cmd| cmd.contains("wisphive"))
-                                })
-                            })
-                            // Check legacy flat format
-                            || rule
-                                .get("command")
-                                .and_then(|v| v.as_str())
-                                .is_some_and(|cmd| cmd.contains("wisphive"))
-                    })
-                });
+    let claude_settings_path = project.join(".claude").join("settings.json");
+    check_project_hook(
+        "Claude Code",
+        &claude_settings_path,
+        &project,
+        &mut issues,
+        &mut ok_count,
+    );
 
-            if has_hook {
-                eprintln!(
-                    "  OK  hooks installed in {}",
-                    project.file_name().unwrap_or_default().to_string_lossy()
-                );
-                ok_count += 1;
-            } else {
-                issues.push(format!(
-                    "FAIL  hooks NOT installed in {}\n      fix: wisphive hooks install --project {}",
-                    project.file_name().unwrap_or_default().to_string_lossy(),
-                    project.display()
-                ));
-            }
-        } else {
-            issues.push(format!(
-                "FAIL  .claude/settings.json is malformed in {}\n      fix: check the JSON syntax in {}",
-                project.file_name().unwrap_or_default().to_string_lossy(),
-                settings_path.display()
-            ));
-        }
-    } else {
-        issues.push(format!(
-            "FAIL  no .claude/settings.json in {}\n      fix: wisphive hooks install --project {}",
-            project.file_name().unwrap_or_default().to_string_lossy(),
-            project.display()
-        ));
-    }
+    let codex_hooks_path = project.join(".codex").join("hooks.json");
+    check_project_hook(
+        "Codex",
+        &codex_hooks_path,
+        &project,
+        &mut issues,
+        &mut ok_count,
+    );
 
     // ── 6. Permissions ──
 
-    if settings_path.exists()
-        && let Ok(content) = std::fs::read_to_string(&settings_path)
+    if claude_settings_path.exists()
+        && let Ok(content) = std::fs::read_to_string(&claude_settings_path)
         && let Ok(settings) = serde_json::from_str::<serde_json::Value>(&content)
     {
         let has_perms = settings
@@ -218,4 +180,63 @@ fn which(binary: &str) -> bool {
 fn wisphive_home() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     PathBuf::from(home).join(".wisphive")
+}
+
+fn check_project_hook(
+    agent_name: &str,
+    path: &std::path::Path,
+    project: &std::path::Path,
+    issues: &mut Vec<String>,
+    ok_count: &mut usize,
+) {
+    if path.exists() {
+        let content = std::fs::read_to_string(path).unwrap_or_default();
+        if let Ok(settings) = serde_json::from_str::<serde_json::Value>(&content) {
+            let has_hook = settings
+                .get("hooks")
+                .and_then(|h| h.get("PreToolUse"))
+                .and_then(|arr| arr.as_array())
+                .is_some_and(|arr| arr.iter().any(has_wisphive_hook));
+
+            if has_hook {
+                eprintln!("  OK  {agent_name} hooks installed");
+                *ok_count += 1;
+            } else {
+                issues.push(format!(
+                    "FAIL  {agent_name} hooks NOT installed in {}\n      fix: wisphive hooks install --project {}",
+                    project.file_name().unwrap_or_default().to_string_lossy(),
+                    project.display()
+                ));
+            }
+        } else {
+            issues.push(format!(
+                "FAIL  {} is malformed\n      fix: check the JSON syntax in {}",
+                path.display(),
+                path.display()
+            ));
+        }
+    } else {
+        issues.push(format!(
+            "FAIL  no {} in {}\n      fix: wisphive hooks install --project {}",
+            path.display(),
+            project.file_name().unwrap_or_default().to_string_lossy(),
+            project.display()
+        ));
+    }
+}
+
+fn has_wisphive_hook(rule: &serde_json::Value) -> bool {
+    rule.get("hooks")
+        .and_then(|h| h.as_array())
+        .is_some_and(|hooks| {
+            hooks.iter().any(|hook| {
+                hook.get("command")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|cmd| cmd.contains("wisphive"))
+            })
+        })
+        || rule
+            .get("command")
+            .and_then(|v| v.as_str())
+            .is_some_and(|cmd| cmd.contains("wisphive"))
 }

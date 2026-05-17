@@ -7,6 +7,29 @@ use anyhow::{Context, Result};
 /// This eliminates the double-prompt — wisphive becomes the sole gatekeeper.
 const WISPHIVE_PERMISSIONS: &[&str] = &["Bash(*)", "Edit(*)", "Write(*)", "NotebookEdit(*)"];
 
+const CLAUDE_HOOK_EVENTS: &[&str] = &[
+    "PreToolUse",
+    "PostToolUse",
+    "PermissionRequest",
+    "Elicitation",
+    "UserPromptSubmit",
+    "Stop",
+    "SubagentStop",
+    "ConfigChange",
+    "TeammateIdle",
+    "TaskCompleted",
+];
+
+const CODEX_HOOK_EVENTS: &[&str] = &[
+    "PreToolUse",
+    "PostToolUse",
+    "PermissionRequest",
+    "UserPromptSubmit",
+    "Stop",
+];
+
+const CODEX_HOOK_TIMEOUT_SECS: u64 = 3_700;
+
 /// Get the wisphive home directory.
 fn wisphive_home() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
@@ -34,13 +57,20 @@ pub fn set_mode(mode: &str) -> Result<()> {
     Ok(())
 }
 
-/// Install Wisphive hooks into a project's .claude/settings.json.
+/// Install Wisphive hooks for Claude Code and Codex.
 /// Performs surgical JSON editing — only adds Wisphive entries, preserves everything else.
 pub fn install(project: Option<PathBuf>, _all: bool) -> Result<()> {
     let project = project
         .or_else(|| std::env::current_dir().ok())
         .context("could not determine project directory")?;
 
+    install_claude(&project)?;
+    install_codex(&project)?;
+
+    Ok(())
+}
+
+fn install_claude(project: &std::path::Path) -> Result<()> {
     let settings_path = project.join(".claude").join("settings.json");
 
     // Read existing settings or start fresh
@@ -58,25 +88,7 @@ pub fn install(project: Option<PathBuf>, _all: bool) -> Result<()> {
         settings["hooks"] = serde_json::json!({});
     }
 
-    // Add PreToolUse hook if not already present
-    add_hook_entry(&mut settings, "PreToolUse", &hook_command);
-
-    // Add PostToolUse hook for audit trail (captures tool results)
-    add_hook_entry(&mut settings, "PostToolUse", &hook_command);
-
-    // Add PermissionRequest hook for permission management
-    add_hook_entry(&mut settings, "PermissionRequest", &hook_command);
-
-    // Add hooks for all other blocking event types
-    for event in &[
-        "Elicitation",
-        "UserPromptSubmit",
-        "Stop",
-        "SubagentStop",
-        "ConfigChange",
-        "TeammateIdle",
-        "TaskCompleted",
-    ] {
+    for event in CLAUDE_HOOK_EVENTS {
         add_hook_entry(&mut settings, event, &hook_command);
     }
 
@@ -99,13 +111,59 @@ pub fn install(project: Option<PathBuf>, _all: bool) -> Result<()> {
     Ok(())
 }
 
-/// Remove Wisphive hooks from a project's .claude/settings.json.
+fn install_codex(project: &std::path::Path) -> Result<()> {
+    let hooks_path = project.join(".codex").join("hooks.json");
+
+    let mut settings: serde_json::Value = if hooks_path.exists() {
+        let content = std::fs::read_to_string(&hooks_path)?;
+        serde_json::from_str(&content)?
+    } else {
+        serde_json::json!({})
+    };
+
+    let hook_command = codex_hook_command(&hook_binary_path());
+
+    if settings.get("hooks").is_none() {
+        settings["hooks"] = serde_json::json!({});
+    }
+
+    for event in CODEX_HOOK_EVENTS {
+        add_hook_entry_with_timeout(
+            &mut settings,
+            event,
+            &hook_command,
+            Some(CODEX_HOOK_TIMEOUT_SECS),
+        );
+    }
+
+    let dir = hooks_path.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "hooks path has no parent directory: {}",
+            hooks_path.display()
+        )
+    })?;
+    std::fs::create_dir_all(dir)?;
+    let formatted = serde_json::to_string_pretty(&settings)?;
+    std::fs::write(&hooks_path, formatted)?;
+
+    eprintln!("Wisphive hooks installed in {}", hooks_path.display());
+    Ok(())
+}
+
+/// Remove Wisphive hooks for Claude Code and Codex.
 /// Only removes entries with the Wisphive hook command — preserves everything else.
 pub fn uninstall(project: Option<PathBuf>, _all: bool) -> Result<()> {
     let project = project
         .or_else(|| std::env::current_dir().ok())
         .context("could not determine project directory")?;
 
+    uninstall_claude(&project)?;
+    uninstall_codex(&project)?;
+
+    Ok(())
+}
+
+fn uninstall_claude(project: &std::path::Path) -> Result<()> {
     let settings_path = project.join(".claude").join("settings.json");
 
     if !settings_path.exists() {
@@ -119,18 +177,7 @@ pub fn uninstall(project: Option<PathBuf>, _all: bool) -> Result<()> {
     let hook_command = hook_binary_path();
 
     // Remove Wisphive entries from all hook types
-    for event in &[
-        "PreToolUse",
-        "PostToolUse",
-        "PermissionRequest",
-        "Elicitation",
-        "UserPromptSubmit",
-        "Stop",
-        "SubagentStop",
-        "ConfigChange",
-        "TeammateIdle",
-        "TaskCompleted",
-    ] {
+    for event in CLAUDE_HOOK_EVENTS {
         remove_hook_entries(&mut settings, event, &hook_command);
     }
 
@@ -141,6 +188,30 @@ pub fn uninstall(project: Option<PathBuf>, _all: bool) -> Result<()> {
     std::fs::write(&settings_path, formatted)?;
 
     eprintln!("Wisphive hooks removed from {}", settings_path.display());
+    Ok(())
+}
+
+fn uninstall_codex(project: &std::path::Path) -> Result<()> {
+    let hooks_path = project.join(".codex").join("hooks.json");
+
+    if !hooks_path.exists() {
+        eprintln!("No .codex/hooks.json found in {}", project.display());
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(&hooks_path)?;
+    let mut settings: serde_json::Value = serde_json::from_str(&content)?;
+
+    let hook_command = hook_binary_path();
+
+    for event in CODEX_HOOK_EVENTS {
+        remove_hook_entries(&mut settings, event, &hook_command);
+    }
+
+    let formatted = serde_json::to_string_pretty(&settings)?;
+    std::fs::write(&hooks_path, formatted)?;
+
+    eprintln!("Wisphive hooks removed from {}", hooks_path.display());
     Ok(())
 }
 
@@ -239,6 +310,15 @@ fn remove_wisphive_permissions(settings: &mut serde_json::Value) {
 /// }
 /// ```
 pub(crate) fn add_hook_entry(settings: &mut serde_json::Value, hook_type: &str, command: &str) {
+    add_hook_entry_with_timeout(settings, hook_type, command, None);
+}
+
+pub(crate) fn add_hook_entry_with_timeout(
+    settings: &mut serde_json::Value,
+    hook_type: &str,
+    command: &str,
+    timeout: Option<u64>,
+) {
     let hooks = settings["hooks"]
         .as_object_mut()
         .expect("hooks should be an object");
@@ -247,24 +327,92 @@ pub(crate) fn add_hook_entry(settings: &mut serde_json::Value, hook_type: &str, 
         .entry(hook_type)
         .or_insert_with(|| serde_json::json!([]));
 
-    if let Some(arr) = entries.as_array() {
-        // Check if our hook is already there (search nested hooks arrays)
-        let already_present = arr.iter().any(has_wisphive_hook);
+    if let Some(arr) = entries.as_array_mut() {
+        let already_present = update_existing_wisphive_hooks(arr, command, timeout);
         if already_present {
             return;
         }
     }
 
     if let Some(arr) = entries.as_array_mut() {
+        let mut command_hook = serde_json::json!({
+            "type": "command",
+            "command": command
+        });
+        if let Some(timeout) = timeout
+            && let Some(obj) = command_hook.as_object_mut()
+        {
+            obj.insert("timeout".into(), serde_json::json!(timeout));
+        }
+
         arr.push(serde_json::json!({
             "matcher": "",
             "hooks": [
-                {
-                    "type": "command",
-                    "command": command
-                }
+                command_hook
             ]
         }));
+    }
+}
+
+fn codex_hook_command(command: &str) -> String {
+    format!(
+        "env WISPHIVE_AGENT_TYPE=codex {}",
+        shell_quote_command(command)
+    )
+}
+
+fn shell_quote_command(command: &str) -> String {
+    if command
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
+    {
+        return command.to_string();
+    }
+
+    format!("'{}'", command.replace('\'', "'\\''"))
+}
+
+fn update_existing_wisphive_hooks(
+    rules: &mut [serde_json::Value],
+    command: &str,
+    timeout: Option<u64>,
+) -> bool {
+    let mut found = false;
+    for rule in rules {
+        if let Some(hooks_arr) = rule.get_mut("hooks").and_then(|v| v.as_array_mut()) {
+            for hook in hooks_arr {
+                let is_wisphive = hook
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|cmd| cmd.contains("wisphive"));
+                if is_wisphive {
+                    found = true;
+                    update_command_hook(hook, command, timeout);
+                }
+            }
+        } else {
+            let is_wisphive = rule
+                .get("command")
+                .and_then(|v| v.as_str())
+                .is_some_and(|cmd| cmd.contains("wisphive"));
+            if is_wisphive {
+                found = true;
+                update_command_hook(rule, command, timeout);
+            }
+        }
+    }
+    found
+}
+
+fn update_command_hook(hook: &mut serde_json::Value, command: &str, timeout: Option<u64>) {
+    if let Some(obj) = hook.as_object_mut() {
+        obj.insert(
+            "command".into(),
+            serde_json::Value::String(command.to_string()),
+        );
+        if let Some(timeout) = timeout {
+            obj.insert("timeout".into(), serde_json::json!(timeout));
+        }
     }
 }
 
@@ -324,6 +472,21 @@ mod tests {
         serde_json::from_str(&content).unwrap()
     }
 
+    fn write_codex_hooks(project: &std::path::Path, settings: &serde_json::Value) {
+        let dir = project.join(".codex");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("hooks.json"),
+            serde_json::to_string_pretty(settings).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn read_codex_hooks(project: &std::path::Path) -> serde_json::Value {
+        let content = fs::read_to_string(project.join(".codex").join("hooks.json")).unwrap();
+        serde_json::from_str(&content).unwrap()
+    }
+
     /// Build a Claude Code-format hook rule.
     fn cc_rule(command: &str) -> serde_json::Value {
         json!({"matcher": "", "hooks": [{"type": "command", "command": command}]})
@@ -377,6 +540,47 @@ mod tests {
             s["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
             "/home/user/.cargo/bin/wisphive-hook"
         );
+    }
+
+    #[test]
+    fn add_with_timeout_sets_command_timeout() {
+        let mut s = json!({"hooks": {}});
+        add_hook_entry_with_timeout(&mut s, "PreToolUse", "wisphive-hook", Some(42));
+        assert_eq!(s["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"], 42);
+    }
+
+    #[test]
+    fn codex_hook_command_sets_agent_type_env() {
+        assert_eq!(
+            codex_hook_command("/usr/local/bin/wisphive-hook"),
+            "env WISPHIVE_AGENT_TYPE=codex /usr/local/bin/wisphive-hook"
+        );
+    }
+
+    #[test]
+    fn codex_hook_command_quotes_spaces() {
+        assert_eq!(
+            codex_hook_command("/Applications/Wisphive Tools/wisphive-hook"),
+            "env WISPHIVE_AGENT_TYPE=codex '/Applications/Wisphive Tools/wisphive-hook'"
+        );
+    }
+
+    #[test]
+    fn add_updates_existing_wisphive_hook_with_timeout() {
+        let mut s = json!({"hooks": {"PreToolUse": [cc_rule("wisphive-hook")]}});
+        add_hook_entry_with_timeout(
+            &mut s,
+            "PreToolUse",
+            "env WISPHIVE_AGENT_TYPE=codex wisphive-hook",
+            Some(CODEX_HOOK_TIMEOUT_SECS),
+        );
+        let arr = s["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(
+            arr[0]["hooks"][0]["command"],
+            "env WISPHIVE_AGENT_TYPE=codex wisphive-hook"
+        );
+        assert_eq!(arr[0]["hooks"][0]["timeout"], CODEX_HOOK_TIMEOUT_SECS);
     }
 
     // ══ remove_hook_entries (handles nested + legacy) ══
@@ -505,6 +709,30 @@ mod tests {
     }
 
     #[test]
+    fn install_creates_codex_hooks_with_timeout() {
+        let tmp = temp_project();
+        let p = tmp.path().to_path_buf();
+        install(Some(p.clone()), false).unwrap();
+        let s = read_codex_hooks(&p);
+        let rule = &s["hooks"]["PreToolUse"][0];
+        assert!(
+            rule["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("wisphive")
+        );
+        assert_eq!(rule["hooks"][0]["type"], "command");
+        assert_eq!(rule["hooks"][0]["timeout"], CODEX_HOOK_TIMEOUT_SECS);
+        assert!(
+            rule["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("WISPHIVE_AGENT_TYPE=codex")
+        );
+        assert!(s.get("permissions").is_none());
+    }
+
+    #[test]
     fn install_preserves_existing_settings() {
         let tmp = temp_project();
         let p = tmp.path().to_path_buf();
@@ -530,6 +758,17 @@ mod tests {
         let s = read_settings(&p);
         assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
         assert_eq!(s["hooks"]["PostToolUse"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn install_preserves_existing_codex_hooks() {
+        let tmp = temp_project();
+        let p = tmp.path().to_path_buf();
+        write_codex_hooks(&p, &json!({"hooks": {"PreToolUse": [cc_rule("policy")]}}));
+        install(Some(p.clone()), false).unwrap();
+        let s = read_codex_hooks(&p);
+        assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+        assert_eq!(s["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "policy");
     }
 
     #[test]
@@ -564,6 +803,28 @@ mod tests {
         assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
         assert_eq!(s["hooks"]["PostToolUse"].as_array().unwrap().len(), 1);
         assert_eq!(s["mcpServers"]["keep"], "this");
+    }
+
+    #[test]
+    fn uninstall_removes_codex_wisphive_only() {
+        let tmp = temp_project();
+        let p = tmp.path().to_path_buf();
+        write_codex_hooks(
+            &p,
+            &json!({"hooks": {
+                "PreToolUse": [cc_rule("policy"), cc_rule("wisphive-hook")],
+                "PostToolUse": [cc_rule("wisphive-hook"), cc_rule("logger")]
+            }}),
+        );
+        uninstall(Some(p.clone()), false).unwrap();
+        let s = read_codex_hooks(&p);
+        assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+        assert_eq!(s["hooks"]["PostToolUse"].as_array().unwrap().len(), 1);
+        assert_eq!(s["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "policy");
+        assert_eq!(
+            s["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+            "logger"
+        );
     }
 
     #[test]

@@ -1,10 +1,10 @@
 # Wisphive
 
-A multiplexed AI agent control plane that gates tool calls through a centralized daemon. When AI coding agents (Claude Code, etc.) try to execute tools like Bash, Edit, or Write, Wisphive intercepts the call and routes it to a terminal dashboard where you approve, deny, or modify it before execution proceeds.
+A multiplexed AI agent control plane that gates tool calls through a centralized daemon. When AI coding agents (Claude Code, Codex, etc.) try to execute tools like Bash, Edit, or Write, Wisphive intercepts the call and routes it to a terminal dashboard where you approve, deny, or modify it before execution proceeds.
 
 ```
-Claude Code ──→ wisphive-hook ──→ Unix socket ──→ wisphive daemon ──→ TUI dashboard
-                (subprocess)        (~1μs)          (queues + blocks)    (human reviews)
+Claude Code / Codex ──→ wisphive-hook ──→ Unix socket ──→ wisphive daemon ──→ TUI dashboard
+                       (subprocess)        (~1μs)          (queues + blocks)    (human reviews)
 ```
 
 ## Why
@@ -15,7 +15,7 @@ AI coding agents are powerful but opaque. They execute shell commands, edit file
 - **Monitor multiple agents** working across different projects simultaneously
 - **Audit everything** — full history with tool inputs, outputs, and decisions
 - **Set granular policies** — auto-approve `cargo test` but block `rm -rf`, per-tool deny/allow patterns
-- **Handle all Claude Code events** — not just tool calls, but permission requests, stop signals, MCP elicitation, prompt review, and more
+- **Handle agent hook events** — not just tool calls, but permission requests, stop signals, MCP elicitation, prompt review, and more
 
 ## Quick Start
 
@@ -27,7 +27,7 @@ cd wisphive
 ./install.sh    # builds release, installs to ~/.cargo/bin, codesigns on macOS
 ```
 
-Requires Rust nightly (edition 2024). Two binaries are produced: `wisphive` (CLI/daemon/TUI) and `wisphive-hook` (Claude Code hook subprocess).
+Requires Rust nightly (edition 2024). Two binaries are produced: `wisphive` (CLI/daemon/TUI) and `wisphive-hook` (Claude Code/Codex hook subprocess).
 
 ### Setup
 
@@ -45,13 +45,13 @@ wisphive hooks enable
 wisphive tui
 ```
 
-Now when Claude Code runs in that project, every tool call routes through Wisphive.
+Now when Claude Code or Codex runs in that project, supported tool calls route through Wisphive.
 
 ### Teardown
 
 ```bash
 wisphive hooks disable     # instant pass-through, agents keep running
-wisphive hooks uninstall   # remove hooks from .claude/settings.json
+wisphive hooks uninstall   # remove hooks from .claude/settings.json and .codex/hooks.json
 wisphive daemon stop       # stop the daemon
 wisphive emergency-off     # panic button — disables everything instantly
 ```
@@ -83,11 +83,11 @@ The dashboard shows three panels: pending queue, connected agents, and projects.
 |-----|--------|
 | `Y` | Approve |
 | `N` | Deny |
-| `M` | Deny with message (Claude sees the feedback) |
+| `M` | Deny with message (the agent sees the feedback) |
 | `!` | Always allow this tool |
 | `E` | Edit input before approving |
 | `C` | Approve with additional context |
-| `?` | Defer to Claude's native prompt |
+| `?` | Defer to the agent's native prompt |
 
 For **PermissionRequest** events, number keys `1-9` select from the dynamic suggestion list.
 
@@ -137,14 +137,14 @@ Patterns are case-insensitive substrings matched against the command text. Confi
 
 ## Hook Events
 
-Wisphive handles all blocking Claude Code hook events:
+Wisphive handles Claude Code hook events and the currently documented Codex turn-scoped events:
 
 | Event | TUI Behavior |
 |-------|-------------|
 | **PreToolUse** | Approve/deny/edit tool calls |
 | **PostToolUse** | Captures execution results for audit |
 | **PermissionRequest** | Dynamic suggestion list — select permissions to grant |
-| **Elicitation** | MCP server requests user input (form/URL) |
+| **Elicitation** | MCP server requests user input (Claude Code path) |
 | **Stop / SubagentStop** | Agent wants to stop — let it or tell it to continue |
 | **UserPromptSubmit** | Review/block user prompts |
 | **ConfigChange** | Veto config changes |
@@ -195,7 +195,8 @@ wisphive emergency-off             # kill switch — disables everything
 wisphive config list               # show all config
 wisphive config set <key> <value>  # set a config value
 wisphive doctor                    # diagnose setup issues
-wisphive agent spawn               # spawn a new Claude Code agent
+wisphive agent start --agent-type claude_code --prompt "..."  # spawn Claude Code
+wisphive agent start --agent-type codex --prompt "..."        # spawn Codex
 wisphive history list              # browse audit history
 wisphive history search <query>    # search history
 ```
@@ -237,11 +238,11 @@ All under `~/.wisphive/`:
 
 ## Architecture
 
-Six workspace crates:
+Seven workspace crates:
 
 ```
 wisphive_protocol   ← shared types + wire protocol (all crates depend on this)
-wisphive_hook       ← lightweight hook binary (runs as Claude Code subprocess)
+wisphive_hook       ← lightweight hook binary (runs as Claude Code/Codex subprocess)
 wisphive_daemon     ← async Tokio server (queue, SQLite, notifications, event ingest)
 wisphive_tui        ← Ratatui terminal dashboard
 wisphive_cli        ← Clap CLI (ties everything together)
@@ -253,7 +254,7 @@ wisphive_adapters   ← agent adapter trait + implementations
 - **Fail-open** — hook errors always approve (exit 0) to avoid blocking agents
 - **Blocking via oneshot channels** — each hook blocks on a `tokio::sync::oneshot` until a human responds or timeout (1 hour, defaults to approve)
 - **JSONL for the hot path** — auto-approved tools write to `events.jsonl` via `O_APPEND` (~1μs) instead of connecting to the daemon
-- **`tool_use_id` correlation** — Claude Code's unique call ID enables deterministic pre/post matching instead of fuzzy agent+tool+recency
+- **`tool_use_id` correlation** — agent tool call IDs enable deterministic pre/post matching instead of fuzzy agent+tool+recency
 - **SQLite WAL + performance pragmas** — `synchronous=NORMAL`, 64MB cache, 5s busy timeout for concurrent reads during TUI browsing
 - **Passive notifications** — macOS `terminal-notifier` (click-to-focus) or `osascript`; Linux `notify-send`. Informational only — decisions are made in the TUI
 

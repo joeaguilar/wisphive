@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use wisphive_protocol::{
-    ClientMessage, ClientType, ManagedAgent, PROTOCOL_VERSION, ServerMessage, SpawnAgentRequest,
+    AgentType, ClientMessage, ClientType, ManagedAgent, PROTOCOL_VERSION, ServerMessage,
+    SpawnAgentRequest,
 };
 
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
@@ -46,9 +47,11 @@ fn connect_to_daemon() -> Result<(BufReader<UnixStream>, UnixStream)> {
 fn send_and_recv(msg: &ClientMessage) -> Result<ServerMessage> {
     let (mut reader, mut writer) = connect_to_daemon()?;
 
-    // Drain the initial QueueSnapshot that handle_tui sends
-    let mut snapshot_line = String::new();
-    reader.read_line(&mut snapshot_line)?;
+    // Drain the initial AgentsSnapshot and QueueSnapshot that handle_tui sends.
+    for _ in 0..2 {
+        let mut snapshot_line = String::new();
+        reader.read_line(&mut snapshot_line)?;
+    }
 
     let encoded = wisphive_protocol::encode(msg)?;
     writer.write_all(encoded.as_bytes())?;
@@ -64,7 +67,7 @@ pub async fn start(req: SpawnAgentRequest) -> Result<()> {
     let project = std::fs::canonicalize(&req.project).unwrap_or_else(|_| req.project.clone());
 
     // Pre-flight checks
-    preflight_checks(&project)?;
+    preflight_checks(&project, &req.agent_type)?;
 
     let request = SpawnAgentRequest { project, ..req };
     let response = send_and_recv(&ClientMessage::SpawnAgent(request))?;
@@ -140,7 +143,7 @@ pub async fn stop(agent_id: String) -> Result<()> {
 }
 
 /// Verify the system is ready to spawn an agent.
-fn preflight_checks(project: &Path) -> Result<()> {
+fn preflight_checks(project: &Path, agent_type: &AgentType) -> Result<()> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let wisphive_dir = PathBuf::from(&home).join(".wisphive");
 
@@ -176,16 +179,23 @@ fn preflight_checks(project: &Path) -> Result<()> {
     }
 
     // 3. Check hooks are installed in the project
-    let settings_path = project.join(".claude").join("settings.json");
-    if !settings_path.exists() {
+    let hooks_path = match agent_type {
+        AgentType::Codex => project.join(".codex").join("hooks.json"),
+        AgentType::ClaudeCode => project.join(".claude").join("settings.json"),
+        AgentType::Red | AgentType::LocalLlm => {
+            anyhow::bail!("managed spawn currently supports Claude Code and Codex")
+        }
+    };
+    if !hooks_path.exists() {
         anyhow::bail!(
-            "No .claude/settings.json in {}.\n  fix: wisphive hooks install --project {}",
+            "No {} in {}.\n  fix: wisphive hooks install --project {}",
+            hooks_path.display(),
             project.display(),
             project.display()
         );
     }
     // Verify wisphive hook is actually present
-    if let Ok(content) = std::fs::read_to_string(&settings_path)
+    if let Ok(content) = std::fs::read_to_string(&hooks_path)
         && !content.contains("wisphive")
     {
         anyhow::bail!(
@@ -206,6 +216,7 @@ fn print_agent(agent: &ManagedAgent) {
         .unwrap_or_else(|| agent.project.display().to_string());
 
     eprintln!("  ID:      {}", agent.agent_id);
+    eprintln!("  Type:    {}", agent.agent_type);
     eprintln!("  PID:     {}", agent.pid);
     eprintln!("  Project: {} ({})", project_name, agent.project.display());
     if let Some(ref model) = agent.model {

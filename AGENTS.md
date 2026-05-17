@@ -21,7 +21,7 @@ cargo fmt --all                  # Format
 
 Prefer `just <task>` for common workflows — see `justfile` for the full list (`build`, `test`, `clippy`, `daemon`, `tui`, `web`, `web-dev`, `frontend-dev`, `frontend-build`, `bootstrap`, `reinstall`, `doctor`, `off`, etc.).
 
-Two binaries are produced: `wisphive` (CLI/daemon/TUI/web) and `wisphive-hook` (Codex hook subprocess).
+Two binaries are produced: `wisphive` (CLI/daemon/TUI/web) and `wisphive-hook` (Claude Code/Codex hook subprocess).
 
 ### Frontend
 
@@ -52,20 +52,20 @@ Run these when touching `Cargo.lock`, frontend lockfiles, TLS/web auth, markdown
 ## Architecture
 
 ```
-Codex → wisphive-hook (subprocess) → Unix socket → wisphive daemon → TUI + web UI + passive notification
+Claude Code / Codex → wisphive-hook (subprocess) → Unix socket → wisphive daemon → TUI + web UI + passive notification
 ```
 
-`wisphive-hook` is installed as both `PreToolUse` (blocks for decision) and `PostToolUse` (audit trail) in the project's `.Codex/settings.json`.
+`wisphive hooks install` installs Claude hooks in `.claude/settings.json` and Codex hooks in `.codex/hooks.json`.
 
 Seven workspace crates with clear dependency flow:
 
 - **wisphive_protocol** — Shared types and newline-delimited JSON wire protocol. `DecisionRequest`, `Decision`, `ClientMessage`/`ServerMessage`, `SpawnAgentRequest`, terminal events. All other crates depend on this.
 - **wisphive_daemon** — Async Tokio server on `~/.wisphive/wisphive.sock`. Accepts hook connections (blocking until decision), TUI/web connections (bidirectional streaming via broadcast channel), persists state to SQLite (`~/.wisphive/wisphive.db`), spawns headless agents via the process registry, manages `portable-pty` terminal sessions, sends platform notifications.
-- **wisphive_hook** — Lightweight binary that runs as a Codex `PreToolUse` / `PostToolUse` hook. Three-layer decision logic: (1) check `~/.wisphive/mode` file, (2) auto-approve safe tools via `~/.wisphive/auto-approve.json`, (3) connect to daemon for human review. Exit codes: 0=approve, 2=deny, 1=error (fail-open).
+- **wisphive_hook** — Lightweight binary that runs as a Claude Code or Codex hook subprocess. Three-layer decision logic: (1) check `~/.wisphive/mode` file, (2) auto-approve safe tools via `~/.wisphive/auto-approve.json`, (3) connect to daemon for human review. Exit codes: 0=approve, 2=deny, 1=error (fail-open).
 - **wisphive_tui** — Ratatui terminal UI. Connects to daemon as a streaming client. Panels include queue, agents, projects, terminals. Keys: `a`/`d` approve/deny, `A`/`D` bulk, `/` filter, Tab switch panels.
 - **wisphive_web** — Axum HTTP/WebSocket server. Embeds the Vite-built React frontend via `rust-embed` and bridges browser ↔ daemon over `/ws`. Optional TLS via `rustls`/`rcgen` self-signed certs. Auth primitives in `auth.rs` (Argon2id passwords, SHA-256-hashed device tokens, per-IP login throttle, `webauthn-rs` for passkeys); request gating in `security.rs` (bearer token + Origin/Host allowlist). Can run standalone (`wisphive web serve`) or in-process with the daemon (`wisphive daemon start --web`).
-- **wisphive_cli** — Clap-based CLI (`wisphive` binary). Subcommands: `daemon {start [--web --host --port --web-dev --no-open --auth-profile --auth-rp-id], stop, status}`, `hooks {install, uninstall, enable, disable, status}`, `tui`, `web {serve [--host --port --dev --no-open --auth-profile --auth-rp-id], set-password, reset-password, devices {list, revoke <id>}, fingerprint}`, `agent {start, list, stop}`, `history {search, recent}`, `config {list, get, set, auto-approve {status, level, add, remove, reset}}`, `term {new, list, attach, replay, close}`, `doctor`, `emergency-off`. Web UI default port is `3100` (CLI) — note `justfile` uses `8080` for the `web` recipe. On first-run (no web password set), `daemon start --web` and `web serve` auto-open the default browser onto the SPA; `--no-open` suppresses this for headless servers / CI. `--auth-profile {local-lan|enterprise}` (default `local-lan`, itr#310) selects the daemon's auth/security posture; `enterprise` additionally requires `--auth-rp-id <domain>` plus user-provided TLS cert (the latter pending itr#270).
-- **wisphive_adapters** — `AgentAdapter` trait and implementations (Codex is hook-based/passive; Red and LocalLLM are stubs).
+- **wisphive_cli** — Clap-based CLI (`wisphive` binary). Subcommands: `daemon {start [--web --host --port --web-dev --no-open --auth-profile --auth-rp-id], stop, status}`, `hooks {install, uninstall, enable, disable, status}`, `tui`, `web {serve [--host --port --dev --no-open --auth-profile --auth-rp-id], set-password, reset-password, devices {list, revoke <id>}, fingerprint}`, `agent {start [--agent-type claude_code|codex], list, stop}`, `history {search, recent}`, `config {list, get, set, auto-approve {status, level, add, remove, reset}}`, `term {new, list, attach, replay, close}`, `doctor`, `emergency-off`. Web UI default port is `3100` (CLI) — note `justfile` uses `8080` for the `web` recipe. On first-run (no web password set), `daemon start --web` and `web serve` auto-open the default browser onto the SPA; `--no-open` suppresses this for headless servers / CI. `--auth-profile {local-lan|enterprise}` (default `local-lan`, itr#310) selects the daemon's auth/security posture; `enterprise` additionally requires `--auth-rp-id <domain>` plus user-provided TLS cert (the latter pending itr#270).
+- **wisphive_adapters** — `AgentAdapter` trait and implementations (Claude Code and Codex are hook-based/passive; Red and LocalLLM are stubs).
 
 ## Key Design Decisions
 
@@ -74,7 +74,7 @@ Seven workspace crates with clear dependency flow:
 - **Broadcast fan-out**: TUI clients subscribe to a `tokio::sync::broadcast` channel for real-time events.
 - **SQLite WAL crash recovery**: Pending decisions persist to disk; audit log tracks all resolutions.
 - **Passive notifications**: macOS uses `osascript display notification` (non-intrusive banner); Linux uses `notify-send`. Notifications are informational only — all tool input fields are shown so users have context when switching to the TUI to respond. Notifications do NOT resolve decisions; only the TUI does.
-- **Permissions management**: `wisphive hooks install` adds Codex permissions (Bash, Edit, Write, NotebookEdit) to `.Codex/settings.json` so Codex auto-allows tools that Wisphive gates (eliminates double-prompt). `wisphive hooks uninstall` removes them.
+- **Permissions management**: `wisphive hooks install` adds Claude Code permissions (Bash, Edit, Write, NotebookEdit) to `.claude/settings.json` so Claude auto-allows tools that Wisphive gates (eliminates double-prompt). Codex hooks are installed in `.codex/hooks.json`; Codex `PermissionRequest` is used for native approvals instead of a permissions allowlist.
 
 ## Codex Hook Response Format
 
@@ -84,24 +84,32 @@ The `wisphive-hook` binary runs as both `PreToolUse` and `PostToolUse` hook. Cod
 
 **PostToolUse additional field**: `tool_response` (the tool's execution output — NOT `tool_result`)
 
-**Structured JSON response** (stdout, exit 0):
+**Codex PreToolUse deny response** (stdout, exit 0):
 ```json
 {
   "hookSpecificOutput": {
     "hookEventName": "PreToolUse",
-    "permissionDecision": "allow|deny|ask",
-    "permissionDecisionReason": "text shown to Codex",
-    "updatedInput": { "command": "sanitized version" },
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "text shown to Codex"
+  }
+}
+```
+
+**Codex PreToolUse context response** (stdout, exit 0):
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
     "additionalContext": "guidance injected into Codex's context"
   }
 }
 ```
 
-**Key capabilities**: `permissionDecision: "deny"` + `permissionDecisionReason` gives Codex feedback on why. `updatedInput` lets hooks sanitize tool input before execution. `"ask"` defers to Codex's native permission prompt. Stderr on exit 2 becomes Codex feedback.
+**Key Codex limitations**: `permissionDecision: "deny"` + `permissionDecisionReason` gives Codex feedback on why. Codex currently parses but does not support `permissionDecision: "ask"`, `updatedInput`, or legacy approve output for `PreToolUse`; Wisphive must not rely on those fields for Codex. Stderr on exit 2 becomes Codex feedback.
 
-**PermissionRequest hook** (separate event): fires when Codex's permission dialog would show. Input includes `permission_suggestions` array — the dynamic options the user would see in the native dialog. Each suggestion is a permission update entry (`addRules`/`setMode`/etc) with `behavior`, `destination`, `rules`. A hook can echo any suggestion back as `updatedPermissions` in its response. Does NOT fire in `-p` (print) mode.
+**Codex PermissionRequest hook** (separate event): fires when Codex is about to ask for approval. Approve with `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}`. Deny with the same shape using `behavior:"deny"` plus optional `message`. Do not return `updatedInput`, `updatedPermissions`, or `interrupt` for Codex `PermissionRequest`; those fields are reserved and fail closed today.
 
-**All Codex hook events** (22 total): `SessionStart`, `SessionEnd`, `InstructionsLoaded`, `UserPromptSubmit` (blocking), `PreToolUse` (blocking), `PermissionRequest` (blocking), `PostToolUse`, `PostToolUseFailure`, `Notification`, `SubagentStart`, `SubagentStop` (blocking), `Stop` (blocking), `StopFailure`, `TeammateIdle` (blocking), `TaskCompleted` (blocking), `ConfigChange` (blocking), `PreCompact`, `PostCompact`, `WorktreeCreate` (blocking), `WorktreeRemove`, `Elicitation` (blocking — MCP form/URL input), `ElicitationResult` (blocking). Wisphive currently handles: `PreToolUse`, `PostToolUse`, `PermissionRequest` (planned).
+**Codex hooks installed by Wisphive**: `PreToolUse`, `PostToolUse`, `PermissionRequest`, `UserPromptSubmit`, `Stop`. Codex project hooks load from `.codex/hooks.json` only after the project `.codex/` layer is trusted. Codex `PreToolUse`/`PostToolUse` support currently covers Bash, `apply_patch`, and MCP tool calls; it does not intercept every shell/tool path.
 
 ## IPC Protocol
 
@@ -123,8 +131,8 @@ Web auth no longer uses a `~/.wisphive/web.token` file. Raw per-device bearer to
 
 ## Reference Documentation
 
-- [tui-textarea reference](Codex/tui-textarea-reference.md) — API reference, key bindings, and integration notes for the TUI text editing widget
-- [investigation-empty-detail-views](Codex/investigation-empty-detail-views.md) — notes on why `ExitPlanMode` and `AskUserQuestion` rendered empty detail views in the TUI
+- [tui-textarea reference](claude/tui-textarea-reference.md) — API reference, key bindings, and integration notes for the TUI text editing widget
+- [investigation-empty-detail-views](claude/investigation-empty-detail-views.md) — notes on why `ExitPlanMode` and `AskUserQuestion` rendered empty detail views in the TUI
 - [docs/plan-cross-agent-conflict-gate.md](docs/plan-cross-agent-conflict-gate.md), [docs/plan-decision-plugins.md](docs/plan-decision-plugins.md), [docs/plan-policy-learning-engine.md](docs/plan-policy-learning-engine.md) — design docs for upcoming workstreams
 - [docs/plan-mobile-device-pairing.md](docs/plan-mobile-device-pairing.md) — critical path, sizing, and RP ID design for the phone-pairing milestone (itr#283 epic)
 - [docs/open-source-path.md](docs/open-source-path.md) — OSS positioning and roadmap
@@ -144,7 +152,7 @@ Keep `AGENTS.md` aligned with reality — a stale entry here misleads every futu
 - **Add a new Codex hook event handler** in `wisphive_hook`, or learn a new fact about hook stdin/stdout schema (the "Codex Hook Response Format" section is the canonical reference for the project).
 - **Change a fail-open / fail-closed default, timeout, or other safety-critical default** (the "Key Design Decisions" section).
 - **Add a new build/test/lint command** that contributors will need (or change an existing one).
-- **Add reference docs under `Codex/` or `docs/`** that future sessions should know exist.
+- **Add reference docs under `claude/` or `docs/`** that future sessions should know exist.
 
 Do **not** add to `AGENTS.md`:
 

@@ -4,7 +4,7 @@ use wisphive_protocol::{AgentType, Decision};
 
 /// Trait for adapting different agent types to the Wisphive protocol.
 ///
-/// Each agent type (Claude Code, Red, local LLMs) has its own communication
+/// Each agent type (Claude Code, Codex, Red, local LLMs) has its own communication
 /// mechanism. Adapters translate between the agent's native protocol and
 /// Wisphive's internal event system.
 #[async_trait]
@@ -16,7 +16,7 @@ pub trait AgentAdapter: Send + Sync {
     fn name(&self) -> &str;
 
     /// Start the adapter. This may involve listening for incoming connections
-    /// (Claude Code hooks push events) or actively connecting to agents
+    /// (Claude/Codex hooks push events) or actively connecting to agents
     /// (Red RPC, Ollama HTTP).
     ///
     /// The `event_tx` sender should be used to push agent events into the

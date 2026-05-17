@@ -1,6 +1,6 @@
 [package]
 name = "wisphive_hook"
-description = "Minimal Claude Code hook handler for Wisphive — fail-open, synchronous, fast"
+description = "Minimal Claude Code and Codex hook handler for Wisphive — fail-open, synchronous, fast"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

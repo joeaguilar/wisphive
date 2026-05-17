@@ -5,8 +5,8 @@ use std::process;
 use std::time::Duration;
 
 use wisphive_protocol::{
-    ClientMessage, ClientType, Decision, DecisionRequest, PROTOCOL_VERSION, ServerMessage,
-    ToolResult,
+    AgentType, ClientMessage, ClientType, Decision, DecisionRequest, HookEventType,
+    PROTOCOL_VERSION, ServerMessage, ToolResult,
 };
 
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(3);
@@ -40,7 +40,7 @@ const DEFAULT_AUTO_APPROVE: &[&str] = &[
     "CronList",
 ];
 
-/// Hook response to format for Claude Code.
+/// Hook response to format for the calling agent.
 struct HookResponse {
     decision: Decision,
     message: Option<String>,
@@ -49,19 +49,67 @@ struct HookResponse {
     /// For PermissionRequest: the selected suggestion to echo back.
     selected_permission: Option<wisphive_protocol::PermissionSuggestion>,
     /// The hook event type — determines the response JSON format.
-    event_type: wisphive_protocol::HookEventType,
+    event_type: HookEventType,
+    /// Agent implementation that invoked this hook.
+    agent_type: AgentType,
 }
 
 impl HookResponse {
     fn simple(decision: Decision) -> Self {
+        Self::new(decision, HookEventType::PreToolUse, AgentType::ClaudeCode)
+    }
+
+    fn new(decision: Decision, event_type: HookEventType, agent_type: AgentType) -> Self {
         Self {
             decision,
             message: None,
             updated_input: None,
             additional_context: None,
             selected_permission: None,
-            event_type: wisphive_protocol::HookEventType::PreToolUse,
+            event_type,
+            agent_type,
         }
+    }
+}
+
+fn detect_agent_type(hook_event: &serde_json::Value) -> AgentType {
+    let env_value = std::env::var("WISPHIVE_AGENT_TYPE").ok();
+    detect_agent_type_from_env(env_value.as_deref(), hook_event)
+}
+
+fn detect_agent_type_from_env(
+    env_value: Option<&str>,
+    hook_event: &serde_json::Value,
+) -> AgentType {
+    if let Some(value) = env_value {
+        match value {
+            "codex" => return AgentType::Codex,
+            "claude_code" | "claude" => return AgentType::ClaudeCode,
+            _ => {}
+        }
+    }
+
+    if hook_event.get("model").is_some() || hook_event.get("turn_id").is_some() {
+        return AgentType::Codex;
+    }
+
+    AgentType::ClaudeCode
+}
+
+fn agent_id_prefix(agent_type: &AgentType) -> &'static str {
+    match agent_type {
+        AgentType::Codex => "codex",
+        AgentType::ClaudeCode => "cc",
+        AgentType::Red => "red",
+        AgentType::LocalLlm => "local",
+    }
+}
+
+fn agent_project_env(agent_type: &AgentType) -> Option<&'static str> {
+    match agent_type {
+        AgentType::Codex => Some("CODEX_PROJECT_DIR"),
+        AgentType::ClaudeCode => Some("CLAUDE_PROJECT_DIR"),
+        AgentType::Red | AgentType::LocalLlm => None,
     }
 }
 
@@ -74,9 +122,9 @@ fn main() {
     process::exit(code);
 }
 
-/// Format the hook response as Claude Code JSON stdout and return exit code.
+/// Format the hook response as agent-specific JSON stdout and return exit code.
 fn format_and_exit(resp: &HookResponse) -> i32 {
-    use wisphive_protocol::HookEventType::*;
+    use HookEventType::*;
     match resp.event_type {
         PermissionRequest => return format_permission_response(resp),
         Stop | SubagentStop => return format_stop_response(resp),
@@ -88,6 +136,9 @@ fn format_and_exit(resp: &HookResponse) -> i32 {
     }
     match resp.decision {
         Decision::Ask => {
+            if resp.agent_type == AgentType::Codex {
+                return 0;
+            }
             // Defer to native prompt
             let json = serde_json::json!({
                 "hookSpecificOutput": {
@@ -100,7 +151,7 @@ fn format_and_exit(resp: &HookResponse) -> i32 {
         }
         Decision::Deny => {
             if let Some(ref msg) = resp.message {
-                // Deny with feedback via JSON (Claude sees the reason)
+                // Deny with feedback via JSON (agent sees the reason)
                 let json = serde_json::json!({
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
@@ -115,6 +166,31 @@ fn format_and_exit(resp: &HookResponse) -> i32 {
             }
         }
         Decision::Approve => {
+            if resp.agent_type == AgentType::Codex {
+                if resp.updated_input.is_some() {
+                    let json = serde_json::json!({
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "deny",
+                            "permissionDecisionReason": "Wisphive blocked this tool call because Codex hooks do not support updatedInput yet. Re-run with the edited input."
+                        }
+                    });
+                    print!("{}", json);
+                    return 0;
+                }
+
+                if let Some(ref ctx) = resp.additional_context {
+                    let json = serde_json::json!({
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "additionalContext": ctx
+                        }
+                    });
+                    print!("{}", json);
+                }
+                return 0;
+            }
+
             let has_extras = resp.updated_input.is_some() || resp.additional_context.is_some();
             if has_extras {
                 let mut output = serde_json::Map::new();
@@ -147,34 +223,11 @@ fn format_and_exit(resp: &HookResponse) -> i32 {
     }
 }
 
-/// Format a PermissionRequest response for Claude Code.
+/// Format a PermissionRequest response for the calling agent.
 fn format_permission_response(resp: &HookResponse) -> i32 {
-    let mut decision_obj = serde_json::Map::new();
-
-    match resp.decision {
-        Decision::Approve => {
-            decision_obj.insert("behavior".into(), serde_json::Value::String("allow".into()));
-            if let Some(ref perm) = resp.selected_permission {
-                decision_obj.insert(
-                    "updatedPermissions".into(),
-                    serde_json::to_value(vec![perm]).unwrap_or(serde_json::json!([])),
-                );
-            }
-            if let Some(ref input) = resp.updated_input {
-                decision_obj.insert("updatedInput".into(), input.clone());
-            }
-        }
-        Decision::Deny => {
-            decision_obj.insert("behavior".into(), serde_json::Value::String("deny".into()));
-            if let Some(ref msg) = resp.message {
-                decision_obj.insert("message".into(), serde_json::Value::String(msg.clone()));
-            }
-        }
-        Decision::Ask => {
-            // Defer — don't output anything, let native prompt handle it
-            return 0;
-        }
-    }
+    let Some(decision_obj) = permission_decision_object(resp) else {
+        return 0;
+    };
 
     let json = serde_json::json!({
         "hookSpecificOutput": {
@@ -186,10 +239,47 @@ fn format_permission_response(resp: &HookResponse) -> i32 {
     0
 }
 
+fn permission_decision_object(
+    resp: &HookResponse,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let mut decision_obj = serde_json::Map::new();
+
+    match resp.decision {
+        Decision::Approve => {
+            decision_obj.insert("behavior".into(), serde_json::Value::String("allow".into()));
+            if resp.agent_type != AgentType::Codex
+                && let Some(ref perm) = resp.selected_permission
+            {
+                decision_obj.insert(
+                    "updatedPermissions".into(),
+                    serde_json::to_value(vec![perm]).unwrap_or(serde_json::json!([])),
+                );
+            }
+            if resp.agent_type != AgentType::Codex
+                && let Some(ref input) = resp.updated_input
+            {
+                decision_obj.insert("updatedInput".into(), input.clone());
+            }
+        }
+        Decision::Deny => {
+            decision_obj.insert("behavior".into(), serde_json::Value::String("deny".into()));
+            if let Some(ref msg) = resp.message {
+                decision_obj.insert("message".into(), serde_json::Value::String(msg.clone()));
+            }
+        }
+        Decision::Ask => return None,
+    }
+
+    Some(decision_obj)
+}
+
 /// Format Stop/SubagentStop: approve = let stop (exit 0), deny = continue working.
 fn format_stop_response(resp: &HookResponse) -> i32 {
     match resp.decision {
         Decision::Approve => {
+            if resp.agent_type == AgentType::Codex {
+                return 0;
+            }
             let json = serde_json::json!({"decision": "approve"});
             print!("{}", json);
             0
@@ -207,7 +297,20 @@ fn format_stop_response(resp: &HookResponse) -> i32 {
 /// Format UserPromptSubmit/ConfigChange: approve = allow, deny = block.
 fn format_block_response(resp: &HookResponse) -> i32 {
     match resp.decision {
-        Decision::Approve => 0,
+        Decision::Approve => {
+            if resp.agent_type == AgentType::Codex
+                && let Some(ref ctx) = resp.additional_context
+            {
+                let json = serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": resp.event_type.to_string(),
+                        "additionalContext": ctx
+                    }
+                });
+                print!("{}", json);
+            }
+            0
+        }
         Decision::Deny => {
             if let Some(ref msg) = resp.message {
                 let json = serde_json::json!({"decision": "block", "reason": msg});
@@ -297,29 +400,29 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
         return Ok(HookResponse::simple(Decision::Approve));
     }
 
-    // Layer 2: Read Claude Code hook data from stdin
+    // Layer 2: Read agent hook data from stdin
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
 
     let hook_event: serde_json::Value = serde_json::from_str(&input)?;
 
     // Determine event type from hook_event_name (early — needed for dispatch)
-    let event_type: wisphive_protocol::HookEventType = hook_event
+    let event_type: HookEventType = hook_event
         .get("hook_event_name")
         .and_then(|v| v.as_str())
         .unwrap_or("PreToolUse")
         .parse()
         .unwrap_or_default();
 
+    let agent_type = detect_agent_type(&hook_event);
+
     // PostToolUse detection: fire-and-forget result to daemon
-    if event_type == wisphive_protocol::HookEventType::PostToolUse
-        || hook_event.get("tool_response").is_some()
-    {
-        handle_post_tool_use(&hook_event, &wisphive_dir)?;
-        return Ok(HookResponse::simple(Decision::Approve));
+    if event_type == HookEventType::PostToolUse || hook_event.get("tool_response").is_some() {
+        handle_post_tool_use(&hook_event, &wisphive_dir, agent_type.clone())?;
+        return Ok(HookResponse::new(Decision::Approve, event_type, agent_type));
     }
 
-    let is_permission_request = event_type == wisphive_protocol::HookEventType::PermissionRequest;
+    let is_permission_request = event_type == HookEventType::PermissionRequest;
 
     // For events without a tool_name (Stop, ConfigChange, etc.), use the event type name
     let tool_name = hook_event
@@ -332,20 +435,20 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
     let agent_id = hook_event
         .get("session_id")
         .and_then(|v| v.as_str())
-        .map(|s| format!("cc-{}", s))
+        .map(|s| format!("{}-{}", agent_id_prefix(&agent_type), s))
         .or_else(|| std::env::var("WISPHIVE_AGENT_ID").ok())
-        .unwrap_or_else(|| format!("cc-{}", process::id()));
+        .unwrap_or_else(|| format!("{}-{}", agent_id_prefix(&agent_type), process::id()));
 
-    let project = std::env::var("CLAUDE_PROJECT_DIR")
+    let project = agent_project_env(&agent_type)
+        .and_then(|key| std::env::var(key).ok())
         .map(PathBuf::from)
-        .or_else(|_| {
+        .or_else(|| {
             hook_event
                 .get("cwd")
                 .and_then(|v| v.as_str())
                 .map(PathBuf::from)
-                .ok_or(())
         })
-        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
     let tool_input = hook_event
         .get("tool_input")
@@ -358,7 +461,7 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
         .map(|s| s.to_string());
 
     // Layer 3: Register agent with daemon (once per session, fire-and-forget)
-    register_agent_once(&agent_id, &project, &wisphive_dir);
+    register_agent_once(&agent_id, agent_type.clone(), &project, &wisphive_dir);
 
     // Auto-approve certain event types based on config (with sensible defaults)
     if is_event_auto_approved(event_type, &wisphive_dir) {
@@ -376,8 +479,9 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
             &tool_name,
             &log_input,
             event_type,
+            &agent_type,
         );
-        return Ok(HookResponse::simple(Decision::Approve));
+        return Ok(HookResponse::new(Decision::Approve, event_type, agent_type));
     }
 
     // Layer 4: Auto-approve check — PermissionRequests always go to daemon
@@ -390,8 +494,9 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
             &tool_name,
             &tool_input,
             event_type,
+            &agent_type,
         );
-        return Ok(HookResponse::simple(Decision::Approve));
+        return Ok(HookResponse::new(Decision::Approve, event_type, agent_type));
     }
 
     // Parse permission suggestions for PermissionRequest events
@@ -422,7 +527,7 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
 
     // Correlation with wisphive-managed terminal sessions: the daemon
     // exports WISPHIVE_TERMINAL_SESSION_ID into the PTY, which flows through
-    // the shell to any `claude` process and on into this hook.
+    // the shell to any Claude/Codex process and on into this hook.
     let terminal_session_id = std::env::var("WISPHIVE_TERMINAL_SESSION_ID")
         .ok()
         .and_then(|s| uuid::Uuid::parse_str(&s).ok());
@@ -430,7 +535,7 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
     let request = DecisionRequest {
         id: uuid::Uuid::new_v4(),
         agent_id,
-        agent_type: wisphive_protocol::AgentType::ClaudeCode,
+        agent_type: agent_type.clone(),
         project,
         tool_name,
         tool_input,
@@ -489,8 +594,9 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
             additional_context,
             selected_permission,
             event_type,
+            agent_type,
         }),
-        _ => Ok(HookResponse::simple(Decision::Approve)),
+        _ => Ok(HookResponse::new(Decision::Approve, event_type, agent_type)),
     }
 }
 
@@ -498,6 +604,7 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
 fn handle_post_tool_use(
     hook_event: &serde_json::Value,
     wisphive_dir: &std::path::Path,
+    agent_type: AgentType,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let tool_name = hook_event
         .get("tool_name")
@@ -518,9 +625,9 @@ fn handle_post_tool_use(
     let agent_id = hook_event
         .get("session_id")
         .and_then(|v| v.as_str())
-        .map(|s| format!("cc-{}", s))
+        .map(|s| format!("{}-{}", agent_id_prefix(&agent_type), s))
         .or_else(|| std::env::var("WISPHIVE_AGENT_ID").ok())
-        .unwrap_or_else(|| format!("cc-{}", std::process::id()));
+        .unwrap_or_else(|| format!("{}-{}", agent_id_prefix(&agent_type), std::process::id()));
 
     let tool_use_id = hook_event
         .get("tool_use_id")
@@ -562,7 +669,12 @@ fn handle_post_tool_use(
 
 /// Register this agent session with the daemon (fire-and-forget).
 /// Uses a marker file to ensure registration only happens once per session.
-fn register_agent_once(agent_id: &str, project: &std::path::Path, wisphive_dir: &std::path::Path) {
+fn register_agent_once(
+    agent_id: &str,
+    agent_type: AgentType,
+    project: &std::path::Path,
+    wisphive_dir: &std::path::Path,
+) {
     // Fast path: check marker file (single stat syscall)
     let sessions_dir = wisphive_dir.join("sessions");
     let marker = sessions_dir.join(agent_id);
@@ -593,7 +705,7 @@ fn register_agent_once(agent_id: &str, project: &std::path::Path, wisphive_dir: 
         // Send AgentRegister (fire-and-forget)
         let msg = wisphive_protocol::encode(&ClientMessage::AgentRegister {
             agent_id: agent_id.to_string(),
-            agent_type: wisphive_protocol::AgentType::ClaudeCode,
+            agent_type: agent_type.clone(),
             project: project.to_path_buf(),
         })?;
         writer.write_all(msg.as_bytes())?;
@@ -751,7 +863,8 @@ fn log_auto_approved(
     project: &std::path::Path,
     tool_name: &str,
     tool_input: &serde_json::Value,
-    event_type: wisphive_protocol::HookEventType,
+    event_type: HookEventType,
+    agent_type: &AgentType,
 ) {
     let path = wisphive_dir.join("events.jsonl");
     let entry = serde_json::json!({
@@ -759,7 +872,7 @@ fn log_auto_approved(
         "hook_event_name": event_type.to_string(),
         "tool_use_id": tool_use_id,
         "agent_id": agent_id,
-        "agent_type": "claude_code",
+        "agent_type": agent_type.to_string(),
         "project": project,
         "tool_name": tool_name,
         "tool_input": tool_input,
@@ -910,6 +1023,67 @@ fn extract_plan_from_transcript(path: &str) -> Option<String> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn detects_codex_from_env_override() {
+        let event = json!({"hook_event_name": "PreToolUse"});
+        assert_eq!(
+            detect_agent_type_from_env(Some("codex"), &event),
+            AgentType::Codex
+        );
+    }
+
+    #[test]
+    fn detects_claude_from_env_override() {
+        let event = json!({"hook_event_name": "PreToolUse", "model": "gpt-5.4"});
+        assert_eq!(
+            detect_agent_type_from_env(Some("claude_code"), &event),
+            AgentType::ClaudeCode
+        );
+    }
+
+    #[test]
+    fn detects_codex_from_codex_fields() {
+        let event = json!({"hook_event_name": "PreToolUse", "turn_id": "turn-1"});
+        assert_eq!(detect_agent_type_from_env(None, &event), AgentType::Codex);
+    }
+
+    #[test]
+    fn defaults_to_claude_without_codex_signal() {
+        let event = json!({"hook_event_name": "PreToolUse"});
+        assert_eq!(
+            detect_agent_type_from_env(None, &event),
+            AgentType::ClaudeCode
+        );
+    }
+
+    #[test]
+    fn codex_permission_response_omits_reserved_fields() {
+        let mut resp = HookResponse::new(
+            Decision::Approve,
+            HookEventType::PermissionRequest,
+            AgentType::Codex,
+        );
+        resp.updated_input = Some(json!({"command": "echo safe"}));
+        resp.selected_permission = Some(wisphive_protocol::PermissionSuggestion {
+            suggestion_type: "addRules".into(),
+            rules: vec![],
+            behavior: "allow".into(),
+            destination: "session".into(),
+            mode: None,
+        });
+
+        let decision = permission_decision_object(&resp).unwrap();
+        assert_eq!(decision.get("behavior"), Some(&json!("allow")));
+        assert!(!decision.contains_key("updatedInput"));
+        assert!(!decision.contains_key("updatedPermissions"));
+    }
 }
 
 fn home_dir() -> PathBuf {

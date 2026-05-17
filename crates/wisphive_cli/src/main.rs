@@ -30,7 +30,7 @@ enum Command {
         action: DaemonAction,
     },
 
-    /// Hook management for Claude Code integration
+    /// Hook management for Claude Code and Codex integration
     Hooks {
         #[command(subcommand)]
         action: HookAction,
@@ -283,6 +283,9 @@ enum AgentAction {
 
 #[derive(clap::Args)]
 struct StartArgs {
+    /// Agent implementation to spawn (claude_code or codex)
+    #[arg(long, default_value = "claude_code", value_parser = ["claude_code", "codex"])]
+    agent_type: String,
     /// Path to the project directory (defaults to current directory)
     #[arg(long)]
     project: Option<std::path::PathBuf>,
@@ -359,7 +362,7 @@ enum HistoryAction {
 
 #[derive(Subcommand)]
 enum HookAction {
-    /// Install Wisphive hooks into a project's .claude/settings.json
+    /// Install Wisphive hooks into a project's .claude/settings.json and .codex/hooks.json
     Install {
         /// Path to the project directory
         #[arg(long)]
@@ -368,7 +371,7 @@ enum HookAction {
         #[arg(long)]
         all: bool,
     },
-    /// Remove Wisphive hooks from a project's .claude/settings.json
+    /// Remove Wisphive hooks from a project's .claude/settings.json and .codex/hooks.json
     Uninstall {
         /// Path to the project directory
         #[arg(long)]
@@ -441,6 +444,10 @@ fn main() -> anyhow::Result<()> {
                             .or_else(|| std::env::current_dir().ok())
                             .unwrap_or_else(|| std::path::PathBuf::from("."));
                         commands::agent::start(wisphive_protocol::SpawnAgentRequest {
+                            agent_type: match args.agent_type.as_str() {
+                                "codex" => wisphive_protocol::AgentType::Codex,
+                                _ => wisphive_protocol::AgentType::ClaudeCode,
+                            },
                             project: proj,
                             prompt: args.prompt,
                             model: args.model,

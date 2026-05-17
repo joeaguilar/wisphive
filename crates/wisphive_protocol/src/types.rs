@@ -8,6 +8,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentType {
+    Codex,
     ClaudeCode,
     Red,
     LocalLlm,
@@ -16,11 +17,16 @@ pub enum AgentType {
 impl std::fmt::Display for AgentType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Codex => write!(f, "codex"),
             Self::ClaudeCode => write!(f, "claude_code"),
             Self::Red => write!(f, "red"),
             Self::LocalLlm => write!(f, "local_llm"),
         }
     }
+}
+
+fn default_agent_type() -> AgentType {
+    AgentType::ClaudeCode
 }
 
 /// Metadata about a connected agent instance.
@@ -33,7 +39,7 @@ pub struct AgentInfo {
     pub last_seen: DateTime<Utc>,
 }
 
-/// A permission rule from Claude Code's PermissionRequest event.
+/// A permission rule from an agent PermissionRequest event.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PermissionRule {
     #[serde(rename = "toolName")]
@@ -42,7 +48,7 @@ pub struct PermissionRule {
     pub rule_content: String,
 }
 
-/// A permission suggestion from Claude Code's PermissionRequest event.
+/// A permission suggestion from an agent PermissionRequest event.
 ///
 /// Each suggestion represents one option the user can select
 /// (e.g., "allow Bash(rm -rf node_modules) in local settings").
@@ -63,7 +69,7 @@ pub struct PermissionSuggestion {
     pub mode: Option<String>,
 }
 
-/// The type of Claude Code hook event.
+/// The type of agent hook event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum HookEventType {
     #[default]
@@ -143,13 +149,13 @@ pub struct DecisionRequest {
     pub tool_name: String,
     pub tool_input: serde_json::Value,
     pub timestamp: DateTime<Utc>,
-    /// The Claude Code hook event type. Defaults to PreToolUse for backward compat.
+    /// The agent hook event type. Defaults to PreToolUse for backward compat.
     #[serde(default)]
     pub hook_event_name: HookEventType,
-    /// Claude Code's unique tool call ID for pre/post correlation.
+    /// Agent-provided unique tool call ID for pre/post correlation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_use_id: Option<String>,
-    /// Permission suggestions from Claude Code's PermissionRequest event.
+    /// Permission suggestions from an agent PermissionRequest event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_suggestions: Option<Vec<PermissionSuggestion>>,
     /// Event-specific data (e.g., Elicitation schema, Stop reason, prompt text).
@@ -268,6 +274,9 @@ pub struct ProjectSummary {
 /// Request to spawn a new AI agent process.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnAgentRequest {
+    /// Agent implementation to spawn.
+    #[serde(default = "default_agent_type")]
+    pub agent_type: AgentType,
     /// Working directory for the agent.
     pub project: PathBuf,
     /// Prompt to pass to the agent.
@@ -317,6 +326,8 @@ pub struct SpawnAgentRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManagedAgent {
     pub agent_id: String,
+    #[serde(default = "default_agent_type")]
+    pub agent_type: AgentType,
     pub pid: u32,
     pub project: PathBuf,
     pub model: Option<String>,
@@ -338,7 +349,7 @@ pub struct ToolResult {
     pub tool_input: serde_json::Value,
     pub tool_result: serde_json::Value,
     pub timestamp: DateTime<Utc>,
-    /// Claude Code's unique tool call ID for pre/post correlation.
+    /// Agent-provided unique tool call ID for pre/post correlation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_use_id: Option<String>,
 }
@@ -378,7 +389,7 @@ pub struct HistoryEntry {
     /// Tool execution result (captured by PostToolUse hook). None for old/denied entries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_result: Option<serde_json::Value>,
-    /// Claude Code's unique tool call ID.
+    /// Agent-provided unique tool call ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_use_id: Option<String>,
     /// Hook event type (PreToolUse, Stop, UserPromptSubmit, etc.).
@@ -685,6 +696,7 @@ mod tests {
     #[test]
     fn agent_type_serde_round_trip() {
         for (variant, expected_json) in [
+            (AgentType::Codex, "\"codex\""),
             (AgentType::ClaudeCode, "\"claude_code\""),
             (AgentType::Red, "\"red\""),
             (AgentType::LocalLlm, "\"local_llm\""),
@@ -698,6 +710,7 @@ mod tests {
 
     #[test]
     fn agent_type_display() {
+        assert_eq!(AgentType::Codex.to_string(), "codex");
         assert_eq!(AgentType::ClaudeCode.to_string(), "claude_code");
         assert_eq!(AgentType::Red.to_string(), "red");
         assert_eq!(AgentType::LocalLlm.to_string(), "local_llm");

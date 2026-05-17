@@ -119,6 +119,7 @@ export interface ProjectSummary {
 }
 
 export interface SpawnAgentRequest {
+  agent_type?: "claude_code" | "codex";
   project: string;
   prompt: string;
   model?: string;

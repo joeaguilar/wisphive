@@ -1457,6 +1457,7 @@ fn handle_spawn_modal_input(app: &mut App, mut modal: Modal, key: KeyEvent) -> I
                 return InputAction::None;
             }
             InputAction::SpawnAgent(wisphive_protocol::SpawnAgentRequest {
+                agent_type: wisphive_protocol::AgentType::ClaudeCode,
                 project,
                 prompt,
                 model: spawn.model_value(),

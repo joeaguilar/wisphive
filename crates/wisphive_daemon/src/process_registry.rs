@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use tokio::process::{Child, Command};
 use tracing::{error, info, warn};
-use wisphive_protocol::{ManagedAgent, SpawnAgentRequest};
+use wisphive_protocol::{AgentType, ManagedAgent, SpawnAgentRequest};
 
 /// Tracks agent processes spawned by the daemon.
 pub struct ProcessRegistry {
@@ -24,91 +24,130 @@ impl ProcessRegistry {
         }
     }
 
-    /// Spawn a new Claude Code agent process.
+    /// Spawn a new managed agent process.
     ///
     /// Returns the `ManagedAgent` metadata on success.
     pub async fn spawn_agent(&mut self, req: SpawnAgentRequest) -> Result<ManagedAgent> {
         let agent_id = format!("agent-{}", uuid::Uuid::new_v4().as_simple());
         let session_id = uuid::Uuid::new_v4();
+        let agent_type = req.agent_type.clone();
 
-        let mut cmd = Command::new("claude");
+        let mut cmd = match &agent_type {
+            AgentType::ClaudeCode => {
+                let mut cmd = Command::new("claude");
 
-        // Non-interactive print mode
-        cmd.arg("-p");
+                // Non-interactive print mode
+                cmd.arg("-p");
 
-        // Wisphive is the gatekeeper — skip Claude's own permission prompts
-        cmd.arg("--dangerously-skip-permissions");
+                // Wisphive is the gatekeeper — skip Claude's own permission prompts
+                cmd.arg("--dangerously-skip-permissions");
 
-        // Session tracking — skip if resuming an existing session
-        if !req.continue_session && req.resume.is_none() {
-            cmd.args(["--session-id", &session_id.to_string()]);
-        }
+                // Session tracking — skip if resuming an existing session
+                if !req.continue_session && req.resume.is_none() {
+                    cmd.args(["--session-id", &session_id.to_string()]);
+                }
 
-        if let Some(ref model) = req.model {
-            cmd.args(["--model", model]);
-        }
-        if let Some(ref name) = req.name {
-            cmd.args(["--name", name]);
-        }
-        if let Some(ref reasoning) = req.reasoning {
-            cmd.args(["--reasoning", reasoning]);
-        }
-        if let Some(max_turns) = req.max_turns {
-            cmd.args(["--max-turns", &max_turns.to_string()]);
-        }
-        if let Some(ref perm_mode) = req.permission_mode {
-            cmd.args(["--permission-mode", perm_mode]);
-        }
-        if let Some(ref sys_prompt) = req.system_prompt {
-            cmd.args(["--system-prompt", sys_prompt]);
-        }
-        if let Some(ref append_prompt) = req.append_system_prompt {
-            cmd.args(["--append-system-prompt", append_prompt]);
-        }
-        if let Some(ref tools) = req.allowed_tools {
-            for tool in tools {
-                cmd.args(["--allowedTools", tool]);
+                if let Some(ref model) = req.model {
+                    cmd.args(["--model", model]);
+                }
+                if let Some(ref name) = req.name {
+                    cmd.args(["--name", name]);
+                }
+                if let Some(ref reasoning) = req.reasoning {
+                    cmd.args(["--reasoning", reasoning]);
+                }
+                if let Some(max_turns) = req.max_turns {
+                    cmd.args(["--max-turns", &max_turns.to_string()]);
+                }
+                if let Some(ref perm_mode) = req.permission_mode {
+                    cmd.args(["--permission-mode", perm_mode]);
+                }
+                if let Some(ref sys_prompt) = req.system_prompt {
+                    cmd.args(["--system-prompt", sys_prompt]);
+                }
+                if let Some(ref append_prompt) = req.append_system_prompt {
+                    cmd.args(["--append-system-prompt", append_prompt]);
+                }
+                if let Some(ref tools) = req.allowed_tools {
+                    for tool in tools {
+                        cmd.args(["--allowedTools", tool]);
+                    }
+                }
+                if let Some(ref tools) = req.disallowed_tools {
+                    for tool in tools {
+                        cmd.args(["--disallowedTools", tool]);
+                    }
+                }
+                if req.continue_session {
+                    cmd.arg("--continue");
+                }
+                if let Some(ref session) = req.resume {
+                    cmd.args(["--resume", session]);
+                }
+                if let Some(ref fmt) = req.output_format {
+                    cmd.args(["--output-format", fmt]);
+                }
+                if req.verbose {
+                    cmd.arg("--verbose");
+                }
+
+                cmd.arg(&req.prompt);
+                cmd
             }
-        }
-        if let Some(ref tools) = req.disallowed_tools {
-            for tool in tools {
-                cmd.args(["--disallowedTools", tool]);
-            }
-        }
-        if req.continue_session {
-            cmd.arg("--continue");
-        }
-        if let Some(ref session) = req.resume {
-            cmd.args(["--resume", session]);
-        }
-        if let Some(ref fmt) = req.output_format {
-            cmd.args(["--output-format", fmt]);
-        }
-        if req.verbose {
-            cmd.arg("--verbose");
-        }
+            AgentType::Codex => {
+                let mut cmd = Command::new("codex");
+                let project = req.project.display().to_string();
 
-        // The prompt is the positional argument
-        cmd.arg(&req.prompt);
+                cmd.arg("exec");
+                cmd.args(["--ask-for-approval", "never"]);
+                cmd.args(["--sandbox", "workspace-write"]);
+                cmd.arg("-C");
+                cmd.arg(&project);
+
+                if let Some(ref model) = req.model {
+                    cmd.args(["--model", model]);
+                }
+                if let Some(ref reasoning) = req.reasoning {
+                    cmd.arg("--config");
+                    cmd.arg(format!("model_reasoning_effort=\"{reasoning}\""));
+                }
+                if let Some(ref fmt) = req.output_format
+                    && (fmt == "json" || fmt == "stream-json")
+                {
+                    cmd.arg("--json");
+                }
+
+                cmd.arg(&req.prompt);
+                cmd
+            }
+            AgentType::Red | AgentType::LocalLlm => {
+                anyhow::bail!("managed spawn currently supports Claude Code and Codex")
+            }
+        };
 
         // Run in the project directory
         cmd.current_dir(&req.project);
 
-        // Set env var for hook correlation
+        // Set env vars for hook correlation
         cmd.env("WISPHIVE_AGENT_ID", &agent_id);
+        cmd.env("WISPHIVE_AGENT_TYPE", agent_type.to_string());
 
-        // Capture stdout, pipe stderr through
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
+        // Managed output is not surfaced yet; avoid child pipe backpressure.
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
 
-        let child = cmd
-            .spawn()
-            .context("failed to spawn claude — is it installed and on PATH?")?;
+        let child = cmd.spawn().with_context(|| {
+            format!(
+                "failed to spawn {} — is it installed and on PATH?",
+                agent_type
+            )
+        })?;
 
         let pid = child.id().context("could not get PID of spawned process")?;
 
         let managed = ManagedAgent {
             agent_id: agent_id.clone(),
+            agent_type,
             pid,
             project: req.project,
             model: req.model,
@@ -121,6 +160,7 @@ impl ProcessRegistry {
 
         info!(
             agent_id = %agent_id,
+            agent_type = %managed.agent_type,
             pid = pid,
             project = %managed.project.display(),
             "spawned agent process"
