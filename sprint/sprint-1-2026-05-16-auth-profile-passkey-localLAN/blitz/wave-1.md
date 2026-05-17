@@ -67,6 +67,51 @@ Three clean commits on `main` ready for Wave 2 (#311) to land against:
 - `4630abc` — chore(fmt): pre-existing drift cleanup
 - `dd70016` — fix(web): #310 review SHOULD-FIX C/D/E
 
+### Wave 2 — #311 (foreground spawn, completed 2026-05-17)
+
+- **Status:** `closed` in itr (close-reason captured in tracker). Reviewers caught one MUST-FIX (M1) corrected in review pass.
+- **Tests:** 351 workspace passing on agent's final report → 352 after M1 regression test added in review pass.
+- **New files:** `crates/wisphive_web/src/passkey.rs` (~800 lines: webauthn_for OnceCell cache + ChallengeStore + TTL reaper + local_lan_rp_origin helper + resolve_passkey_rp)
+- **Modified:** `lib.rs` (4 passkey routes + AppState wiring), `security.rs` (passkey path classification), `auth_profile.rs` (scan_passkey_rp_id_drift now real, TODO removed), `http_tests.rs` (9 HTTP integration tests + AppState passkey_challenges field), `state.rs` (schema migration + insert_web_passkey sig update + find_web_passkey_by_credential_id + update_passkey_sign_count_and_last_used), `Cargo.toml` (workspace: webauthn-rs conditional-ui + uuid v5; wisphive_web: chrono)
+- **Schema migration**: idempotent ALTER via new `try_add_column` helper; aaguid + rp_id columns added; pre-existing rows get `rp_id=''` and warn-on-startup via drift scan
+- **Unblocked:** #312 (Wave 3 ready)
+- **webauthn-rs 0.5 quirks discovered:** start_passkey_registration hardcodes `require_resident_key(false)` AND `UserVerificationPolicy::Required` (LocalLAN's spec'd Preferred is overridden — accepted because modern authenticators create resident credentials regardless); no public SoftPasskey test authenticator in 0.5 (end-to-end crypto round-trip tests skipped, handler-level tests cover non-crypto paths); start_discoverable_authentication behind conditional-ui feature; Passkey::aaguid() not public without danger-credential-internals (storing None for v1)
+- **Sudo gate placeholder for Enterprise register**: returns 403 always with `sudo_required_for_passkey_register` discriminant. Full freshness check needs daemon IPC from #313 — handler is one match-arm change once that IPC ships.
+
+### W2.intervention-1 — stale doc comments cleaned before commit
+
+Two doc comments in `auth_profile.rs` and `lib.rs` still referenced the pre-#311 stub state of `scan_passkey_rp_id_drift` ("no-op stub until itr#311 adds the rp_id column"). The agent updated the function but missed the doc text. Orchestrator fixed both before committing #311 as `8357500`.
+
+### W2.intervention-2 — review-driven SHOULD-FIX applied to #311 commit chain
+
+Two parallel reviewers spawned on `8357500`. Security: `ship-with-must-fix` (M1). Rust code-quality: `ship-ready` (5 SHOULD-FIX, mostly polish).
+
+- **MUST-FIX applied** (committed as `4e67206`):
+  - **M1**: `/login/start` was calling `record_success` which wipes per-IP failure history. Added `AttemptGuard::release_slot()` (decrements `in_flight` only, preserves `failures`/`locked_until`). Replaced the bad call in `post_passkey_login_start`. New regression test `passkey_login_start_does_not_wipe_throttle_after_failures` proves second failure produces backoff_for(2)≈500ms not backoff_for(1)≈250ms.
+- **SHOULD-FIX applied** (same commit):
+  - **R1**: replaced stream-of-consciousness whiteboard comment in passkey login device-row minting with 5-line conclusion-only summary.
+  - **S1**: added `passkey_register_failure` audit rows on `unknown_session` / `wrong_session_variant` paths in register/finish.
+  - **S3**: added `passkey_register_start_ok` + `passkey_login_start_ok` audit events — completes the 6-event ceremony trace.
+  - **R3**: `passkey.rs` tests previously shared cache key `(localhost, https://localhost:3100, 300s)` under parallel execution. New `unique_port()` (AtomicU16 starting at 35000) gives each test a distinct URL → no cross-test cache aliasing.
+  - **R4**: added comment on `ChallengeStore::take()` clarifying post-expiry is destructive.
+  - **R5**: rewrote `is_duplicate_column_error` doc explaining WHY message-match is the contract (SQLite code "1" too generic — catches disk-full, permission-denied too). Doc points at itr#320 for future tracking.
+  - **Reaper docstring fix**: was wrong that "drop = abort" — corrected.
+- **SHOULD-FIX partial** (S2/R2 device-row semantics): backend `LoginResponse.enrolling_device_id: Option<String>` field added so #312 can call `list_web_passkeys_for_device(enrolling_device_id)` correctly. Full design (N+1 rows per user, cascade shape) filed as itr#319.
+- **Filed as itr**:
+  - **itr#319** (medium): security follow-ups — device-row semantics full design, LAN port-mapping rp_origin fix, Passkey blob versioning.
+  - **itr#320** (low): code-quality follow-ups bundle — 7 items including error-discriminant JSON normalization (which #312 will care about).
+- **#312 context updated** with full inherited contract: response shapes (flattened session_id, enrolling_device_id), stable error discriminants (`passkey_unavailable_on_this_origin`, `sudo_required_for_passkey_register`), behavioral contracts (shared throttle with password login, counter-regression handling, 32 KiB body cap, /start consumes throttle slot — don't call on page-load), pre-existing issues, tests needed.
+
+### Wave 2 → Wave 3 gate status
+
+After interventions: `cargo test` ✅ (352 passing) | `cargo clippy` ✅ | `cargo fmt --check` ✅ | `npm run lint` ✅ (the pre-existing 7 errors resolved between sprint planning and now)
+
+Three new commits on `main` ready for Wave 3 (#312 frontend) to land against:
+- `8357500` — feat(web): WebAuthn passkey backend handlers (#311)
+- `4e67206` — fix(web): #311 review M1 throttle bypass + audit gaps + cleanup
+
+Total commits in this blitz so far: 5 (a0d6128, 4630abc, dd70016, 8357500, 4e67206).
+
 
 
 ## Outcomes
