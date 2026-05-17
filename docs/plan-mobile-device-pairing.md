@@ -245,6 +245,230 @@ Target browsers: **Chrome, Firefox, Brave** (desktop + Android). Safari / iOS ou
 
 - [ ] `--tls-cert` / `--tls-key` with a Tailscale cert → phone hits `https://daemon.foo.ts.net` → zero warnings → passkey enroll works.
 
+## LocalLAN browser smoke procedure (itr#315)
+
+Reproducible desktop smoke for the LocalLAN profile. Run after any change that touches `auth_profile.rs`, `auth.rs`, `passkey.rs`, the four `/api/auth/passkey/*` routes, `Login.tsx`, `useAuth.ts`, `useAuthProfile.ts`, or `usePasskey.ts`. Closes itr#219 (umbrella) + itr#269 (passkey onboarding) once green on all three browsers.
+
+Enterprise smoke is a separate procedure tracked under itr#316; this section is LocalLAN-only because itr#270 (`--tls-cert`/`--tls-key`) has not shipped and Enterprise selection requires it.
+
+### 0. Prerequisites
+
+- Rust toolchain installed (`rustup show` reports a toolchain compatible with edition 2024 — see `CONTRIBUTING.md`).
+- Wisphive binary built and on PATH: from repo root, run `./install.sh` (builds release, installs to `~/.cargo/bin`, codesigns on macOS).
+- Clean `~/.wisphive/` directory. **If you have prior daemon state, back it up first:**
+  ```bash
+  wisphive emergency-off || true                         # stop the daemon
+  mv ~/.wisphive ~/.wisphive.bak-$(date +%Y%m%d-%H%M%S)  # back up
+  ```
+  A truly fresh first-run is the only way to exercise the `phase === "setup"` UI and the post-set-password `authed-pending-enroll` gate.
+- All three target browsers installed (current stable):
+  - Google Chrome
+  - Mozilla Firefox
+  - Brave
+- macOS: Touch ID enrolled (System Settings → Touch ID & Password). Windows: Windows Hello configured. Linux: have a USB security key ready (FIDO2/CTAP2, e.g. YubiKey 5).
+
+### 1. Daemon startup
+
+Default profile is LocalLAN — no `--auth-profile` flag required.
+
+```bash
+wisphive daemon start --web --no-open
+```
+
+`--no-open` keeps the smoke driver in control of when each browser opens, so the same fresh `https://localhost:3100` load can be repeated across three browsers without auto-launching the OS default.
+
+**Expected log output** (key lines):
+
+- A `serving https://localhost:3100` (or similar) line confirming the bound port.
+- No WARN about `passkey RP ID does not match active profile` (a fresh `~/.wisphive/` has no `web_passkeys` rows for `scan_passkey_rp_id_drift` to scan; a WARN here means you skipped the backup step).
+- No error about `--auth-rp-id` (LocalLAN ignores it; if you accidentally passed `--auth-profile enterprise` the daemon would have failed fast with `MissingTlsFlags` before logging anything).
+
+**Expected files in `~/.wisphive/`** (auto-provisioned on first run):
+
+- `wisphive.sock` — Unix socket
+- `wisphive.pid` — daemon PID
+- `wisphive.db` — SQLite state (empty `web_devices` / `web_passkeys` tables)
+- `mode` — `active`
+- `web.cert.pem` — self-signed ECDSA P-256 leaf cert (397-day validity cap)
+- `web.key.pem` — private key, mode `0600`
+- `web.cert.meta.json` — SAN sidecar for drift detection
+
+There should be **no** `web.token` file — per-device bearer tokens live in browser `localStorage`, not on disk.
+
+### 2. First-run set-password flow
+
+For each browser, open `https://localhost:3100`.
+
+**TLS warning + accept-and-continue per browser:**
+
+- **Chrome / Brave**: "Your connection is not private" page → click "Advanced" → "Proceed to localhost (unsafe)". Or type `thisisunsafe` anywhere on the warning page (no input field; just type with the page focused). The page reloads through the warning.
+- **Firefox**: "Warning: Potential Security Risk Ahead" → "Advanced…" → "Accept the Risk and Continue".
+
+**Expected UI:**
+
+- Header: "wisphive" (`login-title`).
+- Subtitle: "Welcome. Set a password to finish setup."
+- Fields: New password, Confirm password, Device name (prefilled like `Mac (Chrome)` or `Windows (Firefox)` — `defaultDeviceName()` parses the UA).
+- Submit button: "Set password".
+- Below-form button: "I set it in a terminal — reload" (calls `refreshStatus`; not used in this smoke).
+
+**Password constraints surfaced:**
+
+- Backend enforces `MIN_PASSWORD_LEN = 8`; the frontend mirrors it. Try a 7-character password and confirm the inline error reads "Password must be at least 8 characters." with no round-trip to the server.
+- Mismatched confirm shows "Passwords do not match." (also client-side).
+
+**Success path** (use an 8+ char password + matching confirm):
+
+- Submit fires `POST /api/auth/set-password`.
+- The daemon mints a device row + bearer token, writes a `set_password_succeeded` audit row, and returns the bearer.
+- The frontend stashes the bearer under `wisphive-web-token` in `localStorage` and `useAuth` transitions phase. Because LocalLAN + `https://localhost:3100` resolves to RP ID `localhost` (`AuthPolicy::rp_id_for_origin` returns `Some("localhost")`), `canEnrollPasskeyOnThisOrigin === true`, and the transient `authed-pending-enroll` phase fires.
+
+### 3. Post-set-password enroll-passkey flow (itr#312 happy path)
+
+Driven by `phase === "authed-pending-enroll"` (the new `AuthPhase` from `b6662b2` that fixed the M1 race in the #312 review). On origins where `canEnrollPasskeyOnThisOrigin` is false, `useAuth` skips the transient phase entirely and goes straight to `authed` — so the card below MUST appear on `https://localhost:3100`. If it doesn't, M1 has regressed.
+
+**Expected UI:**
+
+- Header: "wisphive".
+- Subtitle: "Set up a passkey on this device?"
+- Body: "Passkeys let you sign in with Touch ID, Windows Hello, or a security key instead of typing your password."
+- Primary button: "Enroll passkey".
+- Secondary button: "Skip for now".
+
+**Click "Enroll passkey":**
+
+- Frontend calls `POST /api/auth/passkey/register/start`. Response is the flattened body `{ session_id, publicKey }` (#311 review note 1) — the hook strips `session_id` and passes `{ publicKey }` to `navigator.credentials.create()`.
+- **OS dialog fires:**
+  - macOS: Touch ID prompt ("Use your Touch ID to sign in to localhost?").
+  - Windows: Windows Hello prompt (PIN / face / fingerprint).
+  - USB security key: "Insert your security key and touch it."
+- On user verification: frontend calls `POST /api/auth/passkey/register/finish`, daemon inserts a `web_passkeys` row (with `rp_id = "localhost"`), `handleEnrollPasskey` calls `onCompleteEnrollGate()`, `useAuth` flips to `authed`, App.tsx unmounts Login, dashboard appears.
+
+**Verify:**
+
+- `~/.wisphive/wisphive.db` now has exactly one `web_passkeys` row whose `rp_id` column is `"localhost"`:
+  ```bash
+  sqlite3 ~/.wisphive/wisphive.db 'SELECT id, device_id, rp_id FROM web_passkeys;'
+  ```
+- Restart the daemon (`wisphive emergency-off && wisphive daemon start --web --no-open`) and confirm NO WARN log about `passkey RP ID does not match active profile`.
+
+### 4. Logout + login-with-passkey flow
+
+To exercise the login path with the credential just enrolled, either:
+
+- **Open an incognito window** to the same `https://localhost:3100` (preferred — keeps the original tab's `localStorage` intact for comparison), OR
+- **Clear `wisphive-web-token` from `localStorage`** (DevTools → Application → Local Storage → `https://localhost:3100`) and reload.
+
+You'll be back on the login form, this time on `phase === "unauthed"` (not `setup` — password is already set).
+
+**Expected UI:**
+
+- Header: "wisphive".
+- Subtitle: "Sign in to review pending decisions."
+- **NEW**: "Sign in with a passkey" button rendered **above** the password form, inside a `.login-passkey-cta` block, followed by a divider reading "or use your password". This affordance is gated on `showPasskeyAffordances = profile.loaded && profile.canEnrollPasskeyOnThisOrigin` — must be true on `https://localhost:3100`.
+- Below: the password form (Password, Device name, "Sign in" — Confirm password absent because `isSetup === false`).
+
+**Click "Sign in with a passkey":**
+
+- Frontend calls `POST /api/auth/passkey/login/start` (only on click — never on mount, per #311 review note 7).
+- OS dialog fires (Touch ID / Hello / security key), same authenticator as enrollment.
+- On UV success: frontend calls `/finish`, daemon returns `{ token, device_id, enrolling_device_id }` (`enrolling_device_id` is `Some(...)` on passkey login per #311 review note 2). Frontend stashes the new bearer; App.tsx re-renders authed.
+
+**Password form remains as fallback.** Typing the password and clicking "Sign in" must still work even with the passkey button present.
+
+### 5. Edge cases to exercise per browser
+
+Run each of these once per browser. Capture screenshots of any visible mismatch.
+
+#### 5.1 LAN-IP origin (must NOT show passkey affordances)
+
+Find your machine's LAN IP (`ipconfig getifaddr en0` on macOS, `ip route get 1` on Linux). Open `https://192.168.x.y:3100` in the same browser.
+
+- Accept the TLS warning (the cert SAN includes `localhost` only by default until itr#270; expect a name-mismatch warning on top of the self-signed warning).
+- On the login form: the "Sign in with a passkey" button MUST be absent. The post-set-password enroll card MUST be absent (you'd never reach it from an LAN-IP origin on a freshly-bootstrapped daemon, but if you're testing on a re-used daemon and the bearer is unset, only the password form should appear).
+- Why: `AuthPolicy::rp_id_for_origin` returns `None` for RFC1918 IPv4 origins under LocalLAN (`auth_profile.rs::loopback_rp_id_from_origin`), `/api/auth/profile` returns `can_enroll_passkey_on_this_origin: false`, `useAuthProfile` sets `canEnrollPasskeyOnThisOrigin = false`, `Login.tsx` hides both passkey UIs.
+- Password login must still work from the LAN-IP origin (subject to the Origin/Host allowlist letting the request through — it should under LocalLAN).
+
+#### 5.2 Throttle banner (shared bucket, password + passkey)
+
+The `LoginThrottle` (in `auth.rs`) is per-IP and shared between password and passkey paths (#311 review note 4). The backoff schedule starts immediately on the first failure (250ms → 30s ceiling), and a sustained run of failures past `login_throttle_threshold = 5` (LocalLAN) climbs the schedule.
+
+- Submit 5 wrong passwords in rapid succession (or mix in failed passkey attempts — same bucket).
+- Expect a 429 with a `Retry-After` header. The login form renders a red `.login-error-throttled` banner reading **"Too many attempts — try again in Ns."** with `N` counting down (driven by `useAuth`'s `retryAfter` and the `setInterval` in `Login.tsx`).
+- Wait out the countdown → form re-enables → next correct password succeeds.
+- Critical UX detail: the throttle copy must NOT mention "wrong password" specifically (passkey failures also feed it). The current copy is generic — verify it stays that way.
+
+#### 5.3 Skip enroll path
+
+On a fresh `~/.wisphive/`, complete the set-password flow but click "Skip for now" instead of "Enroll passkey".
+
+- `handleSkipEnroll` calls `onCompleteEnrollGate()`; phase flips to `authed`; dashboard appears.
+- No row added to `web_passkeys`.
+- Sanity: `sqlite3 ~/.wisphive/wisphive.db 'SELECT COUNT(*) FROM web_passkeys;'` returns `0`.
+- Logout and reload: the "Sign in with a passkey" button MUST be absent on the unauthed form, because there are no credentials enrolled. (This is currently a frontend gating decision — the button shows whenever the origin can host enroll; verify the behavior matches your build's `Login.tsx`.)
+
+#### 5.4 Re-enroll attempt (known UX gap)
+
+After enrolling a passkey, logout, and use the password form to log back in. Wisphive does not yet expose a logged-in "Manage passkeys" surface — that's itr#220. The current build has no in-flow re-enroll path, so this edge case is exercised indirectly:
+
+- Try to enroll the same authenticator a second time via DevTools (replay `POST /api/auth/passkey/register/start` + finish from the network panel) or wait for itr#220's UI.
+- Expected backend error: "this credential already exists for this user on this authenticator" or similar.
+- Current frontend surfaces this as `PasskeyError { kind: "unknown" }` (itr#322 S8: refine the `InvalidStateError` taxonomy). **Flag this in the smoke results as a UX gap; do NOT fail the smoke** — the error path is functionally correct, just unfriendly.
+
+### 6. Per-browser quirks
+
+- **Chrome / Brave** (Chromium): Touch ID (macOS), Windows Hello, USB key all work via the native `navigator.credentials` path. Brave behaves identically to Chrome here — no Shields exception needed for the localhost origin.
+- **Firefox**: Same authenticator coverage; resident-key-only by design on our backend (#311). Firefox's WebAuthn dialog wording differs from Chrome's ("Use a device") but the OS prompt that fires after is identical.
+- **Safari**: **EXPLICITLY OUT** for v1 per itr#283 epic. Do not run smoke against Safari, do not file Safari bugs from this smoke. itr#283 will revisit post-GA.
+
+### 7. Common failure modes & fixes
+
+- **TLS warning blocks the page entirely** (Chrome / Brave show a hard block on some flags):
+  - Accept-and-continue: "Advanced" → "Proceed". If the link is missing, focus the page and type `thisisunsafe`.
+  - Firefox: "Advanced…" → "Accept the Risk and Continue".
+  - If the cert is genuinely expired or corrupted, delete `web.cert.pem` / `web.key.pem` / `web.cert.meta.json` from `~/.wisphive/` and restart the daemon — `ensure_cert` will regenerate.
+- **"Sign in with a passkey" button missing** on `https://localhost:3100`:
+  - Open DevTools → Network → reload → inspect `GET /api/auth/profile`. If the body's `can_enroll_passkey_on_this_origin` is `false`, the origin doesn't match LocalLAN's loopback gate. Verify you're on `localhost` / `127.0.0.1` / `[::1]` and NOT an RFC1918 IP. The gate is set by `AuthPolicy::rp_id_for_origin` in `auth_profile.rs`.
+  - If `can_enroll_passkey_on_this_origin` is `true` but the button is still hidden, the frontend probe (`useAuthProfile`) may have errored. Check the console for a fetch error and verify the bearer is set (`localStorage.getItem('wisphive-web-token')`).
+- **Post-set-password enroll card never appears**:
+  - This is the M1 regression from #312 review. The fix promoted the gate from a `Login.tsx`-local `pendingEnroll` state into `useAuth`'s `authed-pending-enroll` phase. If the card is missing, `useAuth.setPhase("authed-pending-enroll")` is not firing on `setPassword` success — check `useAuth.ts` for a regression and re-read `crates/wisphive_web/frontend/src/components/Login.tsx` lines 120–128.
+- **Touch ID / Windows Hello not prompting** when "Enroll passkey" is clicked:
+  - macOS: System Settings → Touch ID & Password — confirm at least one fingerprint enrolled. Chrome/Brave/Firefox each need site permission to use the authenticator (System Settings → Privacy & Security → Accessibility / Input Monitoring).
+  - Windows: Settings → Accounts → Sign-in options → Windows Hello — confirm setup.
+  - USB key: re-seat the key. Some keys require touch (gold button) within a window; if you miss it, the dialog times out and surfaces as `PasskeyError { kind: "cancelled" }`.
+- **401 after enroll** (the credential round-trips fine but the next bearer-gated call rejects):
+  - This points at the device-row semantics gap tracked under itr#319. The new device row created during enroll has no passkeys of its own; passkey login returns `enrolling_device_id` pointing at the original device — UI surfaces that consume the bearer must not stale-cache `device_id` ↔ `passkey_id`.
+- **`POST /api/auth/passkey/login/start` fires on page-load** (devtools shows it before any click):
+  - Don't do this — it consumes a throttle slot and inserts a `ChallengeStore` row that reaps at 60s cadence (#311 review note 7). The current `usePasskey.loginWithPasskey` only fires on user click; if you see auto-fires, the hook has regressed.
+
+### 8. What to capture per run
+
+Per browser × per step, record: **browser + browser version + OS + pass/fail + screenshots of any failures or unexpected UI**. Suggested table to paste into the close-reason of #219:
+
+| Browser | Version | OS         | 2. set-pwd | 3. enroll | 4. login-pk | 5.1 LAN-IP | 5.2 throttle | 5.3 skip | Notes |
+|---------|---------|------------|------------|-----------|-------------|------------|--------------|----------|-------|
+| Chrome  |         |            |            |           |             |            |              |          |       |
+| Firefox |         |            |            |           |             |            |              |          |       |
+| Brave   |         |            |            |           |             |            |              |          |       |
+
+Use `pass` / `fail (link)` / `n/a (reason)` in cells. Attach screenshots in the linked issue notes; do not paste raw screenshots into the table.
+
+### 9. Closing #219 and #269
+
+Once the table is green across all three browsers:
+
+1. Paste the completed table into the close-reason for itr#219:
+   ```
+   LocalLAN browsers passed; Enterprise smoke deferred to itr#316 pending #270.
+   <table>
+   ```
+   `itr close 219 -m "<close-reason>"`
+2. Close itr#269 mechanically:
+   ```
+   itr close 269 -m "Closed mechanically — #312 + #315 fulfilled passkey onboarding acceptance."
+   ```
+3. Any new bug surfaced during the smoke that is not already filed (itr#319 / #320 / #321 / #322) MUST be filed as a fresh `itr` issue with the exact repro step from this procedure that produced it.
+
 ## Milestone sequencing
 
 Suggested PR cadence — each PR is reviewable on its own and delivers a closable itr:
