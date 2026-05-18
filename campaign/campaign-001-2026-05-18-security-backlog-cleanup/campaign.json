@@ -1,0 +1,37 @@
+{
+  "id": "campaign-001-2026-05-18-security-backlog-cleanup",
+  "slug": "security-backlog-cleanup",
+  "n": 1,
+  "goal": "Close the top security backlog items blocking LAN/mobile exposure with objective verification.",
+  "scope": {
+    "roadmap_rows": ["Security Prerequisites Before LAN Exposure"],
+    "intended_final_status": {
+      "Security Prerequisites Before LAN Exposure": "🟡"
+    },
+    "out_of_scope": [
+      "Mobile Pairing Critical Path except blockers",
+      "Open-Source Readiness except security reports",
+      "Candidate Next Workstreams"
+    ]
+  },
+  "window": {
+    "started_at": "2026-05-18T00:00:00Z",
+    "ended_at": "2026-05-18T02:18:22Z"
+  },
+  "verify_gate": "cargo fmt --all --check && cargo test --workspace && cargo clippy --workspace -- -D warnings && (cd crates/wisphive_web/frontend && npm test && npm run lint && npm run build && npm audit --omit=dev && npm audit)",
+  "work_cap_tokens": 200000,
+  "work_used_tokens": 78000,
+  "concurrency": 4,
+  "max_waves": null,
+  "totals": {
+    "verified": 7,
+    "blocked": 0,
+    "parked": 0,
+    "next_campaign": 1,
+    "quarantined": 0
+  },
+  "status": "complete",
+  "divergence_note": "Campaign goal follows the roadmap LAN-exposure security blocker section and adds critical dashboard XSS evidence because it is an adjacent authenticated-token compromise vector.",
+  "roadmap_path": "ROADMAP.md",
+  "tracker": "itr"
+}

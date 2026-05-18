@@ -4,6 +4,7 @@
 //! response status without standing up a real TCP listener.
 
 use std::net::{IpAddr, Ipv4Addr};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -87,6 +88,7 @@ async fn test_state() -> (tempfile::TempDir, AppState) {
             auth_policy: AuthProfile::LocalLAN.policy(),
             passkey_challenges: crate::passkey::ChallengeStore::new(),
             log_store: None,
+            revoke_limiter: crate::DeviceRevokeLimiter::default(),
         },
     )
 }
@@ -100,6 +102,10 @@ fn req(method: &str, uri: &str) -> axum::http::request::Builder {
         .uri(uri)
         .header("host", HOST);
     builder.extension(ClientIp(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))))
+}
+
+fn revoke_body(password: &str) -> Body {
+    Body::from(serde_json::json!({ "password": password }).to_string())
 }
 
 async fn run_with_response(
@@ -162,6 +168,71 @@ async fn api_config_accepts_valid_device_token_via_query() {
         .unwrap();
     let (status, _) = run_with(state, r).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn api_config_put_rejects_unknown_fields() {
+    let (_tmp, state) = test_state().await;
+    let (token, _id) = seed_device(state.security.state_db(), "laptop").await;
+    let r = req("PUT", "/api/config")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"auto_approve_level":"read","surprise":true}"#,
+        ))
+        .unwrap();
+
+    let (status, _) = run_with(state, r).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn api_config_put_rejects_oversized_body() {
+    let (_tmp, state) = test_state().await;
+    let (token, _id) = seed_device(state.security.state_db(), "laptop").await;
+    let large = "x".repeat(1024 * 1024 + 1);
+    let r = req("PUT", "/api/config")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "auto_approve_add": [large] }).to_string(),
+        ))
+        .unwrap();
+
+    let (status, _) = run_with(state, r).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn api_config_put_writes_0600_config_atomically() {
+    let (tmp, state) = test_state().await;
+    let (token, device_id) = seed_device(state.security.state_db(), "laptop").await;
+    let body = r#"{"auto_approve_level":"read","notifications":true}"#;
+    let r = req("PUT", "/api/config")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+
+    let (status, _) = run_with(state.clone(), r).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        std::fs::read_to_string(&state.config_path).unwrap(),
+        body,
+        "handler should persist the validated JSON body exactly"
+    );
+    let mode = std::fs::metadata(&state.config_path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
+
+    let audit = state.security.state_db().list_web_audit(10).await.unwrap();
+    assert_eq!(audit[0].event, "web_config_update");
+    assert_eq!(audit[0].device_id.as_deref(), Some(device_id.as_str()));
+    assert_eq!(audit[0].ip.as_deref(), Some("127.0.0.1"));
+    drop(tmp);
 }
 
 #[tokio::test]
@@ -286,6 +357,44 @@ async fn evil_origin_is_rejected_on_api() {
         .unwrap();
     let (status, _) = run_with(state, r).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn dev_cors_does_not_wildcard_evil_origin_preflight() {
+    let (_tmp, state) = test_state().await;
+    let r = req("OPTIONS", "/api/config")
+        .header("origin", "http://evil.com")
+        .header("access-control-request-method", "PUT")
+        .body(Body::empty())
+        .unwrap();
+
+    let app = build_router(state, true);
+    let res = app.oneshot(r).await.unwrap();
+    assert_ne!(
+        res.headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|h| h.to_str().ok()),
+        Some("*")
+    );
+}
+
+#[tokio::test]
+async fn dev_cors_allows_only_configured_vite_origins() {
+    let (_tmp, state) = test_state().await;
+    let r = req("OPTIONS", "/api/config")
+        .header("origin", "http://localhost:5173")
+        .header("access-control-request-method", "PUT")
+        .body(Body::empty())
+        .unwrap();
+
+    let app = build_router(state, true);
+    let res = app.oneshot(r).await.unwrap();
+    assert_eq!(
+        res.headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|h| h.to_str().ok()),
+        Some("http://localhost:5173")
+    );
 }
 
 #[tokio::test]
@@ -449,6 +558,7 @@ async fn login_when_no_password_set_returns_503_setup_required() {
         auth_policy: AuthProfile::LocalLAN.policy(),
         passkey_challenges: crate::passkey::ChallengeStore::new(),
         log_store: None,
+        revoke_limiter: crate::DeviceRevokeLimiter::default(),
     };
 
     let body = serde_json::json!({ "password": "anything" });
@@ -683,6 +793,7 @@ async fn auth_status_reports_setup_required_on_fresh_host() {
         auth_policy: AuthProfile::LocalLAN.policy(),
         passkey_challenges: crate::passkey::ChallengeStore::new(),
         log_store: None,
+        revoke_limiter: crate::DeviceRevokeLimiter::default(),
     };
     let r = req("GET", "/api/auth/status").body(Body::empty()).unwrap();
     let (status, body) = run_with(state, r).await;
@@ -723,6 +834,7 @@ async fn setup_required_blocks_protected_api_routes_with_503() {
         auth_policy: AuthProfile::LocalLAN.policy(),
         passkey_challenges: crate::passkey::ChallengeStore::new(),
         log_store: None,
+        revoke_limiter: crate::DeviceRevokeLimiter::default(),
     };
 
     // Token-gated endpoint — the setup gate must fire *before* the token
@@ -767,6 +879,7 @@ async fn setup_required_lets_auth_status_through() {
         auth_policy: AuthProfile::LocalLAN.policy(),
         passkey_challenges: crate::passkey::ChallengeStore::new(),
         log_store: None,
+        revoke_limiter: crate::DeviceRevokeLimiter::default(),
     };
     let r = req("GET", "/api/auth/status").body(Body::empty()).unwrap();
     let (status, _) = run_with(state, r).await;
@@ -822,6 +935,7 @@ async fn auth_profile_local_lan_lan_ip_origin_cannot_enroll() {
         auth_policy: AuthProfile::LocalLAN.policy(),
         passkey_challenges: crate::passkey::ChallengeStore::new(),
         log_store: None,
+        revoke_limiter: crate::DeviceRevokeLimiter::default(),
     };
     let r = Request::builder()
         .method("GET")
@@ -859,6 +973,7 @@ async fn auth_profile_local_lan_ip_literal_loopback_cannot_enroll() {
         auth_policy: AuthProfile::LocalLAN.policy(),
         passkey_challenges: crate::passkey::ChallengeStore::new(),
         log_store: None,
+        revoke_limiter: crate::DeviceRevokeLimiter::default(),
     };
     let r = Request::builder()
         .method("GET")
@@ -906,6 +1021,7 @@ async fn auth_profile_reachable_in_setup_required_mode() {
         auth_policy: AuthProfile::LocalLAN.policy(),
         passkey_challenges: crate::passkey::ChallengeStore::new(),
         log_store: None,
+        revoke_limiter: crate::DeviceRevokeLimiter::default(),
     };
     let r = req("GET", "/api/auth/profile")
         .header("origin", ORIGIN)
@@ -936,6 +1052,7 @@ async fn auth_profile_enterprise_always_can_enroll() {
         auth_policy: policy,
         passkey_challenges: crate::passkey::ChallengeStore::new(),
         log_store: None,
+        revoke_limiter: crate::DeviceRevokeLimiter::default(),
     };
     let r = req("GET", "/api/auth/profile")
         .header("origin", ORIGIN)
@@ -1027,6 +1144,7 @@ async fn auth_profile_host_fallback_respects_lan_ip_under_local_lan() {
         auth_policy: AuthProfile::LocalLAN.policy(),
         passkey_challenges: crate::passkey::ChallengeStore::new(),
         log_store: None,
+        revoke_limiter: crate::DeviceRevokeLimiter::default(),
     };
     let r = Request::builder()
         .method("GET")
@@ -1077,6 +1195,7 @@ async fn loopback_ipv4_redirects_to_localhost_on_root() {
         auth_policy: AuthProfile::LocalLAN.policy(),
         passkey_challenges: crate::passkey::ChallengeStore::new(),
         log_store: None,
+        revoke_limiter: crate::DeviceRevokeLimiter::default(),
     };
     let r = Request::builder()
         .method("GET")
@@ -1110,6 +1229,7 @@ async fn loopback_ipv4_redirect_preserves_path_and_query() {
         auth_policy: AuthProfile::LocalLAN.policy(),
         passkey_challenges: crate::passkey::ChallengeStore::new(),
         log_store: None,
+        revoke_limiter: crate::DeviceRevokeLimiter::default(),
     };
     let r = Request::builder()
         .method("GET")
@@ -1146,6 +1266,7 @@ async fn loopback_ipv6_redirects_to_localhost() {
         auth_policy: AuthProfile::LocalLAN.policy(),
         passkey_challenges: crate::passkey::ChallengeStore::new(),
         log_store: None,
+        revoke_limiter: crate::DeviceRevokeLimiter::default(),
     };
     let r = Request::builder()
         .method("GET")
@@ -1182,6 +1303,7 @@ async fn loopback_ip_redirect_skips_api_paths() {
         auth_policy: AuthProfile::LocalLAN.policy(),
         passkey_challenges: crate::passkey::ChallengeStore::new(),
         log_store: None,
+        revoke_limiter: crate::DeviceRevokeLimiter::default(),
     };
     let r = Request::builder()
         .method("GET")
@@ -1319,8 +1441,9 @@ async fn devices_revoke_other_device() {
 
     // Actor revokes the victim.
     let r = req("POST", &format!("/api/devices/{victim_id}/revoke"))
+        .header("content-type", "application/json")
         .header("authorization", format!("Bearer {actor_token}"))
-        .body(Body::empty())
+        .body(revoke_body(PASSWORD))
         .unwrap();
     let (status, _) = run_with(state.clone(), r).await;
     assert_eq!(status, StatusCode::OK);
@@ -1343,6 +1466,81 @@ async fn devices_revoke_other_device() {
     assert_eq!(s3, StatusCode::OK);
 }
 
+#[tokio::test]
+async fn devices_revoke_rejects_wrong_password_without_revoking() {
+    let (_tmp, state) = test_state().await;
+    let (actor_token, _) = seed_device(state.security.state_db(), "laptop").await;
+    let (victim_token, victim_id) = seed_device(state.security.state_db(), "phone").await;
+
+    let r = req("POST", &format!("/api/devices/{victim_id}/revoke"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {actor_token}"))
+        .body(revoke_body("wrong-password"))
+        .unwrap();
+    let (status, _) = run_with(state.clone(), r).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let r2 = req("GET", "/api/config")
+        .header("authorization", format!("Bearer {victim_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let (s2, _) = run_with(state, r2).await;
+    assert_eq!(s2, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn devices_revoke_rate_limits_burst_revokes() {
+    let (_tmp, state) = test_state().await;
+    let (actor_token, _) = seed_device(state.security.state_db(), "laptop").await;
+    let (_, victim_one) = seed_device(state.security.state_db(), "phone-1").await;
+    let (_, victim_two) = seed_device(state.security.state_db(), "phone-2").await;
+
+    let r1 = req("POST", &format!("/api/devices/{victim_one}/revoke"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {actor_token}"))
+        .body(revoke_body(PASSWORD))
+        .unwrap();
+    let (s1, _) = run_with(state.clone(), r1).await;
+    assert_eq!(s1, StatusCode::OK);
+
+    let r2 = req("POST", &format!("/api/devices/{victim_two}/revoke"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {actor_token}"))
+        .body(revoke_body(PASSWORD))
+        .unwrap();
+    let app = build_router(state, false);
+    let res = app.oneshot(r2).await.unwrap();
+    assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        res.headers().get("retry-after").is_some(),
+        "rate-limited revoke should include Retry-After"
+    );
+}
+
+#[tokio::test]
+async fn devices_revoke_unknown_id_returns_404_without_audit() {
+    let (_tmp, state) = test_state().await;
+    let (actor_token, _) = seed_device(state.security.state_db(), "laptop").await;
+
+    let r = req("POST", "/api/devices/not-a-real-device/revoke")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {actor_token}"))
+        .body(revoke_body(PASSWORD))
+        .unwrap();
+    let (status, _) = run_with(state.clone(), r).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        state
+            .security
+            .state_db()
+            .list_web_audit(10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "unknown-id revoke should not write a web_audit row"
+    );
+}
+
 /// `/api/devices/{self.id}/revoke` is the symmetric partner to
 /// `/api/auth/logout`: same effect (the caller's token gets revoked,
 /// next request 401s), different UX surface (the devices-list "remove
@@ -1355,8 +1553,9 @@ async fn devices_revoke_self_ends_session() {
     let (token, device_id) = seed_device(state.security.state_db(), "mine").await;
 
     let r = req("POST", &format!("/api/devices/{device_id}/revoke"))
+        .header("content-type", "application/json")
         .header("authorization", format!("Bearer {token}"))
-        .body(Body::empty())
+        .body(revoke_body(PASSWORD))
         .unwrap();
     let (status, _) = run_with(state.clone(), r).await;
     assert_eq!(status, StatusCode::OK);
@@ -1379,8 +1578,9 @@ async fn devices_revoke_is_idempotent() {
 
     for _ in 0..2 {
         let r = req("POST", &format!("/api/devices/{victim_id}/revoke"))
+            .header("content-type", "application/json")
             .header("authorization", format!("Bearer {actor_token}"))
-            .body(Body::empty())
+            .body(revoke_body(PASSWORD))
             .unwrap();
         let (status, _) = run_with(state.clone(), r).await;
         assert_eq!(status, StatusCode::OK, "idempotent revoke must stay 200");
@@ -1427,6 +1627,7 @@ async fn test_state_no_password() -> (tempfile::TempDir, AppState) {
             auth_policy: AuthProfile::LocalLAN.policy(),
             passkey_challenges: crate::passkey::ChallengeStore::new(),
             log_store: None,
+            revoke_limiter: crate::DeviceRevokeLimiter::default(),
         },
     )
 }
@@ -1648,6 +1849,7 @@ async fn passkey_register_start_on_lan_ip_origin_returns_400() {
         auth_policy: AuthProfile::LocalLAN.policy(),
         passkey_challenges: crate::passkey::ChallengeStore::new(),
         log_store: None,
+        revoke_limiter: crate::DeviceRevokeLimiter::default(),
     };
     drop(state);
     let body = serde_json::json!({});
@@ -1805,6 +2007,7 @@ async fn passkey_login_start_on_lan_ip_returns_400() {
         auth_policy: AuthProfile::LocalLAN.policy(),
         passkey_challenges: crate::passkey::ChallengeStore::new(),
         log_store: None,
+        revoke_limiter: crate::DeviceRevokeLimiter::default(),
     };
     let body = serde_json::json!({});
     let r = req("POST", "/api/auth/passkey/login/start")
@@ -1897,6 +2100,7 @@ async fn passkey_register_under_enterprise_with_sudo_required_returns_403() {
         auth_policy: policy,
         passkey_challenges: crate::passkey::ChallengeStore::new(),
         log_store: None,
+        revoke_limiter: crate::DeviceRevokeLimiter::default(),
     };
     let r = Request::builder()
         .method("POST")

@@ -1,0 +1,169 @@
+{
+  "evidence": [
+    {
+      "id": "e-79",
+      "item_id": "Q-79",
+      "kind": "test",
+      "label": "Web API: dev CORS origin allowlist",
+      "command": "cargo test -p wisphive_web",
+      "result": "pass",
+      "artifact_path": null,
+      "artifact_inline": "147 wisphive_web tests passed, including dev_cors_does_not_wildcard_evil_origin_preflight and dev_cors_allows_only_configured_vite_origins.",
+      "captured_at": "2026-05-18T02:18:22Z"
+    },
+    {
+      "id": "e-80",
+      "item_id": "Q-80",
+      "kind": "test",
+      "label": "Hook fail-closed unit coverage",
+      "command": "cargo test -p wisphive_hook",
+      "result": "pass",
+      "artifact_path": null,
+      "artifact_inline": "13 wisphive_hook tests passed, covering fail-mode parsing/defaults, active-mode failure denial, open-mode runtime approval, and limited stdin over-limit denial.",
+      "captured_at": "2026-05-18T02:18:22Z"
+    },
+    {
+      "id": "e-hook-smoke",
+      "item_id": "Q-80",
+      "kind": "log",
+      "label": "Hook smoke matrix",
+      "command": "cargo build -p wisphive_hook plus active/inactive fail-mode smoke invocations",
+      "result": "pass",
+      "artifact_path": null,
+      "artifact_inline": "Worker smoke verified active+closed no-daemon Codex PreToolUse and PermissionRequest deny JSON, active+missing fail-mode parse error deny, and inactive parse error approve.",
+      "captured_at": "2026-05-18T02:18:22Z"
+    },
+    {
+      "id": "e-103",
+      "item_id": "Q-103",
+      "kind": "test",
+      "label": "Frontend markdown XSS regression tests",
+      "command": "cd crates/wisphive_web/frontend && npm test -- MarkdownText",
+      "result": "pass",
+      "artifact_path": null,
+      "artifact_inline": "MarkdownText Vitest suite passed: script tags, img onerror, closing-tag injection, javascript: links, and allowed https links are covered.",
+      "captured_at": "2026-05-18T02:18:22Z"
+    },
+    {
+      "id": "e-no-dangerous-html",
+      "item_id": "Q-103",
+      "kind": "log",
+      "label": "No frontend dangerouslySetInnerHTML usage",
+      "command": "rg -n \"dangerouslySetInnerHTML\" crates/wisphive_web/frontend/src",
+      "result": "pass",
+      "artifact_path": null,
+      "artifact_inline": "ripgrep returned no matches in frontend/src.",
+      "captured_at": "2026-05-18T02:18:22Z"
+    },
+    {
+      "id": "e-frontend-build",
+      "item_id": "Q-103",
+      "kind": "test",
+      "label": "Frontend lint, tests, and production build",
+      "command": "cd crates/wisphive_web/frontend && npm test && npm run lint && npm run build",
+      "result": "pass",
+      "artifact_path": null,
+      "artifact_inline": "Vitest, ESLint, and Vite production build passed. Vite emitted the existing large-chunk warning, not a failure.",
+      "captured_at": "2026-05-18T02:18:22Z"
+    },
+    {
+      "id": "e-npm-audit",
+      "item_id": "Q-103",
+      "kind": "test",
+      "label": "Frontend dependency audit",
+      "command": "cd crates/wisphive_web/frontend && npm audit --omit=dev && npm audit",
+      "result": "pass",
+      "artifact_path": null,
+      "artifact_inline": "Both production-only and full npm audit returned 0 vulnerabilities.",
+      "captured_at": "2026-05-18T02:18:22Z"
+    },
+    {
+      "id": "e-257",
+      "item_id": "Q-257",
+      "kind": "test",
+      "label": "Web device revoke re-proof and rate limit",
+      "command": "cargo test -p wisphive_web",
+      "result": "pass",
+      "artifact_path": null,
+      "artifact_inline": "147 wisphive_web tests passed, including wrong-password no-revoke, burst revoke 429 with Retry-After, self revoke, other-device revoke, and revoke idempotency.",
+      "captured_at": "2026-05-18T02:18:22Z"
+    },
+    {
+      "id": "e-87",
+      "item_id": "Q-87",
+      "kind": "test",
+      "label": "Web config schema, body limit, atomic write, audit",
+      "command": "cargo test -p wisphive_web",
+      "result": "pass",
+      "artifact_path": null,
+      "artifact_inline": "147 wisphive_web tests passed, including unknown-field rejection, oversized-body 413, 0600 atomic write, and web_config_update audit row.",
+      "captured_at": "2026-05-18T02:18:22Z"
+    },
+    {
+      "id": "e-100",
+      "item_id": "Q-100",
+      "kind": "test",
+      "label": "Config read requires bearer token",
+      "command": "cargo test -p wisphive_web",
+      "result": "pass",
+      "artifact_path": null,
+      "artifact_inline": "api_config_rejects_missing_bearer passed as part of the 147-test wisphive_web suite.",
+      "captured_at": "2026-05-18T02:18:22Z"
+    },
+    {
+      "id": "e-260",
+      "item_id": "Q-260",
+      "kind": "test",
+      "label": "Unknown device revoke returns 404 without audit",
+      "command": "cargo test -p wisphive_web",
+      "result": "pass",
+      "artifact_path": null,
+      "artifact_inline": "147 wisphive_web tests passed, including unknown-id revoke 404 without web_audit and already-revoked idempotent 200.",
+      "captured_at": "2026-05-18T02:18:22Z"
+    },
+    {
+      "id": "e-workspace",
+      "item_id": "campaign",
+      "kind": "test",
+      "label": "Rust workspace test gate",
+      "command": "cargo test --workspace",
+      "result": "pass",
+      "artifact_path": null,
+      "artifact_inline": "All workspace unit, integration, and doc tests passed after the final repair patch.",
+      "captured_at": "2026-05-18T02:18:22Z"
+    },
+    {
+      "id": "e-clippy",
+      "item_id": "campaign",
+      "kind": "test",
+      "label": "Rust lint gate",
+      "command": "cargo clippy --workspace -- -D warnings",
+      "result": "pass",
+      "artifact_path": null,
+      "artifact_inline": "Workspace clippy completed with -D warnings and no diagnostics.",
+      "captured_at": "2026-05-18T02:18:22Z"
+    },
+    {
+      "id": "e-fmt",
+      "item_id": "campaign",
+      "kind": "test",
+      "label": "Rust formatting gate",
+      "command": "cargo fmt --all --check",
+      "result": "pass",
+      "artifact_path": null,
+      "artifact_inline": "Formatting check completed with no changes required.",
+      "captured_at": "2026-05-18T02:18:22Z"
+    },
+    {
+      "id": "e-cargo-deny",
+      "item_id": "Q-DENY",
+      "kind": "log",
+      "label": "Rust dependency audit residual",
+      "command": "cargo deny check advisories bans sources",
+      "result": "fail",
+      "artifact_path": null,
+      "artifact_inline": "advisories FAILED while bans and sources were ok. Remaining unmaintained advisories: instant RUSTSEC-2024-0384 via notify, paste RUSTSEC-2024-0436 via ratatui, rustls-pemfile RUSTSEC-2025-0134 via axum-server/direct web dependency, serial RUSTSEC-2017-0008 via portable-pty.",
+      "captured_at": "2026-05-18T02:18:22Z"
+    }
+  ]
+}

@@ -1,0 +1,92 @@
+{
+  "waves": [
+    {
+      "n": 1,
+      "started_at": "2026-05-18T00:20:00Z",
+      "ended_at": "2026-05-18T01:25:00Z",
+      "bundles_run": 2,
+      "items": ["Q-80", "Q-103"],
+      "verify_result": "green",
+      "retries": 0,
+      "quarantines": [],
+      "tokens_used": 36000,
+      "notes": "Parallel workers handled the high-risk hook fail-closed change and frontend markdown/CSP proof. Targeted hook and frontend checks passed before integration."
+    },
+    {
+      "n": 2,
+      "started_at": "2026-05-18T01:25:00Z",
+      "ended_at": "2026-05-18T02:18:22Z",
+      "bundles_run": 1,
+      "items": ["Q-79", "Q-87", "Q-100", "Q-257", "Q-260"],
+      "verify_result": "green-code-red-dependency-audit",
+      "retries": 1,
+      "quarantines": [],
+      "tokens_used": 42000,
+      "notes": "Web endpoint bundle landed with CORS allowlist, config validation/atomic write/audit, and device revoke re-proof/rate-limit/404 semantics. One repair pass added config audit logging and tightened the body cap."
+    }
+  ],
+  "signals": {
+    "total_waves": 2,
+    "retries": 1,
+    "quarantines": 0,
+    "verify_failures": 1,
+    "scout_tickets_accepted": 4,
+    "scout_tickets_parked": 0,
+    "scout_tickets_next_campaign": 1
+  },
+  "retro": {
+    "what_slowed": [
+      "The Rust dependency audit is already red on unmaintained transitive crates outside the edited endpoint, hook, and frontend files.",
+      "Device revoke hardening overlapped three backlog items, so the web endpoint bundle needed one integrated pass instead of independent workers."
+    ],
+    "process_fixes": [
+      "Keep dependency-audit remediation as a dedicated next campaign; it needs dependency and policy decisions, not endpoint-local patches.",
+      "When a security ticket mentions audit logging in fix text but not acceptance, include it in the first pass."
+    ],
+    "followups": ["Q-DENY", "itr#330"]
+  },
+  "smoke_test": {
+    "how_to_run": [
+      "cargo test --workspace",
+      "cargo clippy --workspace -- -D warnings",
+      "cd crates/wisphive_web/frontend && npm test && npm run lint && npm run build",
+      "cargo deny check advisories bans sources"
+    ],
+    "items": [
+      {
+        "id": "S-1",
+        "label": "From a logged-in web session, save the config panel and confirm the config persists; try a non-Vite Origin preflight and confirm no wildcard CORS.",
+        "evidence_refs": ["e-79", "e-87"]
+      },
+      {
+        "id": "S-2",
+        "label": "Use a bearer token to revoke a peer device: wrong password should 401, first valid revoke should 200, immediate second active revoke should 429.",
+        "evidence_refs": ["e-257", "e-260"]
+      },
+      {
+        "id": "S-3",
+        "label": "Render hostile markdown-like agent output and confirm script/img/javascript payloads appear inert while normal https links still work.",
+        "evidence_refs": ["e-103", "e-no-dangerous-html"]
+      }
+    ]
+  },
+  "roadmap_update": {
+    "rows": [
+      {
+        "row": "Security Prerequisites Before LAN Exposure",
+        "proposed_status": "🟡",
+        "evidence_refs": [
+          "e-79",
+          "e-80",
+          "e-103",
+          "e-257",
+          "e-87",
+          "e-100",
+          "e-260",
+          "e-cargo-deny"
+        ],
+        "notes": "Seven endpoint/hook/frontend security backlog items are agent-verified by tests, lint, frontend audit, and workspace gates. Keep the row yellow because cargo-deny advisories remain and mobile/LAN exposure has additional out-of-scope blockers."
+      }
+    ]
+  }
+}

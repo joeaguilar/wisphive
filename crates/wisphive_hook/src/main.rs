@@ -1,6 +1,7 @@
+use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Duration;
 
@@ -10,6 +11,7 @@ use wisphive_protocol::{
 };
 
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_STDIN_BYTES: usize = 8 * 1024 * 1024;
 
 /// Tools that are always safe to auto-approve (read-only + orchestration).
 /// Fallback when no config.json exists. Matches the Read tier.
@@ -52,6 +54,122 @@ struct HookResponse {
     event_type: HookEventType,
     /// Agent implementation that invoked this hook.
     agent_type: AgentType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailMode {
+    Open,
+    Closed,
+}
+
+impl FailMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "open" => Some(Self::Open),
+            "closed" => Some(Self::Closed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookFailureKind {
+    Runtime,
+    InputTooLarge,
+}
+
+#[derive(Debug, Clone)]
+struct HookFailure {
+    kind: HookFailureKind,
+    message: String,
+    event_type: HookEventType,
+    agent_type: AgentType,
+}
+
+impl HookFailure {
+    fn before_parse(message: impl Into<String>) -> Self {
+        Self {
+            kind: HookFailureKind::Runtime,
+            message: message.into(),
+            event_type: HookEventType::PreToolUse,
+            agent_type: detect_agent_type(&serde_json::Value::Null),
+        }
+    }
+
+    fn input_too_large(max_bytes: usize) -> Self {
+        Self {
+            kind: HookFailureKind::InputTooLarge,
+            message: format!(
+                "Wisphive denied this hook because stdin exceeded the {} limit.",
+                format_byte_limit(max_bytes)
+            ),
+            event_type: HookEventType::PreToolUse,
+            agent_type: detect_agent_type(&serde_json::Value::Null),
+        }
+    }
+
+    fn with_context(
+        context: impl AsRef<str>,
+        error: impl fmt::Display,
+        event_type: HookEventType,
+        agent_type: &AgentType,
+    ) -> Self {
+        Self::message(
+            format!("{}: {error}", context.as_ref()),
+            event_type,
+            agent_type,
+        )
+    }
+
+    fn message(
+        message: impl Into<String>,
+        event_type: HookEventType,
+        agent_type: &AgentType,
+    ) -> Self {
+        Self {
+            kind: HookFailureKind::Runtime,
+            message: message.into(),
+            event_type,
+            agent_type: agent_type.clone(),
+        }
+    }
+
+    fn deny_response(&self) -> HookResponse {
+        let mut response =
+            HookResponse::new(Decision::Deny, self.event_type, self.agent_type.clone());
+        response.message = Some(self.message.clone());
+        response
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReadInputError {
+    TooLarge { max_bytes: usize },
+    Io(String),
+    InvalidUtf8(String),
+}
+
+impl fmt::Display for ReadInputError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooLarge { max_bytes } => write!(
+                f,
+                "hook input exceeded the {} limit",
+                format_byte_limit(*max_bytes)
+            ),
+            Self::Io(message) => write!(f, "{message}"),
+            Self::InvalidUtf8(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+fn format_byte_limit(max_bytes: usize) -> String {
+    const MIB: usize = 1024 * 1024;
+    if max_bytes >= MIB && max_bytes.is_multiple_of(MIB) {
+        format!("{} MiB", max_bytes / MIB)
+    } else {
+        format!("{max_bytes} bytes")
+    }
 }
 
 impl HookResponse {
@@ -114,12 +232,51 @@ fn agent_project_env(agent_type: &AgentType) -> Option<&'static str> {
 }
 
 fn main() {
-    // Any failure = exit 0 (allow). Wisphive is fail-open.
-    let code = match run() {
-        Ok(resp) => format_and_exit(&resp),
-        Err(_) => 0,
-    };
+    let code = format_and_exit(&run());
     process::exit(code);
+}
+
+fn mode_is_active(contents: Option<&str>) -> bool {
+    contents.is_some_and(|mode| mode.trim() == "active")
+}
+
+fn is_active(wisphive_dir: &Path) -> bool {
+    let mode_path = wisphive_dir.join("mode");
+    mode_is_active(std::fs::read_to_string(&mode_path).ok().as_deref())
+}
+
+fn fail_mode_from_contents(contents: Option<&str>) -> FailMode {
+    contents
+        .and_then(FailMode::parse)
+        .unwrap_or(FailMode::Closed)
+}
+
+fn read_fail_mode(wisphive_dir: &Path) -> FailMode {
+    let fail_mode_path = wisphive_dir.join("fail-mode");
+    fail_mode_from_contents(std::fs::read_to_string(&fail_mode_path).ok().as_deref())
+}
+
+fn response_for_failure(failure: &HookFailure, fail_mode: FailMode) -> HookResponse {
+    if fail_mode == FailMode::Closed || failure.kind == HookFailureKind::InputTooLarge {
+        failure.deny_response()
+    } else {
+        HookResponse::simple(Decision::Approve)
+    }
+}
+
+fn read_limited_to_string<R: Read>(reader: R, max_bytes: usize) -> Result<String, ReadInputError> {
+    let limit = max_bytes.saturating_add(1) as u64;
+    let mut bytes = Vec::with_capacity(max_bytes.min(8192));
+    let mut limited_reader = reader.take(limit);
+    limited_reader
+        .read_to_end(&mut bytes)
+        .map_err(|err| ReadInputError::Io(err.to_string()))?;
+
+    if bytes.len() > max_bytes {
+        return Err(ReadInputError::TooLarge { max_bytes });
+    }
+
+    String::from_utf8(bytes).map_err(|err| ReadInputError::InvalidUtf8(err.to_string()))
 }
 
 /// Format the hook response as agent-specific JSON stdout and return exit code.
@@ -389,22 +546,32 @@ fn format_task_completed_response(resp: &HookResponse) -> i32 {
     }
 }
 
-fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
+fn run() -> HookResponse {
     let home = home_dir();
     let wisphive_dir = home.join(".wisphive");
 
-    // Layer 1: Mode file check
-    let mode_path = wisphive_dir.join("mode");
-    let mode = std::fs::read_to_string(&mode_path).unwrap_or_else(|_| "off".into());
-    if mode.trim() != "active" {
-        return Ok(HookResponse::simple(Decision::Approve));
+    if !is_active(&wisphive_dir) {
+        return HookResponse::simple(Decision::Approve);
     }
 
-    // Layer 2: Read agent hook data from stdin
-    let mut input = String::new();
-    std::io::stdin().read_to_string(&mut input)?;
+    let fail_mode = read_fail_mode(&wisphive_dir);
+    match run_active(&wisphive_dir) {
+        Ok(response) => response,
+        Err(failure) => response_for_failure(&failure, fail_mode),
+    }
+}
 
-    let hook_event: serde_json::Value = serde_json::from_str(&input)?;
+fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
+    // Layer 2: Read agent hook data from stdin
+    let input = read_limited_to_string(std::io::stdin().lock(), MAX_STDIN_BYTES).map_err(
+        |err| match err {
+            ReadInputError::TooLarge { max_bytes } => HookFailure::input_too_large(max_bytes),
+            other => HookFailure::before_parse(format!("failed to read hook input: {other}")),
+        },
+    )?;
+
+    let hook_event: serde_json::Value = serde_json::from_str(&input)
+        .map_err(|err| HookFailure::before_parse(format!("failed to parse hook input: {err}")))?;
 
     // Determine event type from hook_event_name (early — needed for dispatch)
     let event_type: HookEventType = hook_event
@@ -418,7 +585,14 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
 
     // PostToolUse detection: fire-and-forget result to daemon
     if event_type == HookEventType::PostToolUse || hook_event.get("tool_response").is_some() {
-        handle_post_tool_use(&hook_event, &wisphive_dir, agent_type.clone())?;
+        handle_post_tool_use(&hook_event, wisphive_dir, agent_type.clone()).map_err(|err| {
+            HookFailure::with_context(
+                "failed to send PostToolUse result to Wisphive daemon",
+                err,
+                event_type,
+                &agent_type,
+            )
+        })?;
         return Ok(HookResponse::new(Decision::Approve, event_type, agent_type));
     }
 
@@ -461,10 +635,10 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
         .map(|s| s.to_string());
 
     // Layer 3: Register agent with daemon (once per session, fire-and-forget)
-    register_agent_once(&agent_id, agent_type.clone(), &project, &wisphive_dir);
+    register_agent_once(&agent_id, agent_type.clone(), &project, wisphive_dir);
 
     // Auto-approve certain event types based on config (with sensible defaults)
-    if is_event_auto_approved(event_type, &wisphive_dir) {
+    if is_event_auto_approved(event_type, wisphive_dir) {
         // For events with null tool_input, log event_data instead so the context is preserved
         let log_input = if tool_input.is_null() {
             extract_event_data(event_type, &hook_event).unwrap_or(tool_input.clone())
@@ -472,7 +646,7 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
             tool_input.clone()
         };
         log_auto_approved(
-            &wisphive_dir,
+            wisphive_dir,
             AutoApprovedLog {
                 tool_use_id: &tool_use_id,
                 agent_id: &agent_id,
@@ -487,9 +661,9 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
     }
 
     // Layer 4: Auto-approve check — PermissionRequests always go to daemon
-    if !is_permission_request && is_auto_approved(&tool_name, &tool_input, &wisphive_dir) {
+    if !is_permission_request && is_auto_approved(&tool_name, &tool_input, wisphive_dir) {
         log_auto_approved(
-            &wisphive_dir,
+            wisphive_dir,
             AutoApprovedLog {
                 tool_use_id: &tool_use_id,
                 agent_id: &agent_id,
@@ -553,35 +727,134 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
 
     // Layer 4: Connect to daemon socket (fails instantly if daemon is dead)
     let socket_path = wisphive_dir.join("wisphive.sock");
-    let stream = UnixStream::connect(&socket_path)?;
-    stream.set_read_timeout(Some(SOCKET_TIMEOUT))?;
-    stream.set_write_timeout(Some(SOCKET_TIMEOUT))?;
+    let stream = UnixStream::connect(&socket_path).map_err(|err| {
+        HookFailure::with_context(
+            "failed to connect to Wisphive daemon",
+            err,
+            event_type,
+            &agent_type,
+        )
+    })?;
+    stream
+        .set_read_timeout(Some(SOCKET_TIMEOUT))
+        .map_err(|err| {
+            HookFailure::with_context(
+                "failed to configure daemon read timeout",
+                err,
+                event_type,
+                &agent_type,
+            )
+        })?;
+    stream
+        .set_write_timeout(Some(SOCKET_TIMEOUT))
+        .map_err(|err| {
+            HookFailure::with_context(
+                "failed to configure daemon write timeout",
+                err,
+                event_type,
+                &agent_type,
+            )
+        })?;
 
-    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut reader = BufReader::new(stream.try_clone().map_err(|err| {
+        HookFailure::with_context(
+            "failed to clone daemon socket",
+            err,
+            event_type,
+            &agent_type,
+        )
+    })?);
     let mut writer = stream;
 
     // Handshake
     let hello = wisphive_protocol::encode(&ClientMessage::Hello {
         client: ClientType::Hook,
         version: PROTOCOL_VERSION,
+    })
+    .map_err(|err| {
+        HookFailure::with_context(
+            "failed to encode daemon hello",
+            err,
+            event_type,
+            &agent_type,
+        )
     })?;
-    writer.write_all(hello.as_bytes())?;
+    writer.write_all(hello.as_bytes()).map_err(|err| {
+        HookFailure::with_context("failed to write daemon hello", err, event_type, &agent_type)
+    })?;
 
     let mut welcome_line = String::new();
-    reader.read_line(&mut welcome_line)?;
-    let _welcome: ServerMessage = wisphive_protocol::decode(&welcome_line)?;
+    reader.read_line(&mut welcome_line).map_err(|err| {
+        HookFailure::with_context(
+            "failed to read daemon welcome",
+            err,
+            event_type,
+            &agent_type,
+        )
+    })?;
+    let welcome: ServerMessage = wisphive_protocol::decode(&welcome_line).map_err(|err| {
+        HookFailure::with_context(
+            "failed to parse daemon welcome",
+            err,
+            event_type,
+            &agent_type,
+        )
+    })?;
+    if !matches!(welcome, ServerMessage::Welcome { .. }) {
+        return Err(HookFailure::message(
+            "Wisphive daemon sent an unexpected welcome response",
+            event_type,
+            &agent_type,
+        ));
+    }
 
     // Send decision request
-    let req_msg = wisphive_protocol::encode(&ClientMessage::DecisionRequest(request))?;
-    writer.write_all(req_msg.as_bytes())?;
+    let req_msg =
+        wisphive_protocol::encode(&ClientMessage::DecisionRequest(request)).map_err(|err| {
+            HookFailure::with_context(
+                "failed to encode decision request",
+                err,
+                event_type,
+                &agent_type,
+            )
+        })?;
+    writer.write_all(req_msg.as_bytes()).map_err(|err| {
+        HookFailure::with_context(
+            "failed to write decision request",
+            err,
+            event_type,
+            &agent_type,
+        )
+    })?;
 
     // Block for response — daemon controls timeout (up to 1 hour).
-    writer.set_read_timeout(None)?;
+    writer.set_read_timeout(None).map_err(|err| {
+        HookFailure::with_context(
+            "failed to clear daemon read timeout",
+            err,
+            event_type,
+            &agent_type,
+        )
+    })?;
 
     let mut response_line = String::new();
-    reader.read_line(&mut response_line)?;
+    reader.read_line(&mut response_line).map_err(|err| {
+        HookFailure::with_context(
+            "failed to read daemon decision response",
+            err,
+            event_type,
+            &agent_type,
+        )
+    })?;
 
-    let response: ServerMessage = wisphive_protocol::decode(&response_line)?;
+    let response: ServerMessage = wisphive_protocol::decode(&response_line).map_err(|err| {
+        HookFailure::with_context(
+            "failed to parse daemon decision response",
+            err,
+            event_type,
+            &agent_type,
+        )
+    })?;
 
     match response {
         ServerMessage::DecisionResponse {
@@ -600,7 +873,16 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
             event_type,
             agent_type,
         }),
-        _ => Ok(HookResponse::new(Decision::Approve, event_type, agent_type)),
+        ServerMessage::Error { message } => Err(HookFailure::message(
+            format!("Wisphive daemon returned an error instead of a decision: {message}"),
+            event_type,
+            &agent_type,
+        )),
+        _ => Err(HookFailure::message(
+            "Wisphive daemon sent an unexpected response to a decision request",
+            event_type,
+            &agent_type,
+        )),
     }
 }
 
@@ -1033,6 +1315,96 @@ fn extract_plan_from_transcript(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn fail_mode_parses_valid_values() {
+        assert_eq!(fail_mode_from_contents(Some("open\n")), FailMode::Open);
+        assert_eq!(fail_mode_from_contents(Some("closed")), FailMode::Closed);
+    }
+
+    #[test]
+    fn fail_mode_defaults_to_closed_when_missing_or_invalid() {
+        assert_eq!(fail_mode_from_contents(None), FailMode::Closed);
+        assert_eq!(fail_mode_from_contents(Some("invalid")), FailMode::Closed);
+        assert_eq!(fail_mode_from_contents(Some("")), FailMode::Closed);
+    }
+
+    #[test]
+    fn missing_or_inactive_mode_is_not_active() {
+        assert!(!mode_is_active(None));
+        assert!(!mode_is_active(Some("off")));
+        assert!(mode_is_active(Some("active\n")));
+    }
+
+    #[test]
+    fn closed_fail_mode_turns_runtime_failure_into_deny() {
+        let failure = HookFailure::message(
+            "failed to connect to Wisphive daemon",
+            HookEventType::PermissionRequest,
+            &AgentType::Codex,
+        );
+
+        let response = response_for_failure(&failure, FailMode::Closed);
+
+        assert_eq!(response.decision, Decision::Deny);
+        assert_eq!(response.event_type, HookEventType::PermissionRequest);
+        assert_eq!(response.agent_type, AgentType::Codex);
+        let decision = permission_decision_object(&response).unwrap();
+        assert_eq!(decision.get("behavior"), Some(&json!("deny")));
+        assert_eq!(
+            decision.get("message"),
+            Some(&json!("failed to connect to Wisphive daemon"))
+        );
+    }
+
+    #[test]
+    fn open_fail_mode_preserves_runtime_failure_approval() {
+        let failure = HookFailure::message(
+            "failed to connect to Wisphive daemon",
+            HookEventType::PermissionRequest,
+            &AgentType::Codex,
+        );
+
+        let response = response_for_failure(&failure, FailMode::Open);
+
+        assert_eq!(response.decision, Decision::Approve);
+        assert_eq!(response.event_type, HookEventType::PreToolUse);
+    }
+
+    #[test]
+    fn oversized_input_denies_even_when_fail_mode_is_open() {
+        let failure = HookFailure::input_too_large(MAX_STDIN_BYTES);
+
+        let response = response_for_failure(&failure, FailMode::Open);
+
+        assert_eq!(response.decision, Decision::Deny);
+        assert_eq!(response.event_type, HookEventType::PreToolUse);
+        assert!(
+            response
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("8 MiB")
+        );
+    }
+
+    #[test]
+    fn limited_stdin_accepts_exact_limit() {
+        let input = "abcd";
+
+        let output = read_limited_to_string(Cursor::new(input), 4).unwrap();
+
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn limited_stdin_rejects_over_limit() {
+        let err = read_limited_to_string(Cursor::new("abcde"), 4).unwrap_err();
+
+        assert_eq!(err, ReadInputError::TooLarge { max_bytes: 4 });
+    }
+
     use serde_json::json;
 
     #[test]

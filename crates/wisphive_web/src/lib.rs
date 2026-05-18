@@ -6,20 +6,25 @@ mod security;
 pub mod tls;
 mod ws_bridge;
 
+use std::collections::HashMap;
+use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::WebSocketUpgrade;
 use axum::extract::ws::WebSocket;
+use axum::http::{HeaderValue, Method, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use base64::Engine;
 use rust_embed::RustEmbed;
 use security::{AuthedDevice, ClientIp, SecurityConfig, security_middleware};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use tracing::{Level, info};
 use wisphive_daemon::logging::{LogRecord, LogStore};
 use wisphive_daemon::state::StateDb;
@@ -41,6 +46,9 @@ pub use webauthn_rs::prelude::Url;
 ///
 /// [`STALE_IN_FLIGHT_AGE`]: auth::LoginThrottle
 const VERIFY_DEADLINE: Duration = Duration::from_secs(5);
+const CONFIG_BODY_LIMIT: usize = 64 * 1024;
+const DEVICE_REVOKE_MIN_INTERVAL: Duration = Duration::from_secs(10);
+const DEV_CORS_ORIGINS: &[&str] = &["http://localhost:5173", "http://127.0.0.1:5173"];
 
 /// Shared server state.
 #[derive(Clone)]
@@ -62,6 +70,30 @@ struct AppState {
     /// standalone `wisphive web serve` returns 503 for `/api/logs` until the
     /// follow-up daemon IPC log-subscribe path lands.
     log_store: Option<Arc<LogStore>>,
+    revoke_limiter: DeviceRevokeLimiter,
+}
+
+#[derive(Clone, Default)]
+struct DeviceRevokeLimiter {
+    inner: Arc<Mutex<HashMap<String, Instant>>>,
+}
+
+impl DeviceRevokeLimiter {
+    async fn check(&self, actor_device_id: &str) -> Result<(), Duration> {
+        let mut by_actor = self.inner.lock().await;
+        let now = Instant::now();
+        by_actor.retain(|_, last| now.duration_since(*last) < DEVICE_REVOKE_MIN_INTERVAL);
+
+        if let Some(last) = by_actor.get(actor_device_id) {
+            let elapsed = now.duration_since(*last);
+            if elapsed < DEVICE_REVOKE_MIN_INTERVAL {
+                return Err(DEVICE_REVOKE_MIN_INTERVAL - elapsed);
+            }
+        }
+
+        by_actor.insert(actor_device_id.to_string(), now);
+        Ok(())
+    }
 }
 
 /// Embedded frontend assets (built by Vite into frontend/dist/).
@@ -138,20 +170,135 @@ async fn get_config(axum::extract::State(state): axum::extract::State<AppState>)
 /// PUT /api/config — write config.json
 async fn put_config(
     axum::extract::State(state): axum::extract::State<AppState>,
+    client_ip: ClientIp,
+    axum::Extension(actor): axum::Extension<AuthedDevice>,
     body: String,
 ) -> Response {
-    // Validate JSON
-    if serde_json::from_str::<serde_json::Value>(&body).is_err() {
-        return (axum::http::StatusCode::BAD_REQUEST, "invalid JSON").into_response();
+    let parsed = match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(v) => v,
+        Err(_) => return (axum::http::StatusCode::BAD_REQUEST, "invalid JSON").into_response(),
+    };
+    if let Err(reason) = validate_config_json(&parsed) {
+        return (axum::http::StatusCode::BAD_REQUEST, reason).into_response();
     }
-    match std::fs::write(&state.config_path, &body) {
-        Ok(_) => (axum::http::StatusCode::OK, "saved").into_response(),
+    match write_config_atomic(&state.config_path, &body) {
+        Ok(_) => {
+            let _ = state
+                .security
+                .state_db()
+                .append_web_audit(
+                    "web_config_update",
+                    Some(&actor.id.0),
+                    Some(&client_ip.0.to_string()),
+                    None,
+                )
+                .await;
+            (axum::http::StatusCode::OK, "saved").into_response()
+        }
         Err(e) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             format!("write failed: {e}"),
         )
             .into_response(),
     }
+}
+
+fn validate_config_json(value: &serde_json::Value) -> Result<(), &'static str> {
+    let Some(obj) = value.as_object() else {
+        return Err("config must be a JSON object");
+    };
+
+    for (key, value) in obj {
+        match key.as_str() {
+            "notifications"
+            | "auto_approve_stop"
+            | "auto_approve_user_prompt"
+            | "auto_approve_config_change" => {
+                if !value.is_boolean() {
+                    return Err("boolean config value must be true or false");
+                }
+            }
+            "hook_timeout_secs"
+            | "agent_timeout_secs"
+            | "retention_max_rows"
+            | "retention_max_age_days"
+            | "log_retention_days" => {
+                if value.as_u64().is_none() {
+                    return Err("numeric config value must be an unsigned integer");
+                }
+            }
+            "auto_approve_level" => {
+                let Some(level) = value.as_str() else {
+                    return Err("auto_approve_level must be a string");
+                };
+                if level
+                    .parse::<wisphive_protocol::AutoApproveLevel>()
+                    .is_err()
+                {
+                    return Err("auto_approve_level is invalid");
+                }
+            }
+            "auto_approve_add" | "auto_approve_remove" | "auto_approve" => {
+                let Some(items) = value.as_array() else {
+                    return Err("auto-approve tool lists must be arrays");
+                };
+                if !items.iter().all(|item| item.as_str().is_some()) {
+                    return Err("auto-approve tool lists must contain only strings");
+                }
+            }
+            "tool_rules" => {
+                if serde_json::from_value::<HashMap<String, wisphive_protocol::ToolRule>>(
+                    value.clone(),
+                )
+                .is_err()
+                {
+                    return Err("tool_rules schema is invalid");
+                }
+            }
+            _ => return Err("unknown config field"),
+        }
+    }
+
+    Ok(())
+}
+
+fn write_config_atomic(path: &std::path::Path, body: &str) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.json");
+    let tmp_path = parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
+}
+
+fn dev_cors_layer() -> tower_http::cors::CorsLayer {
+    let origins = DEV_CORS_ORIGINS
+        .iter()
+        .map(|origin| HeaderValue::from_static(origin));
+
+    tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::AllowOrigin::list(origins))
+        .allow_methods([Method::GET, Method::POST, Method::PUT])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
 }
 
 #[derive(Debug, Deserialize)]
@@ -969,8 +1116,49 @@ async fn post_revoke_device(
     client_ip: ClientIp,
     axum::Extension(actor): axum::Extension<AuthedDevice>,
     axum::extract::Path(target_id): axum::extract::Path<String>,
+    axum::Json(body): axum::Json<DeviceRevokeRequest>,
 ) -> Response {
     let db = state.security.state_db().clone();
+    let devices = match db.list_web_devices().await {
+        Ok(devices) => devices,
+        Err(e) => {
+            tracing::warn!(error = %e, "list_web_devices before revoke failed");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "revoke failed",
+            )
+                .into_response();
+        }
+    };
+    let Some(target) = devices.iter().find(|device| device.id == target_id) else {
+        return (axum::http::StatusCode::NOT_FOUND, "device not found").into_response();
+    };
+    if target.revoked_at.is_some() {
+        return (axum::http::StatusCode::OK, "ok").into_response();
+    }
+
+    if !verify_revoke_password(&state, client_ip, &body.password, &actor.id.0).await {
+        return (axum::http::StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+    }
+
+    if let Err(retry_after) = state.revoke_limiter.check(&actor.id.0).await {
+        let retry = retry_after.as_secs().max(1).to_string();
+        let _ = db
+            .append_web_audit(
+                "web_device_revoke_denied",
+                Some(&actor.id.0),
+                Some(&client_ip.0.to_string()),
+                Some("rate_limited"),
+            )
+            .await;
+        return (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", retry)],
+            "throttled",
+        )
+            .into_response();
+    }
+
     if let Err(e) = db.revoke_web_device(&target_id).await {
         tracing::warn!(error = %e, target = %target_id, "revoke_web_device failed");
         return (
@@ -988,6 +1176,120 @@ async fn post_revoke_device(
         )
         .await;
     (axum::http::StatusCode::OK, "ok").into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceRevokeRequest {
+    password: String,
+}
+
+async fn verify_revoke_password(
+    state: &AppState,
+    client_ip: ClientIp,
+    password: &str,
+    actor_device_id: &str,
+) -> bool {
+    let security = state.security.clone();
+    let throttle = security.throttle().clone();
+    let db = security.state_db().clone();
+
+    let guard = match throttle.try_begin_attempt(client_ip.0).await {
+        Ok(g) => g,
+        Err(decision) => {
+            let retry = decision
+                .retry_after
+                .unwrap_or(Duration::from_secs(1))
+                .as_secs()
+                .max(1);
+            let _ = db
+                .append_web_audit(
+                    "web_device_revoke_denied",
+                    Some(actor_device_id),
+                    Some(&client_ip.0.to_string()),
+                    Some("auth_throttled"),
+                )
+                .await;
+            tracing::warn!(retry_after_secs = retry, "device revoke reauth throttled");
+            return false;
+        }
+    };
+
+    if password.len() > MAX_PASSWORD_LEN {
+        guard.record_failure().await;
+        let _ = db
+            .append_web_audit(
+                "web_device_revoke_denied",
+                Some(actor_device_id),
+                Some(&client_ip.0.to_string()),
+                Some("password_too_long"),
+            )
+            .await;
+        return false;
+    }
+
+    let phc = match db.get_web_password_hash().await {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            guard.record_failure().await;
+            let _ = db
+                .append_web_audit(
+                    "web_device_revoke_denied",
+                    Some(actor_device_id),
+                    Some(&client_ip.0.to_string()),
+                    Some("password_missing"),
+                )
+                .await;
+            return false;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read web password hash for revoke");
+            guard.record_failure().await;
+            let _ = db
+                .append_web_audit(
+                    "web_device_revoke_denied",
+                    Some(actor_device_id),
+                    Some(&client_ip.0.to_string()),
+                    Some("db_error"),
+                )
+                .await;
+            return false;
+        }
+    };
+
+    let password = password.to_string();
+    let phc_owned = phc.clone();
+    let verify_handle =
+        tokio::task::spawn_blocking(move || auth::verify_password(&password, &phc_owned));
+    let verified = match tokio::time::timeout(VERIFY_DEADLINE, verify_handle).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(join_err)) => {
+            tracing::warn!(error = %join_err, "device revoke verify task panicked");
+            false
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                deadline_secs = VERIFY_DEADLINE.as_secs(),
+                "device revoke verify exceeded deadline"
+            );
+            false
+        }
+    };
+
+    if verified {
+        guard.record_success().await;
+        true
+    } else {
+        guard.record_failure().await;
+        let _ = db
+            .append_web_audit(
+                "web_device_revoke_denied",
+                Some(actor_device_id),
+                Some(&client_ip.0.to_string()),
+                Some("bad_password"),
+            )
+            .await;
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1769,6 +2071,7 @@ fn build_router(state: AppState, dev_mode: bool) -> Router {
     // affecting any real request.
     let auth_body_limit = || axum::extract::DefaultBodyLimit::max(AUTH_BODY_LIMIT);
     let passkey_body_limit = || axum::extract::DefaultBodyLimit::max(PASSKEY_BODY_LIMIT);
+    let config_body_limit = || axum::extract::DefaultBodyLimit::max(CONFIG_BODY_LIMIT);
     let api = Router::new()
         .route("/ws", get(ws_handler))
         .route("/api/auth/status", get(get_auth_status))
@@ -1809,22 +2112,23 @@ fn build_router(state: AppState, dev_mode: bool) -> Router {
         )
         .route("/api/me", get(get_me))
         .route("/api/devices", get(get_devices))
-        .route("/api/devices/{id}/revoke", post(post_revoke_device))
+        .route(
+            "/api/devices/{id}/revoke",
+            post(post_revoke_device).layer(auth_body_limit()),
+        )
         .route("/api/logs", get(get_logs))
-        .route("/api/config", get(get_config).put(put_config));
+        .route(
+            "/api/config",
+            get(get_config).put(put_config).layer(config_body_limit()),
+        );
 
     let router = if dev_mode {
-        api.with_state(state).layer(
-            tower_http::cors::CorsLayer::new()
-                .allow_origin(tower_http::cors::Any)
-                .allow_methods(tower_http::cors::Any)
-                .allow_headers(tower_http::cors::Any),
-        )
+        api.with_state(state)
     } else {
         api.fallback(get(static_handler)).with_state(state)
     };
 
-    router
+    let router = router
         .layer(axum::middleware::from_fn_with_state(
             security,
             security_middleware,
@@ -1837,7 +2141,17 @@ fn build_router(state: AppState, dev_mode: bool) -> Router {
         // gates those paths normally — the redirect only fires for SPA
         // navigation. See `security::loopback_ip_redirect` for why this
         // exists (WebAuthn forbids IP-literal RP IDs at the browser layer).
-        .layer(axum::middleware::from_fn(security::loopback_ip_redirect))
+        .layer(axum::middleware::from_fn(security::loopback_ip_redirect));
+
+    if dev_mode {
+        tracing::warn!(
+            origins = ?DEV_CORS_ORIGINS,
+            "WARNING: web dev mode enables CORS only for the configured frontend dev origins"
+        );
+        router.layer(dev_cors_layer())
+    } else {
+        router
+    }
 }
 
 /// Start the web server.
@@ -1919,6 +2233,7 @@ pub async fn serve(
         auth_policy,
         passkey_challenges,
         log_store,
+        revoke_limiter: DeviceRevokeLimiter::default(),
     };
 
     let app = build_router(state, dev_mode);
