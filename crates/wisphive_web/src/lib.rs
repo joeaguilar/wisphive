@@ -8,6 +8,7 @@ mod ws_bridge;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
@@ -19,7 +20,8 @@ use base64::Engine;
 use rust_embed::RustEmbed;
 use security::{AuthedDevice, ClientIp, SecurityConfig, security_middleware};
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{Level, info};
+use wisphive_daemon::logging::{LogRecord, LogStore};
 use wisphive_daemon::state::StateDb;
 
 pub use auth_profile::{
@@ -56,6 +58,10 @@ struct AppState {
     /// keyed by an opaque 32-byte session_id. Single-use semantics +
     /// TTL eviction live inside the store itself.
     passkey_challenges: passkey::ChallengeStore,
+    /// In-process daemon log ring. Present only for `wisphive daemon start --web`;
+    /// standalone `wisphive web serve` returns 503 for `/api/logs` until the
+    /// follow-up daemon IPC log-subscribe path lands.
+    log_store: Option<Arc<LogStore>>,
 }
 
 /// Embedded frontend assets (built by Vite into frontend/dist/).
@@ -146,6 +152,67 @@ async fn put_config(
         )
             .into_response(),
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct LogsQuery {
+    tail: Option<usize>,
+    level: Option<String>,
+    q: Option<String>,
+}
+
+fn parse_log_level(raw: Option<&str>) -> Option<Level> {
+    let Some(raw) = raw else {
+        return Some(Level::TRACE);
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "trace" => Some(Level::TRACE),
+        "debug" => Some(Level::DEBUG),
+        "info" => Some(Level::INFO),
+        "warn" => Some(Level::WARN),
+        "error" => Some(Level::ERROR),
+        _ => None,
+    }
+}
+
+/// GET /api/logs — authenticated backfill of the daemon's in-memory log ring.
+async fn get_logs(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<LogsQuery>,
+) -> Response {
+    let Some(store) = state.log_store else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({"error": "logs unavailable in standalone web mode"}).to_string(),
+        )
+            .into_response();
+    };
+
+    let Some(min_level) = parse_log_level(query.level.as_deref()) else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({"error": "invalid log level"}).to_string(),
+        )
+            .into_response();
+    };
+    let tail = query.tail.unwrap_or(500);
+
+    // Ask the store for its full retained window, then apply the substring
+    // filter before tailing. That makes `?q=needle&tail=1` mean "the newest
+    // matching row", not "search only the newest raw row".
+    let mut records: Vec<LogRecord> = store.tail(usize::MAX, min_level);
+    if let Some(q) = query.q.as_deref().filter(|q| !q.is_empty()) {
+        let needle = q.to_ascii_lowercase();
+        records.retain(|record| record.message.to_ascii_lowercase().contains(&needle));
+    }
+    if records.len() > tail {
+        let start = records.len() - tail;
+        records = records.split_off(start);
+    }
+
+    axum::Json(records).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1743,6 +1810,7 @@ fn build_router(state: AppState, dev_mode: bool) -> Router {
         .route("/api/me", get(get_me))
         .route("/api/devices", get(get_devices))
         .route("/api/devices/{id}/revoke", post(post_revoke_device))
+        .route("/api/logs", get(get_logs))
         .route("/api/config", get(get_config).put(put_config));
 
     let router = if dev_mode {
@@ -1790,6 +1858,7 @@ pub async fn serve(
     dev_mode: bool,
     host: [u8; 4],
     auth_profile: AuthProfile,
+    log_store: Option<Arc<LogStore>>,
 ) -> anyhow::Result<()> {
     // Dev mode serves plain HTTP so Vite (http://localhost:5173) can talk
     // to it without a self-signed-cert trust dance. That's fine on
@@ -1849,6 +1918,7 @@ pub async fn serve(
         security,
         auth_policy,
         passkey_challenges,
+        log_store,
     };
 
     let app = build_router(state, dev_mode);

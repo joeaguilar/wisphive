@@ -87,8 +87,12 @@ pub async fn start(web: Option<WebOptions>) -> Result<()> {
         let port = opts.port;
         let dev = opts.dev;
         let profile = opts.auth_profile;
+        let web_log_store = log_store.clone();
         let serve = tokio::spawn(async move {
-            if let Err(e) = wisphive_web::serve(socket_path, port, dev, host, profile).await {
+            if let Err(e) =
+                wisphive_web::serve(socket_path, port, dev, host, profile, Some(web_log_store))
+                    .await
+            {
                 tracing::error!("embedded web server exited: {e}");
             }
         });

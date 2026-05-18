@@ -732,7 +732,7 @@ async fn serve_web(
         )))
     };
 
-    let result = wisphive_web::serve(socket_path, port, dev, host_octets, profile).await;
+    let result = wisphive_web::serve(socket_path, port, dev, host_octets, profile, None).await;
     if let Some(h) = browser_task {
         h.abort();
     }

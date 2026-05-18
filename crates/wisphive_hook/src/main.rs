@@ -473,13 +473,15 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
         };
         log_auto_approved(
             &wisphive_dir,
-            &tool_use_id,
-            &agent_id,
-            &project,
-            &tool_name,
-            &log_input,
-            event_type,
-            &agent_type,
+            AutoApprovedLog {
+                tool_use_id: &tool_use_id,
+                agent_id: &agent_id,
+                project: &project,
+                tool_name: &tool_name,
+                tool_input: &log_input,
+                event_type,
+                agent_type: &agent_type,
+            },
         );
         return Ok(HookResponse::new(Decision::Approve, event_type, agent_type));
     }
@@ -488,13 +490,15 @@ fn run() -> Result<HookResponse, Box<dyn std::error::Error>> {
     if !is_permission_request && is_auto_approved(&tool_name, &tool_input, &wisphive_dir) {
         log_auto_approved(
             &wisphive_dir,
-            &tool_use_id,
-            &agent_id,
-            &project,
-            &tool_name,
-            &tool_input,
-            event_type,
-            &agent_type,
+            AutoApprovedLog {
+                tool_use_id: &tool_use_id,
+                agent_id: &agent_id,
+                project: &project,
+                tool_name: &tool_name,
+                tool_input: &tool_input,
+                event_type,
+                agent_type: &agent_type,
+            },
         );
         return Ok(HookResponse::new(Decision::Approve, event_type, agent_type));
     }
@@ -856,26 +860,27 @@ fn legacy_auto_approved(tool_name: &str, wisphive_dir: &std::path::Path) -> bool
 
 /// Log an auto-approved tool call to events.jsonl for daemon ingestion.
 /// Uses O_APPEND for atomic writes (~0.1-1μs). All errors are swallowed (fail-open).
-fn log_auto_approved(
-    wisphive_dir: &std::path::Path,
-    tool_use_id: &Option<String>,
-    agent_id: &str,
-    project: &std::path::Path,
-    tool_name: &str,
-    tool_input: &serde_json::Value,
+struct AutoApprovedLog<'a> {
+    tool_use_id: &'a Option<String>,
+    agent_id: &'a str,
+    project: &'a std::path::Path,
+    tool_name: &'a str,
+    tool_input: &'a serde_json::Value,
     event_type: HookEventType,
-    agent_type: &AgentType,
-) {
+    agent_type: &'a AgentType,
+}
+
+fn log_auto_approved(wisphive_dir: &std::path::Path, log: AutoApprovedLog<'_>) {
     let path = wisphive_dir.join("events.jsonl");
     let entry = serde_json::json!({
         "event": "auto_approved",
-        "hook_event_name": event_type.to_string(),
-        "tool_use_id": tool_use_id,
-        "agent_id": agent_id,
-        "agent_type": agent_type.to_string(),
-        "project": project,
-        "tool_name": tool_name,
-        "tool_input": tool_input,
+        "hook_event_name": log.event_type.to_string(),
+        "tool_use_id": log.tool_use_id,
+        "agent_id": log.agent_id,
+        "agent_type": log.agent_type.to_string(),
+        "project": log.project,
+        "tool_name": log.tool_name,
+        "tool_input": log.tool_input,
         "timestamp": chrono::Utc::now().to_rfc3339()
     });
     let mut line = serde_json::to_string(&entry).unwrap_or_default();

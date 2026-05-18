@@ -8,11 +8,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode, header};
 use http_body_util::BodyExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tower::ServiceExt;
+use wisphive_daemon::logging::{LogRecord, LogStore};
 use wisphive_daemon::state::StateDb;
 use wisphive_protocol::{ClientCommand, ClientMessage, PROTOCOL_VERSION, ServerMessage, encode};
 
@@ -61,6 +62,16 @@ async fn seed_device(db: &StateDb, name: &str) -> (String, String) {
     (token.raw, id)
 }
 
+fn log_record(level: &str, message: &str) -> LogRecord {
+    LogRecord {
+        ts: chrono::Utc::now().to_rfc3339(),
+        level: level.to_string(),
+        target: "test".to_string(),
+        message: message.to_string(),
+        fields: serde_json::Value::Object(serde_json::Map::new()),
+    }
+}
+
 async fn test_state() -> (tempfile::TempDir, AppState) {
     let (tmp, db) = test_db().await;
     let security =
@@ -75,6 +86,7 @@ async fn test_state() -> (tempfile::TempDir, AppState) {
             security,
             auth_policy: AuthProfile::LocalLAN.policy(),
             passkey_challenges: crate::passkey::ChallengeStore::new(),
+            log_store: None,
         },
     )
 }
@@ -90,11 +102,20 @@ fn req(method: &str, uri: &str) -> axum::http::request::Builder {
     builder.extension(ClientIp(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))))
 }
 
-async fn run_with(state: AppState, req: Request<Body>) -> (StatusCode, Vec<u8>) {
+async fn run_with_response(
+    state: AppState,
+    req: Request<Body>,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
     let app = build_router(state, false);
     let res = app.oneshot(req).await.unwrap();
     let status = res.status();
+    let headers = res.headers().clone();
     let body = res.into_body().collect().await.unwrap().to_bytes().to_vec();
+    (status, headers, body)
+}
+
+async fn run_with(state: AppState, req: Request<Body>) -> (StatusCode, Vec<u8>) {
+    let (status, _, body) = run_with_response(state, req).await;
     (status, body)
 }
 
@@ -141,6 +162,99 @@ async fn api_config_accepts_valid_device_token_via_query() {
         .unwrap();
     let (status, _) = run_with(state, r).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn api_logs_rejects_missing_bearer() {
+    let r = req("GET", "/api/logs").body(Body::empty()).unwrap();
+    let (status, _) = run(r).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn api_logs_returns_503_without_log_store_in_standalone_web() {
+    let (_tmp, state) = test_state().await;
+    let (token, _id) = seed_device(state.security.state_db(), "laptop").await;
+    let r = req("GET", "/api/logs")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let (status, headers, body) = run_with_response(state, r).await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok()),
+        Some("application/json")
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"],
+        "logs unavailable in standalone web mode"
+    );
+}
+
+#[tokio::test]
+async fn api_logs_returns_seeded_records_and_filters() {
+    let (_tmp, mut state) = test_state().await;
+    let store = LogStore::new(3);
+    store.push(log_record("INFO", "daemon startup"));
+    store.push(log_record("WARN", "slow approval path"));
+    store.push(log_record("ERROR", "FATAL Foo failure"));
+    state.log_store = Some(store);
+    let (token, _id) = seed_device(state.security.state_db(), "laptop").await;
+
+    let r = req("GET", "/api/logs")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, headers, body) = run_with_response(state.clone(), r).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok()),
+        Some("application/json")
+    );
+    let records: Vec<LogRecord> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0].message, "daemon startup");
+
+    let r = req("GET", "/api/logs?tail=1")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, body) = run_with_response(state.clone(), r).await;
+    assert_eq!(status, StatusCode::OK);
+    let records: Vec<LogRecord> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].message, "FATAL Foo failure");
+
+    let r = req("GET", "/api/logs?level=warn")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, body) = run_with_response(state.clone(), r).await;
+    assert_eq!(status, StatusCode::OK);
+    let records: Vec<LogRecord> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.message.as_str())
+            .collect::<Vec<_>>(),
+        ["slow approval path", "FATAL Foo failure"]
+    );
+
+    let r = req("GET", "/api/logs?q=foo")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, body) = run_with_response(state, r).await;
+    assert_eq!(status, StatusCode::OK);
+    let records: Vec<LogRecord> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].message, "FATAL Foo failure");
 }
 
 #[tokio::test]
@@ -334,6 +448,7 @@ async fn login_when_no_password_set_returns_503_setup_required() {
         security,
         auth_policy: AuthProfile::LocalLAN.policy(),
         passkey_challenges: crate::passkey::ChallengeStore::new(),
+        log_store: None,
     };
 
     let body = serde_json::json!({ "password": "anything" });
@@ -567,6 +682,7 @@ async fn auth_status_reports_setup_required_on_fresh_host() {
         security,
         auth_policy: AuthProfile::LocalLAN.policy(),
         passkey_challenges: crate::passkey::ChallengeStore::new(),
+        log_store: None,
     };
     let r = req("GET", "/api/auth/status").body(Body::empty()).unwrap();
     let (status, body) = run_with(state, r).await;
@@ -606,6 +722,7 @@ async fn setup_required_blocks_protected_api_routes_with_503() {
         security,
         auth_policy: AuthProfile::LocalLAN.policy(),
         passkey_challenges: crate::passkey::ChallengeStore::new(),
+        log_store: None,
     };
 
     // Token-gated endpoint — the setup gate must fire *before* the token
@@ -649,6 +766,7 @@ async fn setup_required_lets_auth_status_through() {
         security,
         auth_policy: AuthProfile::LocalLAN.policy(),
         passkey_challenges: crate::passkey::ChallengeStore::new(),
+        log_store: None,
     };
     let r = req("GET", "/api/auth/status").body(Body::empty()).unwrap();
     let (status, _) = run_with(state, r).await;
@@ -703,6 +821,7 @@ async fn auth_profile_local_lan_lan_ip_origin_cannot_enroll() {
         security,
         auth_policy: AuthProfile::LocalLAN.policy(),
         passkey_challenges: crate::passkey::ChallengeStore::new(),
+        log_store: None,
     };
     let r = Request::builder()
         .method("GET")
@@ -739,6 +858,7 @@ async fn auth_profile_local_lan_ip_literal_loopback_cannot_enroll() {
         security,
         auth_policy: AuthProfile::LocalLAN.policy(),
         passkey_challenges: crate::passkey::ChallengeStore::new(),
+        log_store: None,
     };
     let r = Request::builder()
         .method("GET")
@@ -785,6 +905,7 @@ async fn auth_profile_reachable_in_setup_required_mode() {
         security,
         auth_policy: AuthProfile::LocalLAN.policy(),
         passkey_challenges: crate::passkey::ChallengeStore::new(),
+        log_store: None,
     };
     let r = req("GET", "/api/auth/profile")
         .header("origin", ORIGIN)
@@ -814,6 +935,7 @@ async fn auth_profile_enterprise_always_can_enroll() {
         security,
         auth_policy: policy,
         passkey_challenges: crate::passkey::ChallengeStore::new(),
+        log_store: None,
     };
     let r = req("GET", "/api/auth/profile")
         .header("origin", ORIGIN)
@@ -904,6 +1026,7 @@ async fn auth_profile_host_fallback_respects_lan_ip_under_local_lan() {
         security,
         auth_policy: AuthProfile::LocalLAN.policy(),
         passkey_challenges: crate::passkey::ChallengeStore::new(),
+        log_store: None,
     };
     let r = Request::builder()
         .method("GET")
@@ -953,6 +1076,7 @@ async fn loopback_ipv4_redirects_to_localhost_on_root() {
         security,
         auth_policy: AuthProfile::LocalLAN.policy(),
         passkey_challenges: crate::passkey::ChallengeStore::new(),
+        log_store: None,
     };
     let r = Request::builder()
         .method("GET")
@@ -985,6 +1109,7 @@ async fn loopback_ipv4_redirect_preserves_path_and_query() {
         security,
         auth_policy: AuthProfile::LocalLAN.policy(),
         passkey_challenges: crate::passkey::ChallengeStore::new(),
+        log_store: None,
     };
     let r = Request::builder()
         .method("GET")
@@ -1020,6 +1145,7 @@ async fn loopback_ipv6_redirects_to_localhost() {
         security,
         auth_policy: AuthProfile::LocalLAN.policy(),
         passkey_challenges: crate::passkey::ChallengeStore::new(),
+        log_store: None,
     };
     let r = Request::builder()
         .method("GET")
@@ -1055,6 +1181,7 @@ async fn loopback_ip_redirect_skips_api_paths() {
         security,
         auth_policy: AuthProfile::LocalLAN.policy(),
         passkey_challenges: crate::passkey::ChallengeStore::new(),
+        log_store: None,
     };
     let r = Request::builder()
         .method("GET")
@@ -1299,6 +1426,7 @@ async fn test_state_no_password() -> (tempfile::TempDir, AppState) {
             security,
             auth_policy: AuthProfile::LocalLAN.policy(),
             passkey_challenges: crate::passkey::ChallengeStore::new(),
+            log_store: None,
         },
     )
 }
@@ -1519,6 +1647,7 @@ async fn passkey_register_start_on_lan_ip_origin_returns_400() {
         security,
         auth_policy: AuthProfile::LocalLAN.policy(),
         passkey_challenges: crate::passkey::ChallengeStore::new(),
+        log_store: None,
     };
     drop(state);
     let body = serde_json::json!({});
@@ -1675,6 +1804,7 @@ async fn passkey_login_start_on_lan_ip_returns_400() {
         security,
         auth_policy: AuthProfile::LocalLAN.policy(),
         passkey_challenges: crate::passkey::ChallengeStore::new(),
+        log_store: None,
     };
     let body = serde_json::json!({});
     let r = req("POST", "/api/auth/passkey/login/start")
@@ -1766,6 +1896,7 @@ async fn passkey_register_under_enterprise_with_sudo_required_returns_403() {
         security,
         auth_policy: policy,
         passkey_challenges: crate::passkey::ChallengeStore::new(),
+        log_store: None,
     };
     let r = Request::builder()
         .method("POST")
