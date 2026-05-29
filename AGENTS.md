@@ -55,13 +55,13 @@ Run these when touching `Cargo.lock`, frontend lockfiles, TLS/web auth, markdown
 Claude Code / Codex → wisphive-hook (subprocess) → Unix socket → wisphive daemon → TUI + web UI + passive notification
 ```
 
-`wisphive hooks install` installs Claude hooks in `.claude/settings.json` and Codex hooks in `.codex/hooks.json`.
+`wisphive hooks install` installs Claude hooks in `.claude/settings.json` and Codex hooks in `.codex/hooks.json`. Codex also requires the installed project hook commands to be reviewed/trusted from the Codex TUI with `/hooks`; trusting the project `.codex/` layer is necessary but not sufficient for non-managed command hooks to run.
 
 Seven workspace crates with clear dependency flow:
 
 - **wisphive_protocol** — Shared types and newline-delimited JSON wire protocol. `DecisionRequest`, `Decision`, `ClientMessage`/`ServerMessage`, `SpawnAgentRequest`, terminal events. All other crates depend on this.
 - **wisphive_daemon** — Async Tokio server on `~/.wisphive/wisphive.sock`. Accepts hook connections (blocking until decision), TUI/web connections (bidirectional streaming via broadcast channel), persists state to SQLite (`~/.wisphive/wisphive.db`), spawns headless agents via the process registry, manages `portable-pty` terminal sessions, sends platform notifications.
-- **wisphive_hook** — Lightweight binary that runs as a Claude Code or Codex hook subprocess. Four-layer decision logic: (1) check `~/.wisphive/mode` file, (2) read `~/.wisphive/fail-mode` for active-mode error posture, (3) auto-approve safe tools via `~/.wisphive/auto-approve.json`, (4) connect to daemon for human review. Exit codes: 0=approve or rich JSON response, 2=deny, 1=error. In active mode, missing/invalid `fail-mode` defaults to `closed`, so hook read/parse/socket/protocol failures deny instead of silently approving; `fail-mode=open` preserves fail-open behavior for availability-first local use.
+- **wisphive_hook** — Lightweight binary that runs as a Claude Code or Codex hook subprocess. Four-layer decision logic: (1) check `~/.wisphive/mode` file, (2) read `~/.wisphive/fail-mode` for active-mode error posture, (3) auto-approve safe tools via `~/.wisphive/auto-approve.json`, (4) connect to daemon for human review. Exit codes: 0=approve or rich JSON response, 2=deny, 1=error. In active mode, missing/invalid `fail-mode` defaults to `closed`, so hook read/parse/protocol failures deny instead of silently approving; `fail-mode=open` preserves fail-open behavior for availability-first local use. **Exception**: a *daemon-unreachable* failure (refused/absent socket — the daemon is down) always fails open regardless of `fail-mode`, since fail-closing a crashed control plane would brick every agent.
 - **wisphive_tui** — Ratatui terminal UI. Connects to daemon as a streaming client. Panels include queue, agents, projects, terminals. Keys: `a`/`d` approve/deny, `A`/`D` bulk, `/` filter, Tab switch panels.
 - **wisphive_web** — Axum HTTP/WebSocket server. Embeds the Vite-built React frontend via `rust-embed` and bridges browser ↔ daemon over `/ws`. Optional TLS via `rustls`/`rcgen` self-signed certs. Auth primitives in `auth.rs` (Argon2id passwords, SHA-256-hashed device tokens, per-IP login throttle, `webauthn-rs` for passkeys); request gating in `security.rs` (bearer token + Origin/Host allowlist). Can run standalone (`wisphive web serve`) or in-process with the daemon (`wisphive daemon start --web`). The web crate depends on `wisphive_daemon` for web auth state and, in embedded mode, reads the daemon's in-memory `LogStore` for `/api/logs`; standalone web returns 503 for that endpoint until daemon-log IPC streaming lands.
 - **wisphive_cli** — Clap-based CLI (`wisphive` binary). Subcommands: `daemon {start [--web --host --port --web-dev --no-open --auth-profile --auth-rp-id], stop, status}`, `hooks {install, uninstall, enable, disable, status}`, `tui`, `web {serve [--host --port --dev --no-open --auth-profile --auth-rp-id], set-password, reset-password, devices {list, revoke <id>}, fingerprint}`, `agent {start [--agent-type claude_code|codex], list, stop}`, `history {search, recent}`, `config {list, get, set, auto-approve {status, level, add, remove, reset}}`, `term {new, list, attach, replay, close}`, `doctor`, `emergency-off`. Web UI default port is `3100` (CLI) — note `justfile` uses `8080` for the `web` recipe. On first-run (no web password set), `daemon start --web` and `web serve` auto-open the default browser onto the SPA; `--no-open` suppresses this for headless servers / CI. `--auth-profile {local-lan|enterprise}` (default `local-lan`, itr#310) selects the daemon's auth/security posture; `enterprise` additionally requires `--auth-rp-id <domain>` plus user-provided TLS cert (the latter pending itr#270).
@@ -69,12 +69,12 @@ Seven workspace crates with clear dependency flow:
 
 ## Key Design Decisions
 
-- **Hook fail-mode**: When `~/.wisphive/mode` is `active`, hook read/parse/socket/protocol failures default to fail-closed via `~/.wisphive/fail-mode` missing/invalid/`closed`. `fail-mode=open` is the explicit availability-first override that approves on runtime failures. Oversized hook stdin still denies.
+- **Hook fail-mode**: When `~/.wisphive/mode` is `active`, hook read/parse/protocol failures default to fail-closed via `~/.wisphive/fail-mode` missing/invalid/`closed`. `fail-mode=open` is the explicit availability-first override that approves on runtime failures. A daemon-unreachable (refused/absent socket) failure always fails open regardless of `fail-mode` — a crashed daemon must not brick agents. Oversized hook stdin still denies.
 - **Blocking hooks via oneshot channels**: Each hook connection gets a `tokio::sync::oneshot` receiver; it blocks until a human resolves the decision or timeout (1 hour, defaults to approve).
 - **Broadcast fan-out**: TUI clients subscribe to a `tokio::sync::broadcast` channel for real-time events.
 - **SQLite WAL crash recovery**: Pending decisions persist to disk; audit log tracks all resolutions.
 - **Passive notifications**: macOS uses `osascript display notification` (non-intrusive banner); Linux uses `notify-send`. Notifications are informational only — all tool input fields are shown so users have context when switching to the TUI to respond. Notifications do NOT resolve decisions; only the TUI does.
-- **Permissions management**: `wisphive hooks install` adds Claude Code permissions (Bash, Edit, Write, NotebookEdit) to `.claude/settings.json` so Claude auto-allows tools that Wisphive gates (eliminates double-prompt). Codex hooks are installed in `.codex/hooks.json`; Codex `PermissionRequest` is used for native approvals instead of a permissions allowlist.
+- **Permissions management**: `wisphive hooks install` adds Claude Code permissions (Bash, Edit, Write, NotebookEdit) to `.claude/settings.json` so Claude auto-allows tools that Wisphive gates (eliminates double-prompt). Codex hooks are installed in `.codex/hooks.json`; after install or hook edits, use Codex `/hooks` to trust the Wisphive command hook. Codex `PermissionRequest` is used for native approvals instead of a permissions allowlist.
 
 ## Codex Hook Response Format
 
@@ -109,7 +109,7 @@ The `wisphive-hook` binary runs as both `PreToolUse` and `PostToolUse` hook. Cod
 
 **Codex PermissionRequest hook** (separate event): fires when Codex is about to ask for approval. Approve with `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}`. Deny with the same shape using `behavior:"deny"` plus optional `message`. Do not return `updatedInput`, `updatedPermissions`, or `interrupt` for Codex `PermissionRequest`; those fields are reserved and fail closed today.
 
-**Codex hooks installed by Wisphive**: `PreToolUse`, `PostToolUse`, `PermissionRequest`, `UserPromptSubmit`, `Stop`. Codex project hooks load from `.codex/hooks.json` only after the project `.codex/` layer is trusted. Codex `PreToolUse`/`PostToolUse` support currently covers Bash, `apply_patch`, and MCP tool calls; it does not intercept every shell/tool path.
+**Codex hooks installed by Wisphive**: `PreToolUse`, `PostToolUse`, `PermissionRequest`, `UserPromptSubmit`, `Stop`. Codex project hooks load from `.codex/hooks.json` only after the project `.codex/` layer is trusted, and non-managed command hooks must also be reviewed/trusted in Codex with `/hooks` before they run. Codex `PreToolUse`/`PostToolUse` support currently covers Bash, `apply_patch`, and MCP tool calls; it does not intercept every shell/tool path.
 
 ## IPC Protocol
 
@@ -124,7 +124,7 @@ All under `~/.wisphive/`:
 - `wisphive.pid` — Daemon PID file
 - `wisphive.db` — SQLite state/audit database
 - `mode` — "active" or "off" (global kill switch)
-- `fail-mode` — "closed" or "open" for active-mode hook failures. Missing/invalid means "closed"; "open" restores availability-first approval on runtime failures. Oversized hook stdin is denied regardless.
+- `fail-mode` — "closed" or "open" for active-mode hook failures. Missing/invalid means "closed"; "open" restores availability-first approval on runtime failures. A daemon-unreachable (refused/absent socket) failure always fails open regardless. Oversized hook stdin is denied regardless.
 - `auto-approve.json` — List of tool names that skip daemon review
 - `web.cert.pem` / `web.key.pem` — Self-signed TLS cert/key for the web UI (key is mode 0600). Validity is capped at 397 days; rotation writes atomically under `web.cert.lock` (flock) with metadata in `web.cert.meta.json`. See `crates/wisphive_web/src/tls.rs`.
 

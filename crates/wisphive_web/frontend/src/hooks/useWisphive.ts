@@ -3,6 +3,7 @@ import type {
   AgentInfo,
   ClientMessage,
   DecisionRequest,
+  DiskAlertKind,
   HistoryEntry,
   ProjectSummary,
   ServerMessage,
@@ -27,6 +28,16 @@ export interface WisphiveState {
    * on successful reauth the hook's `retryPendingApprove` replays the stashed
    * approve. Null when no sudo prompt is pending. */
   pendingReauth: PendingReauth | null;
+  /** Currently-active resource alerts (audit archive size, low disk), one per
+   * `kind`. The daemon raises these instead of deleting audit data (itr#340);
+   * a `disk_alert` with `active:false` clears its kind. */
+  diskAlerts: DiskAlert[];
+}
+
+export interface DiskAlert {
+  kind: DiskAlertKind;
+  message: string;
+  at: string;
 }
 
 export interface PendingReauth {
@@ -87,6 +98,7 @@ export function useWisphive() {
     projects: [],
     terminals: [],
     pendingReauth: null,
+    diskAlerts: [],
   });
 
   const handleMessage = useCallback((data: string) => {
@@ -227,6 +239,20 @@ export function useWisphive() {
                 tool_name: msg.tool_name,
               },
             };
+
+          case "disk_alert": {
+            // Keep at most one active alert per kind. A raise upserts; a clear
+            // (active:false) removes it. Never deletes audit data — purely a
+            // banner signal (itr#340).
+            const others = prev.diskAlerts.filter((a) => a.kind !== msg.kind);
+            if (!msg.active) {
+              return { ...prev, diskAlerts: others };
+            }
+            return {
+              ...prev,
+              diskAlerts: [...others, { kind: msg.kind, message: msg.message, at: msg.at }],
+            };
+          }
 
           default:
             return prev;

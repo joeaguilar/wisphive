@@ -76,6 +76,11 @@ impl FailMode {
 enum HookFailureKind {
     Runtime,
     InputTooLarge,
+    /// The daemon socket could not be reached (refused / absent / connect-level
+    /// IO error). This is a control-plane outage, not a per-call failure: a
+    /// crashed daemon must never brick every agent, so it always fails open
+    /// regardless of `fail-mode`. Runtime parse/protocol errors stay fail-closed.
+    DaemonUnreachable,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +134,22 @@ impl HookFailure {
         Self {
             kind: HookFailureKind::Runtime,
             message: message.into(),
+            event_type,
+            agent_type: agent_type.clone(),
+        }
+    }
+
+    /// Connect-level failure reaching the daemon socket. Tagged
+    /// [`HookFailureKind::DaemonUnreachable`] so it always fails open.
+    fn unreachable(
+        context: impl AsRef<str>,
+        error: impl fmt::Display,
+        event_type: HookEventType,
+        agent_type: &AgentType,
+    ) -> Self {
+        Self {
+            kind: HookFailureKind::DaemonUnreachable,
+            message: format!("{}: {error}", context.as_ref()),
             event_type,
             agent_type: agent_type.clone(),
         }
@@ -257,10 +278,38 @@ fn read_fail_mode(wisphive_dir: &Path) -> FailMode {
 }
 
 fn response_for_failure(failure: &HookFailure, fail_mode: FailMode) -> HookResponse {
-    if fail_mode == FailMode::Closed || failure.kind == HookFailureKind::InputTooLarge {
+    let approve = || {
+        HookResponse::new(
+            Decision::Approve,
+            failure.event_type,
+            failure.agent_type.clone(),
+        )
+    };
+
+    // PostToolUse is telemetry only — a reporting failure must never block a
+    // tool call that already ran.
+    if failure.event_type == HookEventType::PostToolUse {
+        return approve();
+    }
+
+    // Oversized input always denies (DoS guard), regardless of fail-mode.
+    if failure.kind == HookFailureKind::InputTooLarge {
+        return failure.deny_response();
+    }
+
+    // A daemon outage always fails open: with the control plane down there is
+    // no path to a human decision, and fail-closing here would brick every
+    // agent on the machine. Honors the "daemon-down fails open" posture.
+    if failure.kind == HookFailureKind::DaemonUnreachable {
+        return approve();
+    }
+
+    // Other runtime failures (parse/protocol/IO) honor `fail-mode`, which
+    // defaults to closed (deny) per the security posture in AGENTS.md.
+    if fail_mode == FailMode::Closed {
         failure.deny_response()
     } else {
-        HookResponse::simple(Decision::Approve)
+        approve()
     }
 }
 
@@ -284,6 +333,7 @@ fn format_and_exit(resp: &HookResponse) -> i32 {
     use HookEventType::*;
     match resp.event_type {
         PermissionRequest => return format_permission_response(resp),
+        PostToolUse => return format_post_tool_use_response(resp),
         Stop | SubagentStop => return format_stop_response(resp),
         UserPromptSubmit | ConfigChange => return format_block_response(resp),
         Elicitation => return format_elicitation_response(resp),
@@ -378,6 +428,12 @@ fn format_and_exit(resp: &HookResponse) -> i32 {
             0
         }
     }
+}
+
+/// Format PostToolUse: result reporting is telemetry only, so never block or emit
+/// PreToolUse-shaped JSON for a completed tool call.
+fn format_post_tool_use_response(_resp: &HookResponse) -> i32 {
+    0
 }
 
 /// Format a PermissionRequest response for the calling agent.
@@ -585,15 +641,17 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
 
     // PostToolUse detection: fire-and-forget result to daemon
     if event_type == HookEventType::PostToolUse || hook_event.get("tool_response").is_some() {
-        handle_post_tool_use(&hook_event, wisphive_dir, agent_type.clone()).map_err(|err| {
-            HookFailure::with_context(
-                "failed to send PostToolUse result to Wisphive daemon",
-                err,
-                event_type,
-                &agent_type,
-            )
-        })?;
-        return Ok(HookResponse::new(Decision::Approve, event_type, agent_type));
+        let _ = handle_post_tool_use(&hook_event, wisphive_dir, agent_type.clone());
+        let response_event_type = if event_type == HookEventType::PostToolUse {
+            event_type
+        } else {
+            HookEventType::PostToolUse
+        };
+        return Ok(HookResponse::new(
+            Decision::Approve,
+            response_event_type,
+            agent_type,
+        ));
     }
 
     let is_permission_request = event_type == HookEventType::PermissionRequest;
@@ -728,17 +786,21 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
     // Layer 4: Connect to daemon socket (fails instantly if daemon is dead)
     let socket_path = wisphive_dir.join("wisphive.sock");
     let stream = UnixStream::connect(&socket_path).map_err(|err| {
-        HookFailure::with_context(
+        // A refused/absent socket means the daemon is down (e.g. crashed and
+        // left a stale socket). Fail open so the outage can't brick agents.
+        HookFailure::unreachable(
             "failed to connect to Wisphive daemon",
             err,
             event_type,
             &agent_type,
         )
     })?;
+    // Socket-configuration failures on a just-connected stream mean the peer
+    // went away between connect and setup → daemon down → fail open.
     stream
         .set_read_timeout(Some(SOCKET_TIMEOUT))
         .map_err(|err| {
-            HookFailure::with_context(
+            HookFailure::unreachable(
                 "failed to configure daemon read timeout",
                 err,
                 event_type,
@@ -748,7 +810,7 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
     stream
         .set_write_timeout(Some(SOCKET_TIMEOUT))
         .map_err(|err| {
-            HookFailure::with_context(
+            HookFailure::unreachable(
                 "failed to configure daemon write timeout",
                 err,
                 event_type,
@@ -757,7 +819,7 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
         })?;
 
     let mut reader = BufReader::new(stream.try_clone().map_err(|err| {
-        HookFailure::with_context(
+        HookFailure::unreachable(
             "failed to clone daemon socket",
             err,
             event_type,
@@ -766,7 +828,11 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
     })?);
     let mut writer = stream;
 
-    // Handshake
+    // Handshake. Encoding our own Hello is a local concern (keep Runtime), but
+    // every transport step below — and a peer-closed/empty/garbled welcome —
+    // means we never established a working session with a live daemon, so it
+    // fails open. Only AFTER a valid Welcome do we treat the daemon as "up and
+    // answering", where a refusal/garbage response is honored fail-closed.
     let hello = wisphive_protocol::encode(&ClientMessage::Hello {
         client: ClientType::Hook,
         version: PROTOCOL_VERSION,
@@ -780,20 +846,30 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
         )
     })?;
     writer.write_all(hello.as_bytes()).map_err(|err| {
-        HookFailure::with_context("failed to write daemon hello", err, event_type, &agent_type)
+        HookFailure::unreachable("failed to write daemon hello", err, event_type, &agent_type)
     })?;
 
     let mut welcome_line = String::new();
-    reader.read_line(&mut welcome_line).map_err(|err| {
-        HookFailure::with_context(
+    let welcome_bytes = reader.read_line(&mut welcome_line).map_err(|err| {
+        HookFailure::unreachable(
             "failed to read daemon welcome",
             err,
             event_type,
             &agent_type,
         )
     })?;
+    if welcome_bytes == 0 || welcome_line.trim().is_empty() {
+        // EOF: the daemon closed the connection during the handshake (it
+        // crashed or is shutting down). read_line returns Ok(0), not an error.
+        return Err(HookFailure::unreachable(
+            "Wisphive daemon closed the connection during handshake",
+            "no welcome received (EOF)",
+            event_type,
+            &agent_type,
+        ));
+    }
     let welcome: ServerMessage = wisphive_protocol::decode(&welcome_line).map_err(|err| {
-        HookFailure::with_context(
+        HookFailure::unreachable(
             "failed to parse daemon welcome",
             err,
             event_type,
@@ -801,8 +877,9 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
         )
     })?;
     if !matches!(welcome, ServerMessage::Welcome { .. }) {
-        return Err(HookFailure::message(
+        return Err(HookFailure::unreachable(
             "Wisphive daemon sent an unexpected welcome response",
+            "handshake did not complete",
             event_type,
             &agent_type,
         ));
@@ -819,7 +896,8 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
             )
         })?;
     writer.write_all(req_msg.as_bytes()).map_err(|err| {
-        HookFailure::with_context(
+        // Broken pipe writing the request = the daemon died → fail open.
+        HookFailure::unreachable(
             "failed to write decision request",
             err,
             event_type,
@@ -829,7 +907,7 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
 
     // Block for response — daemon controls timeout (up to 1 hour).
     writer.set_read_timeout(None).map_err(|err| {
-        HookFailure::with_context(
+        HookFailure::unreachable(
             "failed to clear daemon read timeout",
             err,
             event_type,
@@ -838,15 +916,29 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
     })?;
 
     let mut response_line = String::new();
-    reader.read_line(&mut response_line).map_err(|err| {
-        HookFailure::with_context(
+    let response_bytes = reader.read_line(&mut response_line).map_err(|err| {
+        HookFailure::unreachable(
             "failed to read daemon decision response",
             err,
             event_type,
             &agent_type,
         )
     })?;
+    if response_bytes == 0 || response_line.trim().is_empty() {
+        // EOF while blocked waiting for the human decision: the daemon was
+        // killed mid-wait (e.g. crashed under load). This is the most common
+        // real-world brick — fail open rather than deny.
+        return Err(HookFailure::unreachable(
+            "Wisphive daemon closed the connection before returning a decision",
+            "no decision received (EOF)",
+            event_type,
+            &agent_type,
+        ));
+    }
 
+    // A non-empty but unparseable response means a live daemon sent garbage —
+    // treat as a reachable-but-misbehaving daemon and honor fail-mode (deny by
+    // default), rather than silently approving.
     let response: ServerMessage = wisphive_protocol::decode(&response_line).map_err(|err| {
         HookFailure::with_context(
             "failed to parse daemon decision response",
@@ -1359,9 +1451,33 @@ mod tests {
     }
 
     #[test]
+    fn post_tool_use_failures_do_not_block_when_fail_mode_is_closed() {
+        let failure = HookFailure::message(
+            "failed to send PostToolUse result to Wisphive daemon",
+            HookEventType::PostToolUse,
+            &AgentType::Codex,
+        );
+
+        let response = response_for_failure(&failure, FailMode::Closed);
+
+        assert_eq!(response.decision, Decision::Approve);
+        assert_eq!(response.event_type, HookEventType::PostToolUse);
+        assert_eq!(response.agent_type, AgentType::Codex);
+    }
+
+    #[test]
+    fn post_tool_use_formatter_never_blocks() {
+        let mut response =
+            HookResponse::new(Decision::Deny, HookEventType::PostToolUse, AgentType::Codex);
+        response.message = Some("reporting failed".into());
+
+        assert_eq!(format_post_tool_use_response(&response), 0);
+    }
+
+    #[test]
     fn open_fail_mode_preserves_runtime_failure_approval() {
         let failure = HookFailure::message(
-            "failed to connect to Wisphive daemon",
+            "failed to parse daemon response",
             HookEventType::PermissionRequest,
             &AgentType::Codex,
         );
@@ -1369,7 +1485,53 @@ mod tests {
         let response = response_for_failure(&failure, FailMode::Open);
 
         assert_eq!(response.decision, Decision::Approve);
-        assert_eq!(response.event_type, HookEventType::PreToolUse);
+        // Fail-open preserves the originating event type so the formatter emits
+        // the correct shape (here a PermissionRequest allow, not a PreToolUse).
+        assert_eq!(response.event_type, HookEventType::PermissionRequest);
+        assert_eq!(response.agent_type, AgentType::Codex);
+    }
+
+    #[test]
+    fn closed_fail_mode_denies_runtime_failure() {
+        // A parse/protocol error (the daemon answered but we couldn't use it)
+        // honors fail-closed and denies.
+        let failure = HookFailure::message(
+            "failed to parse daemon response",
+            HookEventType::PermissionRequest,
+            &AgentType::ClaudeCode,
+        );
+
+        let response = response_for_failure(&failure, FailMode::Closed);
+
+        assert_eq!(response.decision, Decision::Deny);
+        assert_eq!(response.event_type, HookEventType::PermissionRequest);
+    }
+
+    #[test]
+    fn daemon_unreachable_fails_open_even_when_fail_mode_is_closed() {
+        // Regression for the stale-socket brick: a crashed daemon (refused or
+        // absent socket) must never block agents, even under fail-closed.
+        for event_type in [
+            HookEventType::PreToolUse,
+            HookEventType::PermissionRequest,
+            HookEventType::Stop,
+        ] {
+            let failure = HookFailure::unreachable(
+                "failed to connect to Wisphive daemon",
+                "Connection refused (os error 61)",
+                event_type,
+                &AgentType::ClaudeCode,
+            );
+
+            let response = response_for_failure(&failure, FailMode::Closed);
+
+            assert_eq!(
+                response.decision,
+                Decision::Approve,
+                "daemon-unreachable must fail open for {event_type:?}"
+            );
+            assert_eq!(response.event_type, event_type);
+        }
     }
 
     #[test]

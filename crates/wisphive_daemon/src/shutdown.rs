@@ -60,9 +60,7 @@ pub fn check_existing_daemon(path: &std::path::Path) -> Result<()> {
     // Check if process is alive
     #[cfg(unix)]
     {
-        // kill -0 checks if process exists without sending a signal
-        let result = unsafe { libc::kill(pid as i32, 0) };
-        if result == 0 {
+        if process_exists(pid as i32) {
             anyhow::bail!(
                 "another daemon is already running (pid: {}). \
                  If this is stale, remove {}",
@@ -76,6 +74,16 @@ pub fn check_existing_daemon(path: &std::path::Path) -> Result<()> {
     info!("removing stale PID file (pid: {})", pid);
     std::fs::remove_file(path)?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn process_exists(pid: i32) -> bool {
+    // kill -0 checks if process exists without sending a signal.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Guard that removes the PID file when dropped.

@@ -26,6 +26,17 @@ pub struct DaemonConfig {
     pub retention_max_age_days: u64,
     /// Maximum age in days for daemon log files in `log_dir` (older are pruned at startup).
     pub log_retention_days: u64,
+    /// Upper bound (bytes) on the database size for which retention may run a
+    /// full `VACUUM`. Above this, VACUUM is skipped (it rewrites the whole DB
+    /// and can hang/OOM on a multi-GB file); a WAL checkpoint still runs.
+    pub retention_vacuum_max_bytes: u64,
+    /// Size (bytes) of the on-disk audit archive above which a non-destructive
+    /// alert is raised. Wisphive never auto-deletes audit data (itr#340); it
+    /// warns instead. `0` disables the archive-size alert.
+    pub archive_alert_max_bytes: u64,
+    /// Free-space floor (bytes) on the state filesystem; a low-disk alert is
+    /// raised when available space drops below this. `0` disables it.
+    pub disk_alert_free_bytes: u64,
 }
 
 /// User-editable config loaded from ~/.wisphive/config.json.
@@ -58,6 +69,17 @@ pub struct UserConfig {
     /// Max age in days for daemon log files (default: 14).
     #[serde(default)]
     pub log_retention_days: Option<u64>,
+    /// Max DB size in MB for which retention may run a full VACUUM (default: 256).
+    #[serde(default)]
+    pub retention_vacuum_max_mb: Option<u64>,
+    /// Audit-archive size in MB above which a non-destructive alert is raised
+    /// (default: 10240 = 10 GiB). `0` disables.
+    #[serde(default)]
+    pub archive_alert_max_mb: Option<u64>,
+    /// Low-disk alert threshold in MB of free space (default: 10240 = 10 GiB).
+    /// `0` disables.
+    #[serde(default)]
+    pub disk_alert_free_mb: Option<u64>,
 }
 
 fn default_true() -> bool {
@@ -114,6 +136,30 @@ impl DaemonConfig {
             1,
             3650,
         );
+        let retention_vacuum_max_mb = clamp_config(
+            "retention_vacuum_max_mb",
+            user.retention_vacuum_max_mb.unwrap_or(256),
+            16,
+            100_000,
+        );
+        let retention_vacuum_max_bytes = retention_vacuum_max_mb.saturating_mul(1024 * 1024);
+        // Alert thresholds: allow 0 (disabled) up to a generous ceiling. Unlike
+        // the retention knobs these never delete anything, so the lower bound is
+        // 0 rather than a positive minimum.
+        let archive_alert_max_mb = clamp_config(
+            "archive_alert_max_mb",
+            user.archive_alert_max_mb.unwrap_or(10_240),
+            0,
+            100_000_000,
+        );
+        let disk_alert_free_mb = clamp_config(
+            "disk_alert_free_mb",
+            user.disk_alert_free_mb.unwrap_or(10_240),
+            0,
+            100_000_000,
+        );
+        let archive_alert_max_bytes = archive_alert_max_mb.saturating_mul(1024 * 1024);
+        let disk_alert_free_bytes = disk_alert_free_mb.saturating_mul(1024 * 1024);
 
         Self {
             socket_path: home_dir.join("wisphive.sock"),
@@ -127,6 +173,9 @@ impl DaemonConfig {
             retention_max_rows,
             retention_max_age_days,
             log_retention_days,
+            retention_vacuum_max_bytes,
+            archive_alert_max_bytes,
+            disk_alert_free_bytes,
             home_dir,
         }
     }

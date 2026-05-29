@@ -1,4 +1,5 @@
 pub mod config;
+pub mod disk_alert;
 pub mod event_ingest;
 pub mod logging;
 pub mod notify;

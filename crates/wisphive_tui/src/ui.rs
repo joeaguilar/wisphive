@@ -24,6 +24,54 @@ pub fn draw(frame: &mut Frame, app: &App) {
         ViewMode::TerminalReplay => draw_terminal_replay_view(frame, app),
         ViewMode::Dashboard => draw_dashboard(frame, app),
     }
+    // Rendered last so it overlays the active view: a resource alert is
+    // important enough to sit on top of whatever panel is focused.
+    draw_disk_alert_banner(frame, app);
+}
+
+/// Overlay a banner for active daemon resource alerts (audit archive size, low
+/// disk). Wisphive never deletes audit data; the daemon raises these instead
+/// (itr#340). One row per alert, pinned to the top of the frame.
+fn draw_disk_alert_banner(frame: &mut Frame, app: &App) {
+    if app.disk_alerts.is_empty() {
+        return;
+    }
+    let area = frame.area();
+    let height = (app.disk_alerts.len() as u16).min(2);
+    if area.height <= height {
+        return; // too small to overlay without hiding everything
+    }
+    let banner = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height,
+    };
+
+    let lines: Vec<Line> = app
+        .disk_alerts
+        .iter()
+        .take(height as usize)
+        .map(|a| {
+            let (label, color) = match a.kind {
+                wisphive_protocol::DiskAlertKind::ArchiveSize => ("ARCHIVE", Color::Yellow),
+                wisphive_protocol::DiskAlertKind::LowDiskSpace => ("LOW DISK", Color::Red),
+            };
+            Line::from(vec![
+                Span::styled(
+                    format!(" ⚠ {label}: "),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(a.message.clone()),
+            ])
+        })
+        .collect();
+
+    let para = Paragraph::new(lines)
+        .style(Style::default().bg(Color::Rgb(40, 30, 0)))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(Clear, banner);
+    frame.render_widget(para, banner);
 }
 
 fn draw_terminal_list_view(frame: &mut Frame, app: &App) {

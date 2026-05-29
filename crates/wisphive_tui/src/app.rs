@@ -242,6 +242,17 @@ pub struct App {
     /// Last time Esc was pressed while attached to a terminal.
     /// Used to detect double-tap detach (two Escs within a short window).
     pub last_terminal_esc: Option<std::time::Instant>,
+
+    /// Active daemon resource alerts (audit archive size, low disk), at most one
+    /// per kind. Rendered as a banner. Wisphive never deletes audit data; the
+    /// daemon raises these instead (itr#340).
+    pub disk_alerts: Vec<DiskAlertNotice>,
+}
+
+/// A single active resource alert surfaced by the daemon.
+pub struct DiskAlertNotice {
+    pub kind: wisphive_protocol::DiskAlertKind,
+    pub message: String,
 }
 
 /// Client-side state for a live (or replayed) terminal session.
@@ -362,6 +373,21 @@ impl App {
             active_terminal: None,
             replay_terminal: None,
             last_terminal_esc: None,
+            disk_alerts: Vec::new(),
+        }
+    }
+
+    /// Apply a daemon `disk_alert`: a raise (`active`) upserts the alert for its
+    /// kind; a clear (`!active`) removes it. Keeps at most one per kind.
+    pub fn apply_disk_alert(
+        &mut self,
+        kind: wisphive_protocol::DiskAlertKind,
+        active: bool,
+        message: String,
+    ) {
+        self.disk_alerts.retain(|a| a.kind != kind);
+        if active {
+            self.disk_alerts.push(DiskAlertNotice { kind, message });
         }
     }
 

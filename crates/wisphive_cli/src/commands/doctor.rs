@@ -2,6 +2,9 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
+const CODEX_HOOK_REVIEW_NOTE: &str = "Codex project hooks require /hooks review inside Codex; \
+trust the Wisphive hook command there if Codex does not appear in Wisphive after a tool call.";
+
 pub fn run(project: Option<PathBuf>) -> Result<()> {
     let home = wisphive_home();
     let project = project
@@ -68,7 +71,7 @@ pub fn run(project: Option<PathBuf>) -> Result<()> {
         if pid > 0 {
             #[cfg(unix)]
             {
-                unsafe { libc::kill(pid, 0) == 0 }
+                process_exists(pid)
             }
             #[cfg(not(unix))]
             {
@@ -182,6 +185,15 @@ fn wisphive_home() -> PathBuf {
     PathBuf::from(home).join(".wisphive")
 }
 
+#[cfg(unix)]
+fn process_exists(pid: i32) -> bool {
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 fn check_project_hook(
     agent_name: &str,
     path: &std::path::Path,
@@ -200,6 +212,9 @@ fn check_project_hook(
 
             if has_hook {
                 eprintln!("  OK  {agent_name} hooks installed");
+                if agent_name == "Codex" {
+                    eprintln!("      note: {CODEX_HOOK_REVIEW_NOTE}");
+                }
                 *ok_count += 1;
             } else {
                 issues.push(format!(

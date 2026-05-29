@@ -38,14 +38,17 @@ wisphive daemon start
 # 2. Install hooks into your project (run from the project directory)
 wisphive hooks install
 
-# 3. Enable hooks (activates the control plane)
+# 3. For Codex, open /hooks in the Codex TUI and trust the Wisphive hook command
+
+# 4. Enable hooks (activates the control plane)
 wisphive hooks enable
 
-# 4. Open the TUI dashboard (another terminal)
+# 5. Open the TUI dashboard (another terminal)
 wisphive tui
 ```
 
 Now when Claude Code or Codex runs in that project, supported tool calls route through Wisphive.
+Codex project hooks are non-managed hooks, so Codex will not run them until you review and trust them with `/hooks`.
 
 ### Teardown
 
@@ -190,7 +193,7 @@ wisphive hooks install             # install hooks in current project
 wisphive hooks uninstall           # remove hooks from current project
 wisphive hooks enable              # set mode to active
 wisphive hooks disable             # set mode to off (pass-through)
-wisphive hooks status              # show hook/daemon status
+wisphive hooks status              # show hook/daemon status and Codex hook-review reminder
 wisphive emergency-off             # kill switch — disables everything
 wisphive config list               # show all config
 wisphive config set <key> <value>  # set a config value

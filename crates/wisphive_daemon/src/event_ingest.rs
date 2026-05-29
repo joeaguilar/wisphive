@@ -8,24 +8,61 @@ use tracing::{debug, error, info, warn};
 
 use crate::state::StateDb;
 
+/// Size cap for `events.jsonl` before it is rotated. The hook only appends to
+/// this file; the daemon (sole consumer) owns its lifecycle, so rotation
+/// happens here once new lines are drained into SQLite.
+const EVENTS_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Spawn an async task that tails `events.jsonl` and batch-inserts auto-approved
 /// events into the decision_log.
 ///
 /// Uses the `notify` crate for file change detection. On each modify event,
 /// reads new lines from a tracked byte offset, parses JSON, and inserts into
-/// SQLite with `auto_approved = 1`.
+/// SQLite with `auto_approved = 1`. Detects truncation/rotation (file shrank
+/// below the tracked offset) and reseeks to the start so ingestion never
+/// silently stalls. Once new lines are drained and the file exceeds
+/// [`EVENTS_LOG_MAX_BYTES`], rotates it into `log_dir` (reaped by
+/// `logging::prune_old_files`) to bound unbounded growth.
 pub fn spawn_event_ingest(
     events_path: PathBuf,
+    log_dir: PathBuf,
     state_db: Arc<StateDb>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = run_ingest(events_path, state_db).await {
+        if let Err(e) = run_ingest(events_path, log_dir, state_db).await {
             error!("event ingest task failed: {e}");
         }
     })
 }
 
-async fn run_ingest(events_path: PathBuf, state_db: Arc<StateDb>) -> anyhow::Result<()> {
+/// Open `events.jsonl` for reading and seek to `offset` (clamped to EOF).
+async fn open_reader_at(
+    events_path: &std::path::Path,
+    offset: u64,
+) -> anyhow::Result<(BufReader<tokio::fs::File>, u64)> {
+    let file = tokio::fs::File::open(events_path).await?;
+    let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+    let start = offset.min(len);
+    let mut reader = BufReader::new(file);
+    reader.seek(std::io::SeekFrom::Start(start)).await?;
+    Ok((reader, start))
+}
+
+/// `(device, inode)` identity of the file at `path`, or `None` if it can't be
+/// stat'd. Used to detect that the file was replaced (rotated/recreated) even
+/// when the replacement is the same size or larger — a case the byte-offset
+/// shrink check alone would miss.
+async fn file_identity(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = tokio::fs::metadata(path).await.ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+
+async fn run_ingest(
+    events_path: PathBuf,
+    log_dir: PathBuf,
+    state_db: Arc<StateDb>,
+) -> anyhow::Result<()> {
     // Create the events file if it doesn't exist
     if !events_path.exists() {
         let _ = std::fs::OpenOptions::new()
@@ -55,10 +92,15 @@ async fn run_ingest(events_path: PathBuf, state_db: Arc<StateDb>) -> anyhow::Res
 
     info!(path = %events_path.display(), "event ingest watching");
 
-    // Open the file and seek to end (only process new events)
-    let file = tokio::fs::File::open(&events_path).await?;
-    let mut reader = BufReader::new(file);
-    reader.seek(std::io::SeekFrom::End(0)).await?;
+    // Open the file and seek to end (only process pre-existing events once;
+    // new ones arrive via notifications). `offset` tracks our read position so
+    // we can detect truncation/rotation when the file shrinks beneath it.
+    let start_len = tokio::fs::metadata(&events_path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let (mut reader, mut offset) = open_reader_at(&events_path, start_len).await?;
+    let mut file_id = file_identity(&events_path).await;
 
     let mut line_buf = String::new();
 
@@ -71,12 +113,35 @@ async fn run_ingest(events_path: PathBuf, state_db: Arc<StateDb>) -> anyhow::Res
         // Drain any extra notifications that queued up
         while rx.try_recv().is_ok() {}
 
+        // Detect truncation/rotation: the file was replaced or truncated out
+        // from under us if either (a) it is now shorter than our read position,
+        // or (b) its (dev, inode) identity changed — catches a same-or-larger
+        // replacement that the length check alone would miss. Reopen from the
+        // start so we don't stall reading past EOF or skip a new file's prefix.
+        // Re-ingest is harmless — ingest_line dedupes on (content-hashed) id.
+        let current_len = tokio::fs::metadata(&events_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let current_id = file_identity(&events_path).await;
+        if current_len < offset || current_id != file_id {
+            match open_reader_at(&events_path, 0).await {
+                Ok((r, o)) => {
+                    reader = r;
+                    offset = o;
+                    file_id = current_id;
+                }
+                Err(e) => warn!("failed to reopen events.jsonl after rotation: {e}"),
+            }
+        }
+
         // Read all new lines
         loop {
             line_buf.clear();
             match reader.read_line(&mut line_buf).await {
                 Ok(0) => break, // No more data
-                Ok(_) => {
+                Ok(n) => {
+                    offset += n as u64;
                     let trimmed = line_buf.trim();
                     if trimmed.is_empty() {
                         continue;
@@ -91,9 +156,77 @@ async fn run_ingest(events_path: PathBuf, state_db: Arc<StateDb>) -> anyhow::Res
                 }
             }
         }
+
+        // Now that we are drained to EOF, rotate if the file is too large.
+        if offset >= EVENTS_LOG_MAX_BYTES
+            && let Some((reader_next, offset_next)) =
+                rotate_events_log(&events_path, &log_dir, &state_db).await
+        {
+            reader = reader_next;
+            offset = offset_next;
+            file_id = file_identity(&events_path).await;
+        }
     }
 
     Ok(())
+}
+
+/// Rotate `events.jsonl` into `log_dir` once it has been drained into SQLite.
+///
+/// Non-lossy: the file is renamed (so any line a hook appends mid-rotation lands
+/// in the rotated segment, not lost), then `reimport_all` re-ingests the rotated
+/// segment to catch stragglers (idempotent via dedup). The rotated segment lives
+/// in `log_dir`, where `logging::prune_old_files` reaps it by age. Returns a
+/// fresh reader/offset for the new (empty) `events.jsonl`, or `None` on failure
+/// (in which case the caller keeps using the existing reader).
+async fn rotate_events_log(
+    events_path: &std::path::Path,
+    log_dir: &std::path::Path,
+    state_db: &StateDb,
+) -> Option<(BufReader<tokio::fs::File>, u64)> {
+    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S%.3f");
+    let rotated = log_dir.join(format!("events-{stamp}.jsonl"));
+
+    if let Err(e) = tokio::fs::rename(events_path, &rotated).await {
+        warn!("failed to rotate events.jsonl: {e}");
+        return None;
+    }
+
+    // Re-ingest the rotated segment to capture any lines appended between the
+    // last drain and the rename. Dedup makes this safe. On failure the segment
+    // is NOT auto-recovered (rotated segments are only age-reaped, never
+    // re-read), so its un-ingested tail would be lost from SQLite — flag it as
+    // `.failed` and escalate so an operator can re-import it. The file itself is
+    // preserved on disk until `log_retention_days`.
+    if let Err(e) = reimport_all(&rotated, state_db).await {
+        let failed = rotated.with_extension("failed.jsonl");
+        let kept = match tokio::fs::rename(&rotated, &failed).await {
+            Ok(()) => failed,
+            Err(_) => rotated.clone(),
+        };
+        error!(
+            segment = %kept.display(),
+            "failed to reimport rotated events segment; its un-ingested events are NOT in the DB (re-import manually): {e}"
+        );
+    }
+
+    // Recreate an empty events.jsonl so the next hook append (and our reader)
+    // have a file to work with, then reopen from the start.
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(events_path);
+
+    match open_reader_at(events_path, 0).await {
+        Ok((reader, offset)) => {
+            info!(rotated = %rotated.display(), "rotated events.jsonl");
+            Some((reader, offset))
+        }
+        Err(e) => {
+            warn!("failed to reopen events.jsonl after rotation: {e}");
+            None
+        }
+    }
 }
 
 /// Read all lines from events.jsonl and ingest them into the database.
@@ -354,6 +487,82 @@ mod tests {
             1,
             "reimport should be idempotent for events without tool_use_id"
         );
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // rotation (#334)
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn rotate_events_log_is_non_lossy_and_resets() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let events_path = tmp.path().join("events.jsonl");
+        let log_dir = tmp.path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+
+        let content = format!(
+            "{}\n{}\n",
+            auto_approved_event("Bash", "cc-1", Some("t1")),
+            auto_approved_event("Edit", "cc-1", Some("t2")),
+        );
+        std::fs::write(&events_path, &content).unwrap();
+
+        let result = rotate_events_log(&events_path, &log_dir, &db).await;
+        assert!(result.is_some(), "rotation should succeed");
+
+        // Rotated segment landed in log_dir and the live file is now empty.
+        let rotated: Vec<_> = std::fs::read_dir(&log_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("events-")
+            })
+            .collect();
+        assert_eq!(rotated.len(), 1, "exactly one rotated segment expected");
+        assert!(events_path.exists(), "fresh events.jsonl should be recreated");
+        assert_eq!(
+            std::fs::metadata(&events_path).unwrap().len(),
+            0,
+            "fresh events.jsonl should be empty"
+        );
+
+        // No event was lost — both rows were ingested via the rotated segment.
+        let history = db.query_history(None, 10).await.unwrap();
+        assert_eq!(history.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn file_identity_changes_when_file_is_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("events.jsonl");
+        std::fs::write(&path, b"a\n").unwrap();
+        let id1 = file_identity(&path).await;
+        assert!(id1.is_some());
+
+        // Replace the file with a *larger* one (the case the shrink check misses).
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"much longer content than before\n").unwrap();
+        let id2 = file_identity(&path).await;
+        assert!(id2.is_some());
+        assert_ne!(id1, id2, "replaced file should have a different inode");
+
+        // Missing file → None.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(file_identity(&path).await, None);
+    }
+
+    #[tokio::test]
+    async fn open_reader_at_clamps_offset_to_eof() {
+        let tmp = tempfile::tempdir().unwrap();
+        let events_path = tmp.path().join("events.jsonl");
+        std::fs::write(&events_path, b"short\n").unwrap();
+
+        // Offset past EOF (simulating a file that shrank) clamps to file length.
+        let (_reader, offset) = open_reader_at(&events_path, 9999).await.unwrap();
+        assert_eq!(offset, 6);
     }
 
     #[tokio::test]

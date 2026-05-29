@@ -169,8 +169,7 @@ fn preflight_checks(project: &Path, agent_type: &AgentType) -> Result<()> {
     {
         #[cfg(unix)]
         {
-            let alive = unsafe { libc::kill(pid, 0) } == 0;
-            if !alive {
+            if !process_exists(pid) {
                 anyhow::bail!(
                     "Daemon is not running (stale PID file).\n  fix: wisphive daemon start"
                 );
@@ -206,6 +205,15 @@ fn preflight_checks(project: &Path, agent_type: &AgentType) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+fn process_exists(pid: i32) -> bool {
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 fn print_agent(agent: &ManagedAgent) {

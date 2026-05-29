@@ -84,43 +84,98 @@ impl Server {
         self.reauth.clone()
     }
 
+    /// Probe the audit archive size and free disk, and broadcast any
+    /// raise/clear transition to TUI/web clients (also logged in `disk_alert`).
+    /// Wisphive never deletes audit data; this is the non-destructive signal
+    /// that prompts the operator to act (itr#340). `state` latches so each
+    /// condition alerts once per crossing rather than every tick.
+    fn check_disk_alerts(&self, state: &mut crate::disk_alert::AlertState) {
+        let thresholds = crate::disk_alert::Thresholds {
+            archive_max_bytes: self.config.archive_alert_max_bytes,
+            disk_free_min_bytes: self.config.disk_alert_free_bytes,
+        };
+        let events = crate::disk_alert::check(
+            &self.config.log_dir,
+            &self.config.home_dir,
+            thresholds,
+            state,
+        );
+        for ev in events {
+            let _ = self.tui_tx.send(ServerMessage::DiskAlert {
+                kind: ev.kind,
+                active: ev.active,
+                message: ev.message,
+                at: chrono::Utc::now(),
+            });
+        }
+    }
+
     /// Start listening for connections. Runs until shutdown signal.
     pub async fn run(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
-        // Clean up stale socket
+        // Clean up stale runtime state from a prior daemon process
         let _ = std::fs::remove_file(&self.config.socket_path);
+        sweep_stale_session_markers(&self.config.home_dir.join("sessions"));
 
         let listener = UnixListener::bind(&self.config.socket_path)?;
         info!(path = %self.config.socket_path.display(), "listening");
 
         // Spawn event ingest task (tails events.jsonl → decision_log)
         let events_path = self.config.home_dir.join("events.jsonl");
-        let _ingest_handle =
-            crate::event_ingest::spawn_event_ingest(events_path, self.state_db.clone());
+        let _ingest_handle = crate::event_ingest::spawn_event_ingest(
+            events_path,
+            self.config.log_dir.clone(),
+            self.state_db.clone(),
+        );
 
         let mut reap_interval = tokio::time::interval(Duration::from_secs(5));
         reap_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        // Run retention on startup
+        // Single-flight guard: the startup pass and the hourly tick must never
+        // run concurrently (two overlapping VACUUM/archive passes contend on the
+        // pool and can double-archive). `try_lock` → skip if a pass is running.
+        let retention_lock = Arc::new(tokio::sync::Mutex::new(()));
+
+        // Run retention on startup, but OFF the accept path: a VACUUM (or a slow
+        // archive) must never delay the daemon from accepting connections, and a
+        // hang/OOM there previously bricked startup entirely.
         let archive_path = self.config.log_dir.join("decision_log.jsonl");
         {
-            match self
-                .state_db
-                .archive_and_prune(
-                    &archive_path,
-                    self.config.retention_max_rows,
-                    self.config.retention_max_age_days,
-                )
-                .await
-            {
-                Ok(0) => {}
-                Ok(n) => info!(n, "startup retention: archived entries"),
-                Err(e) => warn!("startup retention failed: {e}"),
-            }
+            let state_db = self.state_db.clone();
+            let archive_path = archive_path.clone();
+            let max_rows = self.config.retention_max_rows;
+            let max_age_days = self.config.retention_max_age_days;
+            let vacuum_max_bytes = self.config.retention_vacuum_max_bytes;
+            let retention_lock = retention_lock.clone();
+            tokio::spawn(async move {
+                let _guard = match retention_lock.try_lock() {
+                    Ok(g) => g,
+                    Err(_) => return, // a tick already started a pass
+                };
+                match state_db
+                    .run_retention(&archive_path, max_rows, max_age_days, vacuum_max_bytes)
+                    .await
+                {
+                    Ok(o) if o.is_noop() => {}
+                    Ok(o) => info!(
+                        archived = o.archived,
+                        terminal_events_pruned = o.terminal_events_pruned,
+                        vacuumed = o.vacuumed,
+                        "startup retention"
+                    ),
+                    Err(e) => warn!("startup retention failed: {e}"),
+                }
+            });
         }
 
         let mut retention_interval = tokio::time::interval(Duration::from_secs(3600));
         retention_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         retention_interval.tick().await; // skip immediate tick (we just ran on startup)
+
+        // Latched resource-alert state (archive size, low disk). Probed inline —
+        // a dir scan + statvfs is cheap, unlike the retention VACUUM that runs
+        // off the accept path. Run once at startup, then on each retention tick.
+        let mut alert_state = crate::disk_alert::AlertState::default();
+        self.check_disk_alerts(&mut alert_state);
 
         loop {
             tokio::select! {
@@ -148,17 +203,32 @@ impl Server {
                         let _ = self.tui_tx.send(ServerMessage::AgentDisconnected { agent_id });
                     }
                 }
-                // Periodic retention: archive + prune old decision_log entries
+                // Periodic retention: archive decision_log + prune terminal_events,
+                // checkpoint the WAL, and size-guarded VACUUM. Skipped if the
+                // startup pass (or a prior tick) is still running.
                 _ = retention_interval.tick() => {
-                    match self.state_db.archive_and_prune(
-                        &archive_path,
-                        self.config.retention_max_rows,
-                        self.config.retention_max_age_days,
-                    ).await {
-                        Ok(0) => {}
-                        Ok(n) => info!(n, "retention: archived entries"),
-                        Err(e) => warn!("retention failed: {e}"),
+                    match retention_lock.try_lock() {
+                        Ok(_guard) => match self.state_db.run_retention(
+                            &archive_path,
+                            self.config.retention_max_rows,
+                            self.config.retention_max_age_days,
+                            self.config.retention_vacuum_max_bytes,
+                        ).await {
+                            Ok(o) if o.is_noop() => {}
+                            Ok(o) => info!(
+                                archived = o.archived,
+                                terminal_events_pruned = o.terminal_events_pruned,
+                                vacuumed = o.vacuumed,
+                                "retention"
+                            ),
+                            Err(e) => warn!("retention failed: {e}"),
+                        },
+                        Err(_) => debug!("retention already in progress; skipping tick"),
                     }
+                    // Independent of whether retention ran, re-probe resources:
+                    // the archive only grows (it is never reaped) so its alert
+                    // must be evaluated even when a tick is skipped.
+                    self.check_disk_alerts(&mut alert_state);
                 }
                 accept = listener.accept() => {
                     match accept {
@@ -1151,4 +1221,77 @@ fn persist_auto_approve(tool_name: &str, wisphive_dir: &std::path::Path) -> Resu
 
     std::fs::write(&path, serde_json::to_string_pretty(&config)?)?;
     Ok(())
+}
+
+fn sweep_stale_session_markers(sessions_dir: &std::path::Path) {
+    let entries = match std::fs::read_dir(sessions_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            warn!(path = %sessions_dir.display(), error = %e, "session sweep: read_dir failed");
+            return;
+        }
+    };
+
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "session sweep: remove failed");
+            }
+        }
+    }
+
+    if removed > 0 {
+        info!(removed, "session sweep: cleared stale markers");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sweep_stale_session_markers;
+
+    #[test]
+    fn sweep_removes_existing_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        for name in ["cc-aaa", "cc-bbb", "codex-ccc"] {
+            std::fs::write(sessions.join(name), "").unwrap();
+        }
+        assert_eq!(std::fs::read_dir(&sessions).unwrap().count(), 3);
+
+        sweep_stale_session_markers(&sessions);
+
+        assert_eq!(std::fs::read_dir(&sessions).unwrap().count(), 0);
+        assert!(
+            sessions.exists(),
+            "sweep must not remove the directory itself"
+        );
+    }
+
+    #[test]
+    fn sweep_is_noop_when_dir_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        assert!(!sessions.exists());
+
+        sweep_stale_session_markers(&sessions);
+
+        assert!(!sessions.exists(), "sweep must not create the directory");
+    }
+
+    #[test]
+    fn sweep_is_noop_when_dir_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        sweep_stale_session_markers(&sessions);
+
+        assert!(sessions.exists());
+        assert_eq!(std::fs::read_dir(&sessions).unwrap().count(), 0);
+    }
 }

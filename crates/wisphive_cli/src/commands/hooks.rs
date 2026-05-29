@@ -29,6 +29,9 @@ const CODEX_HOOK_EVENTS: &[&str] = &[
 ];
 
 const CODEX_HOOK_TIMEOUT_SECS: u64 = 3_700;
+const CODEX_HOOK_REVIEW_NOTE: &str = "Codex project hooks are non-managed hooks. \
+After installing or changing them, open /hooks in Codex and trust the Wisphive hook command; \
+project trust alone is not enough for Codex to run them.";
 
 /// Get the wisphive home directory.
 fn wisphive_home() -> PathBuf {
@@ -147,6 +150,7 @@ fn install_codex(project: &std::path::Path) -> Result<()> {
     std::fs::write(&hooks_path, formatted)?;
 
     eprintln!("Wisphive hooks installed in {}", hooks_path.display());
+    eprintln!("{CODEX_HOOK_REVIEW_NOTE}");
     Ok(())
 }
 
@@ -225,7 +229,23 @@ pub fn status() -> Result<()> {
     let pid_path = wisphive_home().join("wisphive.pid");
     if pid_path.exists() {
         let pid = std::fs::read_to_string(&pid_path)?;
-        eprintln!("Daemon: running (pid: {})", pid.trim());
+        let pid = pid.trim();
+        if let Ok(pid_num) = pid.parse::<i32>() {
+            #[cfg(unix)]
+            {
+                if process_exists(pid_num) {
+                    eprintln!("Daemon: running (pid: {pid})");
+                } else {
+                    eprintln!("Daemon: not running (stale PID file: {pid})");
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                eprintln!("Daemon PID file: {pid}");
+            }
+        } else {
+            eprintln!("Daemon: invalid PID file ({pid})");
+        }
     } else {
         eprintln!("Daemon: not running");
     }
@@ -238,7 +258,30 @@ pub fn status() -> Result<()> {
         eprintln!("Socket: not found");
     }
 
+    if let Ok(project) = std::env::current_dir() {
+        let codex_hooks_path = project.join(".codex").join("hooks.json");
+        if codex_hooks_path.exists()
+            && std::fs::read_to_string(&codex_hooks_path)
+                .is_ok_and(|content| content.contains("wisphive"))
+        {
+            eprintln!(
+                "Codex: Wisphive hook file present in {}",
+                codex_hooks_path.display()
+            );
+            eprintln!("Codex: {CODEX_HOOK_REVIEW_NOTE}");
+        }
+    }
+
     Ok(())
+}
+
+#[cfg(unix)]
+fn process_exists(pid: i32) -> bool {
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Get the path to the wisphive-hook binary.

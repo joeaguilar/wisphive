@@ -511,6 +511,28 @@ pub enum ServerMessage {
         id: Option<Uuid>,
         message: String,
     },
+
+    /// A non-destructive resource alert. Wisphive never auto-deletes audit data
+    /// (see itr#340); when the audit archive grows large or the host is low on
+    /// disk it raises this instead, surfaced as a TUI/web banner. `active=false`
+    /// is a clear: the condition dropped back below its threshold.
+    #[serde(rename = "disk_alert")]
+    DiskAlert {
+        kind: DiskAlertKind,
+        active: bool,
+        message: String,
+        at: chrono::DateTime<chrono::Utc>,
+    },
+}
+
+/// Which resource condition a [`ServerMessage::DiskAlert`] describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiskAlertKind {
+    /// The on-disk audit archive has grown past its alert threshold.
+    ArchiveSize,
+    /// Free space on the Wisphive state filesystem dropped below the floor.
+    LowDiskSpace,
 }
 
 /// Protocol version. Increment on breaking wire format changes.

@@ -183,8 +183,7 @@ pub async fn status() -> Result<()> {
 
     #[cfg(unix)]
     {
-        let result = unsafe { libc::kill(pid, 0) };
-        if result == 0 {
+        if process_exists(pid) {
             eprintln!("Daemon: running (pid: {})", pid);
         } else {
             eprintln!("Daemon: not running (stale PID file)");
@@ -203,4 +202,13 @@ pub async fn status() -> Result<()> {
     eprintln!("Database: {}", config.db_path.display());
 
     Ok(())
+}
+
+#[cfg(unix)]
+fn process_exists(pid: i32) -> bool {
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }

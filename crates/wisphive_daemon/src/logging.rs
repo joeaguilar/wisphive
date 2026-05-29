@@ -287,9 +287,39 @@ pub fn init(
     })
 }
 
-/// Delete files in `log_dir` whose mtime is older than `retention_days`. Best
-/// effort — individual unlink failures are swallowed so a permission glitch on
-/// one file can't abort daemon startup.
+/// Whether the pruner is allowed to delete a file with this name by age.
+///
+/// This is an explicit **allowlist**, not a denylist: an unrecognized file is
+/// kept. The cost of accidentally retaining a log file is disk; the cost of
+/// accidentally deleting a data file is permanent loss. `prune_old_files`
+/// previously reaped *every* file in `log_dir`, which silently deleted the
+/// decision archive and `*.failed.jsonl` recovery segments (see #339).
+///
+/// Reapable:
+/// - `wisphive.log*` — rolling daemon logs (mirrored to the in-memory
+///   `LogStore`; pure operational telemetry, safe to drop).
+/// - `events-*.jsonl` rotated hook-event segments — re-ingested into
+///   `decision_log` before rotation, so the on-disk copy is redundant.
+///
+/// Never reaped:
+/// - `*.failed.jsonl` — event segments whose re-ingest FAILED; the only copy of
+///   that telemetry until an operator (or the startup sweep, #336) re-imports it.
+/// - `decision_log.jsonl*` — the decision archive sink and its rotated segments
+///   (long-term audit data; durable-path policy tracked in #340).
+fn is_reapable(name: &str) -> bool {
+    if name.ends_with(".failed.jsonl") {
+        return false;
+    }
+    if name.starts_with("decision_log.jsonl") {
+        return false;
+    }
+    name.starts_with("wisphive.log")
+        || (name.starts_with("events-") && name.ends_with(".jsonl"))
+}
+
+/// Delete reapable files (see [`is_reapable`]) in `log_dir` whose mtime is older
+/// than `retention_days`. Best effort — individual unlink failures are swallowed
+/// so a permission glitch on one file can't abort daemon startup.
 pub fn prune_old_files(log_dir: &Path, retention_days: u64) -> std::io::Result<()> {
     let cutoff = match SystemTime::now()
         .checked_sub(Duration::from_secs(retention_days.saturating_mul(86_400)))
@@ -314,6 +344,13 @@ pub fn prune_old_files(log_dir: &Path, retention_days: u64) -> std::io::Result<(
         let Ok(modified) = metadata.modified() else {
             continue;
         };
+        // Only reap recognized, redundant log/segment files. Unknown files and
+        // data files (decision archive, `.failed.jsonl` recovery) are kept
+        // regardless of age — see `is_reapable`.
+        match entry.file_name().to_str() {
+            Some(name) if is_reapable(name) => {}
+            _ => continue,
+        }
         if modified < cutoff {
             let _ = std::fs::remove_file(entry.path());
         }
@@ -463,6 +500,50 @@ mod tests {
             ratio.is_string(),
             "non-finite f64 should be preserved as a string marker, got {ratio:?}"
         );
+    }
+
+    #[test]
+    fn pruner_only_reaps_allowlisted_files() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Reapable: daemon logs + re-ingested rotated event segments.
+        let daemon_log = dir.path().join("wisphive.log.2020-01-01");
+        let event_seg = dir.path().join("events-20200101-000000.jsonl");
+        // Protected: failed-reimport recovery + the decision archive (live and
+        // rotated). These hold the only copy of audit/telemetry data.
+        let failed_seg = dir.path().join("events-20200101-000000.failed.jsonl");
+        let archive = dir.path().join("decision_log.jsonl");
+        let archive_rotated = dir.path().join("decision_log.jsonl.20200101-000000");
+        // Unknown file: kept (allowlist, not denylist).
+        let unknown = dir.path().join("important-backup.db");
+
+        for f in [
+            &daemon_log,
+            &event_seg,
+            &failed_seg,
+            &archive,
+            &archive_rotated,
+            &unknown,
+        ] {
+            std::fs::write(f, b"x").unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+
+        // retention_days = 0 -> everything is "older than cutoff" by age.
+        prune_old_files(dir.path(), 0).unwrap();
+
+        assert!(!daemon_log.exists(), "daemon log should be reaped");
+        assert!(!event_seg.exists(), "rotated event segment should be reaped");
+        assert!(
+            failed_seg.exists(),
+            ".failed.jsonl recovery segment must never be reaped"
+        );
+        assert!(archive.exists(), "decision archive sink must never be reaped");
+        assert!(
+            archive_rotated.exists(),
+            "rotated decision archive must never be reaped"
+        );
+        assert!(unknown.exists(), "unknown files must not be reaped");
     }
 
     #[test]

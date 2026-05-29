@@ -1726,6 +1726,47 @@ kbd {
   background: rgba(255, 183, 77, 0.08);
 }
 
+/* Daemon resource alerts (audit archive size, low disk). Non-destructive
+ * warnings — Wisphive never deletes audit data (itr#340). */
+.disk-alert-banner {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  margin-bottom: var(--space-md);
+}
+
+.disk-alert {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-sm);
+  padding: 8px 12px;
+  border-radius: 4px;
+  font-size: var(--font-sm);
+  border: 1px solid var(--yellow);
+  color: var(--yellow);
+  background: rgba(255, 183, 77, 0.08);
+}
+
+/* Low disk is more urgent than a large (but safe) archive. */
+.disk-alert-low_disk_space {
+  border-color: var(--red);
+  color: var(--red);
+  background: rgba(244, 67, 54, 0.08);
+}
+
+.disk-alert-icon {
+  flex-shrink: 0;
+}
+
+.disk-alert-label {
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.disk-alert-message {
+  color: var(--text);
+}
+
 .login-setup {
   display: flex;
   flex-direction: column;

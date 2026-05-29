@@ -426,6 +426,9 @@ async fn run_loop(
                     Some(ServerMessage::TermError { id, message }) => {
                         tracing::warn!(?id, %message, "terminal error");
                     }
+                    Some(ServerMessage::DiskAlert { kind, active, message, .. }) => {
+                        app.apply_disk_alert(kind, active, message);
+                    }
                     Some(_) => {}
                     None => {
                         tracing::warn!("daemon disconnected");

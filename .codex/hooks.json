@@ -1,37 +1,48 @@
 {
   "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "env WISPHIVE_AGENT_TYPE=codex /Users/josefaguilar/.cargo/bin/wisphive-hook",
-            "timeout": 3700
-          }
-        ]
-      }
-    ],
     "PermissionRequest": [
       {
-        "matcher": "",
         "hooks": [
           {
-            "type": "command",
             "command": "env WISPHIVE_AGENT_TYPE=codex /Users/josefaguilar/.cargo/bin/wisphive-hook",
-            "timeout": 3700
+            "timeout": 3700,
+            "type": "command"
           }
-        ]
+        ],
+        "matcher": ""
       }
     ],
     "PostToolUse": [
       {
-        "matcher": "",
         "hooks": [
           {
-            "type": "command",
             "command": "env WISPHIVE_AGENT_TYPE=codex /Users/josefaguilar/.cargo/bin/wisphive-hook",
-            "timeout": 3700
+            "timeout": 3700,
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "env WISPHIVE_AGENT_TYPE=codex /Users/josefaguilar/.cargo/bin/wisphive-hook",
+            "timeout": 3700,
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": "env WISPHIVE_AGENT_TYPE=codex /Users/josefaguilar/.cargo/bin/wisphive-hook",
+            "timeout": 3700,
+            "type": "command"
           }
         ]
       }
@@ -40,20 +51,9 @@
       {
         "hooks": [
           {
-            "type": "command",
             "command": "env WISPHIVE_AGENT_TYPE=codex /Users/josefaguilar/.cargo/bin/wisphive-hook",
-            "timeout": 3700
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "env WISPHIVE_AGENT_TYPE=codex /Users/josefaguilar/.cargo/bin/wisphive-hook",
-            "timeout": 3700
+            "timeout": 3700,
+            "type": "command"
           }
         ]
       }
