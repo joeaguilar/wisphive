@@ -403,36 +403,46 @@ fn format_and_exit(resp: &HookResponse) -> i32 {
                 return 0;
             }
 
-            let has_extras = resp.updated_input.is_some() || resp.additional_context.is_some();
-            if has_extras {
-                let mut output = serde_json::Map::new();
-                let mut hook_output = serde_json::Map::new();
-                hook_output.insert(
-                    "hookEventName".into(),
-                    serde_json::Value::String("PreToolUse".into()),
-                );
-                hook_output.insert(
-                    "permissionDecision".into(),
-                    serde_json::Value::String("allow".into()),
-                );
-                if let Some(ref input) = resp.updated_input {
-                    hook_output.insert("updatedInput".into(), input.clone());
-                }
-                output.insert(
-                    "hookSpecificOutput".into(),
-                    serde_json::Value::Object(hook_output),
-                );
-                if let Some(ref ctx) = resp.additional_context {
-                    output.insert(
-                        "additionalContext".into(),
-                        serde_json::Value::String(ctx.clone()),
-                    );
-                }
-                print!("{}", serde_json::Value::Object(output));
+            if let Some(json) = pre_tool_use_approve_value(resp) {
+                print!("{}", json);
             }
             0
         }
     }
+}
+
+/// Build the Claude PreToolUse approve JSON: `allow` plus any `updatedInput` /
+/// `additionalContext`. Returns `None` when there are no extras (bare allow →
+/// no stdout). `additionalContext` is nested INSIDE `hookSpecificOutput`
+/// (alongside `permissionDecision`/`updatedInput`); emitting it as a top-level
+/// sibling would make Claude Code silently ignore it.
+fn pre_tool_use_approve_value(resp: &HookResponse) -> Option<serde_json::Value> {
+    if resp.updated_input.is_none() && resp.additional_context.is_none() {
+        return None;
+    }
+
+    let mut hook_output = serde_json::Map::new();
+    hook_output.insert(
+        "hookEventName".into(),
+        serde_json::Value::String("PreToolUse".into()),
+    );
+    hook_output.insert(
+        "permissionDecision".into(),
+        serde_json::Value::String("allow".into()),
+    );
+    if let Some(ref input) = resp.updated_input {
+        hook_output.insert("updatedInput".into(), input.clone());
+    }
+    if let Some(ref ctx) = resp.additional_context {
+        hook_output.insert(
+            "additionalContext".into(),
+            serde_json::Value::String(ctx.clone()),
+        );
+    }
+
+    Some(serde_json::json!({
+        "hookSpecificOutput": serde_json::Value::Object(hook_output)
+    }))
 }
 
 /// Format telemetry-only hook events so they never fall through to PreToolUse.
@@ -532,15 +542,11 @@ fn format_stop_response(resp: &HookResponse) -> i32 {
 fn format_block_response(resp: &HookResponse) -> i32 {
     match resp.decision {
         Decision::Approve => {
-            if resp.agent_type == AgentType::Codex
-                && let Some(ref ctx) = resp.additional_context
-            {
-                let json = serde_json::json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": resp.event_type.to_string(),
-                        "additionalContext": ctx
-                    }
-                });
+            // Inject reviewer-supplied context for both Claude and Codex. The
+            // `hookSpecificOutput.{hookEventName, additionalContext}` shape is
+            // accepted by both agents; gating it on Codex dropped the context
+            // on the Claude path.
+            if let Some(json) = block_additional_context_value(resp) {
                 print!("{}", json);
             }
             0
@@ -556,6 +562,19 @@ fn format_block_response(resp: &HookResponse) -> i32 {
         }
         Decision::Ask => 0,
     }
+}
+
+/// Build the `additionalContext` injection JSON for block-style events
+/// (UserPromptSubmit / ConfigChange / PreCompact) on approve. Returns `None`
+/// when there is no context to inject (bare approve → no stdout).
+fn block_additional_context_value(resp: &HookResponse) -> Option<serde_json::Value> {
+    let ctx = resp.additional_context.as_ref()?;
+    Some(serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": resp.event_type.to_string(),
+            "additionalContext": ctx
+        }
+    }))
 }
 
 /// Format Elicitation: approve = accept with content, deny = decline/cancel.
@@ -1767,5 +1786,101 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn claude_pre_tool_use_approve_nests_additional_context_in_hook_specific_output() {
+        // Regression for itr#356: additionalContext must live INSIDE
+        // hookSpecificOutput (sibling of permissionDecision/updatedInput), not
+        // at the top level where Claude Code silently ignores it.
+        let mut resp = HookResponse::new(
+            Decision::Approve,
+            HookEventType::PreToolUse,
+            AgentType::ClaudeCode,
+        );
+        resp.updated_input = Some(json!({"command": "echo safe"}));
+        resp.additional_context = Some("guidance for Claude".into());
+
+        let output = pre_tool_use_approve_value(&resp).unwrap();
+
+        assert_eq!(
+            output,
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "updatedInput": {"command": "echo safe"},
+                    "additionalContext": "guidance for Claude"
+                }
+            })
+        );
+        // The bug was a top-level sibling; assert it is NOT there.
+        assert!(output.get("additionalContext").is_none());
+    }
+
+    #[test]
+    fn pre_tool_use_approve_without_extras_emits_nothing() {
+        let resp = HookResponse::new(
+            Decision::Approve,
+            HookEventType::PreToolUse,
+            AgentType::ClaudeCode,
+        );
+        assert!(pre_tool_use_approve_value(&resp).is_none());
+    }
+
+    #[test]
+    fn claude_block_approve_emits_additional_context() {
+        // Regression for itr#357: a Claude UserPromptSubmit approve carrying
+        // reviewer context must emit it, not drop it (was Codex-only).
+        let mut resp = HookResponse::new(
+            Decision::Approve,
+            HookEventType::UserPromptSubmit,
+            AgentType::ClaudeCode,
+        );
+        resp.additional_context = Some("remember to run the lints".into());
+
+        let output = block_additional_context_value(&resp).unwrap();
+
+        assert_eq!(
+            output,
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": "remember to run the lints"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn codex_block_approve_still_emits_additional_context() {
+        // The fix removed the Codex-only gate; Codex must keep emitting too.
+        let mut resp = HookResponse::new(
+            Decision::Approve,
+            HookEventType::ConfigChange,
+            AgentType::Codex,
+        );
+        resp.additional_context = Some("config reloaded".into());
+
+        let output = block_additional_context_value(&resp).unwrap();
+
+        assert_eq!(
+            output["hookSpecificOutput"]["hookEventName"],
+            json!("ConfigChange")
+        );
+        assert_eq!(
+            output["hookSpecificOutput"]["additionalContext"],
+            json!("config reloaded")
+        );
+    }
+
+    #[test]
+    fn block_approve_without_context_emits_nothing() {
+        let resp = HookResponse::new(
+            Decision::Approve,
+            HookEventType::UserPromptSubmit,
+            AgentType::ClaudeCode,
+        );
+        assert!(block_additional_context_value(&resp).is_none());
     }
 }
