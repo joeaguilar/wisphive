@@ -515,14 +515,13 @@ mod tests {
         let rotated: Vec<_> = std::fs::read_dir(&log_dir)
             .unwrap()
             .flatten()
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("events-")
-            })
+            .filter(|e| e.file_name().to_string_lossy().starts_with("events-"))
             .collect();
         assert_eq!(rotated.len(), 1, "exactly one rotated segment expected");
-        assert!(events_path.exists(), "fresh events.jsonl should be recreated");
+        assert!(
+            events_path.exists(),
+            "fresh events.jsonl should be recreated"
+        );
         assert_eq!(
             std::fs::metadata(&events_path).unwrap().len(),
             0,

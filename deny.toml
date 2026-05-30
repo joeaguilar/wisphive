@@ -1,0 +1,25 @@
+[advisories]
+ignore = [
+    # Transitive via notify -> notify-types. No fixed version is available yet;
+    # review by 2026-08-30 or when notify removes instant.
+    { id = "RUSTSEC-2024-0384", reason = "Transitive unmaintained crate via notify; no patched upgrade available. Tracked by itr#330; review by 2026-08-30." },
+    # Transitive via ratatui. Ratatui has not removed paste in the current
+    # dependency line; review by 2026-08-30.
+    { id = "RUSTSEC-2024-0436", reason = "Transitive unmaintained crate via ratatui; no patched upgrade available in current line. Tracked by itr#330; review by 2026-08-30." },
+    # Direct and transitive through axum-server. Migrating direct PEM parsing is
+    # separable from axum-server's own dependency; review by 2026-08-30.
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is direct and axum-server-transitive; migration needs a dedicated TLS follow-up. Tracked by itr#330; review by 2026-08-30." },
+    # Transitive via portable-pty. No patched portable-pty path is available in
+    # the current terminal stack; review by 2026-08-30.
+    { id = "RUSTSEC-2017-0008", reason = "Transitive unmaintained crate via portable-pty; no patched upgrade available in current terminal stack. Tracked by itr#330; review by 2026-08-30." },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

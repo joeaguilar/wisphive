@@ -332,14 +332,19 @@ fn read_limited_to_string<R: Read>(reader: R, max_bytes: usize) -> Result<String
 fn format_and_exit(resp: &HookResponse) -> i32 {
     use HookEventType::*;
     match resp.event_type {
+        PreToolUse => {}
         PermissionRequest => return format_permission_response(resp),
-        PostToolUse => return format_post_tool_use_response(resp),
+        PostToolUse | PostToolUseFailure => return format_post_tool_use_response(resp),
         Stop | SubagentStop => return format_stop_response(resp),
-        UserPromptSubmit | ConfigChange => return format_block_response(resp),
-        Elicitation => return format_elicitation_response(resp),
+        UserPromptSubmit | ConfigChange | PreCompact => return format_block_response(resp),
+        Elicitation | ElicitationResult => return format_elicitation_response(resp),
         TeammateIdle => return format_teammate_idle_response(resp),
         TaskCompleted => return format_task_completed_response(resp),
-        _ => {} // PreToolUse and unknown fall through to existing logic
+        InstructionsLoaded | SubagentStart | StopFailure | WorktreeCreate | WorktreeRemove
+        | PostCompact | SessionStart | SessionEnd | Notification => {
+            return format_lifecycle_event_response(resp);
+        }
+        Unknown => return format_unknown_event_response(resp),
     }
     match resp.decision {
         Decision::Ask => {
@@ -430,7 +435,18 @@ fn format_and_exit(resp: &HookResponse) -> i32 {
     }
 }
 
-/// Format PostToolUse: result reporting is telemetry only, so never block or emit
+/// Format telemetry-only hook events so they never fall through to PreToolUse.
+fn format_lifecycle_event_response(_resp: &HookResponse) -> i32 {
+    0
+}
+
+/// Format unknown hook events loudly without emitting a wrong event shape.
+fn format_unknown_event_response(_resp: &HookResponse) -> i32 {
+    eprintln!("Wisphive ignored an unknown hook event. Update wisphive_protocol::HookEventType.");
+    0
+}
+
+/// Format PostToolUse/PostToolUseFailure: result reporting is telemetry only, so never block or emit
 /// PreToolUse-shaped JSON for a completed tool call.
 fn format_post_tool_use_response(_resp: &HookResponse) -> i32 {
     0
@@ -438,18 +454,23 @@ fn format_post_tool_use_response(_resp: &HookResponse) -> i32 {
 
 /// Format a PermissionRequest response for the calling agent.
 fn format_permission_response(resp: &HookResponse) -> i32 {
-    let Some(decision_obj) = permission_decision_object(resp) else {
+    let Some(json) = permission_response_value(resp) else {
         return 0;
     };
 
-    let json = serde_json::json!({
+    print!("{}", json);
+    0
+}
+
+fn permission_response_value(resp: &HookResponse) -> Option<serde_json::Value> {
+    let decision_obj = permission_decision_object(resp)?;
+
+    Some(serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "PermissionRequest",
             "decision": serde_json::Value::Object(decision_obj)
         }
-    });
-    print!("{}", json);
-    0
+    }))
 }
 
 fn permission_decision_object(
@@ -553,7 +574,10 @@ fn format_elicitation_response(resp: &HookResponse) -> i32 {
 
     let mut output = serde_json::Map::new();
     let mut hook_output = serde_json::Map::new();
-    hook_output.insert("hookEventName".into(), serde_json::json!("Elicitation"));
+    hook_output.insert(
+        "hookEventName".into(),
+        serde_json::json!(resp.event_type.to_string()),
+    );
     hook_output.insert("action".into(), serde_json::json!(action));
     if action == "accept"
         && let Some(ref input) = resp.updated_input
@@ -1102,6 +1126,7 @@ fn register_agent_once(
 ///   "auto_approve_stop": bool          (default: false)
 ///   "auto_approve_user_prompt": bool   (default: true)
 ///   "auto_approve_config_change": bool (default: true)
+///   "auto_approve_lifecycle": bool     (default: true)
 ///
 /// Set to false to send these events to the daemon for review (useful for debugging).
 fn is_event_auto_approved(
@@ -1114,6 +1139,15 @@ fn is_event_auto_approved(
         HookEventType::Stop | HookEventType::SubagentStop => ("auto_approve_stop", false),
         HookEventType::UserPromptSubmit => ("auto_approve_user_prompt", true),
         HookEventType::ConfigChange => ("auto_approve_config_change", true),
+        HookEventType::InstructionsLoaded
+        | HookEventType::PostToolUseFailure
+        | HookEventType::SubagentStart
+        | HookEventType::StopFailure
+        | HookEventType::WorktreeRemove
+        | HookEventType::PostCompact
+        | HookEventType::SessionStart
+        | HookEventType::SessionEnd
+        | HookEventType::Notification => ("auto_approve_lifecycle", true),
         _ => return false,
     };
 
@@ -1404,6 +1438,12 @@ fn extract_plan_from_transcript(path: &str) -> Option<String> {
     None
 }
 
+fn home_dir() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1623,10 +1663,109 @@ mod tests {
         assert!(!decision.contains_key("updatedInput"));
         assert!(!decision.contains_key("updatedPermissions"));
     }
-}
 
-fn home_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+    #[test]
+    fn claude_permission_response_matches_documented_envelope() {
+        let mut resp = HookResponse::new(
+            Decision::Approve,
+            HookEventType::PermissionRequest,
+            AgentType::ClaudeCode,
+        );
+        resp.updated_input = Some(json!({"command": "npm run lint"}));
+        resp.selected_permission = Some(wisphive_protocol::PermissionSuggestion {
+            suggestion_type: "addRules".into(),
+            rules: vec![wisphive_protocol::PermissionRule {
+                tool_name: "Bash".into(),
+                rule_content: "npm run lint".into(),
+            }],
+            behavior: "allow".into(),
+            destination: "session".into(),
+            mode: None,
+        });
+
+        let output = permission_response_value(&resp).unwrap();
+
+        assert_eq!(
+            output,
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": {
+                        "behavior": "allow",
+                        "updatedInput": {
+                            "command": "npm run lint"
+                        },
+                        "updatedPermissions": [{
+                            "type": "addRules",
+                            "rules": [{
+                                "toolName": "Bash",
+                                "ruleContent": "npm run lint"
+                            }],
+                            "behavior": "allow",
+                            "destination": "session"
+                        }]
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn codex_permission_response_matches_documented_envelope_without_reserved_fields() {
+        let mut resp = HookResponse::new(
+            Decision::Approve,
+            HookEventType::PermissionRequest,
+            AgentType::Codex,
+        );
+        resp.updated_input = Some(json!({"command": "npm run lint"}));
+        resp.selected_permission = Some(wisphive_protocol::PermissionSuggestion {
+            suggestion_type: "addRules".into(),
+            rules: vec![wisphive_protocol::PermissionRule {
+                tool_name: "Bash".into(),
+                rule_content: "npm run lint".into(),
+            }],
+            behavior: "allow".into(),
+            destination: "session".into(),
+            mode: None,
+        });
+
+        let output = permission_response_value(&resp).unwrap();
+
+        assert_eq!(
+            output,
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": {
+                        "behavior": "allow"
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn permission_deny_response_matches_documented_envelope() {
+        let mut resp = HookResponse::new(
+            Decision::Deny,
+            HookEventType::PermissionRequest,
+            AgentType::Codex,
+        );
+        resp.message = Some("Blocked by repository policy.".into());
+
+        let output = permission_response_value(&resp).unwrap();
+
+        assert_eq!(
+            output,
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": {
+                        "behavior": "deny",
+                        "message": "Blocked by repository policy."
+                    }
+                }
+            })
+        );
+    }
 }

@@ -97,7 +97,11 @@ fn free_bytes_impl(_path: &Path) -> Option<u64> {
 /// Compare `usage` against `thresholds`, update the latch `state`, and return
 /// the transitions to surface this tick (raises and clears). Pure — no IO — so
 /// the edge logic is unit-testable without touching a real filesystem.
-pub fn evaluate(usage: DiskUsage, thresholds: Thresholds, state: &mut AlertState) -> Vec<AlertEvent> {
+pub fn evaluate(
+    usage: DiskUsage,
+    thresholds: Thresholds,
+    state: &mut AlertState,
+) -> Vec<AlertEvent> {
     let mut events = Vec::new();
 
     if thresholds.archive_max_bytes > 0 {
@@ -146,7 +150,10 @@ pub fn evaluate(usage: DiskUsage, thresholds: Thresholds, state: &mut AlertState
             events.push(AlertEvent {
                 kind: DiskAlertKind::LowDiskSpace,
                 active: false,
-                message: format!("Free disk recovered ({} free).", human_bytes(usage.free_bytes)),
+                message: format!(
+                    "Free disk recovered ({} free).",
+                    human_bytes(usage.free_bytes)
+                ),
             });
         }
     }
@@ -253,8 +260,16 @@ mod tests {
         };
         let events = evaluate(usage, thresholds(), &mut state);
         assert_eq!(events.len(), 2);
-        assert!(events.iter().any(|e| e.kind == DiskAlertKind::ArchiveSize && e.active));
-        assert!(events.iter().any(|e| e.kind == DiskAlertKind::LowDiskSpace && e.active));
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == DiskAlertKind::ArchiveSize && e.active)
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == DiskAlertKind::LowDiskSpace && e.active)
+        );
     }
 
     #[test]
@@ -275,7 +290,11 @@ mod tests {
     fn archive_bytes_sums_only_archive_files() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("decision_log.jsonl"), vec![0u8; 100]).unwrap();
-        std::fs::write(dir.path().join("decision_log.jsonl.20200101-000000"), vec![0u8; 50]).unwrap();
+        std::fs::write(
+            dir.path().join("decision_log.jsonl.20200101-000000"),
+            vec![0u8; 50],
+        )
+        .unwrap();
         std::fs::write(dir.path().join("events-20200101.jsonl"), vec![0u8; 999]).unwrap();
         std::fs::write(dir.path().join("wisphive.log.today"), vec![0u8; 999]).unwrap();
 
@@ -288,7 +307,10 @@ mod tests {
         // report a nonzero figure on any normal CI/dev host.
         let dir = tempfile::tempdir().unwrap();
         let free = free_bytes(dir.path());
-        assert!(free.is_some(), "statvfs should succeed for an existing path");
+        assert!(
+            free.is_some(),
+            "statvfs should succeed for an existing path"
+        );
         assert!(free.unwrap() > 0);
     }
 }

@@ -313,8 +313,7 @@ fn is_reapable(name: &str) -> bool {
     if name.starts_with("decision_log.jsonl") {
         return false;
     }
-    name.starts_with("wisphive.log")
-        || (name.starts_with("events-") && name.ends_with(".jsonl"))
+    name.starts_with("wisphive.log") || (name.starts_with("events-") && name.ends_with(".jsonl"))
 }
 
 /// Delete reapable files (see [`is_reapable`]) in `log_dir` whose mtime is older
@@ -533,12 +532,18 @@ mod tests {
         prune_old_files(dir.path(), 0).unwrap();
 
         assert!(!daemon_log.exists(), "daemon log should be reaped");
-        assert!(!event_seg.exists(), "rotated event segment should be reaped");
+        assert!(
+            !event_seg.exists(),
+            "rotated event segment should be reaped"
+        );
         assert!(
             failed_seg.exists(),
             ".failed.jsonl recovery segment must never be reaped"
         );
-        assert!(archive.exists(), "decision archive sink must never be reaped");
+        assert!(
+            archive.exists(),
+            "decision archive sink must never be reaped"
+        );
         assert!(
             archive_rotated.exists(),
             "rotated decision archive must never be reaped"

@@ -929,11 +929,12 @@ impl StateDb {
 
         if count.0 as u64 > max_rows {
             let excess = count.0 as u64 - max_rows;
-            let excess_rows: Vec<(String,)> =
-                sqlx::query_as("SELECT id FROM decision_log ORDER BY resolved_at ASC, id ASC LIMIT ?")
-                    .bind(excess as i64)
-                    .fetch_all(&self.pool)
-                    .await?;
+            let excess_rows: Vec<(String,)> = sqlx::query_as(
+                "SELECT id FROM decision_log ORDER BY resolved_at ASC, id ASC LIMIT ?",
+            )
+            .bind(excess as i64)
+            .fetch_all(&self.pool)
+            .await?;
 
             if !excess_rows.is_empty() {
                 total_archived += self.archive_rows_by_ids(&excess_rows, archive_path).await?;
@@ -2655,7 +2656,15 @@ mod tests {
         db.create_terminal_session(&meta).await.unwrap();
 
         let events: Vec<_> = (0..5u64)
-            .map(|seq| (id, seq, seq as i64, TerminalDirection::Output, b"out".to_vec()))
+            .map(|seq| {
+                (
+                    id,
+                    seq,
+                    seq as i64,
+                    TerminalDirection::Output,
+                    b"out".to_vec(),
+                )
+            })
             .collect();
         db.insert_terminal_events_batch(&events).await.unwrap();
         assert_eq!(db.replay_terminal_events(id, None).await.unwrap().len(), 5);
@@ -2686,7 +2695,11 @@ mod tests {
             std::fs::read_dir(tmp.path())
                 .unwrap()
                 .flatten()
-                .filter(|e| e.file_name().to_string_lossy().starts_with("decision_log.jsonl."))
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("decision_log.jsonl.")
+                })
                 .count()
         };
         assert_eq!(siblings(), 0, "no rotation under cap");
@@ -2707,7 +2720,15 @@ mod tests {
         let meta = make_term_meta(id);
         db.create_terminal_session(&meta).await.unwrap();
         let events: Vec<_> = (0..3u64)
-            .map(|seq| (id, seq, seq as i64, TerminalDirection::Output, b"x".to_vec()))
+            .map(|seq| {
+                (
+                    id,
+                    seq,
+                    seq as i64,
+                    TerminalDirection::Output,
+                    b"x".to_vec(),
+                )
+            })
             .collect();
         db.insert_terminal_events_batch(&events).await.unwrap();
 
