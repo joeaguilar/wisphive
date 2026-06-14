@@ -1,5 +1,7 @@
 # Plan: Mobile Device Pairing (Unlock Workflow)
 
+_Last reviewed: 2026-06-14_
+
 ## Goal
 
 Let a logged-in operator pair a phone with Wisphive in under a minute. Phone runs the same web UI, authenticates as a first-class device, and approves/denies decisions from the same queue the desktop TUI sees. Zero CLI required on either side.

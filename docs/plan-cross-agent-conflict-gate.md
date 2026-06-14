@@ -1,5 +1,7 @@
 # Plan: Cross-Agent Conflict Gate
 
+_Last reviewed: 2026-06-14_
+
 ## Problem
 
 Wisphive monitors multiple agents across multiple projects simultaneously. Each agent independently edits files — and Wisphive sees every Write and Edit tool call. But today the daemon treats each call in isolation. If Agent A writes `src/auth.rs` and Agent B tries to write `src/auth.rs` two seconds later, Wisphive approves both without warning. The human in the TUI has no visibility into the conflict.

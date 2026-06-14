@@ -6,6 +6,17 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 Wisphive is a multiplexed AI agent control plane that gates tool calls from AI agents (Codex, Red, local LLMs) through a centralized daemon. Agents request approval before executing tools; humans review and approve/deny via a TUI dashboard. Passive OS notifications alert the user when decisions are pending.
 
+## Documentation Map
+
+**Start here when you need context this file doesn't carry:** [`docs/DOCUMENTATION.md`](docs/DOCUMENTATION.md) — the index of every documentation surface and how they link together. Quick links:
+
+- **Why a design is the way it is** → ADRs at [`docs/decisions/`](docs/decisions/README.md)
+- **What's done / in flight / next** → [`docs/ROADMAP.md`](docs/ROADMAP.md) + `itr ready`
+- **A task to work on** → `itr` (`itr ready`, `itr next`, `itr get <ID>`)
+- **What happened in a past milestone** → [`docs/handoff/`](docs/handoff/)
+- **Upcoming-workstream designs** → [`docs/plan-*.md`](docs/) (conflict gate, decision plugins, policy learning, mobile pairing, red)
+- **Exploratory research** → [`docs/research/`](docs/research/) · **Reference notes** → [`claude/`](claude/)
+
 ## Build & Test Commands
 
 ```bash

@@ -1,5 +1,7 @@
 # Plan: Decision Plugins (Extensions for a Control Plane)
 
+_Last reviewed: 2026-06-14_
+
 ## Problem
 
 Wisphive's extensibility today is limited to:

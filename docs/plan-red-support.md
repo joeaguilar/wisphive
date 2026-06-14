@@ -1,5 +1,7 @@
 # Wisphive Red Support Spec
 
+_Last reviewed: 2026-06-14_
+
 ## Goal
 
 Add first-class Wisphive support for spawning and supervising Red agents, with Wisphive acting as the blocking pre-execution permission gate for Red tool calls.

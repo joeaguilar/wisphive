@@ -1,6 +1,7 @@
 # Roadmap - Wisphive
 
 _Last updated: 2026-05-30 (manual $roadmap baseline)_
+_Last reviewed: 2026-06-14_
 
 > Cross-sprint product map. Bridges the repo's product docs, sprint history, and live `itr` backlog.
 > Read at the start of every `/sprint`. Update at the end of every `/sprint-review`.
@@ -45,7 +46,7 @@ Cells without the marker are PO-edited and should be preserved verbatim.
 
 | Section | Status | Size | Linked itr | Notes |
 |---------|--------|------|------------|-------|
-| §A.1 Hook IPC and decision protocol | 🟡 <!-- auto --> | M <!-- auto --> | itr#25, itr#30, itr#251, itr#252, itr#253, itr#254 <!-- auto --> | Rich decisions, PermissionRequest schema verification, and hook-event dispatch hardening shipped; ExitPlanMode failure fallback remains. <!-- auto --> |
+| §A.1 Hook IPC and decision protocol | 🟡 <!-- auto --> | M <!-- auto --> | itr#25, itr#30, itr#251, itr#252, itr#253, itr#254 <!-- auto --> | Rich decisions, PermissionRequest schema verification, and hook-event dispatch hardening shipped; ExitPlanMode failure fallback remains. Decisions: ADR-0001 (tiered fail posture), ADR-0002 (always-defer classification). <!-- auto --> |
 | §A.2 Daemon state, queue, persistence, and audit log | 🟡 <!-- auto --> | L <!-- auto --> | itr#31, itr#88, itr#89, itr#297, itr#298, itr#299, itr#300, itr#301, itr#302, itr#332, itr#333, itr#334, itr#335, itr#336 <!-- auto --> | Core queue/persistence exists; audit binding, retention, ingest, stale-socket, and storage durability gaps remain. <!-- auto --> |
 | §A.3 TUI review dashboard | 🟡 <!-- auto --> | M <!-- auto --> | itr#12, itr#32, itr#36, itr#56, itr#127, itr#220 <!-- auto --> | Main review UX exists; navigation polish and web-auth event surfacing remain. <!-- auto --> |
 | §A.4 Web review UI and WebSocket bridge | 🟡 <!-- auto --> | L <!-- auto --> | itr#40, itr#41, itr#44, itr#45, itr#52, itr#104, itr#105, itr#106, itr#108, itr#109, itr#110, itr#111, itr#112, itr#113, itr#114, itr#115, itr#116, itr#204, itr#205, itr#206, itr#207, itr#208, itr#240, itr#241, itr#295, itr#296 <!-- auto --> | Functional queue/history/spawn UX exists; reconnect, type-safety, logs live-tail, terminals, and accessibility are still partial. <!-- auto --> |
@@ -55,7 +56,7 @@ Cells without the marker are PO-edited and should be preserved verbatim.
 
 | Section | Status | Size | Linked itr | Notes |
 |---------|--------|------|------------|-------|
-| §B.1 TLS, web auth, device bearer tokens, and origin/host gates | 🟡 <!-- auto --> | L <!-- auto --> | itr#78, itr#79, itr#80, itr#209, itr#210, itr#211, itr#212, itr#213, itr#214, itr#215, itr#224, itr#225, itr#226, itr#227, itr#228, itr#229, itr#270, itr#274, itr#278, itr#279, itr#280, itr#317 <!-- auto --> | Password/device-token auth and self-signed TLS shipped; LAN SAN filtering, user cert flags, and several auth hardening tails remain. <!-- auto --> |
+| §B.1 TLS, web auth, device bearer tokens, and origin/host gates | 🟡 <!-- auto --> | L <!-- auto --> | itr#78, itr#79, itr#80, itr#209, itr#210, itr#211, itr#212, itr#213, itr#214, itr#215, itr#224, itr#225, itr#226, itr#227, itr#228, itr#229, itr#270, itr#274, itr#278, itr#279, itr#280, itr#317 <!-- auto --> | Password/device-token auth and self-signed TLS shipped; LAN SAN filtering, user cert flags, and several auth hardening tails remain. Decisions: ADR-0003 (enterprise profile non-functional until user-cert TLS / itr#270). <!-- auto --> |
 | §B.2 First-run onboarding and desktop passkeys | 🟡 <!-- auto --> | M <!-- auto --> | itr#267, itr#268, itr#269, itr#310, itr#311, itr#312, itr#315, itr#316, itr#319, itr#321, itr#323 <!-- auto --> | Sprint-1 shipped Chrome LocalLAN happy path; Firefox/Brave LocalLAN matrix, Enterprise smoke, and passkey follow-ups remain. <!-- auto --> |
 | §B.3 Device management and enterprise enrollment | 🟡 <!-- auto --> | L <!-- auto --> | itr#220, itr#257, itr#313 <!-- auto --> | Revoke hardening exists; Devices UI, passkey list/remove, and Enterprise enroll flow still need delivery. <!-- auto --> |
 | §B.4 Mobile phone pairing workflow | ❌ <!-- auto --> | XL <!-- auto --> | itr#266, itr#270, itr#271, itr#272, itr#283, itr#288, itr#289 <!-- auto --> | Planned in detail, but the LAN cert, pairing listener, QR/mobile route, and privacy notice chain is not shipped. <!-- auto --> |
@@ -83,7 +84,7 @@ Cells without the marker are PO-edited and should be preserved verbatim.
 
 | Section | Status | Size | Linked itr | Notes |
 |---------|--------|------|------------|-------|
-| §D.1 Auto-approve policy engine and tool-rule safety | 🟡 <!-- auto --> | M <!-- auto --> | itr#121, itr#129, itr#308 <!-- auto --> | Content-aware rules exist; duplicated tool lists, config parsing posture, and hook config performance remain. <!-- auto --> |
+| §D.1 Auto-approve policy engine and tool-rule safety | 🟡 <!-- auto --> | M <!-- auto --> | itr#121, itr#129, itr#308 <!-- auto --> | Content-aware rules exist; duplicated tool lists, config parsing posture, and hook config performance remain. Decisions: ADR-0002 (always-defer classification / itr#380). <!-- auto --> |
 
 ### §E - Hardening, Quality, and Release
 

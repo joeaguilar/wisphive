@@ -6,6 +6,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Wisphive is a multiplexed AI agent control plane that gates tool calls from AI agents (Claude Code, Codex, Red, local LLMs) through a centralized daemon. Agents request approval before executing tools; humans review and approve/deny via a TUI dashboard. Passive OS notifications alert the user when decisions are pending.
 
+## Documentation Map
+
+**Start here when you need context this file doesn't carry:** [`docs/DOCUMENTATION.md`](docs/DOCUMENTATION.md) — the index of every documentation surface and how they link together. Quick links:
+
+- **Why a design is the way it is** → ADRs at [`docs/decisions/`](docs/decisions/README.md)
+- **What's done / in flight / next** → [`docs/ROADMAP.md`](docs/ROADMAP.md) + `itr ready`
+- **A task to work on** → `itr` (`itr ready`, `itr next`, `itr get <ID>`)
+- **What happened in a past milestone** → [`docs/handoff/`](docs/handoff/)
+- **Upcoming-workstream designs** → [`docs/plan-*.md`](docs/) (conflict gate, decision plugins, policy learning, mobile pairing, red)
+- **Exploratory research** → [`docs/research/`](docs/research/) · **Reference notes** → [`claude/`](claude/)
+
 ## Build & Test Commands
 
 ```bash
@@ -146,6 +157,14 @@ Web auth no longer uses a `~/.wisphive/web.token` file. Raw per-device bearer to
 - [docs/plan-mobile-device-pairing.md](docs/plan-mobile-device-pairing.md) — critical path, sizing, and RP ID design for the phone-pairing milestone (itr#283 epic)
 - [docs/open-source-path.md](docs/open-source-path.md) — OSS positioning and roadmap
 
+## Session Handoffs
+
+Substantial sessions end with a durable handoff at `docs/handoff/YYYY-MM-DD-<topic>.md` — an append-only milestone breadcrumb for the next implementer (a fresh clone, a collaborator, or a reviewing agent on another machine). Write one when you close an epic/phase **or** when you hand off mid-stream. Each handoff records what shipped, the trade-offs made, the hard rules established, and where to start next, with an "if you only have 60 seconds" pointer and a link to its predecessor. **Handoffs are never rewritten in place** — if the situation changes, write a new dated handoff that links back. Copy `docs/handoff/TEMPLATE.md` to start; get the facts from git (`git show --stat <sha>`), not from memory.
+
+## Architecture Decision Records (ADRs)
+
+Non-obvious, security-critical decisions live as durable ADRs under `docs/decisions/`, not just as prose here — `~/.claude` memory is machine-local, but ADRs are git-tracked, so a fresh clone or a reviewing agent on another machine can reconstruct the reasoning and the alternatives weighed. The index is [`docs/decisions/README.md`](docs/decisions/README.md); the template is [`docs/decisions/0000-template.md`](docs/decisions/0000-template.md). **File an ADR when a decision constrains future work, was non-obvious / had real alternatives, or someone will later ask "why is it done this way" — copy `docs/decisions/0000-template.md` to `NNNN-short-title.md`, fill it in, and add a row to the index.** Status lifecycle is `Proposed` → `Accepted` → `Superseded by ADR-XXXX` / `Deprecated`; never delete a superseded ADR — flip its status and link the successor. The tiered fail posture (ADR-0001) and the always-defer classification (ADR-0002, itr#380) are already backfilled.
+
 ## Rust Edition
 
 The workspace uses Rust **edition 2024**. Requires Rust **nightly** (per `CONTRIBUTING.md`); a recent stable toolchain that supports edition 2024 also works.
@@ -159,7 +178,7 @@ Keep `CLAUDE.md` aligned with reality — a stale entry here misleads every futu
 - **Add, remove, or rename a runtime file under `~/.wisphive/`** (sockets, PID, DB, mode, certs, tokens, config). Include permissions/locking semantics when non-obvious.
 - **Change the IPC wire protocol** (new client kinds, new framing, breaking message changes).
 - **Add a new Claude Code hook event handler** in `wisphive_hook`, or learn a new fact about hook stdin/stdout schema (the "Claude Code Hook Response Format" section is the canonical reference for the project).
-- **Change a fail-open / fail-closed default, timeout, or other safety-critical default** (the "Key Design Decisions" section).
+- **Change a fail-open / fail-closed default, timeout, or other safety-critical default** (the "Key Design Decisions" section). If the decision was non-obvious or had real alternatives, also file/refresh an ADR under `docs/decisions/`.
 - **Add a new build/test/lint command** that contributors will need (or change an existing one).
 - **Add reference docs under `claude/` or `docs/`** that future sessions should know exist.
 

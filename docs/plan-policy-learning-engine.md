@@ -1,5 +1,7 @@
 # Plan: Policy Learning Engine
 
+_Last reviewed: 2026-06-14_
+
 ## Problem
 
 Wisphive's auto-approve rules are static — a human writes patterns in `config.json`, the hook evaluates them. Over time, a user builds muscle memory: "I always approve `cargo test`", "I always approve Read calls", "I always deny anything touching `.env`". This knowledge exists only in the human's head and in the `decision_log` SQLite table. The system never learns.

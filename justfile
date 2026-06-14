@@ -29,6 +29,10 @@ clippy:
 fmt:
     cargo fmt --all
 
+# Lint the docs/ROADMAP.md <-> itr <-> crates seam (deterministic drift check)
+docs-lint:
+    python3 scripts/roadmap_sync_check.py
+
 # Start the daemon in the foreground
 daemon:
     wisphive daemon start
