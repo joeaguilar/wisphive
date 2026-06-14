@@ -4,6 +4,7 @@ pub mod event_ingest;
 pub mod logging;
 pub mod notify;
 pub mod process_registry;
+pub mod project_audit;
 pub mod queue;
 pub mod registry;
 pub mod server;

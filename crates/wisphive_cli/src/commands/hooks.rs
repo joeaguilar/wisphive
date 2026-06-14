@@ -1,32 +1,14 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use wisphive_daemon::project_audit::{
+    AgentHookAudit, CLAUDE_HOOK_EVENTS, CODEX_HOOK_EVENTS, HookMode, audit_project,
+};
 
 /// Permissions that Wisphive adds to .claude/settings.json so Claude Code
 /// auto-allows tools that Wisphive will gate via its hook.
 /// This eliminates the double-prompt — wisphive becomes the sole gatekeeper.
 const WISPHIVE_PERMISSIONS: &[&str] = &["Bash(*)", "Edit(*)", "Write(*)", "NotebookEdit(*)"];
-
-const CLAUDE_HOOK_EVENTS: &[&str] = &[
-    "PreToolUse",
-    "PostToolUse",
-    "PermissionRequest",
-    "Elicitation",
-    "UserPromptSubmit",
-    "Stop",
-    "SubagentStop",
-    "ConfigChange",
-    "TeammateIdle",
-    "TaskCompleted",
-];
-
-const CODEX_HOOK_EVENTS: &[&str] = &[
-    "PreToolUse",
-    "PostToolUse",
-    "PermissionRequest",
-    "UserPromptSubmit",
-    "Stop",
-];
 
 const CODEX_HOOK_TIMEOUT_SECS: u64 = 3_700;
 const CODEX_HOOK_REVIEW_NOTE: &str = "Codex project hooks are non-managed hooks. \
@@ -259,20 +241,64 @@ pub fn status() -> Result<()> {
     }
 
     if let Ok(project) = std::env::current_dir() {
-        let codex_hooks_path = project.join(".codex").join("hooks.json");
-        if codex_hooks_path.exists()
-            && std::fs::read_to_string(&codex_hooks_path)
-                .is_ok_and(|content| content.contains("wisphive"))
-        {
-            eprintln!(
-                "Codex: Wisphive hook file present in {}",
-                codex_hooks_path.display()
-            );
+        let audit = audit_project(&project);
+        eprintln!("Project: {}", audit.project_dir.display());
+        print_agent_hook_status("Claude Code", &audit.hooks.claude, &audit.hooks.mode);
+        print_agent_hook_status("Codex", &audit.hooks.codex, &audit.hooks.mode);
+
+        if audit.hooks.codex.installed {
             eprintln!("Codex: {CODEX_HOOK_REVIEW_NOTE}");
         }
     }
 
     Ok(())
+}
+
+fn print_agent_hook_status(agent_name: &str, audit: &AgentHookAudit, mode: &HookMode) {
+    let installed = audit.installed_events.len();
+    let total = installed + audit.missing_events.len();
+
+    if audit.enabled {
+        eprintln!("{agent_name}: hooks enabled ({installed}/{total} events)");
+        return;
+    }
+
+    if audit.installed {
+        eprintln!(
+            "{agent_name}: hooks installed but disabled (mode: {})",
+            hook_mode_label(mode)
+        );
+        return;
+    }
+
+    if !audit.config_present {
+        eprintln!(
+            "{agent_name}: hooks not installed (missing {})",
+            audit.config_path.display()
+        );
+        return;
+    }
+
+    if !audit.config_valid {
+        let detail = audit
+            .read_error
+            .as_deref()
+            .or(audit.parse_error.as_deref())
+            .unwrap_or("invalid hook config");
+        eprintln!("{agent_name}: hook config invalid ({detail})");
+        return;
+    }
+
+    eprintln!("{agent_name}: hooks incomplete ({installed}/{total} events)");
+}
+
+fn hook_mode_label(mode: &HookMode) -> String {
+    match mode {
+        HookMode::Active => "active".into(),
+        HookMode::Off => "off".into(),
+        HookMode::Missing => "missing".into(),
+        HookMode::Invalid(value) => format!("invalid: {value}"),
+    }
 }
 
 #[cfg(unix)]
