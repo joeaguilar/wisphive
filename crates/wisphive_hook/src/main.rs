@@ -744,9 +744,16 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
     // ("did not answer"), so they ALWAYS defer to the native prompt — even at
     // auto_approve_level=all — unless the "dangerous" posture is set. Evaluated
     // before the auto-approve layers so the level can't override it.
-    // PermissionRequest is exempt: it IS the native-answer path and must reach
-    // the daemon (auto-approve already skips it below).
-    if !is_permission_request && is_always_deferred(&tool_name, wisphive_dir) {
+    //
+    // This fires for BOTH PreToolUse and PermissionRequest. PermissionRequest is
+    // the ONLY path that carries the human's answer back for these tools, so it
+    // must defer too: Decision::Ask emits no decision object (see
+    // permission_decision_object), letting Claude's native dialog render the
+    // question/plan and capture the selection. Routing it to the daemon instead
+    // (the old `!is_permission_request` guard) auto-resolved the prompt with no
+    // selection — "Allowed by PermissionRequest hook" → "did not answer". See
+    // itr#388 (regression on the itr#380 / ADR-0002 always-defer work).
+    if is_always_deferred(&tool_name, wisphive_dir) {
         return Ok(HookResponse::new(Decision::Ask, event_type, agent_type));
     }
 
@@ -1564,6 +1571,21 @@ mod tests {
             &serde_json::Value::Null,
             dir.path()
         ));
+    }
+
+    #[test]
+    fn always_deferred_tool_emits_no_decision_on_permission_request() {
+        // itr#388: an always-deferred tool reaching the PermissionRequest event
+        // must defer to Claude's native dialog. Decision::Ask produces no decision
+        // object (empty stdout), NOT a behavior:allow that silently resolves the
+        // prompt with no selection ("Allowed by PermissionRequest hook").
+        let response = HookResponse::new(
+            Decision::Ask,
+            HookEventType::PermissionRequest,
+            AgentType::ClaudeCode,
+        );
+        assert!(permission_decision_object(&response).is_none());
+        assert!(permission_response_value(&response).is_none());
     }
 
     #[test]
