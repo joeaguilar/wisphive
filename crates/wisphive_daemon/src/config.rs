@@ -57,6 +57,20 @@ pub struct UserConfig {
     /// Tools to exclude from auto-approve despite the level.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_approve_remove: Option<Vec<String>>,
+    /// Extra tools/events that always defer to the agent's native prompt
+    /// (questions, plan-mode, elicitations, and operator-added harmful actions),
+    /// on top of the built-in default set. See `DEFAULT_ALWAYS_ASK` in
+    /// wisphive_hook and itr#380.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub always_ask: Option<Vec<String>>,
+    /// Tools to drop from the built-in always-defer set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub always_ask_remove: Option<Vec<String>>,
+    /// "Dangerous" posture: when true, the always-defer set is ignored and
+    /// everything (including questions/plan-mode) is auto-approved per the
+    /// level. Off by default; pairs with `auto_approve_level: all`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub auto_approve_dangerous: bool,
     /// Content-aware rules per tool (deny/allow patterns on tool input).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_rules: Option<std::collections::HashMap<String, wisphive_protocol::ToolRule>>,
@@ -84,6 +98,10 @@ pub struct UserConfig {
 
 fn default_true() -> bool {
     true
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Clamp a config value to a valid range, logging a warning if clamped.

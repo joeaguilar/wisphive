@@ -224,7 +224,25 @@ enum AutoApproveAction {
         /// Tool name (e.g. "WebFetch")
         tool: String,
     },
-    /// Reset to defaults (level: read, no overrides)
+    /// Apply a posture preset: "balanced" (auto-approve tools, always ask
+    /// questions/plan-mode/harmful) or "dangerous" (auto-approve everything,
+    /// including questions)
+    Mode {
+        /// Posture: balanced | dangerous
+        mode: String,
+    },
+    /// Always defer a tool/event to the native prompt regardless of level
+    /// (e.g. a harmful-action tool)
+    Defer {
+        /// Tool name (e.g. "AskUserQuestion")
+        tool: String,
+    },
+    /// Stop always-deferring a tool/event so it follows the auto-approve level
+    Undefer {
+        /// Tool name (e.g. "ExitPlanMode")
+        tool: String,
+    },
+    /// Reset to defaults (level: read, balanced posture, no overrides)
     Reset,
 }
 
@@ -402,6 +420,13 @@ fn main() -> anyhow::Result<()> {
                 AutoApproveAction::Level { level } => commands::config::auto_approve_level(&level),
                 AutoApproveAction::Add { tool } => commands::config::auto_approve_add(&tool),
                 AutoApproveAction::Remove { tool } => commands::config::auto_approve_remove(&tool),
+                AutoApproveAction::Mode { mode } => commands::config::auto_approve_mode(&mode),
+                AutoApproveAction::Defer { tool } => {
+                    commands::config::auto_approve_defer_add(&tool)
+                }
+                AutoApproveAction::Undefer { tool } => {
+                    commands::config::auto_approve_defer_remove(&tool)
+                }
                 AutoApproveAction::Reset => commands::config::auto_approve_reset(),
             },
         },

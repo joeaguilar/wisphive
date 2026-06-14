@@ -576,13 +576,15 @@ impl AutoApproveLevel {
                 // Web (read-only)
                 "WebSearch",
                 "WebFetch",
-                // Orchestration & planning
+                // Orchestration
+                // NOTE: AskUserQuestion / EnterPlanMode / ExitPlanMode are
+                // deliberately NOT here. They carry a human answer back only
+                // through the native prompt, so they are routed to an
+                // always-defer classification in wisphive_hook instead of being
+                // auto-approved at any level (see itr#380).
                 "Agent",
                 "Skill",
                 "ToolSearch",
-                "AskUserQuestion",
-                "EnterPlanMode",
-                "ExitPlanMode",
                 "EnterWorktree",
                 "ExitWorktree",
                 // Task management
@@ -631,6 +633,20 @@ impl std::fmt::Display for AutoApproveLevel {
         }
     }
 }
+
+/// Tools/events that ALWAYS defer to the agent's native prompt, regardless of
+/// [`AutoApproveLevel`] — unless the operator opts into the "dangerous" posture
+/// (`auto_approve_dangerous: true`). They elicit a human answer that can only be
+/// carried back through the native prompt (PermissionRequest / Elicitation), so
+/// auto-approving them would silently resolve the prompt with no selection. The
+/// enforcement point is `is_always_deferred` in wisphive_hook; operators extend
+/// the set via `always_ask` and trim it via `always_ask_remove`. See itr#380.
+pub const DEFAULT_ALWAYS_ASK: &[&str] = &[
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "Elicitation",
+];
 
 impl std::str::FromStr for AutoApproveLevel {
     type Err = String;

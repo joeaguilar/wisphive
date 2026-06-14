@@ -6,8 +6,8 @@ use std::process;
 use std::time::Duration;
 
 use wisphive_protocol::{
-    AgentType, ClientMessage, ClientType, Decision, DecisionRequest, HookEventType,
-    PROTOCOL_VERSION, ServerMessage, ToolResult,
+    AgentType, ClientMessage, ClientType, DEFAULT_ALWAYS_ASK, Decision, DecisionRequest,
+    HookEventType, PROTOCOL_VERSION, ServerMessage, ToolResult,
 };
 
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(3);
@@ -27,9 +27,9 @@ const DEFAULT_AUTO_APPROVE: &[&str] = &[
     "Agent",
     "Skill",
     "ToolSearch",
-    "AskUserQuestion",
-    "EnterPlanMode",
-    "ExitPlanMode",
+    // AskUserQuestion / EnterPlanMode / ExitPlanMode are intentionally absent:
+    // they are handled by the always-defer classification (DEFAULT_ALWAYS_ASK /
+    // is_always_deferred) so a human answer is never silently auto-approved.
     "EnterWorktree",
     "ExitWorktree",
     "TaskCreate",
@@ -738,6 +738,18 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
     // Layer 3: Register agent with daemon (once per session, fire-and-forget)
     register_agent_once(&agent_id, agent_type.clone(), &project, wisphive_dir);
 
+    // Always-defer classification: questions, plan-mode, elicitations, and any
+    // operator-designated harmful tools carry a human answer back only through
+    // the agent's native prompt. Auto-approving them silently drops the answer
+    // ("did not answer"), so they ALWAYS defer to the native prompt — even at
+    // auto_approve_level=all — unless the "dangerous" posture is set. Evaluated
+    // before the auto-approve layers so the level can't override it.
+    // PermissionRequest is exempt: it IS the native-answer path and must reach
+    // the daemon (auto-approve already skips it below).
+    if !is_permission_request && is_always_deferred(&tool_name, wisphive_dir) {
+        return Ok(HookResponse::new(Decision::Ask, event_type, agent_type));
+    }
+
     // Auto-approve certain event types based on config (with sensible defaults)
     if is_event_auto_approved(event_type, wisphive_dir) {
         // For events with null tool_input, log event_data instead so the context is preserved
@@ -1178,6 +1190,49 @@ fn is_event_auto_approved(
         .unwrap_or(default)
 }
 
+/// Check whether a tool/event must always defer to the agent's native prompt.
+///
+/// Returns `true` for the built-in [`DEFAULT_ALWAYS_ASK`] set plus any
+/// `always_ask` additions in config.json, minus `always_ask_remove` entries —
+/// UNLESS the operator has opted into the "dangerous" posture
+/// (`auto_approve_dangerous: true`), in which case nothing always-defers and
+/// even questions are auto-approved per the level.
+fn is_always_deferred(tool_name: &str, wisphive_dir: &std::path::Path) -> bool {
+    let config: Option<serde_json::Value> =
+        std::fs::read_to_string(wisphive_dir.join("config.json"))
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok());
+
+    if let Some(ref config) = config {
+        // Dangerous posture: auto-approve everything, including questions.
+        if config
+            .get("auto_approve_dangerous")
+            .and_then(|v| v.as_bool())
+            == Some(true)
+        {
+            return false;
+        }
+
+        // Operator removals win over the built-in defaults.
+        if let Some(arr) = config.get("always_ask_remove").and_then(|v| v.as_array())
+            && arr.iter().any(|v| v.as_str() == Some(tool_name))
+        {
+            return false;
+        }
+    }
+
+    if DEFAULT_ALWAYS_ASK.contains(&tool_name) {
+        return true;
+    }
+
+    // Operator additions (e.g. harmful-action tools).
+    config
+        .as_ref()
+        .and_then(|c| c.get("always_ask"))
+        .and_then(|v| v.as_array())
+        .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(tool_name)))
+}
+
 /// Check if a tool is auto-approved using tiered levels + content-aware rules.
 ///
 /// Priority: auto_approve_remove → auto_approve_add → level → legacy → defaults.
@@ -1467,6 +1522,90 @@ fn home_dir() -> PathBuf {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// Write a config.json into a fresh temp dir and return both.
+    fn dir_with_config(config: serde_json::Value) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_string(&config).unwrap(),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn questions_always_defer_with_no_config() {
+        let dir = tempfile::tempdir().unwrap();
+        for tool in [
+            "AskUserQuestion",
+            "EnterPlanMode",
+            "ExitPlanMode",
+            "Elicitation",
+        ] {
+            assert!(
+                is_always_deferred(tool, dir.path()),
+                "{tool} should always defer"
+            );
+        }
+        assert!(!is_always_deferred("Bash", dir.path()));
+    }
+
+    #[test]
+    fn questions_defer_even_at_level_all() {
+        // The core fix: auto_approve_level=all must NOT auto-approve questions.
+        let dir = dir_with_config(serde_json::json!({ "auto_approve_level": "all" }));
+        assert!(is_always_deferred("AskUserQuestion", dir.path()));
+        // ...and a normal tool is still auto-approved at level all (defer guard
+        // only intercepts the always-ask set).
+        assert!(!is_always_deferred("Bash", dir.path()));
+        assert!(is_auto_approved(
+            "Bash",
+            &serde_json::Value::Null,
+            dir.path()
+        ));
+    }
+
+    #[test]
+    fn dangerous_posture_disables_always_defer() {
+        let dir = dir_with_config(serde_json::json!({
+            "auto_approve_level": "all",
+            "auto_approve_dangerous": true,
+        }));
+        assert!(!is_always_deferred("AskUserQuestion", dir.path()));
+        assert!(!is_always_deferred("ExitPlanMode", dir.path()));
+    }
+
+    #[test]
+    fn always_ask_remove_opts_a_default_out() {
+        let dir = dir_with_config(serde_json::json!({
+            "always_ask_remove": ["ExitPlanMode"],
+        }));
+        assert!(!is_always_deferred("ExitPlanMode", dir.path()));
+        // Other defaults are unaffected.
+        assert!(is_always_deferred("AskUserQuestion", dir.path()));
+    }
+
+    #[test]
+    fn always_ask_adds_a_custom_harmful_tool() {
+        let dir = dir_with_config(serde_json::json!({
+            "always_ask": ["Bash"],
+        }));
+        assert!(is_always_deferred("Bash", dir.path()));
+    }
+
+    #[test]
+    fn default_auto_approve_no_longer_includes_questions() {
+        // Removed from the read-tier defaults so the always-defer guard is the
+        // single source of truth for these.
+        let dir = tempfile::tempdir().unwrap();
+        for tool in ["AskUserQuestion", "EnterPlanMode", "ExitPlanMode"] {
+            assert!(
+                !is_auto_approved(tool, &serde_json::Value::Null, dir.path()),
+                "{tool} must not be auto-approved by default"
+            );
+        }
+    }
 
     #[test]
     fn fail_mode_parses_valid_values() {
