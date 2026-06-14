@@ -562,7 +562,12 @@ pub enum AutoApproveLevel {
 
 impl AutoApproveLevel {
     /// Tools added at this specific tier (not cumulative).
-    fn tier_tools(&self) -> &'static [&'static str] {
+    ///
+    /// This is the single source of truth for the auto-approve tool lists
+    /// across the whole workspace (itr#121). The hook's default fallback, the
+    /// TUI/CLI toggle lists, and the web UI (via [`ToolTiers`] / `/api/tool-tiers`)
+    /// all derive from here — removing a tool from a tier removes it everywhere.
+    pub fn tier_tools(&self) -> &'static [&'static str] {
         match self {
             Self::Off => &[],
             Self::Read => &[
@@ -647,6 +652,46 @@ pub const DEFAULT_ALWAYS_ASK: &[&str] = &[
     "ExitPlanMode",
     "Elicitation",
 ];
+
+/// Serializable view of the auto-approve tiers — derived entirely from
+/// [`AutoApproveLevel::tier_tools`] and [`DEFAULT_ALWAYS_ASK`]. This is what the
+/// web frontend reads from `GET /api/tool-tiers` instead of hardcoding the lists
+/// in TypeScript, so the React bundle stays in lockstep with the Rust source
+/// (itr#121). Serialize-only: the `&'static str` slices can't be deserialized.
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolTiers {
+    pub read: &'static [&'static str],
+    pub write: &'static [&'static str],
+    pub execute: &'static [&'static str],
+    /// Always-defer set (questions / plan-mode / elicitations). Surfaced so the
+    /// UI can display/label them, even though no level auto-approves them.
+    pub always_ask: &'static [&'static str],
+}
+
+impl ToolTiers {
+    /// The current tier definitions, straight from the single source of truth.
+    pub fn current() -> Self {
+        Self {
+            read: AutoApproveLevel::Read.tier_tools(),
+            write: AutoApproveLevel::Write.tier_tools(),
+            execute: AutoApproveLevel::Execute.tier_tools(),
+            always_ask: DEFAULT_ALWAYS_ASK,
+        }
+    }
+}
+
+/// Every tool the config UIs enumerate for their toggle lists: all auto-approve
+/// tiers plus the always-defer set, in display order (read tier, then the
+/// always-ask questions, then write, then execute). Single source for the TUI
+/// `ALL_TOOLS` list and the CLI `auto-approve status` output (itr#121).
+pub fn all_known_tools() -> Vec<&'static str> {
+    let mut tools = Vec::new();
+    tools.extend_from_slice(AutoApproveLevel::Read.tier_tools());
+    tools.extend_from_slice(DEFAULT_ALWAYS_ASK);
+    tools.extend_from_slice(AutoApproveLevel::Write.tier_tools());
+    tools.extend_from_slice(AutoApproveLevel::Execute.tier_tools());
+    tools
+}
 
 impl std::str::FromStr for AutoApproveLevel {
     type Err = String;
@@ -909,6 +954,53 @@ mod tests {
         assert!(AutoApproveLevel::Read.includes("WebSearch"));
         assert!(!AutoApproveLevel::Read.includes("Edit"));
         assert!(!AutoApproveLevel::Read.includes("Bash"));
+    }
+
+    #[test]
+    fn all_known_tools_derives_from_tiers_and_always_ask() {
+        // itr#121: the TUI/CLI toggle lists are derived, not hardcoded. Every
+        // tiered tool and every always-defer tool must appear exactly once.
+        let all = all_known_tools();
+        for tier in [
+            AutoApproveLevel::Read,
+            AutoApproveLevel::Write,
+            AutoApproveLevel::Execute,
+        ] {
+            for tool in tier.tier_tools() {
+                assert!(all.contains(tool), "{tool} missing from all_known_tools");
+            }
+        }
+        for tool in DEFAULT_ALWAYS_ASK {
+            assert!(all.contains(tool), "{tool} missing from all_known_tools");
+        }
+        // No duplicates — tiers are disjoint and disjoint from always-ask.
+        let mut seen = std::collections::HashSet::new();
+        for tool in &all {
+            assert!(
+                seen.insert(*tool),
+                "duplicate tool {tool} in all_known_tools"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_tiers_mirror_the_levels() {
+        // itr#121: the web view is the same data the levels enforce.
+        let tiers = ToolTiers::current();
+        assert_eq!(tiers.read, AutoApproveLevel::Read.tier_tools());
+        assert_eq!(tiers.write, AutoApproveLevel::Write.tier_tools());
+        assert_eq!(tiers.execute, AutoApproveLevel::Execute.tier_tools());
+        assert_eq!(tiers.always_ask, DEFAULT_ALWAYS_ASK);
+        // Serializes to the {read,write,execute,always_ask} shape the SPA reads.
+        let json = serde_json::to_value(&tiers).unwrap();
+        assert!(json.get("read").and_then(|v| v.as_array()).is_some());
+        assert!(
+            json["read"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "WebSearch")
+        );
     }
 
     #[test]

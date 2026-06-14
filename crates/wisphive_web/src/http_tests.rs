@@ -171,6 +171,48 @@ async fn api_config_accepts_valid_device_token_via_query() {
 }
 
 #[tokio::test]
+async fn api_tool_tiers_requires_device_token() {
+    let r = req("GET", "/api/tool-tiers").body(Body::empty()).unwrap();
+    let (status, _) = run(r).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn api_tool_tiers_returns_protocol_tiers() {
+    // itr#121: the SPA reads the tool lists from here (single source of truth),
+    // so the endpoint must surface exactly the tiers the hook enforces.
+    let (_tmp, state) = test_state().await;
+    let (token, _id) = seed_device(state.security.state_db(), "laptop").await;
+    let r = req("GET", "/api/tool-tiers")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = run_with(state, r).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    // The {read,write,execute,always_ask} shape the React getToolStatus() expects.
+    for key in ["read", "write", "execute", "always_ask"] {
+        assert!(
+            v.get(key).and_then(|x| x.as_array()).is_some(),
+            "missing {key}"
+        );
+    }
+    let read: Vec<String> = serde_json::from_value(v["read"].clone()).unwrap();
+    assert_eq!(
+        read,
+        wisphive_protocol::AutoApproveLevel::Read
+            .tier_tools()
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+    );
+    // Questions stay out of the auto-approve tiers — they're always-defer.
+    assert!(!read.contains(&"AskUserQuestion".to_string()));
+    let always: Vec<String> = serde_json::from_value(v["always_ask"].clone()).unwrap();
+    assert!(always.contains(&"AskUserQuestion".to_string()));
+}
+
+#[tokio::test]
 async fn api_config_put_rejects_unknown_fields() {
     let (_tmp, state) = test_state().await;
     let (token, _id) = seed_device(state.security.state_db(), "laptop").await;

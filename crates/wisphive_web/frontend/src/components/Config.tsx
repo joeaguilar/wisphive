@@ -4,14 +4,10 @@ import { apiFetch } from "../api";
 const LEVELS = ["off", "read", "write", "execute", "all"] as const;
 type Level = typeof LEVELS[number];
 
-const LEVEL_TOOLS: Record<string, string[]> = {
-  read: ["Read", "Glob", "Grep", "LS", "LSP", "NotebookRead", "WebSearch", "WebFetch",
-    "Agent", "Skill", "ToolSearch", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
-    "EnterWorktree", "ExitWorktree", "TaskCreate", "TaskUpdate", "TaskGet", "TaskList",
-    "TaskOutput", "TaskStop", "TodoRead", "CronList"],
-  write: ["Edit", "Write", "NotebookEdit", "CronCreate", "CronDelete"],
-  execute: ["Bash"],
-};
+// Tool tiers come from GET /api/tool-tiers (sourced from wisphive_protocol — the
+// single source of truth, itr#121) instead of being hardcoded here, so the SPA
+// can't drift from the tiers the hook actually enforces.
+type ToolTiers = { read: string[]; write: string[]; execute: string[]; always_ask: string[] };
 
 interface Config {
   auto_approve_level?: Level;
@@ -19,7 +15,7 @@ interface Config {
   auto_approve_remove?: string[];
 }
 
-function getToolStatus(tool: string, level: Level, add: string[], remove: string[]): { auto: boolean; source: string } {
+function getToolStatus(tool: string, level: Level, add: string[], remove: string[], levelTools: Record<string, string[]>): { auto: boolean; source: string } {
   const isRemoved = remove.includes(tool);
   const isAdded = add.includes(tool);
 
@@ -32,7 +28,7 @@ function getToolStatus(tool: string, level: Level, add: string[], remove: string
 
   if (level === "all") return { auto: true, source: "level" };
 
-  for (const [lvl, tools] of Object.entries(LEVEL_TOOLS)) {
+  for (const [lvl, tools] of Object.entries(levelTools)) {
     const lvlIdx = levelOrder.indexOf(lvl);
     if (lvlIdx <= currentIdx && tools.includes(tool)) {
       return { auto: true, source: "level" };
@@ -46,15 +42,21 @@ export function ConfigView() {
   const [level, setLevel] = useState<Level>("read");
   const [add, setAdd] = useState<string[]>([]);
   const [remove, setRemove] = useState<string[]>([]);
+  const [levelTools, setLevelTools] = useState<Record<string, string[]>>({ read: [], write: [], execute: [] });
   const [loading, setLoading] = useState(true);
 
   const loadConfig = useCallback(async () => {
     try {
-      const res = await apiFetch(`/api/config`);
-      const data: Config = await res.json();
+      const [cfgRes, tiersRes] = await Promise.all([
+        apiFetch(`/api/config`),
+        apiFetch(`/api/tool-tiers`),
+      ]);
+      const data: Config = await cfgRes.json();
+      const tiers: ToolTiers = await tiersRes.json();
       setLevel(data.auto_approve_level || "read");
       setAdd(data.auto_approve_add || []);
       setRemove(data.auto_approve_remove || []);
+      setLevelTools({ read: tiers.read, write: tiers.write, execute: tiers.execute });
     } catch (e) {
       console.warn("Failed to load config:", e);
     }
@@ -82,7 +84,7 @@ export function ConfigView() {
   }, []);
 
   const toggleTool = (tool: string) => {
-    const status = getToolStatus(tool, level, add, remove);
+    const status = getToolStatus(tool, level, add, remove, levelTools);
     let newAdd = [...add];
     let newRemove = [...remove];
 
@@ -138,13 +140,13 @@ export function ConfigView() {
       <div className="config-tools">
         {["Read Tier", "Write Tier", "Execute Tier"].map((tierLabel, tierIdx) => {
           const tierKey = ["read", "write", "execute"][tierIdx];
-          const tools = LEVEL_TOOLS[tierKey];
+          const tools = levelTools[tierKey];
           return (
             <div key={tierKey} className="config-tier">
               <h3>{tierLabel}</h3>
               <div className="tool-list">
                 {tools.map((tool) => {
-                  const status = getToolStatus(tool, level, add, remove);
+                  const status = getToolStatus(tool, level, add, remove, levelTools);
                   return (
                     <div
                       key={tool}

@@ -153,28 +153,9 @@ pub fn auto_approve_status() -> Result<()> {
         }
     }
     eprintln!("Tools at this level:");
-    // Show all tools included by the level
-    let all_tools = [
-        "Read",
-        "Glob",
-        "Grep",
-        "LS",
-        "WebSearch",
-        "WebFetch",
-        "NotebookRead",
-        "Agent",
-        "Skill",
-        "TaskCreate",
-        "TaskUpdate",
-        "TaskGet",
-        "TaskList",
-        "TodoRead",
-        "ToolSearch",
-        "Edit",
-        "Write",
-        "NotebookEdit",
-        "Bash",
-    ];
+    // Show all tools included by the level. The list is the single source of
+    // truth in wisphive_protocol (itr#121) — no hand-maintained copy here.
+    let all_tools = wisphive_protocol::all_known_tools();
     for tool in &all_tools {
         if level.includes(tool) {
             eprintln!("  + {tool}");

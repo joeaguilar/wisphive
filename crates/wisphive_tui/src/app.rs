@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 use uuid::Uuid;
 
 use wisphive_protocol::{
@@ -11,42 +12,12 @@ use serde::Deserialize;
 
 use crate::modal::Modal;
 
-/// All known tools for the config toggle list.
-pub const ALL_TOOLS: &[&str] = &[
-    // Read tier
-    "Read",
-    "Glob",
-    "Grep",
-    "LS",
-    "LSP",
-    "NotebookRead",
-    "WebSearch",
-    "WebFetch",
-    "Agent",
-    "Skill",
-    "ToolSearch",
-    "AskUserQuestion",
-    "EnterPlanMode",
-    "ExitPlanMode",
-    "EnterWorktree",
-    "ExitWorktree",
-    "TaskCreate",
-    "TaskUpdate",
-    "TaskGet",
-    "TaskList",
-    "TaskOutput",
-    "TaskStop",
-    "TodoRead",
-    "CronList",
-    // Write tier
-    "Edit",
-    "Write",
-    "NotebookEdit",
-    "CronCreate",
-    "CronDelete",
-    // Execute tier
-    "Bash",
-];
+/// All known tools for the config toggle list — derived from the single source
+/// of truth in `wisphive_protocol` (itr#121) rather than hardcoded here, so the
+/// list can never drift from the tiers the hook actually enforces. Indexed by
+/// [`ConfigRow::Tool`]; the derivation is deterministic so indices are stable.
+pub static ALL_TOOLS: LazyLock<Vec<&'static str>> =
+    LazyLock::new(wisphive_protocol::all_known_tools);
 
 /// A row in the config view — either the level selector, a tool, an inline rule, or an event toggle.
 #[derive(Debug, Clone)]

@@ -167,6 +167,14 @@ async fn get_config(axum::extract::State(state): axum::extract::State<AppState>)
     }
 }
 
+/// GET /api/tool-tiers — the auto-approve tier definitions, sourced from
+/// `wisphive_protocol` (the single source of truth, itr#121). The SPA reads this
+/// instead of hardcoding the tool lists in TypeScript, so the bundle can't drift
+/// from the tiers the hook enforces. Gated like every other `/api/*` route.
+async fn get_tool_tiers() -> Response {
+    axum::Json(wisphive_protocol::ToolTiers::current()).into_response()
+}
+
 /// PUT /api/config — write config.json
 async fn put_config(
     axum::extract::State(state): axum::extract::State<AppState>,
@@ -2120,7 +2128,8 @@ fn build_router(state: AppState, dev_mode: bool) -> Router {
         .route(
             "/api/config",
             get(get_config).put(put_config).layer(config_body_limit()),
-        );
+        )
+        .route("/api/tool-tiers", get(get_tool_tiers));
 
     let router = if dev_mode {
         api.with_state(state)

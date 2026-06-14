@@ -13,35 +13,6 @@ use wisphive_protocol::{
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_STDIN_BYTES: usize = 8 * 1024 * 1024;
 
-/// Tools that are always safe to auto-approve (read-only + orchestration).
-/// Fallback when no config.json exists. Matches the Read tier.
-const DEFAULT_AUTO_APPROVE: &[&str] = &[
-    "Read",
-    "Glob",
-    "Grep",
-    "LS",
-    "LSP",
-    "NotebookRead",
-    "WebSearch",
-    "WebFetch",
-    "Agent",
-    "Skill",
-    "ToolSearch",
-    // AskUserQuestion / EnterPlanMode / ExitPlanMode are intentionally absent:
-    // they are handled by the always-defer classification (DEFAULT_ALWAYS_ASK /
-    // is_always_deferred) so a human answer is never silently auto-approved.
-    "EnterWorktree",
-    "ExitWorktree",
-    "TaskCreate",
-    "TaskUpdate",
-    "TaskGet",
-    "TaskList",
-    "TaskOutput",
-    "TaskStop",
-    "TodoRead",
-    "CronList",
-];
-
 /// Hook response to format for the calling agent.
 struct HookResponse {
     decision: Decision,
@@ -1344,7 +1315,13 @@ fn legacy_auto_approved(tool_name: &str, wisphive_dir: &std::path::Path) -> bool
     {
         return arr.iter().any(|v| v.as_str() == Some(tool_name));
     }
-    DEFAULT_AUTO_APPROVE.contains(&tool_name)
+    // Default fallback (no config.json, no legacy auto-approve.json): the Read
+    // tier, sourced from wisphive_protocol so the list lives in exactly one place
+    // (itr#121). Questions/plan-mode are intentionally absent — they go through
+    // the always-defer classification, not auto-approval.
+    wisphive_protocol::AutoApproveLevel::Read
+        .tier_tools()
+        .contains(&tool_name)
 }
 
 /// Log an auto-approved tool call to events.jsonl for daemon ingestion.
