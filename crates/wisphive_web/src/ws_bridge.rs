@@ -11,6 +11,64 @@ use wisphive_protocol::{
 
 use crate::security::AuthedDevice;
 
+/// Maximum bytes a single newline-delimited line from the daemon may occupy
+/// before the bridge tears the connection down (itr#83). Without a cap a
+/// misbehaving or compromised daemon peer that streams bytes with no newline
+/// would grow the line buffer until the web process OOMs. Aligned with the
+/// daemon socket reader's 8 MiB cap.
+const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Read one newline-delimited line from the daemon, capping it at
+/// [`MAX_LINE_BYTES`] (itr#83). Mirrors `Lines::next_line` semantics
+/// (`Ok(None)` at clean EOF, trailing `\n`/`\r\n` stripped) but bounds memory:
+/// it pulls from the buffered reader in chunks and errors the moment the
+/// accumulated line would exceed the cap, so a peer that never sends a newline
+/// can't OOM the bridge.
+/// `buf` is the caller-owned partial-line accumulator, kept across calls so the
+/// read stays cancel-safe inside `tokio::select!`: if the browser→daemon branch
+/// fires and drops this future mid-line, the partial survives in `buf` and the
+/// next call resumes it. Cleared on a successful return.
+async fn read_capped_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+) -> anyhow::Result<Option<String>> {
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        match available.iter().position(|&b| b == b'\n') {
+            Some(idx) => {
+                if buf.len() + idx > MAX_LINE_BYTES {
+                    return Err(anyhow::anyhow!(
+                        "daemon line exceeded {MAX_LINE_BYTES}-byte cap"
+                    ));
+                }
+                buf.extend_from_slice(&available[..idx]);
+                reader.consume(idx + 1);
+                break;
+            }
+            None => {
+                let take = available.len();
+                if buf.len() + take > MAX_LINE_BYTES {
+                    return Err(anyhow::anyhow!(
+                        "daemon line exceeded {MAX_LINE_BYTES}-byte cap"
+                    ));
+                }
+                buf.extend_from_slice(available);
+                reader.consume(take);
+            }
+        }
+    }
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    Ok(Some(String::from_utf8(std::mem::take(buf))?))
+}
+
 /// Bridge a WebSocket connection to the daemon's Unix socket.
 ///
 /// 1. Connect to daemon, send Hello(Tui), wait for Welcome.
@@ -30,7 +88,10 @@ pub async fn bridge(ws: WebSocket, socket_path: &Path, device: AuthedDevice) -> 
     // Connect to daemon
     let stream = UnixStream::connect(socket_path).await?;
     let (reader, mut daemon_writer) = stream.into_split();
-    let mut daemon_lines = BufReader::new(reader).lines();
+    let mut daemon_lines = BufReader::new(reader);
+    // Persistent partial-line accumulator for the capped daemon reader (itr#83);
+    // kept across select iterations to stay cancel-safe.
+    let mut line_buf: Vec<u8> = Vec::new();
 
     // Handshake with daemon
     let hello = encode(&ClientMessage::Hello {
@@ -40,8 +101,7 @@ pub async fn bridge(ws: WebSocket, socket_path: &Path, device: AuthedDevice) -> 
     daemon_writer.write_all(hello.as_bytes()).await?;
 
     // Wait for Welcome
-    let welcome_line = daemon_lines
-        .next_line()
+    let welcome_line = read_capped_line(&mut daemon_lines, &mut line_buf)
         .await?
         .ok_or_else(|| anyhow::anyhow!("daemon closed before welcome"))?;
     let _welcome: ServerMessage = wisphive_protocol::decode(&welcome_line)?;
@@ -56,7 +116,7 @@ pub async fn bridge(ws: WebSocket, socket_path: &Path, device: AuthedDevice) -> 
     loop {
         tokio::select! {
             // Daemon → Browser
-            line = daemon_lines.next_line() => {
+            line = read_capped_line(&mut daemon_lines, &mut line_buf) => {
                 match line {
                     Ok(Some(text)) => {
                         debug!(len = text.len(), "daemon → browser");
@@ -159,5 +219,29 @@ mod tests {
     fn rewrap_rejects_garbage() {
         assert!(rewrap_with_device("not json at all", &authed("d")).is_none());
         assert!(rewrap_with_device(r#"{"type":"not_a_variant"}"#, &authed("d")).is_none());
+    }
+
+    // ---- itr#83: capped daemon line length ----
+
+    #[tokio::test]
+    async fn capped_reader_accepts_normal_daemon_line() {
+        let payload = b"{\"type\":\"welcome\"}\n";
+        let mut reader = tokio::io::BufReader::new(&payload[..]);
+        let mut buf = Vec::new();
+        let line = read_capped_line(&mut reader, &mut buf).await.unwrap();
+        assert_eq!(line.as_deref(), Some("{\"type\":\"welcome\"}"));
+        assert!(buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn capped_reader_rejects_over_limit_daemon_line() {
+        // A daemon peer streaming bytes with no newline past the cap must be
+        // rejected (bounded memory), not buffered until OOM.
+        let oversized = vec![b'x'; MAX_LINE_BYTES + 16];
+        let mut reader = tokio::io::BufReader::new(&oversized[..]);
+        let mut buf = Vec::new();
+        let result = read_capped_line(&mut reader, &mut buf).await;
+        assert!(result.is_err(), "over-limit daemon line must error");
+        assert!(buf.len() <= MAX_LINE_BYTES);
     }
 }

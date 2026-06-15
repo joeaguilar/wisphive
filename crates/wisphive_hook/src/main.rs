@@ -13,6 +13,67 @@ use wisphive_protocol::{
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_STDIN_BYTES: usize = 8 * 1024 * 1024;
 
+/// Maximum bytes a single newline-delimited response line from the daemon may
+/// occupy before the hook rejects it (itr#83). Without a cap, a misbehaving or
+/// hostile daemon peer that streams bytes with no newline would grow the hook's
+/// read buffer until OOM. Aligned with `MAX_STDIN_BYTES` (8 MiB) — comfortably
+/// above any legitimate welcome/decision response.
+const MAX_LINE_BYTES: usize = MAX_STDIN_BYTES;
+
+/// Read one newline-delimited line from a blocking reader, capping it at
+/// `max_bytes` (itr#83). Mirrors [`std::io::BufRead::read_line`] semantics
+/// (returns the number of bytes read; `0` = EOF; `line` keeps the trailing
+/// `\n`) but bounds memory: it appends a byte at a time and bails with an error
+/// the moment the line would exceed the cap, so a peer that never sends a
+/// newline can't grow `line` past the cap and OOM the hook.
+fn read_line_capped<R: BufRead>(
+    reader: &mut R,
+    line: &mut String,
+    max_bytes: usize,
+) -> std::io::Result<usize> {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(b) => b,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if available.is_empty() {
+            break; // EOF
+        }
+        match available.iter().position(|&b| b == b'\n') {
+            Some(idx) => {
+                if buf.len() + idx + 1 > max_bytes {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("daemon line exceeded {max_bytes}-byte cap"),
+                    ));
+                }
+                buf.extend_from_slice(&available[..=idx]); // include the '\n'
+                let consumed = idx + 1;
+                reader.consume(consumed);
+                break;
+            }
+            None => {
+                let take = available.len();
+                if buf.len() + take > max_bytes {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("daemon line exceeded {max_bytes}-byte cap"),
+                    ));
+                }
+                buf.extend_from_slice(available);
+                reader.consume(take);
+            }
+        }
+    }
+    let text = String::from_utf8(buf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let n = text.len();
+    line.push_str(&text);
+    Ok(n)
+}
+
 /// Hook response to format for the calling agent.
 struct HookResponse {
     decision: Decision,
@@ -883,14 +944,15 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
     })?;
 
     let mut welcome_line = String::new();
-    let welcome_bytes = reader.read_line(&mut welcome_line).map_err(|err| {
-        HookFailure::unreachable(
-            "failed to read daemon welcome",
-            err,
-            event_type,
-            &agent_type,
-        )
-    })?;
+    let welcome_bytes =
+        read_line_capped(&mut reader, &mut welcome_line, MAX_LINE_BYTES).map_err(|err| {
+            HookFailure::unreachable(
+                "failed to read daemon welcome",
+                err,
+                event_type,
+                &agent_type,
+            )
+        })?;
     if welcome_bytes == 0 || welcome_line.trim().is_empty() {
         // EOF: the daemon closed the connection during the handshake (it
         // crashed or is shutting down). read_line returns Ok(0), not an error.
@@ -949,14 +1011,15 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
     })?;
 
     let mut response_line = String::new();
-    let response_bytes = reader.read_line(&mut response_line).map_err(|err| {
-        HookFailure::unreachable(
-            "failed to read daemon decision response",
-            err,
-            event_type,
-            &agent_type,
-        )
-    })?;
+    let response_bytes = read_line_capped(&mut reader, &mut response_line, MAX_LINE_BYTES)
+        .map_err(|err| {
+            HookFailure::unreachable(
+                "failed to read daemon decision response",
+                err,
+                event_type,
+                &agent_type,
+            )
+        })?;
     if response_bytes == 0 || response_line.trim().is_empty() {
         // EOF while blocked waiting for the human decision: the daemon was
         // killed mid-wait (e.g. crashed under load). This is the most common
@@ -1060,9 +1123,9 @@ fn handle_post_tool_use(
     })?;
     writer.write_all(hello.as_bytes())?;
 
-    // Consume welcome
+    // Consume welcome (capped so a hostile daemon can't OOM the hook — itr#83)
     let mut welcome_line = String::new();
-    reader.read_line(&mut welcome_line)?;
+    read_line_capped(&mut reader, &mut welcome_line, MAX_LINE_BYTES)?;
 
     // Send tool result (fire-and-forget)
     let msg = wisphive_protocol::encode(&ClientMessage::ToolResult(ToolResult {
@@ -1110,8 +1173,9 @@ fn register_agent_once(
         })?;
         writer.write_all(hello.as_bytes())?;
 
+        // Consume welcome (capped — itr#83)
         let mut welcome_line = String::new();
-        reader.read_line(&mut welcome_line)?;
+        read_line_capped(&mut reader, &mut welcome_line, MAX_LINE_BYTES)?;
 
         // Send AgentRegister (fire-and-forget)
         let msg = wisphive_protocol::encode(&ClientMessage::AgentRegister {
@@ -1762,6 +1826,52 @@ mod tests {
         let err = read_limited_to_string(Cursor::new("abcde"), 4).unwrap_err();
 
         assert_eq!(err, ReadInputError::TooLarge { max_bytes: 4 });
+    }
+
+    // ---- itr#83: capped daemon-response line read ----
+
+    #[test]
+    fn capped_line_reads_normal_response() {
+        // A normal newline-terminated daemon line passes and keeps its '\n',
+        // matching std read_line semantics.
+        let mut reader = std::io::BufReader::new(Cursor::new("{\"ok\":true}\nnext"));
+        let mut line = String::new();
+        let n = read_line_capped(&mut reader, &mut line, MAX_LINE_BYTES).unwrap();
+        assert_eq!(line, "{\"ok\":true}\n");
+        assert_eq!(n, "{\"ok\":true}\n".len());
+    }
+
+    #[test]
+    fn capped_line_returns_zero_on_eof() {
+        let mut reader = std::io::BufReader::new(Cursor::new(""));
+        let mut line = String::new();
+        let n = read_line_capped(&mut reader, &mut line, MAX_LINE_BYTES).unwrap();
+        assert_eq!(n, 0);
+        assert!(line.is_empty());
+    }
+
+    #[test]
+    fn capped_line_rejects_over_limit_without_newline() {
+        // A daemon that streams bytes with no newline past the cap is rejected
+        // as an error (bounded memory), not buffered until OOM.
+        let oversized = "z".repeat(64);
+        let mut reader = std::io::BufReader::new(Cursor::new(oversized));
+        let mut line = String::new();
+        let err = read_line_capped(&mut reader, &mut line, 16).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        // The accumulated line never exceeds the cap.
+        assert!(line.len() <= 16);
+    }
+
+    #[test]
+    fn capped_line_accepts_line_at_exact_limit() {
+        // 15 data bytes + '\n' == 16 == the cap: legitimate, must pass.
+        let payload = format!("{}\n", "y".repeat(15));
+        let mut reader = std::io::BufReader::new(Cursor::new(payload.clone()));
+        let mut line = String::new();
+        let n = read_line_capped(&mut reader, &mut line, 16).unwrap();
+        assert_eq!(n, 16);
+        assert_eq!(line, payload);
     }
 
     use serde_json::json;

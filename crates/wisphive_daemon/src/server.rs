@@ -19,6 +19,13 @@ use crate::config::DaemonConfig;
 /// dropping. Large enough to absorb a healthy burst between select wake-ups,
 /// small enough to cap worst-case RAM.
 const CONN_CHANNEL_CAPACITY: usize = 1024;
+
+/// Maximum bytes a single newline-delimited line may occupy on a daemon socket
+/// reader before the connection is rejected (itr#83). Without a cap a peer that
+/// streams bytes with no newline grows the line buffer until OOM. Aligned with
+/// the hook's 8 MiB stdin cap — comfortably above the largest legitimate
+/// message (queue snapshots, terminal catch-up) yet far below a memory threat.
+const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 use crate::process_registry::ProcessRegistry;
 use crate::queue::DecisionQueue;
 use crate::registry::AgentRegistry;
@@ -323,15 +330,77 @@ impl Server {
     }
 }
 
+/// Reader half of a daemon socket connection. A plain [`BufReader`] (not
+/// [`tokio::io::Lines`]) so every read goes through [`read_capped_line`], which
+/// enforces [`MAX_LINE_BYTES`] (itr#83).
+type SocketReader = BufReader<tokio::net::unix::OwnedReadHalf>;
+
+/// Read one newline-delimited line into `buf`, capping it at [`MAX_LINE_BYTES`]
+/// (itr#83).
+///
+/// Mirrors [`tokio::io::Lines::next_line`] semantics: returns `Ok(None)` at
+/// clean EOF, `Ok(Some(line))` with the trailing `\n`/`\r\n` stripped. Unlike
+/// `next_line`/`read_until`, it bounds memory: it pulls from the buffered reader
+/// in chunks and bails with an error the moment the accumulated line would
+/// exceed the cap, so a peer streaming bytes with no newline can never grow the
+/// buffer past `MAX_LINE_BYTES` and OOM the daemon.
+///
+/// `buf` is the caller-owned partial-line accumulator. It is passed in (rather
+/// than allocated here) so this future stays cancel-safe inside `tokio::select!`:
+/// if a sibling branch fires and drops this future after some bytes have been
+/// consumed from the reader, the partial line survives in `buf` and the next
+/// call resumes it instead of corrupting the framing. On a successful return the
+/// helper clears `buf` for the next line.
+async fn read_capped_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+) -> Result<Option<String>> {
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            // EOF. A trailing partial line (no newline) is still returned, same
+            // as `read_until`; a truly empty buffer is a clean close.
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        match available.iter().position(|&b| b == b'\n') {
+            Some(idx) => {
+                if buf.len() + idx > MAX_LINE_BYTES {
+                    return Err(anyhow::anyhow!("line exceeded {MAX_LINE_BYTES}-byte cap"));
+                }
+                buf.extend_from_slice(&available[..idx]);
+                reader.consume(idx + 1); // drop the consumed bytes incl. '\n'
+                break;
+            }
+            None => {
+                let take = available.len();
+                if buf.len() + take > MAX_LINE_BYTES {
+                    // Even without a newline yet, the line is already too long.
+                    return Err(anyhow::anyhow!("line exceeded {MAX_LINE_BYTES}-byte cap"));
+                }
+                buf.extend_from_slice(available);
+                reader.consume(take);
+            }
+        }
+    }
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    let line = String::from_utf8(std::mem::take(buf))?;
+    Ok(Some(line))
+}
+
 /// Handle a single client connection. Dispatches based on the Hello handshake.
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(stream: UnixStream, ctx: &ConnectionContext) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let mut lines = BufReader::new(reader);
+    let mut line_buf = Vec::new();
 
     // Read the Hello handshake
-    let first_line = lines
-        .next_line()
+    let first_line = read_capped_line(&mut lines, &mut line_buf)
         .await?
         .ok_or_else(|| anyhow::anyhow!("connection closed before hello"))?;
 
@@ -379,12 +448,12 @@ async fn handle_connection(stream: UnixStream, ctx: &ConnectionContext) -> Resul
 /// Handle a hook connection: receive DecisionRequest, block until resolved.
 #[allow(clippy::too_many_arguments)]
 async fn handle_hook(
-    mut lines: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    mut lines: SocketReader,
     mut writer: tokio::net::unix::OwnedWriteHalf,
     ctx: &ConnectionContext,
 ) -> Result<()> {
-    let line = lines
-        .next_line()
+    let mut line_buf = Vec::new();
+    let line = read_capped_line(&mut lines, &mut line_buf)
         .await?
         .ok_or_else(|| anyhow::anyhow!("hook disconnected before sending request"))?;
 
@@ -582,7 +651,7 @@ async fn eager_persist(state_db: &crate::state::StateDb, id: uuid::Uuid, decisio
 
 /// Handle a TUI connection: stream events, receive commands.
 async fn handle_tui(
-    mut lines: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    mut lines: SocketReader,
     mut writer: tokio::net::unix::OwnedWriteHalf,
     ctx: &ConnectionContext,
 ) -> Result<()> {
@@ -631,6 +700,11 @@ async fn handle_tui(
     let mut term_attachments: std::collections::HashMap<uuid::Uuid, tokio::task::JoinHandle<()>> =
         std::collections::HashMap::new();
 
+    // Persistent partial-line accumulator for the capped command reader (itr#83).
+    // Lives across loop iterations so a cancelled read (sibling select branch
+    // fired) resumes its partial line instead of desyncing the framing.
+    let mut line_buf = Vec::new();
+
     loop {
         tokio::select! {
             // Per-connection messages from worker tasks (e.g. terminal forwarders)
@@ -661,7 +735,7 @@ async fn handle_tui(
                 }
             }
             // Read commands from TUI
-            line = lines.next_line() => {
+            line = read_capped_line(&mut lines, &mut line_buf) => {
                 match line {
                     Ok(Some(text)) => {
                         let command: wisphive_protocol::ClientCommand =
@@ -1623,9 +1697,10 @@ fn peer_uid_allowed(peer_uid: u32, daemon_uid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONN_CHANNEL_CAPACITY, partition_sudo_gated, peer_uid_allowed, set_socket_permissions,
-        sweep_stale_session_markers,
+        CONN_CHANNEL_CAPACITY, MAX_LINE_BYTES, partition_sudo_gated, peer_uid_allowed,
+        read_capped_line, set_socket_permissions, sweep_stale_session_markers,
     };
+    use tokio::io::BufReader;
 
     fn ids(items: &[(uuid::Uuid, String)]) -> Vec<uuid::Uuid> {
         items.iter().map(|(id, _)| *id).collect()
@@ -1690,6 +1765,64 @@ mod tests {
             rejected_full > 0,
             "excess sends past capacity must be rejected as Full (dropped), not queued"
         );
+    }
+
+    // ---- itr#83: capped socket line length ----
+
+    #[tokio::test]
+    async fn capped_reader_accepts_normal_line() {
+        let payload = b"{\"type\":\"hello\"}\nrest";
+        let mut reader = BufReader::new(&payload[..]);
+        let mut buf = Vec::new();
+        let line = read_capped_line(&mut reader, &mut buf).await.unwrap();
+        assert_eq!(line.as_deref(), Some("{\"type\":\"hello\"}"));
+        // buf is cleared for the next line.
+        assert!(buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn capped_reader_strips_crlf() {
+        let payload = b"line-one\r\n";
+        let mut reader = BufReader::new(&payload[..]);
+        let mut buf = Vec::new();
+        let line = read_capped_line(&mut reader, &mut buf).await.unwrap();
+        assert_eq!(line.as_deref(), Some("line-one"));
+    }
+
+    #[tokio::test]
+    async fn capped_reader_returns_none_on_clean_eof() {
+        let payload: &[u8] = b"";
+        let mut reader = BufReader::new(payload);
+        let mut buf = Vec::new();
+        let line = read_capped_line(&mut reader, &mut buf).await.unwrap();
+        assert!(line.is_none());
+    }
+
+    #[tokio::test]
+    async fn capped_reader_rejects_over_limit_line() {
+        // A line longer than MAX_LINE_BYTES with no newline must be rejected as
+        // an error (bounded memory) rather than buffered until OOM.
+        let oversized = vec![b'a'; MAX_LINE_BYTES + 16];
+        let mut reader = BufReader::new(&oversized[..]);
+        let mut buf = Vec::new();
+        let result = read_capped_line(&mut reader, &mut buf).await;
+        assert!(
+            result.is_err(),
+            "an over-limit line must error, not grow unbounded"
+        );
+        // The accumulator never exceeds the cap.
+        assert!(buf.len() <= MAX_LINE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn capped_reader_accepts_line_at_exactly_the_limit() {
+        // A line of exactly MAX_LINE_BYTES followed by a newline is legitimate.
+        let mut payload = vec![b'b'; MAX_LINE_BYTES];
+        payload.push(b'\n');
+        let mut reader = BufReader::new(&payload[..]);
+        let mut buf = Vec::new();
+        let line = read_capped_line(&mut reader, &mut buf).await.unwrap();
+        assert_eq!(line.map(|l| l.len()), Some(MAX_LINE_BYTES));
     }
 
     #[test]
