@@ -12,6 +12,13 @@ use wisphive_protocol::{
 };
 
 use crate::config::DaemonConfig;
+
+/// Capacity of the per-TUI-connection worker channel (itr#82). Bounds memory
+/// when a fast producer (terminal forwarder, `TermReplay`) outruns a slow TUI
+/// socket: at most this many `ServerMessage`s queue before producers start
+/// dropping. Large enough to absorb a healthy burst between select wake-ups,
+/// small enough to cap worst-case RAM.
+const CONN_CHANNEL_CAPACITY: usize = 1024;
 use crate::process_registry::ProcessRegistry;
 use crate::queue::DecisionQueue;
 use crate::registry::AgentRegistry;
@@ -536,10 +543,7 @@ type GatedItem = (uuid::Uuid, String);
 /// `gated` (they get a `WebReauthRequired` bounce) and the rest are allowed.
 /// Pure decision logic lifted verbatim from the `ApproveAll` arm so it can be
 /// unit-tested in isolation.
-fn partition_sudo_gated(
-    fresh: bool,
-    matching: Vec<GatedItem>,
-) -> (Vec<GatedItem>, Vec<GatedItem>) {
+fn partition_sudo_gated(fresh: bool, matching: Vec<GatedItem>) -> (Vec<GatedItem>, Vec<GatedItem>) {
     if fresh {
         (Vec::new(), matching)
     } else {
@@ -615,7 +619,12 @@ async fn handle_tui(
     // (e.g. per-session terminal forwarders). The select loop drains this
     // and writes to the single owned socket, so there's no lock contention
     // on the writer.
-    let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    // Bounded (itr#82): an unbounded channel let a fast producer (a chatty
+    // terminal forwarder or a large `TermReplay`) outrun a slow/stalled TUI
+    // socket and grow the queue without limit → OOM → daemon crash → gating
+    // disabled. 1024 caps worst-case memory while absorbing a healthy burst;
+    // producers `try_send` and drop on `Full` (see the forwarders below).
+    let (conn_tx, mut conn_rx) = mpsc::channel::<ServerMessage>(CONN_CHANNEL_CAPACITY);
 
     // Attached terminal sessions on this connection. Aborted on detach,
     // disconnect, or TermEnded. Key: terminal session id.
@@ -715,7 +724,7 @@ async fn dispatch_command(
     device_id: Option<wisphive_protocol::DeviceId>,
     msg: ClientMessage,
     term_attachments: &mut std::collections::HashMap<uuid::Uuid, tokio::task::JoinHandle<()>>,
-    conn_tx: &tokio::sync::mpsc::UnboundedSender<ServerMessage>,
+    conn_tx: &tokio::sync::mpsc::Sender<ServerMessage>,
 ) -> Result<std::ops::ControlFlow<()>> {
     use std::ops::ControlFlow;
     match msg {
@@ -1268,7 +1277,7 @@ async fn handle_terminal_command(
     ctx: &ConnectionContext,
     msg: ClientMessage,
     term_attachments: &mut std::collections::HashMap<uuid::Uuid, tokio::task::JoinHandle<()>>,
-    conn_tx: &tokio::sync::mpsc::UnboundedSender<ServerMessage>,
+    conn_tx: &tokio::sync::mpsc::Sender<ServerMessage>,
 ) -> Result<()> {
     match msg {
         ClientMessage::TermCreate {
@@ -1325,12 +1334,21 @@ async fn handle_terminal_command(
                                         continue;
                                     }
                                     let msg = crate::terminal::frame_to_chunk(sess_id, &frame);
-                                    if tx.send(msg).is_err() {
-                                        break;
+                                    // Bounded channel (itr#82): drop a frame on `Full`
+                                    // (slow/stalled TUI) rather than block this forwarder
+                                    // or grow memory; only a closed channel ends it.
+                                    match tx.try_send(msg) {
+                                        Ok(()) => {}
+                                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                            warn!(%sess_id, "TUI conn channel full; dropping terminal frame");
+                                        }
+                                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                            break;
+                                        }
                                     }
                                 }
                                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                                    let _ = tx.send(ServerMessage::TermError {
+                                    let _ = tx.try_send(ServerMessage::TermError {
                                         id: Some(sess_id),
                                         message: "attachment lagged, please re-attach".into(),
                                     });
@@ -1491,20 +1509,24 @@ async fn handle_terminal_command(
                                     &payload,
                                 ),
                             };
-                            if tx.send(msg).is_err() {
+                            if tx.send(msg).await.is_err() {
                                 return;
                             }
                         }
-                        let _ = tx.send(ServerMessage::TermReplayDone {
-                            id,
-                            total_events: total,
-                        });
+                        let _ = tx
+                            .send(ServerMessage::TermReplayDone {
+                                id,
+                                total_events: total,
+                            })
+                            .await;
                     }
                     Err(e) => {
-                        let _ = tx.send(ServerMessage::TermError {
-                            id: Some(id),
-                            message: format!("replay failed: {e}"),
-                        });
+                        let _ = tx
+                            .send(ServerMessage::TermError {
+                                id: Some(id),
+                                message: format!("replay failed: {e}"),
+                            })
+                            .await;
                     }
                 }
             });
@@ -1601,7 +1623,8 @@ fn peer_uid_allowed(peer_uid: u32, daemon_uid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        partition_sudo_gated, peer_uid_allowed, set_socket_permissions, sweep_stale_session_markers,
+        CONN_CHANNEL_CAPACITY, partition_sudo_gated, peer_uid_allowed, set_socket_permissions,
+        sweep_stale_session_markers,
     };
 
     fn ids(items: &[(uuid::Uuid, String)]) -> Vec<uuid::Uuid> {
@@ -1637,6 +1660,36 @@ mod tests {
         let (gated, allowed) = partition_sudo_gated(false, Vec::new());
         assert!(gated.is_empty());
         assert!(allowed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn conn_channel_is_bounded_and_drops_when_full() {
+        // A bounded channel must accept exactly its capacity then reject (drop)
+        // excess sends as Full — the policy the terminal forwarders rely on so a
+        // stalled TUI can't grow memory without limit (itr#82).
+        let (tx, _rx) =
+            tokio::sync::mpsc::channel::<wisphive_protocol::ServerMessage>(CONN_CHANNEL_CAPACITY);
+
+        let mut accepted = 0usize;
+        let mut rejected_full = 0usize;
+        for _ in 0..(CONN_CHANNEL_CAPACITY * 4) {
+            match tx.try_send(wisphive_protocol::ServerMessage::Welcome {
+                version: wisphive_protocol::PROTOCOL_VERSION,
+            }) {
+                Ok(()) => accepted += 1,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => rejected_full += 1,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+            }
+        }
+
+        assert_eq!(
+            accepted, CONN_CHANNEL_CAPACITY,
+            "a bounded channel must accept exactly its capacity before backing up"
+        );
+        assert!(
+            rejected_full > 0,
+            "excess sends past capacity must be rejected as Full (dropped), not queued"
+        );
     }
 
     #[test]
