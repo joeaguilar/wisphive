@@ -73,6 +73,23 @@ pub struct AgentHookAudit {
     pub enabled: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectDirectoryEntry {
+    pub name: String,
+    pub path: PathBuf,
+    pub kind: ProjectDirectoryEntryKind,
+    pub hidden: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectDirectoryEntryKind {
+    Directory,
+    File,
+    Symlink,
+    Other,
+}
+
 impl ProjectAudit {
     pub fn scan(project_dir: impl AsRef<Path>) -> Self {
         audit_project(project_dir)
@@ -91,6 +108,43 @@ impl HookMode {
 
 pub fn audit_project(project_dir: impl AsRef<Path>) -> ProjectAudit {
     audit_project_with_home(project_dir, default_wisphive_home())
+}
+
+pub fn list_project_directory(
+    path: impl AsRef<Path>,
+) -> std::io::Result<Vec<ProjectDirectoryEntry>> {
+    let mut entries = Vec::new();
+
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        let kind = if file_type.is_dir() {
+            ProjectDirectoryEntryKind::Directory
+        } else if file_type.is_file() {
+            ProjectDirectoryEntryKind::File
+        } else if file_type.is_symlink() {
+            ProjectDirectoryEntryKind::Symlink
+        } else {
+            ProjectDirectoryEntryKind::Other
+        };
+
+        entries.push(ProjectDirectoryEntry {
+            hidden: name.starts_with('.'),
+            name,
+            path: entry.path(),
+            kind,
+        });
+    }
+
+    entries.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
+    Ok(entries)
 }
 
 pub fn audit_project_with_home(
@@ -392,5 +446,25 @@ mod tests {
         assert!(audit.hooks.codex.parse_error.is_some());
         assert!(!audit.hooks.codex.installed);
         assert!(!audit.hooks.codex.enabled);
+    }
+
+    #[test]
+    fn list_project_directory_sorts_dirs_before_files_and_marks_hidden() {
+        let project = tempfile::tempdir().unwrap();
+
+        fs::write(project.path().join("zeta.txt"), "").unwrap();
+        fs::create_dir(project.path().join("Alpha")).unwrap();
+        fs::write(project.path().join(".env"), "").unwrap();
+        fs::create_dir(project.path().join("beta")).unwrap();
+
+        let entries = list_project_directory(project.path()).unwrap();
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+
+        assert_eq!(names, vec!["Alpha", "beta", ".env", "zeta.txt"]);
+        assert_eq!(entries[0].kind, ProjectDirectoryEntryKind::Directory);
+        assert_eq!(entries[1].kind, ProjectDirectoryEntryKind::Directory);
+        assert_eq!(entries[2].kind, ProjectDirectoryEntryKind::File);
+        assert!(entries[2].hidden);
+        assert!(!entries[3].hidden);
     }
 }

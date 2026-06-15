@@ -4,6 +4,7 @@ pub mod daemon;
 pub mod doctor;
 pub mod history;
 pub mod hooks;
+pub mod projects;
 pub mod term;
 pub mod tui;
 pub mod web;

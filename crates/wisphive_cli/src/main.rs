@@ -36,6 +36,12 @@ enum Command {
         action: HookAction,
     },
 
+    /// Discover, audit, and seed Wisphive project AI configuration
+    Projects {
+        #[command(subcommand)]
+        action: ProjectsAction,
+    },
+
     /// Emergency kill switch — disables all hooks instantly
     EmergencyOff,
 
@@ -406,6 +412,43 @@ enum HookAction {
     Status,
 }
 
+#[derive(Subcommand)]
+enum ProjectsAction {
+    /// Print a present/missing AI-config audit matrix for a project directory
+    Audit {
+        /// Project directory to audit
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+        /// Emit structured JSON instead of the text matrix
+        #[arg(long)]
+        json: bool,
+    },
+    /// Alias of audit, kept explicit for scan-first project discovery flows
+    Scan {
+        /// Project directory to scan
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+        /// Emit structured JSON instead of the text matrix
+        #[arg(long)]
+        json: bool,
+    },
+    /// List a directory for future TUI/web project browsers
+    List {
+        /// Directory to list
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+        /// Emit structured JSON instead of text rows
+        #[arg(long)]
+        json: bool,
+    },
+    /// Seed missing AI config by delegating to the project seeding script
+    Seed {
+        /// Project directory to seed
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+    },
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -438,6 +481,13 @@ fn main() -> anyhow::Result<()> {
             HookAction::Install { project, all } => commands::hooks::install(project, all),
             HookAction::Uninstall { project, all } => commands::hooks::uninstall(project, all),
             HookAction::Status => commands::hooks::status(),
+        },
+        Command::Projects { action } => match action {
+            ProjectsAction::Audit { path, json } | ProjectsAction::Scan { path, json } => {
+                commands::projects::audit(path, json)
+            }
+            ProjectsAction::List { path, json } => commands::projects::list(path, json),
+            ProjectsAction::Seed { path } => commands::projects::seed(path),
         },
 
         // History commands (need tokio runtime for socket communication)
