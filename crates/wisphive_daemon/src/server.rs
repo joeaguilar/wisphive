@@ -299,17 +299,23 @@ async fn handle_connection(stream: UnixStream, ctx: &ConnectionContext) -> Resul
     match hello {
         ClientMessage::Hello { client, version } => {
             if version != PROTOCOL_VERSION {
-                let err = encode(&ServerMessage::Error {
-                    message: format!("unsupported protocol version: {version}"),
-                })?;
-                writer.write_all(err.as_bytes()).await?;
+                write_msg(
+                    &mut writer,
+                    &ServerMessage::Error {
+                        message: format!("unsupported protocol version: {version}"),
+                    },
+                )
+                .await?;
                 return Ok(());
             }
 
-            let welcome = encode(&ServerMessage::Welcome {
-                version: PROTOCOL_VERSION,
-            })?;
-            writer.write_all(welcome.as_bytes()).await?;
+            write_msg(
+                &mut writer,
+                &ServerMessage::Welcome {
+                    version: PROTOCOL_VERSION,
+                },
+            )
+            .await?;
 
             match client {
                 ClientType::Hook => handle_hook(lines, writer, ctx).await,
@@ -317,10 +323,13 @@ async fn handle_connection(stream: UnixStream, ctx: &ConnectionContext) -> Resul
             }
         }
         _ => {
-            let err = encode(&ServerMessage::Error {
-                message: "expected Hello as first message".into(),
-            })?;
-            writer.write_all(err.as_bytes()).await?;
+            write_msg(
+                &mut writer,
+                &ServerMessage::Error {
+                    message: "expected Hello as first message".into(),
+                },
+            )
+            .await?;
             Ok(())
         }
     }
@@ -410,15 +419,18 @@ async fn handle_hook(
             }
 
             // Send rich response to hook
-            let resp = encode(&ServerMessage::DecisionResponse {
-                id,
-                decision: rich.decision,
-                message: rich.message,
-                updated_input: rich.updated_input,
-                additional_context: rich.additional_context,
-                selected_permission: rich.selected_permission,
-            })?;
-            writer.write_all(resp.as_bytes()).await?;
+            write_msg(
+                &mut writer,
+                &ServerMessage::DecisionResponse {
+                    id,
+                    decision: rich.decision,
+                    message: rich.message,
+                    updated_input: rich.updated_input,
+                    additional_context: rich.additional_context,
+                    selected_permission: rich.selected_permission,
+                },
+            )
+            .await?;
         }
         ClientMessage::ToolResult(result) => {
             // Touch last_seen for the agent
@@ -465,14 +477,69 @@ async fn handle_hook(
             }
         }
         _ => {
-            let err = encode(&ServerMessage::Error {
-                message: "expected DecisionRequest, ToolResult, or AgentRegister from hook".into(),
-            })?;
-            writer.write_all(err.as_bytes()).await?;
+            write_msg(
+                &mut writer,
+                &ServerMessage::Error {
+                    message: "expected DecisionRequest, ToolResult, or AgentRegister from hook"
+                        .into(),
+                },
+            )
+            .await?;
         }
     }
 
     Ok(())
+}
+
+/// A pending bulk-approve item: the queued decision id plus its tool name.
+type GatedItem = (uuid::Uuid, String);
+
+/// Partition queued `(id, tool_name)` items into `(gated, allowed)` for a
+/// web-origin bulk approve.
+///
+/// When the device's sudo grace is `fresh`, nothing is held back — every item
+/// is allowed. Otherwise sudo-class tools (`is_sudo_tool`) are split off as
+/// `gated` (they get a `WebReauthRequired` bounce) and the rest are allowed.
+/// Pure decision logic lifted verbatim from the `ApproveAll` arm so it can be
+/// unit-tested in isolation.
+fn partition_sudo_gated(
+    fresh: bool,
+    matching: Vec<GatedItem>,
+) -> (Vec<GatedItem>, Vec<GatedItem>) {
+    if fresh {
+        (Vec::new(), matching)
+    } else {
+        matching
+            .into_iter()
+            .partition(|(_, t)| crate::sudo_gate::is_sudo_tool(t))
+    }
+}
+
+/// Encode a single `ServerMessage` and write it to the TUI socket.
+///
+/// Dedupes the `let encoded = encode(&msg)?; writer.write_all(...)` pair that
+/// previously appeared dozens of times across the TUI handler. Behaviour is
+/// identical to the inline form: on the happy path it returns `Ok(())`; an
+/// encode or write error is propagated to the caller, which decides whether to
+/// break the select loop (on disconnect) or bubble the error up.
+async fn write_msg(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    msg: &ServerMessage,
+) -> Result<()> {
+    let encoded = encode(msg)?;
+    writer.write_all(encoded.as_bytes()).await?;
+    Ok(())
+}
+
+/// Eagerly persist a resolved decision so subsequent history queries see it.
+///
+/// The hook handler's `resolve_pending` is idempotent (no-op if already done),
+/// so resolving here ahead of the hook is safe. A persistence failure is logged
+/// and swallowed — exactly as the six inline call sites did before extraction.
+async fn eager_persist(state_db: &crate::state::StateDb, id: uuid::Uuid, decision: Decision) {
+    if let Err(e) = state_db.resolve_pending(id, decision).await {
+        warn!("eager persist failed for {id}: {e}");
+    }
 }
 
 /// Handle a TUI connection: stream events, receive commands.
@@ -488,18 +555,24 @@ async fn handle_tui(
         let reg = ctx.agent_registry.lock().await;
         reg.snapshot()
     };
-    let agents_msg = encode(&ServerMessage::AgentsSnapshot {
-        agents: agents_snap,
-    })?;
-    writer.write_all(agents_msg.as_bytes()).await?;
+    write_msg(
+        &mut writer,
+        &ServerMessage::AgentsSnapshot {
+            agents: agents_snap,
+        },
+    )
+    .await?;
 
     // Send initial queue snapshot
     let snapshot = {
         let q = ctx.queue.lock().await;
         q.snapshot()
     };
-    let snap_msg = encode(&ServerMessage::QueueSnapshot { items: snapshot })?;
-    writer.write_all(snap_msg.as_bytes()).await?;
+    write_msg(
+        &mut writer,
+        &ServerMessage::QueueSnapshot { items: snapshot },
+    )
+    .await?;
 
     // Subscribe to broadcast events for this TUI
     let mut tui_rx = ctx.tui_tx.subscribe();
@@ -521,8 +594,7 @@ async fn handle_tui(
             msg = conn_rx.recv() => {
                 match msg {
                     Some(m) => {
-                        let encoded = encode(&m)?;
-                        if writer.write_all(encoded.as_bytes()).await.is_err() {
+                        if write_msg(&mut writer, &m).await.is_err() {
                             break;
                         }
                     }
@@ -533,8 +605,7 @@ async fn handle_tui(
             event = tui_rx.recv() => {
                 match event {
                     Ok(msg) => {
-                        let encoded = encode(&msg)?;
-                        if writer.write_all(encoded.as_bytes()).await.is_err() {
+                        if write_msg(&mut writer, &msg).await.is_err() {
                             break; // TUI disconnected
                         }
                     }
@@ -558,622 +629,24 @@ async fn handle_tui(
                                     continue;
                                 }
                             };
-                        // Every decision arm below logs `%device_id` (None = local
-                        // TUI, implicitly trusted). The Approve / ApproveAll arms
+                        // Every decision arm logs `%device_id` (None = local TUI,
+                        // implicitly trusted). The Approve / ApproveAll arms
                         // consult `ctx.reauth` before honouring web-origin
                         // approvals of sudo-class tools (itr#218).
                         let device_id = command.device_id.clone();
                         let msg = command.body;
-                        match msg {
-                            ClientMessage::Approve { id, message, updated_input, always_allow, additional_context } => {
-                                info!(?device_id, %id, "approve");
-
-                                // Sudo-mode gate: if the approve is coming from
-                                // an authenticated web device, the target tool is
-                                // sudo-class, and the device's reauth grace has
-                                // lapsed, we refuse to resolve and bounce a
-                                // WebReauthRequired back on this connection so
-                                // the browser can open the sudo modal. TUI
-                                // origin approvals (device_id = None) bypass.
-                                if let Some(ref dev) = device_id {
-                                    let tool = {
-                                        let q = ctx.queue.lock().await;
-                                        q.peek(id).map(|r| r.tool_name.clone())
-                                    };
-                                    if let Some(tool_name) = tool
-                                        && crate::sudo_gate::is_sudo_tool(&tool_name)
-                                        && !ctx.reauth.is_fresh(dev).await
-                                    {
-                                        let reauth_msg = ServerMessage::WebReauthRequired {
-                                            device_id: dev.0.clone(),
-                                            request_id: id.to_string(),
-                                            tool_name: tool_name.clone(),
-                                            at: chrono::Utc::now(),
-                                        };
-                                        let encoded = encode(&reauth_msg)?;
-                                        writer.write_all(encoded.as_bytes()).await?;
-                                        debug!(%id, tool = %tool_name, device_id = %dev.0, "sudo gate: reauth required");
-                                        continue;
-                                    }
-                                }
-
-                                let rich = RichDecision {
-                                    decision: Decision::Approve,
-                                    message,
-                                    updated_input,
-                                    always_allow,
-                                    additional_context,
-                                    selected_permission: None,
-                                };
-                                {
-                                    let mut q = ctx.queue.lock().await;
-                                    q.resolve(id, rich);
-                                }
-                                // Eagerly persist so subsequent history queries see this decision.
-                                // The hook handler's resolve_pending is idempotent (no-op if already done).
-                                if let Err(e) = ctx.state_db.resolve_pending(id, Decision::Approve).await {
-                                    warn!("eager persist failed for {id}: {e}");
-                                }
-                            }
-                            ClientMessage::Deny { id, message } => {
-                                info!(?device_id, %id, "deny");
-                                let rich = RichDecision {
-                                    decision: Decision::Deny,
-                                    message,
-                                    ..RichDecision::deny()
-                                };
-                                {
-                                    let mut q = ctx.queue.lock().await;
-                                    q.resolve(id, rich);
-                                }
-                                if let Err(e) = ctx.state_db.resolve_pending(id, Decision::Deny).await {
-                                    warn!("eager persist failed for {id}: {e}");
-                                }
-                            }
-                            ClientMessage::Ask { id } => {
-                                info!(?device_id, %id, "ask");
-                                let mut q = ctx.queue.lock().await;
-                                q.resolve(id, RichDecision::from(Decision::Ask));
-                                // Ask/defer decisions are not persisted to the audit log
-                            }
-                            ClientMessage::ApproveAll { ref filter } => {
-                                // Web-origin bulk approves get the same sudo-class
-                                // treatment as single approvals: items in the
-                                // sudo-class set are held back behind a
-                                // WebReauthRequired signal while the rest
-                                // resolve. TUI-origin bulk approves are trusted
-                                // and fast-path through the original path.
-                                if let Some(ref dev) = device_id {
-                                    let matching: Vec<(uuid::Uuid, String)> = {
-                                        let q = ctx.queue.lock().await;
-                                        q.snapshot()
-                                            .into_iter()
-                                            .filter(|req| filter.as_ref().is_none_or(|f| f.matches(req)))
-                                            .map(|req| (req.id, req.tool_name))
-                                            .collect()
-                                    };
-                                    let fresh = ctx.reauth.is_fresh(dev).await;
-                                    let (gated, allowed): (Vec<_>, Vec<_>) = if fresh {
-                                        (Vec::new(), matching)
-                                    } else {
-                                        matching.into_iter().partition(|(_, t)| crate::sudo_gate::is_sudo_tool(t))
-                                    };
-
-                                    let allowed_ids: Vec<uuid::Uuid> = {
-                                        let mut q = ctx.queue.lock().await;
-                                        allowed
-                                            .iter()
-                                            .filter(|(id, _)| q.resolve(*id, RichDecision::from(Decision::Approve)))
-                                            .map(|(id, _)| *id)
-                                            .collect()
-                                    };
-                                    info!(
-                                        ?device_id,
-                                        approved = allowed_ids.len(),
-                                        gated = gated.len(),
-                                        "approve_all"
-                                    );
-                                    for id in &allowed_ids {
-                                        if let Err(e) = ctx.state_db.resolve_pending(*id, Decision::Approve).await {
-                                            warn!("eager persist failed for {id}: {e}");
-                                        }
-                                    }
-                                    for (id, tool_name) in gated {
-                                        let reauth_msg = ServerMessage::WebReauthRequired {
-                                            device_id: dev.0.clone(),
-                                            request_id: id.to_string(),
-                                            tool_name: tool_name.clone(),
-                                            at: chrono::Utc::now(),
-                                        };
-                                        let encoded = encode(&reauth_msg)?;
-                                        writer.write_all(encoded.as_bytes()).await?;
-                                        debug!(%id, tool = %tool_name, device_id = %dev.0, "sudo gate: reauth required (approve_all)");
-                                    }
-                                } else {
-                                    let ids = {
-                                        let mut q = ctx.queue.lock().await;
-                                        q.resolve_all(filter, Decision::Approve)
-                                    };
-                                    info!(?device_id, count = ids.len(), "approve_all");
-                                    for id in ids {
-                                        if let Err(e) = ctx.state_db.resolve_pending(id, Decision::Approve).await {
-                                            warn!("eager persist failed for {id}: {e}");
-                                        }
-                                    }
-                                }
-                            }
-                            ClientMessage::DenyAll { ref filter } => {
-                                let ids = {
-                                    let mut q = ctx.queue.lock().await;
-                                    q.resolve_all(filter, Decision::Deny)
-                                };
-                                info!(?device_id, count = ids.len(), "deny_all");
-                                for id in ids {
-                                    if let Err(e) = ctx.state_db.resolve_pending(id, Decision::Deny).await {
-                                        warn!("eager persist failed for {id}: {e}");
-                                    }
-                                }
-                            }
-                            ClientMessage::SpawnAgent(req) => {
-                                let mut pr = ctx.process_registry.lock().await;
-                                match pr.spawn_agent(req).await {
-                                    Ok(agent) => {
-                                        let resp = encode(&ServerMessage::AgentSpawned(agent))?;
-                                        writer.write_all(resp.as_bytes()).await?;
-                                    }
-                                    Err(e) => {
-                                        let resp = encode(&ServerMessage::Error {
-                                            message: format!("failed to spawn agent: {e}"),
-                                        })?;
-                                        writer.write_all(resp.as_bytes()).await?;
-                                    }
-                                }
-                            }
-                            ClientMessage::ListAgents => {
-                                let pr = ctx.process_registry.lock().await;
-                                let agents = pr.list();
-                                let resp = encode(&ServerMessage::AgentList { agents })?;
-                                writer.write_all(resp.as_bytes()).await?;
-                            }
-                            ClientMessage::ReimportEvents => {
-                                let events_path = ctx.home_dir.join("events.jsonl");
-                                match crate::event_ingest::reimport_all(&events_path, &ctx.state_db).await {
-                                    Ok(count) => {
-                                        let resp = encode(&ServerMessage::ReimportComplete { count })?;
-                                        writer.write_all(resp.as_bytes()).await?;
-                                    }
-                                    Err(e) => {
-                                        let resp = encode(&ServerMessage::Error {
-                                            message: format!("reimport failed: {e}"),
-                                        })?;
-                                        writer.write_all(resp.as_bytes()).await?;
-                                    }
-                                }
-                            }
-                            ClientMessage::QueryHistory { ref agent_id, limit, ref request_id } => {
-                                let limit = limit.unwrap_or(200);
-                                match ctx.state_db.query_history(agent_id.as_deref(), limit).await {
-                                    Ok(entries) => {
-                                        let resp = encode(&ServerMessage::HistoryResponse { entries, request_id: request_id.clone() })?;
-                                        writer.write_all(resp.as_bytes()).await?;
-                                    }
-                                    Err(e) => {
-                                        let resp = encode(&ServerMessage::Error {
-                                            message: format!("history query failed: {e}"),
-                                        })?;
-                                        writer.write_all(resp.as_bytes()).await?;
-                                    }
-                                }
-                            }
-                            ClientMessage::SearchHistory(ref search) => {
-                                match ctx.state_db.search_history(search).await {
-                                    Ok(entries) => {
-                                        let resp = encode(&ServerMessage::HistoryResponse { entries, request_id: search.request_id.clone() })?;
-                                        writer.write_all(resp.as_bytes()).await?;
-                                    }
-                                    Err(e) => {
-                                        let resp = encode(&ServerMessage::Error {
-                                            message: format!("search failed: {e}"),
-                                        })?;
-                                        writer.write_all(resp.as_bytes()).await?;
-                                    }
-                                }
-                            }
-                            ClientMessage::QuerySessions => {
-                                match ctx.state_db.query_sessions().await {
-                                    Ok(mut sessions) => {
-                                        // Enrich with live status
-                                        let live_agents = {
-                                            let reg = ctx.agent_registry.lock().await;
-                                            reg.snapshot()
-                                        };
-                                        let live_ids: std::collections::HashSet<String> =
-                                            live_agents.iter().map(|a| a.agent_id.clone()).collect();
-
-                                        // Pending counts from queue
-                                        let pending_counts: std::collections::HashMap<String, u32> = {
-                                            let q = ctx.queue.lock().await;
-                                            let snapshot = q.snapshot();
-                                            let mut counts = std::collections::HashMap::new();
-                                            for req in &snapshot {
-                                                *counts.entry(req.agent_id.clone()).or_insert(0) += 1;
-                                            }
-                                            counts
-                                        };
-
-                                        for session in &mut sessions {
-                                            session.is_live = live_ids.contains(&session.agent_id);
-                                            session.pending_count = pending_counts.get(&session.agent_id).copied().unwrap_or(0);
-                                        }
-
-                                        // Add live agents with no history yet
-                                        for agent in &live_agents {
-                                            if !sessions.iter().any(|s| s.agent_id == agent.agent_id) {
-                                                sessions.push(wisphive_protocol::SessionSummary {
-                                                    agent_id: agent.agent_id.clone(),
-                                                    agent_type: agent.agent_type.clone(),
-                                                    project: agent.project.clone(),
-                                                    first_seen: agent.connected_at,
-                                                    last_seen: agent.last_seen,
-                                                    total_calls: 0,
-                                                    approved: 0,
-                                                    denied: 0,
-                                                    is_live: true,
-                                                    pending_count: pending_counts.get(&agent.agent_id).copied().unwrap_or(0),
-                                                });
-                                            }
-                                        }
-
-                                        // Sort: live+pending first, then live, then by last_seen DESC
-                                        sessions.sort_by(|a, b| {
-                                            let a_key = (a.is_live && a.pending_count > 0, a.is_live, a.last_seen);
-                                            let b_key = (b.is_live && b.pending_count > 0, b.is_live, b.last_seen);
-                                            b_key.partial_cmp(&a_key).unwrap_or(std::cmp::Ordering::Equal)
-                                        });
-
-                                        let resp = encode(&ServerMessage::SessionsResponse { sessions })?;
-                                        writer.write_all(resp.as_bytes()).await?;
-                                    }
-                                    Err(e) => {
-                                        let resp = encode(&ServerMessage::Error {
-                                            message: format!("sessions query failed: {e}"),
-                                        })?;
-                                        writer.write_all(resp.as_bytes()).await?;
-                                    }
-                                }
-                            }
-                            ClientMessage::QueryProjects => {
-                                match ctx.state_db.query_projects().await {
-                                    Ok(mut projects) => {
-                                        // Enrich with live agent presence
-                                        let live_agents = {
-                                            let reg = ctx.agent_registry.lock().await;
-                                            reg.snapshot()
-                                        };
-                                        let mut live_projects: std::collections::HashSet<std::path::PathBuf> =
-                                            std::collections::HashSet::new();
-                                        for agent in &live_agents {
-                                            live_projects.insert(agent.project.clone());
-                                        }
-
-                                        // Pending counts per project
-                                        let pending_counts: std::collections::HashMap<std::path::PathBuf, u32> = {
-                                            let q = ctx.queue.lock().await;
-                                            let snapshot = q.snapshot();
-                                            let mut counts = std::collections::HashMap::new();
-                                            for req in &snapshot {
-                                                *counts.entry(req.project.clone()).or_insert(0) += 1;
-                                            }
-                                            counts
-                                        };
-
-                                        for project in &mut projects {
-                                            project.has_live_agents = live_projects.contains(&project.project);
-                                            project.pending_count = pending_counts.get(&project.project).copied().unwrap_or(0);
-                                        }
-
-                                        // Add projects with live agents but no history
-                                        for agent in &live_agents {
-                                            if !projects.iter().any(|p| p.project == agent.project) {
-                                                projects.push(wisphive_protocol::ProjectSummary {
-                                                    project: agent.project.clone(),
-                                                    first_seen: agent.connected_at,
-                                                    last_seen: agent.last_seen,
-                                                    total_calls: 0,
-                                                    approved: 0,
-                                                    denied: 0,
-                                                    agent_count: 1,
-                                                    pending_count: pending_counts.get(&agent.project).copied().unwrap_or(0),
-                                                    has_live_agents: true,
-                                                });
-                                            }
-                                        }
-
-                                        projects.sort_by(|a, b| {
-                                            let a_key = (a.has_live_agents && a.pending_count > 0, a.has_live_agents, a.last_seen);
-                                            let b_key = (b.has_live_agents && b.pending_count > 0, b.has_live_agents, b.last_seen);
-                                            b_key.partial_cmp(&a_key).unwrap_or(std::cmp::Ordering::Equal)
-                                        });
-
-                                        let resp = encode(&ServerMessage::ProjectsResponse { projects })?;
-                                        writer.write_all(resp.as_bytes()).await?;
-                                    }
-                                    Err(e) => {
-                                        let resp = encode(&ServerMessage::Error {
-                                            message: format!("projects query failed: {e}"),
-                                        })?;
-                                        writer.write_all(resp.as_bytes()).await?;
-                                    }
-                                }
-                            }
-                            ClientMessage::StopAgent { ref agent_id } => {
-                                let mut pr = ctx.process_registry.lock().await;
-                                match pr.stop_agent(agent_id).await {
-                                    Ok(exit_code) => {
-                                        let resp = encode(&ServerMessage::AgentExited {
-                                            agent_id: agent_id.clone(),
-                                            exit_code,
-                                        })?;
-                                        writer.write_all(resp.as_bytes()).await?;
-                                    }
-                                    Err(e) => {
-                                        let resp = encode(&ServerMessage::Error {
-                                            message: format!("{e}"),
-                                        })?;
-                                        writer.write_all(resp.as_bytes()).await?;
-                                    }
-                                }
-                            }
-                            ClientMessage::TermCreate { label, command, args, cwd, cols, rows, env } => {
-                                match ctx.terminal_manager
-                                    .create(label, command, args, cwd, cols, rows, env)
-                                    .await
-                                {
-                                    Ok(meta) => {
-                                        let resp = encode(&ServerMessage::TermCreated(meta))?;
-                                        writer.write_all(resp.as_bytes()).await?;
-                                    }
-                                    Err(e) => {
-                                        let resp = encode(&ServerMessage::TermError {
-                                            id: None,
-                                            message: format!("term create failed: {e}"),
-                                        })?;
-                                        writer.write_all(resp.as_bytes()).await?;
-                                    }
-                                }
-                            }
-                            ClientMessage::TermAttach { id } => {
-                                if let Some(handle) = term_attachments.remove(&id) {
-                                    handle.abort();
-                                }
-                                let session = ctx.terminal_manager.get(id).await;
-                                match session {
-                                    Some(session) => {
-                                        // Snapshot the current screen BEFORE subscribing so
-                                        // the seq counter we capture matches what we'll see
-                                        // on the receiver.
-                                        let next_seq = session.seq_load();
-                                        let catchup = crate::terminal::catchup_message(&session, next_seq);
-                                        let encoded = encode(&catchup)?;
-                                        writer.write_all(encoded.as_bytes()).await?;
-
-                                        let mut rx = session.subscribe();
-                                        let sess_id = session.id;
-                                        let tx = conn_tx.clone();
-                                        let handle = tokio::spawn(async move {
-                                            loop {
-                                                match rx.recv().await {
-                                                    Ok(frame) => {
-                                                        if frame.seq < next_seq {
-                                                            continue;
-                                                        }
-                                                        let msg = crate::terminal::frame_to_chunk(sess_id, &frame);
-                                                        if tx.send(msg).is_err() {
-                                                            break;
-                                                        }
-                                                    }
-                                                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                                                        let _ = tx.send(ServerMessage::TermError {
-                                                            id: Some(sess_id),
-                                                            message: "attachment lagged, please re-attach".into(),
-                                                        });
-                                                        break;
-                                                    }
-                                                    Err(broadcast::error::RecvError::Closed) => break,
-                                                }
-                                            }
-                                        });
-                                        term_attachments.insert(id, handle);
-                                    }
-                                    None => {
-                                        let resp = encode(&ServerMessage::TermError {
-                                            id: Some(id),
-                                            message: "terminal session not found or no longer running".into(),
-                                        })?;
-                                        writer.write_all(resp.as_bytes()).await?;
-                                    }
-                                }
-                            }
-                            ClientMessage::TermDetach { id } => {
-                                if let Some(handle) = term_attachments.remove(&id) {
-                                    handle.abort();
-                                }
-                            }
-                            ClientMessage::TermInput { id, data } => {
-                                match crate::terminal::decode_b64(&data) {
-                                    Ok(bytes) => {
-                                        if let Err(e) = ctx.terminal_manager.write_input(id, bytes).await {
-                                            let resp = encode(&ServerMessage::TermError {
-                                                id: Some(id),
-                                                message: format!("term input failed: {e}"),
-                                            })?;
-                                            writer.write_all(resp.as_bytes()).await?;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        let resp = encode(&ServerMessage::TermError {
-                                            id: Some(id),
-                                            message: format!("invalid term input payload: {e}"),
-                                        })?;
-                                        writer.write_all(resp.as_bytes()).await?;
-                                    }
-                                }
-                            }
-                            ClientMessage::TermResize { id, cols, rows } => {
-                                if let Err(e) = ctx.terminal_manager.resize(id, cols, rows).await {
-                                    let resp = encode(&ServerMessage::TermError {
-                                        id: Some(id),
-                                        message: format!("term resize failed: {e}"),
-                                    })?;
-                                    writer.write_all(resp.as_bytes()).await?;
-                                }
-                            }
-                            ClientMessage::TermClose { id, kill } => {
-                                if let Some(handle) = term_attachments.remove(&id) {
-                                    handle.abort();
-                                }
-                                if let Err(e) = ctx.terminal_manager.close(id, kill).await {
-                                    let resp = encode(&ServerMessage::TermError {
-                                        id: Some(id),
-                                        message: format!("term close failed: {e}"),
-                                    })?;
-                                    writer.write_all(resp.as_bytes()).await?;
-                                }
-                            }
-                            ClientMessage::TermList => {
-                                match ctx.terminal_manager.list_all().await {
-                                    Ok(sessions) => {
-                                        let resp = encode(&ServerMessage::TermListResponse { sessions })?;
-                                        writer.write_all(resp.as_bytes()).await?;
-                                    }
-                                    Err(e) => {
-                                        let resp = encode(&ServerMessage::TermError {
-                                            id: None,
-                                            message: format!("term list failed: {e}"),
-                                        })?;
-                                        writer.write_all(resp.as_bytes()).await?;
-                                    }
-                                }
-                            }
-                            ClientMessage::TermSetGroup { id, group } => {
-                                match ctx.terminal_manager.set_group(id, group.as_deref()).await {
-                                    Ok(()) => {
-                                        if let Ok(sessions) = ctx.terminal_manager.list_all().await {
-                                            let _ = ctx.tui_tx.send(ServerMessage::TermListResponse { sessions });
-                                        }
-                                    }
-                                    Err(e) => {
-                                        let resp = encode(&ServerMessage::TermError {
-                                            id: Some(id),
-                                            message: format!("term set group failed: {e}"),
-                                        })?;
-                                        writer.write_all(resp.as_bytes()).await?;
-                                    }
-                                }
-                            }
-                            ClientMessage::TermReorder { id, sort_order } => {
-                                match ctx.terminal_manager.set_sort_order(id, sort_order).await {
-                                    Ok(()) => {
-                                        if let Ok(sessions) = ctx.terminal_manager.list_all().await {
-                                            let _ = ctx.tui_tx.send(ServerMessage::TermListResponse { sessions });
-                                        }
-                                    }
-                                    Err(e) => {
-                                        let resp = encode(&ServerMessage::TermError {
-                                            id: Some(id),
-                                            message: format!("term reorder failed: {e}"),
-                                        })?;
-                                        writer.write_all(resp.as_bytes()).await?;
-                                    }
-                                }
-                            }
-                            ClientMessage::TermReplay { id, from_seq, speed: _ } => {
-                                // Pull events from SQLite and stream them as
-                                // replay chunks. Speed pacing is client-side.
-                                let state_db = ctx.state_db.clone();
-                                let tx = conn_tx.clone();
-                                tokio::spawn(async move {
-                                    match state_db.replay_terminal_events(id, from_seq).await {
-                                        Ok(events) => {
-                                            let total = events.len() as u64;
-                                            for (seq, ts_us, direction, payload) in events {
-                                                let msg = ServerMessage::TermReplayChunk {
-                                                    id,
-                                                    seq,
-                                                    ts_us,
-                                                    direction,
-                                                    data: base64::Engine::encode(
-                                                        &base64::engine::general_purpose::STANDARD,
-                                                        &payload,
-                                                    ),
-                                                };
-                                                if tx.send(msg).is_err() {
-                                                    return;
-                                                }
-                                            }
-                                            let _ = tx.send(ServerMessage::TermReplayDone {
-                                                id,
-                                                total_events: total,
-                                            });
-                                        }
-                                        Err(e) => {
-                                            let _ = tx.send(ServerMessage::TermError {
-                                                id: Some(id),
-                                                message: format!("replay failed: {e}"),
-                                            });
-                                        }
-                                    }
-                                });
-                            }
-                            ClientMessage::MarkDeviceFresh => {
-                                // Only authenticated web origins can refresh sudo
-                                // timers — the envelope's device_id is filled in
-                                // by the web crate's short-lived sender
-                                // (post_auth_reauth), never by the browser. A
-                                // payload without a device_id is dropped so a
-                                // local TUI bug can't accidentally elevate any
-                                // phantom device.
-                                if let Some(ref dev) = device_id {
-                                    ctx.reauth.touch(dev).await;
-                                    info!(device_id = %dev.0, "device marked fresh for sudo-mode");
-                                    let ack = encode(&ServerMessage::MarkDeviceFreshAck {
-                                        device_id: dev.0.clone(),
-                                    })?;
-                                    writer.write_all(ack.as_bytes()).await?;
-                                } else {
-                                    warn!("mark_device_fresh without device_id; ignoring");
-                                }
-                            }
-                            ClientMessage::ApprovePermission { id, suggestion_index, message } => {
-                                info!(?device_id, %id, suggestion_index, "approve_permission");
-                                // Look up the selected suggestion from the queued request
-                                let selected = {
-                                    let q = ctx.queue.lock().await;
-                                    q.snapshot().iter()
-                                        .find(|r| r.id == id)
-                                        .and_then(|r| r.permission_suggestions.as_ref())
-                                        .and_then(|s| s.get(suggestion_index))
-                                        .cloned()
-                                };
-                                let rich = RichDecision {
-                                    decision: Decision::Approve,
-                                    message,
-                                    updated_input: None,
-                                    always_allow: false,
-                                    additional_context: None,
-                                    selected_permission: selected,
-                                };
-                                {
-                                    let mut q = ctx.queue.lock().await;
-                                    q.resolve(id, rich);
-                                }
-                                if let Err(e) = ctx.state_db.resolve_pending(id, Decision::Approve).await {
-                                    warn!("eager persist failed for {id}: {e}");
-                                }
-                            }
-                            _ => {
-                                warn!("unexpected message from TUI: {:?}", msg);
-                            }
+                        if dispatch_command(
+                            &mut writer,
+                            ctx,
+                            device_id,
+                            msg,
+                            &mut term_attachments,
+                            &conn_tx,
+                        )
+                        .await?
+                        .is_break()
+                        {
+                            break;
                         }
                     }
                     Ok(None) => break, // TUI disconnected
@@ -1193,6 +666,819 @@ async fn handle_tui(
     }
 
     info!("TUI client disconnected");
+    Ok(())
+}
+
+/// Route one decoded TUI command to its per-domain dispatcher.
+///
+/// Returns `ControlFlow::Break(())` only when a dispatcher signals the select
+/// loop should stop (TUI disconnect); `ControlFlow::Continue(())` otherwise.
+/// Pure routing — the behaviour of each arm is unchanged from the original
+/// inline `match`.
+async fn dispatch_command(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    ctx: &ConnectionContext,
+    device_id: Option<wisphive_protocol::DeviceId>,
+    msg: ClientMessage,
+    term_attachments: &mut std::collections::HashMap<uuid::Uuid, tokio::task::JoinHandle<()>>,
+    conn_tx: &tokio::sync::mpsc::UnboundedSender<ServerMessage>,
+) -> Result<std::ops::ControlFlow<()>> {
+    use std::ops::ControlFlow;
+    match msg {
+        ClientMessage::Approve { .. }
+        | ClientMessage::Deny { .. }
+        | ClientMessage::Ask { .. }
+        | ClientMessage::ApproveAll { .. }
+        | ClientMessage::DenyAll { .. }
+        | ClientMessage::ApprovePermission { .. }
+        | ClientMessage::MarkDeviceFresh => {
+            handle_decision_command(writer, ctx, device_id, msg).await?;
+        }
+        ClientMessage::SpawnAgent(_)
+        | ClientMessage::ListAgents
+        | ClientMessage::StopAgent { .. }
+        | ClientMessage::ReimportEvents => {
+            handle_agent_command(writer, ctx, msg).await?;
+        }
+        ClientMessage::QueryHistory { .. }
+        | ClientMessage::SearchHistory(_)
+        | ClientMessage::QuerySessions
+        | ClientMessage::QueryProjects => {
+            handle_query_command(writer, ctx, msg).await?;
+        }
+        ClientMessage::TermCreate { .. }
+        | ClientMessage::TermAttach { .. }
+        | ClientMessage::TermDetach { .. }
+        | ClientMessage::TermInput { .. }
+        | ClientMessage::TermResize { .. }
+        | ClientMessage::TermClose { .. }
+        | ClientMessage::TermList
+        | ClientMessage::TermSetGroup { .. }
+        | ClientMessage::TermReorder { .. }
+        | ClientMessage::TermReplay { .. } => {
+            handle_terminal_command(writer, ctx, msg, term_attachments, conn_tx).await?;
+        }
+        _ => {
+            warn!("unexpected message from TUI: {:?}", msg);
+        }
+    }
+    Ok(ControlFlow::Continue(()))
+}
+
+/// Dispatch decision-class commands: approve/deny/ask, bulk variants, the
+/// permission-selection approve, and the web sudo reauth refresh.
+///
+/// These share the sudo/reauth gate (itr#218) and the eager-persist path.
+async fn handle_decision_command(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    ctx: &ConnectionContext,
+    device_id: Option<wisphive_protocol::DeviceId>,
+    msg: ClientMessage,
+) -> Result<()> {
+    match msg {
+        ClientMessage::Approve {
+            id,
+            message,
+            updated_input,
+            always_allow,
+            additional_context,
+        } => {
+            info!(?device_id, %id, "approve");
+
+            // Sudo-mode gate: if the approve is coming from
+            // an authenticated web device, the target tool is
+            // sudo-class, and the device's reauth grace has
+            // lapsed, we refuse to resolve and bounce a
+            // WebReauthRequired back on this connection so
+            // the browser can open the sudo modal. TUI
+            // origin approvals (device_id = None) bypass.
+            if let Some(ref dev) = device_id {
+                let tool = {
+                    let q = ctx.queue.lock().await;
+                    q.peek(id).map(|r| r.tool_name.clone())
+                };
+                if let Some(tool_name) = tool
+                    && crate::sudo_gate::is_sudo_tool(&tool_name)
+                    && !ctx.reauth.is_fresh(dev).await
+                {
+                    let reauth_msg = ServerMessage::WebReauthRequired {
+                        device_id: dev.0.clone(),
+                        request_id: id.to_string(),
+                        tool_name: tool_name.clone(),
+                        at: chrono::Utc::now(),
+                    };
+                    write_msg(writer, &reauth_msg).await?;
+                    debug!(%id, tool = %tool_name, device_id = %dev.0, "sudo gate: reauth required");
+                    return Ok(());
+                }
+            }
+
+            let rich = RichDecision {
+                decision: Decision::Approve,
+                message,
+                updated_input,
+                always_allow,
+                additional_context,
+                selected_permission: None,
+            };
+            {
+                let mut q = ctx.queue.lock().await;
+                q.resolve(id, rich);
+            }
+            // Eagerly persist so subsequent history queries see this decision.
+            eager_persist(&ctx.state_db, id, Decision::Approve).await;
+        }
+        ClientMessage::Deny { id, message } => {
+            info!(?device_id, %id, "deny");
+            let rich = RichDecision {
+                decision: Decision::Deny,
+                message,
+                ..RichDecision::deny()
+            };
+            {
+                let mut q = ctx.queue.lock().await;
+                q.resolve(id, rich);
+            }
+            eager_persist(&ctx.state_db, id, Decision::Deny).await;
+        }
+        ClientMessage::Ask { id } => {
+            info!(?device_id, %id, "ask");
+            let mut q = ctx.queue.lock().await;
+            q.resolve(id, RichDecision::from(Decision::Ask));
+            // Ask/defer decisions are not persisted to the audit log
+        }
+        ClientMessage::ApproveAll { ref filter } => {
+            // Web-origin bulk approves get the same sudo-class
+            // treatment as single approvals: items in the
+            // sudo-class set are held back behind a
+            // WebReauthRequired signal while the rest
+            // resolve. TUI-origin bulk approves are trusted
+            // and fast-path through the original path.
+            if let Some(ref dev) = device_id {
+                let matching: Vec<(uuid::Uuid, String)> = {
+                    let q = ctx.queue.lock().await;
+                    q.snapshot()
+                        .into_iter()
+                        .filter(|req| filter.as_ref().is_none_or(|f| f.matches(req)))
+                        .map(|req| (req.id, req.tool_name))
+                        .collect()
+                };
+                let fresh = ctx.reauth.is_fresh(dev).await;
+                let (gated, allowed) = partition_sudo_gated(fresh, matching);
+
+                let allowed_ids: Vec<uuid::Uuid> = {
+                    let mut q = ctx.queue.lock().await;
+                    allowed
+                        .iter()
+                        .filter(|(id, _)| q.resolve(*id, RichDecision::from(Decision::Approve)))
+                        .map(|(id, _)| *id)
+                        .collect()
+                };
+                info!(
+                    ?device_id,
+                    approved = allowed_ids.len(),
+                    gated = gated.len(),
+                    "approve_all"
+                );
+                for id in &allowed_ids {
+                    eager_persist(&ctx.state_db, *id, Decision::Approve).await;
+                }
+                for (id, tool_name) in gated {
+                    let reauth_msg = ServerMessage::WebReauthRequired {
+                        device_id: dev.0.clone(),
+                        request_id: id.to_string(),
+                        tool_name: tool_name.clone(),
+                        at: chrono::Utc::now(),
+                    };
+                    write_msg(writer, &reauth_msg).await?;
+                    debug!(%id, tool = %tool_name, device_id = %dev.0, "sudo gate: reauth required (approve_all)");
+                }
+            } else {
+                let ids = {
+                    let mut q = ctx.queue.lock().await;
+                    q.resolve_all(filter, Decision::Approve)
+                };
+                info!(?device_id, count = ids.len(), "approve_all");
+                for id in ids {
+                    eager_persist(&ctx.state_db, id, Decision::Approve).await;
+                }
+            }
+        }
+        ClientMessage::DenyAll { ref filter } => {
+            let ids = {
+                let mut q = ctx.queue.lock().await;
+                q.resolve_all(filter, Decision::Deny)
+            };
+            info!(?device_id, count = ids.len(), "deny_all");
+            for id in ids {
+                eager_persist(&ctx.state_db, id, Decision::Deny).await;
+            }
+        }
+        ClientMessage::MarkDeviceFresh => {
+            // Only authenticated web origins can refresh sudo
+            // timers — the envelope's device_id is filled in
+            // by the web crate's short-lived sender
+            // (post_auth_reauth), never by the browser. A
+            // payload without a device_id is dropped so a
+            // local TUI bug can't accidentally elevate any
+            // phantom device.
+            if let Some(ref dev) = device_id {
+                ctx.reauth.touch(dev).await;
+                info!(device_id = %dev.0, "device marked fresh for sudo-mode");
+                write_msg(
+                    writer,
+                    &ServerMessage::MarkDeviceFreshAck {
+                        device_id: dev.0.clone(),
+                    },
+                )
+                .await?;
+            } else {
+                warn!("mark_device_fresh without device_id; ignoring");
+            }
+        }
+        ClientMessage::ApprovePermission {
+            id,
+            suggestion_index,
+            message,
+        } => {
+            info!(?device_id, %id, suggestion_index, "approve_permission");
+            // Look up the selected suggestion from the queued request
+            let selected = {
+                let q = ctx.queue.lock().await;
+                q.snapshot()
+                    .iter()
+                    .find(|r| r.id == id)
+                    .and_then(|r| r.permission_suggestions.as_ref())
+                    .and_then(|s| s.get(suggestion_index))
+                    .cloned()
+            };
+            let rich = RichDecision {
+                decision: Decision::Approve,
+                message,
+                updated_input: None,
+                always_allow: false,
+                additional_context: None,
+                selected_permission: selected,
+            };
+            {
+                let mut q = ctx.queue.lock().await;
+                q.resolve(id, rich);
+            }
+            eager_persist(&ctx.state_db, id, Decision::Approve).await;
+        }
+        _ => {
+            warn!("unexpected message from TUI: {:?}", msg);
+        }
+    }
+    Ok(())
+}
+
+/// Dispatch agent-process commands: spawn, list, stop, and event re-import.
+async fn handle_agent_command(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    ctx: &ConnectionContext,
+    msg: ClientMessage,
+) -> Result<()> {
+    match msg {
+        ClientMessage::SpawnAgent(req) => {
+            let mut pr = ctx.process_registry.lock().await;
+            match pr.spawn_agent(req).await {
+                Ok(agent) => {
+                    write_msg(writer, &ServerMessage::AgentSpawned(agent)).await?;
+                }
+                Err(e) => {
+                    write_msg(
+                        writer,
+                        &ServerMessage::Error {
+                            message: format!("failed to spawn agent: {e}"),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+        ClientMessage::ListAgents => {
+            let pr = ctx.process_registry.lock().await;
+            let agents = pr.list();
+            write_msg(writer, &ServerMessage::AgentList { agents }).await?;
+        }
+        ClientMessage::ReimportEvents => {
+            let events_path = ctx.home_dir.join("events.jsonl");
+            match crate::event_ingest::reimport_all(&events_path, &ctx.state_db).await {
+                Ok(count) => {
+                    write_msg(writer, &ServerMessage::ReimportComplete { count }).await?;
+                }
+                Err(e) => {
+                    write_msg(
+                        writer,
+                        &ServerMessage::Error {
+                            message: format!("reimport failed: {e}"),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+        ClientMessage::StopAgent { ref agent_id } => {
+            let mut pr = ctx.process_registry.lock().await;
+            match pr.stop_agent(agent_id).await {
+                Ok(exit_code) => {
+                    write_msg(
+                        writer,
+                        &ServerMessage::AgentExited {
+                            agent_id: agent_id.clone(),
+                            exit_code,
+                        },
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    write_msg(
+                        writer,
+                        &ServerMessage::Error {
+                            message: format!("{e}"),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+        _ => {
+            warn!("unexpected message from TUI: {:?}", msg);
+        }
+    }
+    Ok(())
+}
+
+/// Dispatch history/session/project query commands. Sessions and projects are
+/// enriched with live agent presence and pending counts before responding.
+async fn handle_query_command(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    ctx: &ConnectionContext,
+    msg: ClientMessage,
+) -> Result<()> {
+    match msg {
+        ClientMessage::QueryHistory {
+            ref agent_id,
+            limit,
+            ref request_id,
+        } => {
+            let limit = limit.unwrap_or(200);
+            match ctx.state_db.query_history(agent_id.as_deref(), limit).await {
+                Ok(entries) => {
+                    write_msg(
+                        writer,
+                        &ServerMessage::HistoryResponse {
+                            entries,
+                            request_id: request_id.clone(),
+                        },
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    write_msg(
+                        writer,
+                        &ServerMessage::Error {
+                            message: format!("history query failed: {e}"),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+        ClientMessage::SearchHistory(ref search) => {
+            match ctx.state_db.search_history(search).await {
+                Ok(entries) => {
+                    write_msg(
+                        writer,
+                        &ServerMessage::HistoryResponse {
+                            entries,
+                            request_id: search.request_id.clone(),
+                        },
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    write_msg(
+                        writer,
+                        &ServerMessage::Error {
+                            message: format!("search failed: {e}"),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+        ClientMessage::QuerySessions => {
+            match ctx.state_db.query_sessions().await {
+                Ok(mut sessions) => {
+                    // Enrich with live status
+                    let live_agents = {
+                        let reg = ctx.agent_registry.lock().await;
+                        reg.snapshot()
+                    };
+                    let live_ids: std::collections::HashSet<String> =
+                        live_agents.iter().map(|a| a.agent_id.clone()).collect();
+
+                    // Pending counts from queue
+                    let pending_counts: std::collections::HashMap<String, u32> = {
+                        let q = ctx.queue.lock().await;
+                        let snapshot = q.snapshot();
+                        let mut counts = std::collections::HashMap::new();
+                        for req in &snapshot {
+                            *counts.entry(req.agent_id.clone()).or_insert(0) += 1;
+                        }
+                        counts
+                    };
+
+                    for session in &mut sessions {
+                        session.is_live = live_ids.contains(&session.agent_id);
+                        session.pending_count =
+                            pending_counts.get(&session.agent_id).copied().unwrap_or(0);
+                    }
+
+                    // Add live agents with no history yet
+                    for agent in &live_agents {
+                        if !sessions.iter().any(|s| s.agent_id == agent.agent_id) {
+                            sessions.push(wisphive_protocol::SessionSummary {
+                                agent_id: agent.agent_id.clone(),
+                                agent_type: agent.agent_type.clone(),
+                                project: agent.project.clone(),
+                                first_seen: agent.connected_at,
+                                last_seen: agent.last_seen,
+                                total_calls: 0,
+                                approved: 0,
+                                denied: 0,
+                                is_live: true,
+                                pending_count: pending_counts
+                                    .get(&agent.agent_id)
+                                    .copied()
+                                    .unwrap_or(0),
+                            });
+                        }
+                    }
+
+                    // Sort: live+pending first, then live, then by last_seen DESC
+                    sessions.sort_by(|a, b| {
+                        let a_key = (a.is_live && a.pending_count > 0, a.is_live, a.last_seen);
+                        let b_key = (b.is_live && b.pending_count > 0, b.is_live, b.last_seen);
+                        b_key
+                            .partial_cmp(&a_key)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+
+                    write_msg(writer, &ServerMessage::SessionsResponse { sessions }).await?;
+                }
+                Err(e) => {
+                    write_msg(
+                        writer,
+                        &ServerMessage::Error {
+                            message: format!("sessions query failed: {e}"),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+        ClientMessage::QueryProjects => {
+            match ctx.state_db.query_projects().await {
+                Ok(mut projects) => {
+                    // Enrich with live agent presence
+                    let live_agents = {
+                        let reg = ctx.agent_registry.lock().await;
+                        reg.snapshot()
+                    };
+                    let mut live_projects: std::collections::HashSet<std::path::PathBuf> =
+                        std::collections::HashSet::new();
+                    for agent in &live_agents {
+                        live_projects.insert(agent.project.clone());
+                    }
+
+                    // Pending counts per project
+                    let pending_counts: std::collections::HashMap<std::path::PathBuf, u32> = {
+                        let q = ctx.queue.lock().await;
+                        let snapshot = q.snapshot();
+                        let mut counts = std::collections::HashMap::new();
+                        for req in &snapshot {
+                            *counts.entry(req.project.clone()).or_insert(0) += 1;
+                        }
+                        counts
+                    };
+
+                    for project in &mut projects {
+                        project.has_live_agents = live_projects.contains(&project.project);
+                        project.pending_count =
+                            pending_counts.get(&project.project).copied().unwrap_or(0);
+                    }
+
+                    // Add projects with live agents but no history
+                    for agent in &live_agents {
+                        if !projects.iter().any(|p| p.project == agent.project) {
+                            projects.push(wisphive_protocol::ProjectSummary {
+                                project: agent.project.clone(),
+                                first_seen: agent.connected_at,
+                                last_seen: agent.last_seen,
+                                total_calls: 0,
+                                approved: 0,
+                                denied: 0,
+                                agent_count: 1,
+                                pending_count: pending_counts
+                                    .get(&agent.project)
+                                    .copied()
+                                    .unwrap_or(0),
+                                has_live_agents: true,
+                            });
+                        }
+                    }
+
+                    projects.sort_by(|a, b| {
+                        let a_key = (
+                            a.has_live_agents && a.pending_count > 0,
+                            a.has_live_agents,
+                            a.last_seen,
+                        );
+                        let b_key = (
+                            b.has_live_agents && b.pending_count > 0,
+                            b.has_live_agents,
+                            b.last_seen,
+                        );
+                        b_key
+                            .partial_cmp(&a_key)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+
+                    write_msg(writer, &ServerMessage::ProjectsResponse { projects }).await?;
+                }
+                Err(e) => {
+                    write_msg(
+                        writer,
+                        &ServerMessage::Error {
+                            message: format!("projects query failed: {e}"),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+        _ => {
+            warn!("unexpected message from TUI: {:?}", msg);
+        }
+    }
+    Ok(())
+}
+
+/// Dispatch terminal-session commands. These mutate the per-connection
+/// `term_attachments` map and spawn forwarders that send back over `conn_tx`.
+async fn handle_terminal_command(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    ctx: &ConnectionContext,
+    msg: ClientMessage,
+    term_attachments: &mut std::collections::HashMap<uuid::Uuid, tokio::task::JoinHandle<()>>,
+    conn_tx: &tokio::sync::mpsc::UnboundedSender<ServerMessage>,
+) -> Result<()> {
+    match msg {
+        ClientMessage::TermCreate {
+            label,
+            command,
+            args,
+            cwd,
+            cols,
+            rows,
+            env,
+        } => {
+            match ctx
+                .terminal_manager
+                .create(label, command, args, cwd, cols, rows, env)
+                .await
+            {
+                Ok(meta) => {
+                    write_msg(writer, &ServerMessage::TermCreated(meta)).await?;
+                }
+                Err(e) => {
+                    write_msg(
+                        writer,
+                        &ServerMessage::TermError {
+                            id: None,
+                            message: format!("term create failed: {e}"),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+        ClientMessage::TermAttach { id } => {
+            if let Some(handle) = term_attachments.remove(&id) {
+                handle.abort();
+            }
+            let session = ctx.terminal_manager.get(id).await;
+            match session {
+                Some(session) => {
+                    // Snapshot the current screen BEFORE subscribing so
+                    // the seq counter we capture matches what we'll see
+                    // on the receiver.
+                    let next_seq = session.seq_load();
+                    let catchup = crate::terminal::catchup_message(&session, next_seq);
+                    write_msg(writer, &catchup).await?;
+
+                    let mut rx = session.subscribe();
+                    let sess_id = session.id;
+                    let tx = conn_tx.clone();
+                    let handle = tokio::spawn(async move {
+                        loop {
+                            match rx.recv().await {
+                                Ok(frame) => {
+                                    if frame.seq < next_seq {
+                                        continue;
+                                    }
+                                    let msg = crate::terminal::frame_to_chunk(sess_id, &frame);
+                                    if tx.send(msg).is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(broadcast::error::RecvError::Lagged(_)) => {
+                                    let _ = tx.send(ServerMessage::TermError {
+                                        id: Some(sess_id),
+                                        message: "attachment lagged, please re-attach".into(),
+                                    });
+                                    break;
+                                }
+                                Err(broadcast::error::RecvError::Closed) => break,
+                            }
+                        }
+                    });
+                    term_attachments.insert(id, handle);
+                }
+                None => {
+                    write_msg(
+                        writer,
+                        &ServerMessage::TermError {
+                            id: Some(id),
+                            message: "terminal session not found or no longer running".into(),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+        ClientMessage::TermDetach { id } => {
+            if let Some(handle) = term_attachments.remove(&id) {
+                handle.abort();
+            }
+        }
+        ClientMessage::TermInput { id, data } => match crate::terminal::decode_b64(&data) {
+            Ok(bytes) => {
+                if let Err(e) = ctx.terminal_manager.write_input(id, bytes).await {
+                    write_msg(
+                        writer,
+                        &ServerMessage::TermError {
+                            id: Some(id),
+                            message: format!("term input failed: {e}"),
+                        },
+                    )
+                    .await?;
+                }
+            }
+            Err(e) => {
+                write_msg(
+                    writer,
+                    &ServerMessage::TermError {
+                        id: Some(id),
+                        message: format!("invalid term input payload: {e}"),
+                    },
+                )
+                .await?;
+            }
+        },
+        ClientMessage::TermResize { id, cols, rows } => {
+            if let Err(e) = ctx.terminal_manager.resize(id, cols, rows).await {
+                write_msg(
+                    writer,
+                    &ServerMessage::TermError {
+                        id: Some(id),
+                        message: format!("term resize failed: {e}"),
+                    },
+                )
+                .await?;
+            }
+        }
+        ClientMessage::TermClose { id, kill } => {
+            if let Some(handle) = term_attachments.remove(&id) {
+                handle.abort();
+            }
+            if let Err(e) = ctx.terminal_manager.close(id, kill).await {
+                write_msg(
+                    writer,
+                    &ServerMessage::TermError {
+                        id: Some(id),
+                        message: format!("term close failed: {e}"),
+                    },
+                )
+                .await?;
+            }
+        }
+        ClientMessage::TermList => match ctx.terminal_manager.list_all().await {
+            Ok(sessions) => {
+                write_msg(writer, &ServerMessage::TermListResponse { sessions }).await?;
+            }
+            Err(e) => {
+                write_msg(
+                    writer,
+                    &ServerMessage::TermError {
+                        id: None,
+                        message: format!("term list failed: {e}"),
+                    },
+                )
+                .await?;
+            }
+        },
+        ClientMessage::TermSetGroup { id, group } => {
+            match ctx.terminal_manager.set_group(id, group.as_deref()).await {
+                Ok(()) => {
+                    if let Ok(sessions) = ctx.terminal_manager.list_all().await {
+                        let _ = ctx
+                            .tui_tx
+                            .send(ServerMessage::TermListResponse { sessions });
+                    }
+                }
+                Err(e) => {
+                    write_msg(
+                        writer,
+                        &ServerMessage::TermError {
+                            id: Some(id),
+                            message: format!("term set group failed: {e}"),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+        ClientMessage::TermReorder { id, sort_order } => {
+            match ctx.terminal_manager.set_sort_order(id, sort_order).await {
+                Ok(()) => {
+                    if let Ok(sessions) = ctx.terminal_manager.list_all().await {
+                        let _ = ctx
+                            .tui_tx
+                            .send(ServerMessage::TermListResponse { sessions });
+                    }
+                }
+                Err(e) => {
+                    write_msg(
+                        writer,
+                        &ServerMessage::TermError {
+                            id: Some(id),
+                            message: format!("term reorder failed: {e}"),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+        ClientMessage::TermReplay {
+            id,
+            from_seq,
+            speed: _,
+        } => {
+            // Pull events from SQLite and stream them as
+            // replay chunks. Speed pacing is client-side.
+            let state_db = ctx.state_db.clone();
+            let tx = conn_tx.clone();
+            tokio::spawn(async move {
+                match state_db.replay_terminal_events(id, from_seq).await {
+                    Ok(events) => {
+                        let total = events.len() as u64;
+                        for (seq, ts_us, direction, payload) in events {
+                            let msg = ServerMessage::TermReplayChunk {
+                                id,
+                                seq,
+                                ts_us,
+                                direction,
+                                data: base64::Engine::encode(
+                                    &base64::engine::general_purpose::STANDARD,
+                                    &payload,
+                                ),
+                            };
+                            if tx.send(msg).is_err() {
+                                return;
+                            }
+                        }
+                        let _ = tx.send(ServerMessage::TermReplayDone {
+                            id,
+                            total_events: total,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ServerMessage::TermError {
+                            id: Some(id),
+                            message: format!("replay failed: {e}"),
+                        });
+                    }
+                }
+            });
+        }
+        _ => {
+            warn!("unexpected message from TUI: {:?}", msg);
+        }
+    }
     Ok(())
 }
 
@@ -1251,7 +1537,42 @@ fn sweep_stale_session_markers(sessions_dir: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::sweep_stale_session_markers;
+    use super::{partition_sudo_gated, sweep_stale_session_markers};
+
+    fn ids(items: &[(uuid::Uuid, String)]) -> Vec<uuid::Uuid> {
+        items.iter().map(|(id, _)| *id).collect()
+    }
+
+    #[test]
+    fn partition_fresh_device_allows_everything() {
+        let bash = (uuid::Uuid::new_v4(), "Bash".to_string());
+        let read = (uuid::Uuid::new_v4(), "Read".to_string());
+        let (gated, allowed) = partition_sudo_gated(true, vec![bash.clone(), read.clone()]);
+
+        // A fresh reauth grace holds nothing back — even sudo-class tools pass.
+        assert!(gated.is_empty());
+        assert_eq!(ids(&allowed), vec![bash.0, read.0]);
+    }
+
+    #[test]
+    fn partition_stale_device_gates_only_sudo_tools() {
+        let bash = (uuid::Uuid::new_v4(), "Bash".to_string());
+        let edit = (uuid::Uuid::new_v4(), "Edit".to_string());
+        let read = (uuid::Uuid::new_v4(), "Read".to_string());
+        let (gated, allowed) =
+            partition_sudo_gated(false, vec![bash.clone(), read.clone(), edit.clone()]);
+
+        // Stale device: sudo-class (Bash, Edit) held back; read-only (Read) passes.
+        assert_eq!(ids(&gated), vec![bash.0, edit.0]);
+        assert_eq!(ids(&allowed), vec![read.0]);
+    }
+
+    #[test]
+    fn partition_empty_input_yields_empty_partitions() {
+        let (gated, allowed) = partition_sudo_gated(false, Vec::new());
+        assert!(gated.is_empty());
+        assert!(allowed.is_empty());
+    }
 
     #[test]
     fn sweep_removes_existing_markers() {
