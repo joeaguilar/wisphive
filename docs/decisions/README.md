@@ -23,6 +23,7 @@ alternatives, or (c) someone will later ask "why is it done this way." When in d
 | [0001](0001-tiered-fail-posture.md) | Tiered fail posture for the hook decision path | Accepted | 2026-06-14 | — |
 | [0002](0002-always-defer-classification.md) | Always-defer classification for questions / plan-mode / elicitations | Accepted | 2026-06-14 | #380 |
 | [0003](0003-enterprise-profile-non-functional-until-tls.md) | Enterprise auth profile non-functional until user-cert TLS lands | Accepted | 2026-06-14 | #310, #270 |
+| [0004](0004-deterministic-agent-analytics-first.md) | Deterministic agent analytics before generated summaries | Accepted | 2026-06-15 | #390, #391, #392, #393, #394, #395 |
 
 ## Status lifecycle
 

@@ -1,7 +1,7 @@
 # Roadmap - Wisphive
 
-_Last updated: 2026-05-30 (manual $roadmap baseline)_
-_Last reviewed: 2026-06-14_
+_Last updated: 2026-06-15 (deterministic analytics workstream paperwork)_
+_Last reviewed: 2026-06-15_
 
 > Cross-sprint product map. Bridges the repo's product docs, sprint history, and live `itr` backlog.
 > Read at the start of every `/sprint`. Update at the end of every `/sprint-review`.
@@ -18,9 +18,9 @@ Cells without the marker are PO-edited and should be preserved verbatim.
 ## Source baseline
 
 - Product overview: `README.md`, `AGENTS.md`
-- Planning docs: `docs/plan-mobile-device-pairing.md`, `docs/plan-cross-agent-conflict-gate.md`, `docs/plan-decision-plugins.md`, `docs/plan-policy-learning-engine.md`, `docs/plan-red-support.md`, `docs/open-source-path.md`
+- Planning docs: `docs/plan-mobile-device-pairing.md`, `docs/plan-cross-agent-conflict-gate.md`, `docs/plan-decision-plugins.md`, `docs/plan-policy-learning-engine.md`, `docs/plan-deterministic-agent-analytics.md`, `docs/plan-red-support.md`, `docs/open-source-path.md`
 - Sprint evidence: `sprint/sprint-1-2026-05-16-auth-profile-passkey-localLAN/plan.md`
-- Backlog evidence: `itr` snapshot on 2026-05-30 (`355` total, `170` done, `184` open, `1` wontfix)
+- Backlog evidence: `itr` snapshot on 2026-06-15 (`395` total, `188` done, `206` open, `1` wontfix)
 
 ## Release boundary
 
@@ -36,6 +36,7 @@ Cells without the marker are PO-edited and should be preserved verbatim.
 - §D.2 Policy learning engine - powerful but safety-sensitive; defer until core policy rules are mature. <!-- auto -->
 - §D.3 Decision plugins, webhooks, and richer adapters - extension surface after the core product stabilizes. <!-- auto -->
 - §D.4 Red / Local LLM / post-MVP adapters - adapter expansion after the primary Codex/Claude path is solid. <!-- auto -->
+- §D.5 Deterministic agent analytics - planned; fact extraction, work journals, risk digest, dashboards, and overlap analytics land before generated summaries or policy automation. Decisions: ADR-0004. <!-- auto -->
 
 **Excluded (never):**
 - None currently. <!-- auto -->
@@ -77,6 +78,7 @@ Cells without the marker are PO-edited and should be preserved verbatim.
 | §D.2 Policy learning engine | ❌ <!-- auto --> | XL <!-- auto --> | docs/plan-policy-learning-engine.md <!-- auto --> | Detailed safety design exists; not part of the first release boundary. <!-- auto --> |
 | §D.3 Decision plugins, webhooks, and richer adapters | ❌ <!-- auto --> | XL <!-- auto --> | docs/plan-decision-plugins.md <!-- auto --> | Extension architecture is planned; defer until base control plane and policy safety are mature. <!-- auto --> |
 | §D.4 Red / Local LLM / post-MVP adapters | ❌ <!-- auto --> | L <!-- auto --> | itr#4, itr#5, itr#7, itr#76, docs/plan-red-support.md <!-- auto --> | Red/LocalLLM adapter work is tracked as post-MVP; current hook-based Codex/Claude path remains primary. <!-- auto --> |
+| §D.5 Deterministic agent analytics and work journal | ❌ <!-- auto --> | XL <!-- auto --> | itr#390, itr#391, itr#392, itr#393, itr#394, itr#395, docs/plan-deterministic-agent-analytics.md <!-- auto --> | Planned as a facts-first observability workstream: analytics substrate, session work journal, risk digest, operations dashboard, and historical overlap analytics. Optional LLM narrative and policy automation are explicitly later. Decisions: ADR-0004. <!-- auto --> |
 
 ## Sections - Hardening and Release
 
@@ -104,6 +106,7 @@ Cells without the marker are PO-edited and should be preserved verbatim.
 - §B.1 TLS, web auth, device bearer tokens, and origin/host gates - gates onboarding, Devices UI, Enterprise, and mobile pairing. <!-- auto -->
 - §C.3 Project discovery, AI-config audit, seeding, and config sharing - discovery core gates CLI, TUI, and web project onboarding. <!-- auto -->
 - §D.1 Auto-approve policy engine and tool-rule safety - safety base for policy learning, plugins, and wider automation. <!-- auto -->
+- §D.5 Deterministic agent analytics and work journal - shared fact substrate for summaries, risk review, dashboards, overlap reports, and future policy-learning evidence. <!-- auto -->
 
 **Inter-section edges:**
 - §B.2 depends on §B.1 for AuthProfile, TLS/auth primitives, and origin-aware profile lookup. <!-- auto -->
@@ -112,6 +115,7 @@ Cells without the marker are PO-edited and should be preserved verbatim.
 - §C.2 depends on §A.1 and §A.2 for protocol changes and persisted terminal event replay. <!-- auto -->
 - §C.3 depends on §A.5 for CLI integration and feeds §A.3/§A.4 once surfaced in TUI/web. <!-- auto -->
 - §D.2 and §D.3 depend on §D.1 so automation expands from a safer policy base. <!-- auto -->
+- §D.5 depends on §A.2 for durable audit/history data and feeds §C.4 historical overlap evidence plus §D.2 policy-learning evidence. Decisions: ADR-0004. <!-- auto -->
 - §E.3 is a release gate for all v1 sections. <!-- auto -->
 
 ## Trajectory

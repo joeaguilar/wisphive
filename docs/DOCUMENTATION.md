@@ -1,6 +1,6 @@
 # Documentation Strategy — Wisphive
 
-_Last reviewed: 2026-06-14_
+_Last reviewed: 2026-06-15_
 
 > **Start here.** This file is the map of every documentation surface in Wisphive: what each one
 > is for, who keeps it current, and **how they link together**. If you are an agent picking up a
@@ -32,7 +32,7 @@ The fix is two things:
 | **Why a design is the way it is** | `docs/decisions/` (ADRs) — start at [`docs/decisions/README.md`](decisions/README.md) |
 | **What v1 is / scope boundary** | `CLAUDE.md` (de-facto spec) + `docs/ROADMAP.md` "Release boundary" |
 | **What happened in a past milestone** | `docs/handoff/YYYY-MM-DD-<topic>.md` |
-| **An upcoming workstream's design** | `docs/plan-*.md` (cross-agent conflict gate, decision plugins, policy learning, mobile pairing, red support) |
+| **An upcoming workstream's design** | `docs/plan-*.md` (cross-agent conflict gate, deterministic analytics, decision plugins, policy learning, mobile pairing, red support) |
 | **Exploratory analysis / landscape scans** | `docs/research/` |
 | **OSS positioning and roadmap** | `docs/open-source-path.md` |
 | **TUI widget / investigation reference notes** | `claude/` (tui-textarea reference, empty-detail-views investigation) |
@@ -90,9 +90,10 @@ Both are dated, append-only, never rewritten in place.
 ## Plan docs
 
 `docs/plan-*.md` hold the design for upcoming or deferred workstreams (cross-agent conflict gate,
-decision plugins, policy learning engine, mobile device pairing, Red support). They are living
-design docs — when a plan's decision is locked, distill it into an ADR and let the plan doc carry
-the elaboration. Each carries a `_Last reviewed: YYYY-MM-DD_` line near the top.
+deterministic agent analytics, decision plugins, policy learning engine, mobile device pairing, Red
+support). They are living design docs — when a plan's decision is locked, distill it into an ADR and
+let the plan doc carry the elaboration. Each carries a `_Last reviewed: YYYY-MM-DD_` line near the
+top.
 
 ## Archival
 
@@ -143,6 +144,7 @@ docs/
 ├── ROADMAP.md                   ← done / in-flight / next (section grain)
 ├── open-source-path.md          ← OSS positioning and roadmap
 ├── plan-cross-agent-conflict-gate.md   ← upcoming-workstream designs
+├── plan-deterministic-agent-analytics.md
 ├── plan-decision-plugins.md
 ├── plan-mobile-device-pairing.md
 ├── plan-policy-learning-engine.md
