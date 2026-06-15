@@ -204,10 +204,19 @@ impl DaemonConfig {
         Self::new(home)
     }
 
-    /// Ensure the home directory and log directory exist.
+    /// Ensure the home directory and log directory exist, and lock the home
+    /// directory down to owner-only (0700).
+    ///
+    /// `create_dir_all` honours the process umask, so a permissive umask could
+    /// leave `~/.wisphive` group/world readable; the explicit chmod forces
+    /// 0700 so the socket, SQLite DB, audit archive, and config inside are not
+    /// reachable by other local users. Defence-in-depth alongside the 0600
+    /// socket perms and the peer-credential check in `server.rs` (itr#81).
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(&self.home_dir)?;
         std::fs::create_dir_all(&self.log_dir)?;
+        std::fs::set_permissions(&self.home_dir, std::fs::Permissions::from_mode(0o700))?;
         Ok(())
     }
 

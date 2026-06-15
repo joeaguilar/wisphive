@@ -117,6 +117,13 @@ impl Server {
         sweep_stale_session_markers(&self.config.home_dir.join("sessions"));
 
         let listener = UnixListener::bind(&self.config.socket_path)?;
+        // Lock the socket down to owner-only (0600) immediately after bind,
+        // before any client can connect. `bind` honours the process umask, so
+        // a permissive umask could otherwise leave the socket group/world
+        // accessible; this fchmod-equivalent forces owner-only regardless.
+        // Defence-in-depth alongside the per-accept peer-credential check below
+        // and the 0700 home dir set in `DaemonConfig::ensure_dirs` (itr#81).
+        set_socket_permissions(&self.config.socket_path)?;
         info!(path = %self.config.socket_path.display(), "listening");
 
         // Spawn event ingest task (tails events.jsonl → decision_log)
@@ -233,6 +240,33 @@ impl Server {
                 accept = listener.accept() => {
                     match accept {
                         Ok((stream, _addr)) => {
+                            // Peer-credential gate: only the daemon's own uid may
+                            // drive the control plane. A different local uid that
+                            // can reach the socket (e.g. via a permissive parent
+                            // dir or a shared host) is logged and dropped, never
+                            // crashing the accept loop. The 0600 socket perms make
+                            // this rare; the check is the second layer (itr#81).
+                            let daemon_uid = current_uid();
+                            match stream.peer_cred() {
+                                Ok(cred) => {
+                                    if !peer_uid_allowed(cred.uid(), daemon_uid) {
+                                        warn!(
+                                            peer_uid = cred.uid(),
+                                            daemon_uid,
+                                            "rejecting connection from foreign uid"
+                                        );
+                                        // Drop the stream — the connection is closed.
+                                        continue;
+                                    }
+                                }
+                                Err(e) => {
+                                    // Can't establish the peer's identity; fail
+                                    // closed and drop rather than serve an
+                                    // unauthenticated peer.
+                                    warn!("rejecting connection: peer_cred lookup failed: {e}");
+                                    continue;
+                                }
+                            }
                             let ctx = Arc::new(ConnectionContext {
                                 queue: self.queue.clone(),
                                 process_registry: self.process_registry.clone(),
@@ -1535,9 +1569,40 @@ fn sweep_stale_session_markers(sessions_dir: &std::path::Path) {
     }
 }
 
+/// Force the bound Unix socket to owner-only (0600) permissions.
+///
+/// Called right after `bind`, before the accept loop starts, so no client
+/// can connect while the socket is still at the umask-derived mode. Uses
+/// `set_permissions` (a `chmod` on the path) — the socket already exists at
+/// this point, so there's no create-time race with a non-owner (only the
+/// owning uid could have created an entry at this path).
+fn set_socket_permissions(socket_path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+}
+
+/// The effective uid of the running daemon process.
+fn current_uid() -> u32 {
+    // SAFETY: `geteuid` is always-succeeds and has no preconditions.
+    unsafe { libc::geteuid() }
+}
+
+/// Decide whether a connecting peer's uid is allowed to drive the daemon.
+///
+/// Only the daemon's own uid is trusted; every other local uid is rejected.
+/// `root` (uid 0) is deliberately NOT special-cased as allowed — a root peer
+/// that is not the daemon's own uid is still a foreign principal under this
+/// single-user model and is dropped. Pure function so the accept/reject
+/// decision is unit-testable without a cross-uid socket.
+fn peer_uid_allowed(peer_uid: u32, daemon_uid: u32) -> bool {
+    peer_uid == daemon_uid
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{partition_sudo_gated, sweep_stale_session_markers};
+    use super::{
+        partition_sudo_gated, peer_uid_allowed, set_socket_permissions, sweep_stale_session_markers,
+    };
 
     fn ids(items: &[(uuid::Uuid, String)]) -> Vec<uuid::Uuid> {
         items.iter().map(|(id, _)| *id).collect()
@@ -1614,5 +1679,44 @@ mod tests {
 
         assert!(sessions.exists());
         assert_eq!(std::fs::read_dir(&sessions).unwrap().count(), 0);
+    }
+
+    // ── Socket hardening (itr#81) ──────────────────────────────────────────
+
+    #[test]
+    fn set_socket_permissions_forces_owner_only_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("wisphive.sock");
+
+        // Bind a real Unix socket so we chmod an actual socket inode (mirrors
+        // what the daemon does after `UnixListener::bind`).
+        let _listener = UnixListener::bind(&sock).unwrap();
+
+        set_socket_permissions(&sock).unwrap();
+
+        let mode = std::fs::metadata(&sock).unwrap().permissions().mode();
+        // Mask off the file-type bits; only the permission bits matter.
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "socket must be owner-only (srw-------), got {:o}",
+            mode & 0o777
+        );
+    }
+
+    #[test]
+    fn peer_uid_allowed_accepts_same_uid_rejects_others() {
+        // Same uid as the daemon → allowed.
+        assert!(peer_uid_allowed(1000, 1000));
+        assert!(peer_uid_allowed(0, 0));
+
+        // Any other uid → rejected, including root vs non-root either way.
+        assert!(!peer_uid_allowed(1001, 1000));
+        assert!(!peer_uid_allowed(0, 1000));
+        assert!(!peer_uid_allowed(1000, 0));
+        assert!(!peer_uid_allowed(65534, 1000)); // nobody
     }
 }
