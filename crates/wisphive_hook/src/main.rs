@@ -774,8 +774,10 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
     // operator-designated harmful tools carry a human answer back only through
     // the agent's native prompt. Auto-approving them silently drops the answer
     // ("did not answer"), so they ALWAYS defer to the native prompt — even at
-    // auto_approve_level=all — unless the "dangerous" posture is set. Evaluated
-    // before the auto-approve layers so the level can't override it.
+    // auto_approve_level=all. Intrinsic interactive prompts defer even under the
+    // "dangerous" posture (see is_always_deferred); only operator-added harmful
+    // tools are released by it. Evaluated before the auto-approve layers so the
+    // level can't override it.
     //
     // This fires for BOTH PreToolUse and PermissionRequest. PermissionRequest is
     // the ONLY path that carries the human's answer back for these tools, so it
@@ -1234,43 +1236,50 @@ fn is_event_auto_approved(
 
 /// Check whether a tool/event must always defer to the agent's native prompt.
 ///
-/// Returns `true` for the built-in [`DEFAULT_ALWAYS_ASK`] set plus any
-/// `always_ask` additions in config.json, minus `always_ask_remove` entries —
-/// UNLESS the operator has opted into the "dangerous" posture
-/// (`auto_approve_dangerous: true`), in which case nothing always-defers and
-/// even questions are auto-approved per the level.
+/// Intrinsic interactive prompts — the built-in [`DEFAULT_ALWAYS_ASK`] set
+/// (questions, plan-mode, elicitations) — defer UNCONDITIONALLY: their answer
+/// travels back only through the agent's native prompt, so "auto-approving" one
+/// approves nothing and silently discards the human's selection ("did not
+/// answer"). Neither the `auto_approve_dangerous` posture nor an
+/// `always_ask_remove` entry can make the daemon answer them.
+///
+/// Operator-designated harmful tools (config.json `always_ask`) also defer, but
+/// they ARE released by the "dangerous" posture or an `always_ask_remove` entry.
 fn is_always_deferred(tool_name: &str, wisphive_dir: &std::path::Path) -> bool {
-    let config: Option<serde_json::Value> =
-        std::fs::read_to_string(wisphive_dir.join("config.json"))
-            .ok()
-            .and_then(|c| serde_json::from_str(&c).ok());
-
-    if let Some(ref config) = config {
-        // Dangerous posture: auto-approve everything, including questions.
-        if config
-            .get("auto_approve_dangerous")
-            .and_then(|v| v.as_bool())
-            == Some(true)
-        {
-            return false;
-        }
-
-        // Operator removals win over the built-in defaults.
-        if let Some(arr) = config.get("always_ask_remove").and_then(|v| v.as_array())
-            && arr.iter().any(|v| v.as_str() == Some(tool_name))
-        {
-            return false;
-        }
-    }
-
+    // Intrinsic interactive prompts win over every config posture — evaluated
+    // first so nothing below can un-defer a question/plan/elicitation. (The
+    // "dangerous" posture used to re-swallow these, dropping the human's answer.)
     if DEFAULT_ALWAYS_ASK.contains(&tool_name) {
         return true;
     }
 
+    let Some(config) = std::fs::read_to_string(wisphive_dir.join("config.json"))
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+    else {
+        return false;
+    };
+
+    // Dangerous posture: auto-approve everything else, including operator
+    // `always_ask` additions. (Intrinsic prompts already returned above.)
+    if config
+        .get("auto_approve_dangerous")
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
+        return false;
+    }
+
+    // Operator removals win over operator additions.
+    if let Some(arr) = config.get("always_ask_remove").and_then(|v| v.as_array())
+        && arr.iter().any(|v| v.as_str() == Some(tool_name))
+    {
+        return false;
+    }
+
     // Operator additions (e.g. harmful-action tools).
     config
-        .as_ref()
-        .and_then(|c| c.get("always_ask"))
+        .get("always_ask")
         .and_then(|v| v.as_array())
         .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(tool_name)))
 }
@@ -1630,23 +1639,36 @@ mod tests {
     }
 
     #[test]
-    fn dangerous_posture_disables_always_defer() {
+    fn dangerous_posture_never_swallows_interactive_prompts() {
+        // The dangerous posture may auto-approve tool CALLS, but interactive
+        // prompts (questions/plan/elicit) can't be "approved" — answering one
+        // needs the human — so they must defer even here. Only operator
+        // `always_ask` additions are released by the dangerous posture.
         let dir = dir_with_config(serde_json::json!({
             "auto_approve_level": "all",
             "auto_approve_dangerous": true,
+            "always_ask": ["Bash"],
         }));
-        assert!(!is_always_deferred("AskUserQuestion", dir.path()));
-        assert!(!is_always_deferred("ExitPlanMode", dir.path()));
+        assert!(is_always_deferred("AskUserQuestion", dir.path()));
+        assert!(is_always_deferred("ExitPlanMode", dir.path()));
+        assert!(is_always_deferred("Elicitation", dir.path()));
+        // Operator-added harmful tool IS released by the dangerous posture.
+        assert!(!is_always_deferred("Bash", dir.path()));
     }
 
     #[test]
-    fn always_ask_remove_opts_a_default_out() {
+    fn always_ask_remove_cannot_opt_out_interactive_prompts() {
+        // `always_ask_remove` may drop operator `always_ask` additions, but never
+        // an intrinsic interactive prompt — those defer unconditionally.
         let dir = dir_with_config(serde_json::json!({
-            "always_ask_remove": ["ExitPlanMode"],
+            "always_ask": ["Bash"],
+            "always_ask_remove": ["ExitPlanMode", "Bash"],
         }));
-        assert!(!is_always_deferred("ExitPlanMode", dir.path()));
-        // Other defaults are unaffected.
+        // Intrinsic prompts ignore the removal.
+        assert!(is_always_deferred("ExitPlanMode", dir.path()));
         assert!(is_always_deferred("AskUserQuestion", dir.path()));
+        // Operator addition CAN be removed.
+        assert!(!is_always_deferred("Bash", dir.path()));
     }
 
     #[test]
