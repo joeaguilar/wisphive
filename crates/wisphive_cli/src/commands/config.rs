@@ -143,8 +143,11 @@ pub fn auto_approve_status() -> Result<()> {
     eprintln!("Level: {level}");
     if config.auto_approve_dangerous {
         eprintln!(
-            "Posture: DANGEROUS — questions/plan-mode are auto-approved too (nothing defers)."
+            "Posture: DANGEROUS — operator always_ask tools are auto-approved too; only intrinsic prompts still defer:"
         );
+        for t in wisphive_protocol::DEFAULT_ALWAYS_ASK {
+            eprintln!("  ? {t}");
+        }
     } else {
         let deferred = effective_always_ask(&config);
         eprintln!("Posture: balanced — these always defer to you regardless of level:");
@@ -237,8 +240,11 @@ pub fn auto_approve_reset() -> Result<()> {
 ///
 /// - `balanced` — auto-approve operational tools broadly (level: all) but ALWAYS
 ///   surface questions/plan-mode/harmful actions for review.
-/// - `dangerous` — auto-approve EVERYTHING, including questions (level: all,
-///   nothing defers). Use only for fully unattended, trusted runs.
+/// - `dangerous` — additionally release operator-designated `always_ask` tools
+///   (level: all). Intrinsic interactive prompts (questions/plan-mode/
+///   elicitations) STILL defer — their answer only travels through the native
+///   prompt, so auto-approving them would discard the human's selection.
+///   Use only for fully unattended, trusted runs.
 pub fn auto_approve_mode(mode: &str) -> Result<()> {
     let mut config = load();
     match mode {
@@ -255,7 +261,7 @@ pub fn auto_approve_mode(mode: &str) -> Result<()> {
             config.auto_approve_dangerous = true;
             save(&config)?;
             eprintln!(
-                "Posture: DANGEROUS — EVERYTHING is auto-approved, including questions and plan-mode. Nothing will defer to you."
+                "Posture: DANGEROUS — all tools auto-approved, including operator always_ask entries. Only questions/plan-mode/elicitations still defer to you."
             );
         }
         other => anyhow::bail!("unknown posture: {other} (use 'balanced' or 'dangerous')"),

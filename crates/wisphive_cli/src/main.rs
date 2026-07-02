@@ -231,8 +231,8 @@ enum AutoApproveAction {
         tool: String,
     },
     /// Apply a posture preset: "balanced" (auto-approve tools, always ask
-    /// questions/plan-mode/harmful) or "dangerous" (auto-approve everything,
-    /// including questions)
+    /// questions/plan-mode/harmful) or "dangerous" (also release operator
+    /// always_ask tools; questions/plan-mode/elicitations still defer)
     Mode {
         /// Posture: balanced | dangerous
         mode: String,

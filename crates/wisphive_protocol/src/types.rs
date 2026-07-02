@@ -640,12 +640,14 @@ impl std::fmt::Display for AutoApproveLevel {
 }
 
 /// Tools/events that ALWAYS defer to the agent's native prompt, regardless of
-/// [`AutoApproveLevel`] — unless the operator opts into the "dangerous" posture
-/// (`auto_approve_dangerous: true`). They elicit a human answer that can only be
-/// carried back through the native prompt (PermissionRequest / Elicitation), so
-/// auto-approving them would silently resolve the prompt with no selection. The
-/// enforcement point is `is_always_deferred` in wisphive_hook; operators extend
-/// the set via `always_ask` and trim it via `always_ask_remove`. See itr#380.
+/// [`AutoApproveLevel`] and of the "dangerous" posture — `auto_approve_dangerous`
+/// releases only operator-designated `always_ask` tools, never these. They
+/// elicit a human answer that can only be carried back through the native
+/// prompt (PermissionRequest / Elicitation), so auto-approving them would
+/// silently resolve the prompt with no selection. The enforcement point is
+/// `is_always_deferred` in wisphive_hook; operators extend the set via
+/// `always_ask`, and `always_ask_remove` trims only those additions — the
+/// intrinsic entries here cannot be removed. See itr#380, itr#388.
 pub const DEFAULT_ALWAYS_ASK: &[&str] = &[
     "AskUserQuestion",
     "EnterPlanMode",
