@@ -1,7 +1,7 @@
 # Roadmap - Wisphive
 
-_Last updated: 2026-06-15 (deterministic analytics workstream paperwork)_
-_Last reviewed: 2026-06-15_
+_Last updated: 2026-07-02 (Command Center program adopted; backlog rectified into sequenced epics)_
+_Last reviewed: 2026-07-02_
 
 > Cross-sprint product map. Bridges the repo's product docs, sprint history, and live `itr` backlog.
 > Read at the start of every `/sprint`. Update at the end of every `/sprint-review`.
@@ -18,13 +18,40 @@ Cells without the marker are PO-edited and should be preserved verbatim.
 ## Source baseline
 
 - Product overview: `README.md`, `AGENTS.md`
+- **Steering spec (active program): `docs/command-center-spec.md`** + evidence base `docs/command-center-notes.md`
 - Planning docs: `docs/plan-mobile-device-pairing.md`, `docs/plan-cross-agent-conflict-gate.md`, `docs/plan-decision-plugins.md`, `docs/plan-policy-learning-engine.md`, `docs/plan-deterministic-agent-analytics.md`, `docs/plan-red-support.md`, `docs/open-source-path.md`
 - Sprint evidence: `sprint/sprint-1-2026-05-16-auth-profile-passkey-localLAN/plan.md`
-- Backlog evidence: `itr` snapshot on 2026-06-15 (`395` total, `188` done, `206` open, `1` wontfix)
+- Backlog evidence: `itr` snapshot on 2026-07-02 (`406` total, `196` done, `209` open, `1` wontfix) — rectified: every open issue now lives under a phase epic below, or is explicitly deferred/continuous
+
+## Program order — sequenced epics (adopted 2026-07-02)
+
+The Command Center steering spec (`docs/command-center-spec.md`) is the active program. The full open
+backlog was rectified into the phase epics below; work the phases **in order**. Phases 1→3 are strictly
+sequential (each builds on trust the previous one establishes). Phases 4–5 follow the spec's priorities.
+Phases 6–9 are the pre-existing v1 backlog, re-sequenced beneath the program; they may interleave
+opportunistically, but ship in this order when forced to choose. `itr get <epic-id>` lists members;
+hard technical dependencies are encoded as `itr` blocker edges, program order lives here.
+
+| Phase | Epic | Tracker | Pri | Scope (members) | Hard deps |
+|---|---|---|---|---|---|
+| **1** | Decision-plane trust — Command Center P0 | wisphive **#396** | critical | Five silent-weakening config bugs #358 #360 #361 #366 #308 + auto-answer audit trail #397. Exit: spec §4 red-team check. | — |
+| **2** | Decision-plane integrity — P0.5 | wisphive **#403** | high | Audit correctness & durability (#363 ghost approvals, #370 dup-id corruption, #301/#302 ingest loss, #368 fsync, #88 resolver identity, #347), secret redaction #89, hook fail-safety (#344 #345 #346 #337 #359), pending-decision persistence (#297–#300). Can start alongside Phase 1; **blocks the inbox (#399)**. | — |
+| **3** | Command Center Layer 1 — live ops console | wisphive **#398** | high | Waiting-on-you inbox #399 (centerpiece), agent liveness board #400, working-tree strip #401, burn meter #402, + answer-path correctness #249 #250 #253. | #396; #399 also blocked by #403, #249, #250, #253, #397 |
+| **4** | Command Center Layer 2 — durable state of play | **werkit#5** (stories werkit#6 #7 #8) | high | State-of-play Stop-hook + start render, cross-project re-entry digest, promise ledger. Daemon-independent renderer; do not ship the Stop hook until Phase 1 lands (spec §6.1). | wisphive #396 (hook safety) |
+| **5** | Remote access — scrollback + mobile pairing | wisphive **#284** → **#283** | high | Scrollback replay chain #285–#287 (+privacy #288 #289), then pairing: #266 (#270 #271 #272), enterprise enroll #313, Devices UI #220, smoke #316. The inbox-on-the-phone is the payoff (85% of sessions are remote-triggered). | #283 blocked by #284, #227, #270–#272, #313 |
+| **6** | Project discovery, audit & seeding | wisphive **#349** | high | #353 #354 #355 — onboarding more projects into gating; feeds the command center's active-project list. | — |
+| **7** | Client reliability & UX debt | wisphive **#404** | medium | 43 web/TUI issues: reconnect+rehydration, TS type-safety, React correctness, a11y, TUI panics/scrolling, terminal views, logs tail. | — |
+| **8** | Security & correctness hardening tail | wisphive **#405** | medium | 67 issues: daemon DoS caps, spawn/terminal gating, file perms, hash-chain audit #93, web auth/TLS follow-ups, logging hygiene, CLI bugs, #364 #365 #389. OSS release gate. | — |
+| **9** | Open-source release readiness | wisphive **#55** | high | LICENSE, repo hygiene, README/docs #67 #72; ships only after Phase 8 is green or explicitly waived. | Phase 8 (policy, not encoded) |
+| **∞** | Code health (opportunistic) | wisphive **#406** | low | Refactors/duplication/perf (#124 #126 #127 #132 …). Pull items in when touching the area; never a dedicated sprint. **Open PO decision: #125 (delete adapters crate) contradicts #4/#5 (implement adapters).** | — |
+| — | Deferred (v2) | — | — | Deterministic analytics #390–#395 (near-term slices superseded by #397/#402/werkit#6 — re-plan #390 after Phase 3), conflict gate, policy learning, decision plugins, Red/LocalLLM adapters + post-MVP #1 #2 #4–#8, loop console (spec §7). | all of the above |
+
+Continuous (not phased): sprint-process improvements #324–#329 — apply at each `/sprint`/`/blitz`.
 
 ## Release boundary
 
 **v1 ships when:**
+- Command Center Phase 0 trust (itr#396) + integrity (itr#403) close their red-team exit criteria, and Layer 1 (itr#398) is live against real sessions. <!-- auto -->
 - Core hook, daemon, TUI, web UI, CLI, and agent-launch flows are stable enough for daily agent supervision. <!-- auto -->
 - Web auth, TLS, first-run onboarding, desktop passkeys, Devices UI, and mobile pairing are complete. <!-- auto -->
 - Project discovery/audit/seeding has at least CLI support and one UI surface. <!-- auto -->
@@ -78,7 +105,7 @@ Cells without the marker are PO-edited and should be preserved verbatim.
 | §D.2 Policy learning engine | ❌ <!-- auto --> | XL <!-- auto --> | docs/plan-policy-learning-engine.md <!-- auto --> | Detailed safety design exists; not part of the first release boundary. <!-- auto --> |
 | §D.3 Decision plugins, webhooks, and richer adapters | ❌ <!-- auto --> | XL <!-- auto --> | docs/plan-decision-plugins.md <!-- auto --> | Extension architecture is planned; defer until base control plane and policy safety are mature. <!-- auto --> |
 | §D.4 Red / Local LLM / post-MVP adapters | ❌ <!-- auto --> | L <!-- auto --> | itr#4, itr#5, itr#7, itr#76, docs/plan-red-support.md <!-- auto --> | Red/LocalLLM adapter work is tracked as post-MVP; current hook-based Codex/Claude path remains primary. <!-- auto --> |
-| §D.5 Deterministic agent analytics and work journal | ❌ <!-- auto --> | XL <!-- auto --> | itr#390, itr#391, itr#392, itr#393, itr#394, itr#395, docs/plan-deterministic-agent-analytics.md <!-- auto --> | Planned as a facts-first observability workstream: analytics substrate, session work journal, risk digest, operations dashboard, and historical overlap analytics. Optional LLM narrative and policy automation are explicitly later. Decisions: ADR-0004. <!-- auto --> |
+| §D.5 Deterministic agent analytics and work journal | ❌ <!-- auto --> | XL <!-- auto --> | itr#390, itr#391, itr#392, itr#393, itr#394, itr#395, docs/plan-deterministic-agent-analytics.md <!-- auto --> | Near-term slices superseded by the Command Center program (audit trail itr#397 ⊂ #391's substrate; burn meter itr#402 overlaps #394; werkit#6 state-of-play overlaps #392). Re-plan itr#390 after Layer 1 ships so remaining scope builds on the audit-trail substrate. Decisions: ADR-0004. <!-- auto --> |
 
 ## Sections - Hardening and Release
 
@@ -120,7 +147,10 @@ Cells without the marker are PO-edited and should be preserved verbatim.
 
 ## Trajectory
 
-No trajectory drafted in this baseline. `/sprint` should derive the next sprint from the current `itr` state, with wide dependencies and release blockers surfaced first.
+The trajectory is the **Program order** table above: Phase 1 (itr#396) → Phase 2 (itr#403) → Phase 3
+(itr#398) is the strict critical path; Phases 4–9 follow in listed order, interleaving only when a phase
+is blocked. `/sprint` should draw its Sprint Goal from the lowest-numbered phase with open, unblocked
+members (`itr ready` inside the phase epic).
 
 ## Stub filing
 
