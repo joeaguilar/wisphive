@@ -855,8 +855,25 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
         return Ok(HookResponse::new(Decision::Ask, event_type, agent_type));
     }
 
+    // Control-plane self-protection (itr#425, ADR-0005 I9): a Write/Edit/Bash
+    // that targets ~/.wisphive/** must never ride an auto_approve_level — a gated
+    // agent holding a generic write approval could otherwise rewrite its own gate
+    // (config.json, mode, events.jsonl, the DB). When true, this skips BOTH
+    // auto-approve layers below so the call falls through to daemon human review.
+    // It deliberately does NOT return Decision::Ask: Ask hands the call to
+    // Claude's native prompt, which `hooks install` has already allow-listed for
+    // Write/Edit/Bash — that would auto-allow the self-edit and defeat the guard.
+    // The `allow_self_modification: true` opt-in disables this (named-flag escape
+    // hatch per the working agreement). When the daemon is unreachable the tiered
+    // posture fails open (ADR-0001), but gating is then off for every tool anyway,
+    // so the meaningful case — daemon up, level high — is the one this closes.
+    let force_human_review = !allow_self_modification(wisphive_dir)
+        && targets_control_plane(&tool_name, &tool_input, wisphive_dir);
+
     // Auto-approve certain event types based on config (with sensible defaults)
-    if let Some(toggle_key) = event_auto_approved_by(event_type, wisphive_dir) {
+    if !force_human_review
+        && let Some(toggle_key) = event_auto_approved_by(event_type, wisphive_dir)
+    {
         // For events with null tool_input, log event_data instead so the context is preserved
         let log_input = if tool_input.is_null() {
             extract_event_data(event_type, &hook_event).unwrap_or(tool_input.clone())
@@ -881,7 +898,8 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
     }
 
     // Layer 4: Auto-approve check — PermissionRequests always go to daemon
-    if !is_permission_request
+    if !force_human_review
+        && !is_permission_request
         && let Some(rule) = auto_approved_by(&tool_name, &tool_input, wisphive_dir)
     {
         // An operator always_ask tool released by the dangerous posture is a
@@ -1757,6 +1775,93 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/tmp"))
 }
 
+/// Operator opt-out for control-plane self-protection (itr#425). Absent/false
+/// keeps the guard on — the secure default; `true` lets the agent edit its own
+/// `~/.wisphive` state without human review.
+fn allow_self_modification(wisphive_dir: &std::path::Path) -> bool {
+    std::fs::read_to_string(wisphive_dir.join("config.json"))
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .and_then(|cfg| cfg.get("allow_self_modification")?.as_bool())
+        .unwrap_or(false)
+}
+
+/// Whether a tool call would touch the wisphive control-plane state dir
+/// (itr#425, ADR-0005 I9). File tools (`Write`/`Edit`/`MultiEdit`/`NotebookEdit`)
+/// match on a lexically-normalized path; `Bash` matches on a best-effort
+/// substring of the canonical dir and its `~`/`$HOME` spellings — a backstop,
+/// explicitly not soundness (a command can obfuscate the path arbitrarily).
+fn targets_control_plane(
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+    wisphive_dir: &std::path::Path,
+) -> bool {
+    let path_field = match tool_name {
+        "Write" | "Edit" | "MultiEdit" => Some("file_path"),
+        "NotebookEdit" => Some("notebook_path"),
+        "Bash" => {
+            return tool_input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .is_some_and(|c| command_references_dir(c, wisphive_dir));
+        }
+        _ => None,
+    };
+    path_field
+        .and_then(|f| tool_input.get(f))
+        .and_then(|v| v.as_str())
+        .is_some_and(|p| path_in_dir(p, wisphive_dir))
+}
+
+/// Best-effort test of whether a tool-supplied path resolves inside `dir`.
+/// Expands a leading `~`/`$HOME`/`${HOME}` (relative to `dir`'s parent, i.e. the
+/// home that owns the state dir), lexically normalizes (`.`/`..` collapsed —
+/// without touching the filesystem, since the target may not exist yet), then
+/// checks component-wise containment. Relative paths are left as-is: the agent's
+/// cwd is the project, not the state dir, and the Bash substring backstop covers
+/// spellings this misses.
+fn path_in_dir(raw: &str, dir: &std::path::Path) -> bool {
+    let home = dir.parent().unwrap_or(dir);
+    let expanded = if raw == "~" {
+        home.to_path_buf()
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        home.join(rest)
+    } else if let Some(rest) = raw
+        .strip_prefix("${HOME}/")
+        .or_else(|| raw.strip_prefix("$HOME/"))
+    {
+        home.join(rest)
+    } else {
+        PathBuf::from(raw)
+    };
+    lexical_normalize(&expanded).starts_with(dir)
+}
+
+/// Collapse `.` and `..` components lexically (no filesystem access).
+fn lexical_normalize(p: &std::path::Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Best-effort substring backstop for Bash commands that name the state dir.
+fn command_references_dir(cmd: &str, wisphive_dir: &std::path::Path) -> bool {
+    let canonical = wisphive_dir.to_string_lossy();
+    cmd.contains(canonical.as_ref())
+        || ["~/.wisphive", "$HOME/.wisphive", "${HOME}/.wisphive"]
+            .iter()
+            .any(|spelling| cmd.contains(spelling))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2493,5 +2598,111 @@ mod tests {
             AgentType::ClaudeCode,
         );
         assert!(block_additional_context_value(&resp).is_none());
+    }
+
+    // ── Control-plane self-protection (itr#425) ────────────────────────────
+
+    /// A `<home>/.wisphive` layout so tilde forms expand the way they do in
+    /// production (where `wisphive_dir.parent()` is the real home).
+    fn home_and_state() -> (tempfile::TempDir, PathBuf) {
+        let home = tempfile::tempdir().unwrap();
+        let state = home.path().join(".wisphive");
+        std::fs::create_dir_all(&state).unwrap();
+        (home, state)
+    }
+
+    fn write_cmd(path: &str) -> serde_json::Value {
+        json!({ "file_path": path })
+    }
+
+    #[test]
+    fn self_protect_matches_absolute_state_path() {
+        let (_home, state) = home_and_state();
+        let target = state.join("config.json");
+        assert!(targets_control_plane(
+            "Write",
+            &write_cmd(target.to_str().unwrap()),
+            &state
+        ));
+    }
+
+    #[test]
+    fn self_protect_matches_tilde_and_home_forms() {
+        let (_home, state) = home_and_state();
+        for raw in ["~/.wisphive/mode", "$HOME/.wisphive/mode", "${HOME}/.wisphive/mode"] {
+            assert!(
+                targets_control_plane("Edit", &write_cmd(raw), &state),
+                "expected {raw} to resolve into the state dir"
+            );
+        }
+    }
+
+    #[test]
+    fn self_protect_covers_every_file_tool_and_notebook_path() {
+        let (_home, state) = home_and_state();
+        assert!(targets_control_plane("MultiEdit", &write_cmd("~/.wisphive/config.json"), &state));
+        assert!(targets_control_plane(
+            "NotebookEdit",
+            &json!({ "notebook_path": "~/.wisphive/x.ipynb" }),
+            &state
+        ));
+    }
+
+    #[test]
+    fn self_protect_collapses_parent_dir_escape() {
+        let (_home, state) = home_and_state();
+        // `..` back-and-forth must still resolve inside the state dir.
+        assert!(targets_control_plane(
+            "Write",
+            &write_cmd("~/.wisphive/../.wisphive/config.json"),
+            &state
+        ));
+    }
+
+    #[test]
+    fn self_protect_ignores_unrelated_and_sibling_paths() {
+        let (home, state) = home_and_state();
+        // A normal project edit.
+        assert!(!targets_control_plane("Write", &write_cmd("/src/app.rs"), &state));
+        // Component-wise containment: `.wisphive-evil` is NOT inside `.wisphive`.
+        let sibling = home.path().join(".wisphive-evil").join("config.json");
+        assert!(!targets_control_plane("Write", &write_cmd(sibling.to_str().unwrap()), &state));
+    }
+
+    #[test]
+    fn self_protect_bash_substring_backstop() {
+        let (_home, state) = home_and_state();
+        assert!(targets_control_plane(
+            "Bash",
+            &json!({ "command": "echo off > ~/.wisphive/mode" }),
+            &state
+        ));
+        let abs = state.join("config.json");
+        assert!(targets_control_plane(
+            "Bash",
+            &json!({ "command": format!("cat {}", abs.display()) }),
+            &state
+        ));
+        assert!(!targets_control_plane(
+            "Bash",
+            &json!({ "command": "cargo test --workspace" }),
+            &state
+        ));
+    }
+
+    #[test]
+    fn self_protect_bypassed_by_opt_in_flag() {
+        let (_home, state) = home_and_state();
+        // Default: flag absent → guard on.
+        assert!(!allow_self_modification(&state));
+        // The composite gate the hook computes.
+        let gated = |cfg: serde_json::Value| {
+            std::fs::write(state.join("config.json"), cfg.to_string()).unwrap();
+            !allow_self_modification(&state)
+                && targets_control_plane("Write", &write_cmd("~/.wisphive/config.json"), &state)
+        };
+        assert!(gated(json!({})), "no flag → force human review");
+        assert!(gated(json!({ "allow_self_modification": false })), "false → force review");
+        assert!(!gated(json!({ "allow_self_modification": true })), "opt-in → allow");
     }
 }

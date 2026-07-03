@@ -544,7 +544,7 @@ Rule states: `candidate → suggested → active_human | active_auto → revoked
 
 `~/.wisphive/**` is added to `BLOCKED_WRITE_PATHS`, and Bash patterns targeting `~/.wisphive` (writes to `config.json`, `mode`, `events.jsonl`, the DB) are added to `BLOCKED_BASH_PATTERNS`. The learner must never suggest a rule whose effect is to pre-approve modification of wisphive's own state.
 
-**Note (found during this pass, independent of the learner):** nothing today deny-lists agent writes to `~/.wisphive/` in the *static* rules either — an agent with an approved generic Write/Bash can edit `config.json` directly. Filed separately as a default-deny hardening issue; the learning engine must not ship before it.
+**Note (found during this pass, independent of the learner):** nothing today deny-lists agent writes to `~/.wisphive/` in the *static* rules either — an agent with an approved generic Write/Bash can edit `config.json` directly. Filed separately as a default-deny hardening issue; the learning engine must not ship before it. **Landed (itr#425):** the hook now forces any `Write`/`Edit`/`MultiEdit`/`NotebookEdit`/`Bash` call targeting `~/.wisphive/**` past every auto-approve layer to daemon human review, at any level, unless `allow_self_modification: true` is set — see `targets_control_plane` in `crates/wisphive_hook/src/main.rs`. This blocker for the learner is cleared.
 
 ### I10 — The Blocked list is a backstop, not the security boundary
 

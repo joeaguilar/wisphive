@@ -74,6 +74,8 @@ control plane out of its own training set (I9).
   to a shared crate; auto-apply becomes meaningfully rarer (time-diversity + per-project
   scoping), which is accepted — suggest-mode is the product, auto-mode is a convenience.
 - The learning engine is blocked on the `~/.wisphive` default-deny hardening issue (I9).
+  **Cleared (itr#425):** the hook now forces agent writes to `~/.wisphive/**` to human review
+  (`targets_control_plane`, opt out via `allow_self_modification`); this blocker is resolved.
 
 ## Alternatives considered
 
