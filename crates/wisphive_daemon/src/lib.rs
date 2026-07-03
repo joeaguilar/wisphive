@@ -13,4 +13,6 @@ pub mod state;
 pub mod sudo_gate;
 pub mod terminal;
 
-pub use config::{DaemonConfig, UserConfig};
+pub use config::{
+    ConfigUpdateError, DaemonConfig, UserConfig, update_config_json, write_config_atomic,
+};

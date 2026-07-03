@@ -7,21 +7,48 @@ fn config_path() -> PathBuf {
     PathBuf::from(home).join(".wisphive").join("config.json")
 }
 
+/// Load config.json for read-only display. A corrupt file falls back to
+/// defaults with a warning; write paths must use [`load_for_write`] instead so
+/// they can never rewrite the file from that lossy fallback (itr#308).
 fn load() -> UserConfig {
     let path = config_path();
     match std::fs::read_to_string(&path) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Ok(content) => match serde_json::from_str(&content) {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!(
+                    "warning: {} is not valid JSON ({e}); showing built-in defaults",
+                    path.display()
+                );
+                UserConfig::default()
+            }
+        },
         Err(_) => UserConfig::default(),
+    }
+}
+
+/// Load config.json ahead of a save. Unlike [`load`], a corrupt existing file
+/// is an error: proceeding would rewrite the file from defaults and silently
+/// destroy whatever the operator had in it (itr#308). Unknown keys survive the
+/// round-trip via `UserConfig::extra` (itr#361).
+fn load_for_write() -> Result<UserConfig> {
+    let path = config_path();
+    match std::fs::read_to_string(&path) {
+        Ok(content) => serde_json::from_str(&content).with_context(|| {
+            format!(
+                "{} is not valid JSON; refusing to overwrite it — fix or remove the file",
+                path.display()
+            )
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(UserConfig::default()),
+        Err(e) => Err(e).context("failed to read config.json"),
     }
 }
 
 fn save(config: &UserConfig) -> Result<()> {
     let path = config_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let json = serde_json::to_string_pretty(config)?;
-    std::fs::write(&path, json).context("failed to write config.json")?;
+    wisphive_daemon::write_config_atomic(&path, &json).context("failed to write config.json")?;
     Ok(())
 }
 
@@ -47,7 +74,7 @@ pub fn get(key: &str) -> Result<()> {
 }
 
 pub fn set(key: &str, value: &str) -> Result<()> {
-    let mut config = load();
+    let mut config = load_for_write()?;
     match key {
         "notifications" => {
             config.notifications = match value {
@@ -186,7 +213,7 @@ pub fn auto_approve_status() -> Result<()> {
 pub fn auto_approve_level(level_str: &str) -> Result<()> {
     let level: wisphive_protocol::AutoApproveLevel =
         level_str.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-    let mut config = load();
+    let mut config = load_for_write()?;
     config.auto_approve_level = Some(level);
     save(&config)?;
     eprintln!("auto_approve_level = {level}");
@@ -194,7 +221,7 @@ pub fn auto_approve_level(level_str: &str) -> Result<()> {
 }
 
 pub fn auto_approve_add(tool: &str) -> Result<()> {
-    let mut config = load();
+    let mut config = load_for_write()?;
     let add = config.auto_approve_add.get_or_insert_with(Vec::new);
     if !add.iter().any(|t| t == tool) {
         add.push(tool.to_string());
@@ -209,7 +236,7 @@ pub fn auto_approve_add(tool: &str) -> Result<()> {
 }
 
 pub fn auto_approve_remove(tool: &str) -> Result<()> {
-    let mut config = load();
+    let mut config = load_for_write()?;
     let remove = config.auto_approve_remove.get_or_insert_with(Vec::new);
     if !remove.iter().any(|t| t == tool) {
         remove.push(tool.to_string());
@@ -224,7 +251,7 @@ pub fn auto_approve_remove(tool: &str) -> Result<()> {
 }
 
 pub fn auto_approve_reset() -> Result<()> {
-    let mut config = load();
+    let mut config = load_for_write()?;
     config.auto_approve_level = None;
     config.auto_approve_add = None;
     config.auto_approve_remove = None;
@@ -246,7 +273,7 @@ pub fn auto_approve_reset() -> Result<()> {
 ///   prompt, so auto-approving them would discard the human's selection.
 ///   Use only for fully unattended, trusted runs.
 pub fn auto_approve_mode(mode: &str) -> Result<()> {
-    let mut config = load();
+    let mut config = load_for_write()?;
     match mode {
         "balanced" | "safe" => {
             config.auto_approve_level = Some(wisphive_protocol::AutoApproveLevel::All);
@@ -272,7 +299,7 @@ pub fn auto_approve_mode(mode: &str) -> Result<()> {
 
 /// Add a tool/event to the always-defer set (e.g. a harmful-action tool).
 pub fn auto_approve_defer_add(tool: &str) -> Result<()> {
-    let mut config = load();
+    let mut config = load_for_write()?;
     // Clear any prior removal so the tool actually defers again.
     if let Some(ref mut remove) = config.always_ask_remove {
         remove.retain(|t| t != tool);
@@ -291,7 +318,7 @@ pub fn auto_approve_defer_add(tool: &str) -> Result<()> {
 /// Drop a tool/event from the always-defer set so it follows the normal
 /// auto-approve level again.
 pub fn auto_approve_defer_remove(tool: &str) -> Result<()> {
-    let mut config = load();
+    let mut config = load_for_write()?;
     // Drop from operator additions if present.
     if let Some(ref mut add) = config.always_ask {
         add.retain(|t| t != tool);
