@@ -2668,7 +2668,11 @@ mod tests {
     #[test]
     fn self_protect_matches_tilde_and_home_forms() {
         let (_home, state) = home_and_state();
-        for raw in ["~/.wisphive/mode", "$HOME/.wisphive/mode", "${HOME}/.wisphive/mode"] {
+        for raw in [
+            "~/.wisphive/mode",
+            "$HOME/.wisphive/mode",
+            "${HOME}/.wisphive/mode",
+        ] {
             assert!(
                 targets_control_plane("Edit", &write_cmd(raw), &state),
                 "expected {raw} to resolve into the state dir"
@@ -2679,7 +2683,11 @@ mod tests {
     #[test]
     fn self_protect_covers_every_file_tool_and_notebook_path() {
         let (_home, state) = home_and_state();
-        assert!(targets_control_plane("MultiEdit", &write_cmd("~/.wisphive/config.json"), &state));
+        assert!(targets_control_plane(
+            "MultiEdit",
+            &write_cmd("~/.wisphive/config.json"),
+            &state
+        ));
         assert!(targets_control_plane(
             "NotebookEdit",
             &json!({ "notebook_path": "~/.wisphive/x.ipynb" }),
@@ -2702,10 +2710,18 @@ mod tests {
     fn self_protect_ignores_unrelated_and_sibling_paths() {
         let (home, state) = home_and_state();
         // A normal project edit.
-        assert!(!targets_control_plane("Write", &write_cmd("/src/app.rs"), &state));
+        assert!(!targets_control_plane(
+            "Write",
+            &write_cmd("/src/app.rs"),
+            &state
+        ));
         // Component-wise containment: `.wisphive-evil` is NOT inside `.wisphive`.
         let sibling = home.path().join(".wisphive-evil").join("config.json");
-        assert!(!targets_control_plane("Write", &write_cmd(sibling.to_str().unwrap()), &state));
+        assert!(!targets_control_plane(
+            "Write",
+            &write_cmd(sibling.to_str().unwrap()),
+            &state
+        ));
     }
 
     #[test]
@@ -2776,7 +2792,13 @@ mod tests {
                 && targets_control_plane("Write", &write_cmd("~/.wisphive/config.json"), &state)
         };
         assert!(gated(json!({})), "no flag → force human review");
-        assert!(gated(json!({ "allow_self_modification": false })), "false → force review");
-        assert!(!gated(json!({ "allow_self_modification": true })), "opt-in → allow");
+        assert!(
+            gated(json!({ "allow_self_modification": false })),
+            "false → force review"
+        );
+        assert!(
+            !gated(json!({ "allow_self_modification": true })),
+            "opt-in → allow"
+        );
     }
 }

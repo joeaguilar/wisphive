@@ -161,7 +161,11 @@ async fn ask_defer_removes_pending_row_without_logging() {
 
     db.delete_pending(id).await.unwrap();
 
-    assert_eq!(db.pending_count().await.unwrap(), 0, "pending row must be gone");
+    assert_eq!(
+        db.pending_count().await.unwrap(),
+        0,
+        "pending row must be gone"
+    );
     assert!(
         db.query_history(None, 10).await.unwrap().is_empty(),
         "Ask/defer must not land in decision_log"
@@ -183,12 +187,20 @@ async fn drain_orphaned_pending_records_failopen_and_clears_table() {
 
     let drained = db.drain_orphaned_pending().await.unwrap();
     assert_eq!(drained, 2);
-    assert_eq!(db.pending_count().await.unwrap(), 0, "table must be cleared");
+    assert_eq!(
+        db.pending_count().await.unwrap(),
+        0,
+        "table must be cleared"
+    );
 
     let history = db.query_history(None, 10).await.unwrap();
     assert_eq!(history.len(), 2);
     for entry in &history {
-        assert_eq!(entry.decision, Decision::Approve, "fail-open outcome, not Deny");
+        assert_eq!(
+            entry.decision,
+            Decision::Approve,
+            "fail-open outcome, not Deny"
+        );
         assert_eq!(entry.decided_by.as_deref(), Some("daemon_restart:failopen"));
     }
 
@@ -227,8 +239,16 @@ async fn persist_pending_round_trips_permission_suggestions() {
 
     db.persist_pending(&req).await.unwrap();
 
-    let read = db.pending_permission_suggestions(id).await.unwrap().unwrap();
-    assert_eq!(read.len(), 2, "both suggestions must survive the round-trip");
+    let read = db
+        .pending_permission_suggestions(id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        read.len(),
+        2,
+        "both suggestions must survive the round-trip"
+    );
     assert_eq!(read[0].suggestion_type, "addRules");
     assert_eq!(read[0].behavior, "allow");
     assert_eq!(read[1].mode.as_deref(), Some("plan"));
@@ -237,7 +257,12 @@ async fn persist_pending_round_trips_permission_suggestions() {
     let plain = make_request("Read", "cc-2", "/muse");
     let plain_id = plain.id;
     db.persist_pending(&plain).await.unwrap();
-    assert!(db.pending_permission_suggestions(plain_id).await.unwrap().is_none());
+    assert!(
+        db.pending_permission_suggestions(plain_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 // ════════════════════════════════════════════════════════════

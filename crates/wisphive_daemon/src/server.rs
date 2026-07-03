@@ -78,7 +78,10 @@ impl Server {
         // binds the socket, so no live hook can race the drain.
         match state_db.drain_orphaned_pending().await {
             Ok(0) => {}
-            Ok(n) => info!(drained = n, "recovered orphaned pending decisions from prior run"),
+            Ok(n) => info!(
+                drained = n,
+                "recovered orphaned pending decisions from prior run"
+            ),
             Err(e) => warn!("failed to drain orphaned pending decisions: {e}"),
         }
         let process_registry = Arc::new(Mutex::new(ProcessRegistry::new()));
@@ -2035,7 +2038,9 @@ mod tests {
         let home = tmp.path().to_path_buf();
 
         // First boot: create dirs + schema, nothing to drain.
-        let s1 = super::Server::new(DaemonConfig::new(home.clone())).await.unwrap();
+        let s1 = super::Server::new(DaemonConfig::new(home.clone()))
+            .await
+            .unwrap();
         let db_path = DaemonConfig::new(home.clone())
             .db_path
             .to_string_lossy()
@@ -2051,10 +2056,16 @@ mod tests {
         }
 
         // Restart: Server::new must drain the orphan.
-        let _s2 = super::Server::new(DaemonConfig::new(home.clone())).await.unwrap();
+        let _s2 = super::Server::new(DaemonConfig::new(home.clone()))
+            .await
+            .unwrap();
 
         let db = StateDb::open(&db_path).await.unwrap();
-        assert_eq!(db.pending_count().await.unwrap(), 0, "restart must clear orphans");
+        assert_eq!(
+            db.pending_count().await.unwrap(),
+            0,
+            "restart must clear orphans"
+        );
         let history = db.query_history(None, 10).await.unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].decision, wisphive_protocol::Decision::Approve);
