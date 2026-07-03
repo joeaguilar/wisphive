@@ -75,6 +75,7 @@ fn read_line_capped<R: BufRead>(
 }
 
 /// Hook response to format for the calling agent.
+#[derive(Debug)]
 struct HookResponse {
     decision: Decision,
     message: Option<String>,
@@ -981,9 +982,56 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
         terminal_session_id,
     };
 
-    // Layer 4: Connect to daemon socket (fails instantly if daemon is dead)
+    // Layer 4: connect to the daemon and block for a human decision. The whole
+    // transport (connect → handshake → request → response) lives in
+    // `request_decision` so the connect-vs-handshake-vs-live-daemon failure
+    // boundary is testable against a socket harness (itr#337).
     let socket_path = wisphive_dir.join("wisphive.sock");
-    let stream = UnixStream::connect(&socket_path).map_err(|err| {
+    let response = request_decision(&socket_path, request, event_type, agent_type.clone())?;
+
+    // A daemon-resolved Ask on the Codex PreToolUse path is a fail-closed deny
+    // (itr#366); that non-human outcome must reach the audit trail (itr#397) —
+    // the daemon skips logging Ask resolutions, so this record is its only trace.
+    if response.decision == Decision::Ask
+        && agent_type == AgentType::Codex
+        && event_type == HookEventType::PreToolUse
+    {
+        log_auto_approved(
+            wisphive_dir,
+            AutoApprovedLog {
+                tool_use_id: &tool_use_id,
+                agent_id: &audit_agent_id,
+                project: &audit_project,
+                tool_name: &audit_tool_name,
+                tool_input: &audit_tool_input,
+                event_type,
+                agent_type: &agent_type,
+                event: "denied",
+                decided_by: "codex_ask_fail_closed:daemon_ask",
+            },
+        );
+    }
+    Ok(response)
+}
+
+/// Connect to the daemon, handshake, send the decision request, and read the
+/// response. Extracted from [`run_active`] so the connect-vs-handshake-vs-live-
+/// daemon failure boundary is testable against a socket harness (itr#337).
+///
+/// Failure classification (consumed by [`response_for_failure`]): every
+/// transport step up to and including an EOF/garbled *welcome* is
+/// [`HookFailureKind::DaemonUnreachable`] — no session with a live daemon was
+/// ever established, so it fails **open**. Only AFTER a valid `Welcome` is the
+/// daemon "up and answering": an EOF-before-decision still fails open (the
+/// common crash-brick), but a well-formed `Error` or an unexpected/garbage
+/// message is honored fail-**closed** per `fail-mode`.
+fn request_decision(
+    socket_path: &Path,
+    request: DecisionRequest,
+    event_type: HookEventType,
+    agent_type: AgentType,
+) -> Result<HookResponse, HookFailure> {
+    let stream = UnixStream::connect(socket_path).map_err(|err| {
         // A refused/absent socket means the daemon is down (e.g. crashed and
         // left a stale socket). Fail open so the outage can't brick agents.
         HookFailure::unreachable(
@@ -1157,29 +1205,8 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
             selected_permission,
             ..
         } => {
-            // A daemon-resolved Ask on the Codex PreToolUse path becomes a
-            // fail-closed deny (itr#366) — and that non-human outcome must be
-            // in the audit trail (itr#397). The daemon skips logging Ask
-            // resolutions, so this record is the only trace.
-            if decision == Decision::Ask
-                && agent_type == AgentType::Codex
-                && event_type == HookEventType::PreToolUse
-            {
-                log_auto_approved(
-                    wisphive_dir,
-                    AutoApprovedLog {
-                        tool_use_id: &tool_use_id,
-                        agent_id: &audit_agent_id,
-                        project: &audit_project,
-                        tool_name: &audit_tool_name,
-                        tool_input: &audit_tool_input,
-                        event_type,
-                        agent_type: &agent_type,
-                        event: "denied",
-                        decided_by: "codex_ask_fail_closed:daemon_ask",
-                    },
-                );
-            }
+            // Transport only — the caller (run_active) writes the Codex Ask →
+            // fail-closed-deny audit record (itr#366/#397) from response.decision.
             Ok(HookResponse {
                 decision,
                 message,
@@ -2799,6 +2826,151 @@ mod tests {
         assert!(
             !gated(json!({ "allow_self_modification": true })),
             "opt-in → allow"
+        );
+    }
+
+    // ── Socket harness: connect/handshake/decision failure classification (itr#337) ──
+    //
+    // These drive the real request_decision transport against a fake daemon on a
+    // real Unix socket, locking the connect-vs-handshake-vs-live-daemon boundary:
+    // anything up to a valid Welcome fails OPEN (no session ever established),
+    // while a live daemon that then refuses or garbles is honored fail-CLOSED.
+
+    fn harness_request() -> DecisionRequest {
+        DecisionRequest {
+            id: uuid::Uuid::new_v4(),
+            agent_id: "cc-1".into(),
+            agent_type: AgentType::ClaudeCode,
+            project: PathBuf::from("/muse"),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({"command": "ls"}),
+            timestamp: chrono::Utc::now(),
+            hook_event_name: HookEventType::PreToolUse,
+            tool_use_id: None,
+            permission_suggestions: None,
+            event_data: None,
+            terminal_session_id: None,
+        }
+    }
+
+    /// Bind a fake daemon socket, run `server` on the single accepted
+    /// connection in a thread, and return the failure `request_decision`
+    /// classified. The `server` closure receives the accepted stream.
+    fn socket_scenario<F>(server: F) -> HookFailure
+    where
+        F: FnOnce(std::os::unix::net::UnixStream) + Send + 'static,
+    {
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("wisphive.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let handle = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                server(stream);
+            }
+        });
+        let result = request_decision(
+            &socket_path,
+            harness_request(),
+            HookEventType::PreToolUse,
+            AgentType::ClaudeCode,
+        );
+        let _ = handle.join();
+        result.expect_err("scenario must produce a failure, not a decision")
+    }
+
+    fn drain_line(reader: &mut impl std::io::BufRead) {
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line);
+    }
+
+    fn send_welcome(writer: &mut impl std::io::Write) {
+        let welcome = wisphive_protocol::encode(&ServerMessage::Welcome {
+            version: PROTOCOL_VERSION,
+        })
+        .unwrap();
+        let _ = writer.write_all(welcome.as_bytes());
+    }
+
+    #[test]
+    fn socket_eof_during_handshake_fails_open() {
+        // (a) accept, read the Hello, then close before sending Welcome.
+        let err = socket_scenario(|stream| {
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            drain_line(&mut reader); // consume the hook's Hello, then drop → EOF
+        });
+        assert_eq!(err.kind, HookFailureKind::DaemonUnreachable);
+        assert_eq!(
+            response_for_failure(&err, FailMode::Closed).decision,
+            Decision::Approve,
+            "handshake EOF must fail open even under fail-mode=closed"
+        );
+    }
+
+    #[test]
+    fn socket_eof_before_decision_fails_open() {
+        // (b) complete the handshake, then close before the decision — the
+        // common crash-brick.
+        let err = socket_scenario(|stream| {
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+            drain_line(&mut reader); // Hello
+            send_welcome(&mut writer);
+            drain_line(&mut reader); // DecisionRequest, then drop → EOF mid-wait
+        });
+        assert_eq!(err.kind, HookFailureKind::DaemonUnreachable);
+        assert_eq!(
+            response_for_failure(&err, FailMode::Closed).decision,
+            Decision::Approve,
+            "mid-wait EOF must fail open even under fail-mode=closed"
+        );
+    }
+
+    #[test]
+    fn socket_error_response_fails_closed() {
+        // (c) a live daemon that answers with Error is reachable-but-refusing.
+        let err = socket_scenario(|stream| {
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+            drain_line(&mut reader);
+            send_welcome(&mut writer);
+            drain_line(&mut reader);
+            let msg = wisphive_protocol::encode(&ServerMessage::Error {
+                message: "daemon boom".into(),
+            })
+            .unwrap();
+            let _ = writer.write_all(msg.as_bytes());
+        });
+        assert_eq!(err.kind, HookFailureKind::Runtime);
+        assert_eq!(
+            response_for_failure(&err, FailMode::Closed).decision,
+            Decision::Deny,
+            "a well-formed Error must fail closed under fail-mode=closed"
+        );
+        assert_eq!(
+            response_for_failure(&err, FailMode::Open).decision,
+            Decision::Approve,
+            "…and fail open only when the operator chose fail-mode=open"
+        );
+    }
+
+    #[test]
+    fn socket_garbage_decision_fails_closed() {
+        // (d) a live daemon that answers with unparseable bytes — never approve
+        // garbage silently.
+        let err = socket_scenario(|stream| {
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+            drain_line(&mut reader);
+            send_welcome(&mut writer);
+            drain_line(&mut reader);
+            let _ = writer.write_all(b"this is not valid json\n");
+        });
+        assert_eq!(err.kind, HookFailureKind::Runtime);
+        assert_eq!(
+            response_for_failure(&err, FailMode::Closed).decision,
+            Decision::Deny,
+            "garbage response must fail closed under fail-mode=closed"
         );
     }
 }
