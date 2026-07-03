@@ -186,7 +186,8 @@ impl StateDb {
             let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
             let select_sql = format!(
                 "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, \
-                 requested_at, resolved_at, tool_result, tool_use_id, hook_event_name, terminal_session_id \
+                 requested_at, resolved_at, tool_result, tool_use_id, hook_event_name, terminal_session_id, \
+                 decided_by, config_hash \
                  FROM decision_log WHERE id IN ({})",
                 placeholders.join(",")
             );
@@ -212,6 +213,8 @@ impl StateDb {
                 tool_use_id,
                 hook_event_name,
                 terminal_session_id,
+                decided_by,
+                config_hash,
             ) in &rows
             {
                 let entry = serde_json::json!({
@@ -227,6 +230,8 @@ impl StateDb {
                     "tool_use_id": tool_use_id,
                     "hook_event_name": hook_event_name,
                     "terminal_session_id": terminal_session_id,
+                    "decided_by": decided_by,
+                    "config_hash": config_hash,
                 });
                 let mut line = serde_json::to_string(&entry).unwrap_or_default();
                 line.push('\n');

@@ -393,6 +393,16 @@ pub struct HistorySearch {
     /// Opaque correlation ID echoed back in the response.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// Only entries resolved at/after this instant (audit queries, itr#397).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<DateTime<Utc>>,
+    /// Filter by project path (exact match).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Filter by the layer/rule that made the decision (substring match on
+    /// `decided_by`, e.g. "level:", "human", "always_ask").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_by: Option<String>,
 }
 
 /// A resolved decision from the audit log.
@@ -419,6 +429,17 @@ pub struct HistoryEntry {
     /// ID of the wisphive terminal session this call originated from, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_session_id: Option<Uuid>,
+    /// The layer/rule that resolved this decision (itr#397 audit trail):
+    /// "human", "timeout:approve", a hook rule like "level:all" /
+    /// "auto_approve_add" / "tool_rules:Bash:allow_pattern" /
+    /// "always_ask:intrinsic" / "event_toggle:auto_approve_stop", etc.
+    /// None on rows from before the audit trail landed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_by: Option<String>,
+    /// Truncated SHA-256 of ~/.wisphive/config.json at decision time, so a
+    /// policy weakening is correlatable with the decisions it produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_hash: Option<String>,
 }
 
 // ── Terminal sessions ───────────────────────────────────────────────

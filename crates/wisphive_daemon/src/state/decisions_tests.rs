@@ -24,6 +24,9 @@ async fn log_auto(
         timestamp,
         tool_use_id,
         hook_event_name,
+        decision: "approve",
+        decided_by: Some("level:all"),
+        config_hash: None,
     })
     .await
     .unwrap();

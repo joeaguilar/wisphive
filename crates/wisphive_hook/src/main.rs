@@ -802,12 +802,41 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
     // (the old `!is_permission_request` guard) auto-resolved the prompt with no
     // selection — "Allowed by PermissionRequest hook" → "did not answer". See
     // itr#388 (regression on the itr#380 / ADR-0002 always-defer work).
-    if is_always_deferred(&tool_name, wisphive_dir) {
+    let defer_class = always_defer_classification(&tool_name, wisphive_dir);
+    if matches!(defer_class, DeferClass::Intrinsic | DeferClass::Operator) {
+        // Audit the deferral (itr#397): this decision was made by policy, not
+        // a human, and used to leave no trace anywhere. On the Codex PreToolUse
+        // path Ask cannot defer (itr#366) — the real effect is a fail-closed
+        // deny, and the audit record says so.
+        let base = match defer_class {
+            DeferClass::Intrinsic => "always_ask:intrinsic",
+            _ => "always_ask:operator",
+        };
+        let (event, decided_by) =
+            if agent_type == AgentType::Codex && event_type == HookEventType::PreToolUse {
+                ("denied", format!("codex_ask_fail_closed:{base}"))
+            } else {
+                ("deferred", base.to_string())
+            };
+        log_auto_approved(
+            wisphive_dir,
+            AutoApprovedLog {
+                tool_use_id: &tool_use_id,
+                agent_id: &agent_id,
+                project: &project,
+                tool_name: &tool_name,
+                tool_input: &tool_input,
+                event_type,
+                agent_type: &agent_type,
+                event,
+                decided_by: &decided_by,
+            },
+        );
         return Ok(HookResponse::new(Decision::Ask, event_type, agent_type));
     }
 
     // Auto-approve certain event types based on config (with sensible defaults)
-    if is_event_auto_approved(event_type, wisphive_dir) {
+    if let Some(toggle_key) = event_auto_approved_by(event_type, wisphive_dir) {
         // For events with null tool_input, log event_data instead so the context is preserved
         let log_input = if tool_input.is_null() {
             extract_event_data(event_type, &hook_event).unwrap_or(tool_input.clone())
@@ -824,13 +853,24 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
                 tool_input: &log_input,
                 event_type,
                 agent_type: &agent_type,
+                event: "auto_approved",
+                decided_by: &format!("event_toggle:{toggle_key}"),
             },
         );
         return Ok(HookResponse::new(Decision::Approve, event_type, agent_type));
     }
 
     // Layer 4: Auto-approve check — PermissionRequests always go to daemon
-    if !is_permission_request && is_auto_approved(&tool_name, &tool_input, wisphive_dir) {
+    if !is_permission_request
+        && let Some(rule) = auto_approved_by(&tool_name, &tool_input, wisphive_dir)
+    {
+        // An operator always_ask tool released by the dangerous posture is a
+        // policy bypass the audit record must show explicitly (itr#397).
+        let decided_by = if defer_class == DeferClass::ReleasedByDangerous {
+            format!("auto_approve_dangerous:{rule}")
+        } else {
+            rule
+        };
         log_auto_approved(
             wisphive_dir,
             AutoApprovedLog {
@@ -841,6 +881,8 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
                 tool_input: &tool_input,
                 event_type,
                 agent_type: &agent_type,
+                event: "auto_approved",
+                decided_by: &decided_by,
             },
         );
         return Ok(HookResponse::new(Decision::Approve, event_type, agent_type));
@@ -878,6 +920,13 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
     let terminal_session_id = std::env::var("WISPHIVE_TERMINAL_SESSION_ID")
         .ok()
         .and_then(|s| uuid::Uuid::parse_str(&s).ok());
+
+    // Kept for the itr#397 audit record written after the daemon responds —
+    // the originals move into the request below.
+    let audit_agent_id = agent_id.clone();
+    let audit_project = project.clone();
+    let audit_tool_name = tool_name.clone();
+    let audit_tool_input = tool_input.clone();
 
     let request = DecisionRequest {
         id: uuid::Uuid::new_v4(),
@@ -1069,15 +1118,40 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
             additional_context,
             selected_permission,
             ..
-        } => Ok(HookResponse {
-            decision,
-            message,
-            updated_input,
-            additional_context,
-            selected_permission,
-            event_type,
-            agent_type,
-        }),
+        } => {
+            // A daemon-resolved Ask on the Codex PreToolUse path becomes a
+            // fail-closed deny (itr#366) — and that non-human outcome must be
+            // in the audit trail (itr#397). The daemon skips logging Ask
+            // resolutions, so this record is the only trace.
+            if decision == Decision::Ask
+                && agent_type == AgentType::Codex
+                && event_type == HookEventType::PreToolUse
+            {
+                log_auto_approved(
+                    wisphive_dir,
+                    AutoApprovedLog {
+                        tool_use_id: &tool_use_id,
+                        agent_id: &audit_agent_id,
+                        project: &audit_project,
+                        tool_name: &audit_tool_name,
+                        tool_input: &audit_tool_input,
+                        event_type,
+                        agent_type: &agent_type,
+                        event: "denied",
+                        decided_by: "codex_ask_fail_closed:daemon_ask",
+                    },
+                );
+            }
+            Ok(HookResponse {
+                decision,
+                message,
+                updated_input,
+                additional_context,
+                selected_permission,
+                event_type,
+                agent_type,
+            })
+        }
         ServerMessage::Error { message } => Err(HookFailure::message(
             format!("Wisphive daemon returned an error instead of a decision: {message}"),
             event_type,
@@ -1219,10 +1293,11 @@ fn register_agent_once(
 ///   "auto_approve_lifecycle": bool     (default: true)
 ///
 /// Set to false to send these events to the daemon for review (useful for debugging).
-fn is_event_auto_approved(
+/// Returns the toggle key that approved the event (itr#397 audit), or `None`.
+fn event_auto_approved_by(
     event_type: wisphive_protocol::HookEventType,
     wisphive_dir: &std::path::Path,
-) -> bool {
+) -> Option<&'static str> {
     use wisphive_protocol::HookEventType;
 
     let (config_key, default) = match event_type {
@@ -1238,15 +1313,50 @@ fn is_event_auto_approved(
         | HookEventType::SessionStart
         | HookEventType::SessionEnd
         | HookEventType::Notification => ("auto_approve_lifecycle", true),
-        _ => return false,
+        _ => return None,
     };
 
     let config_path = wisphive_dir.join("config.json");
-    std::fs::read_to_string(&config_path)
+    let enabled = std::fs::read_to_string(&config_path)
         .ok()
         .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
         .and_then(|config| config.get(config_key)?.as_bool())
-        .unwrap_or(default)
+        .unwrap_or(default);
+    enabled.then_some(config_key)
+}
+
+/// Truncated SHA-256 of ~/.wisphive/config.json at decision time, for the
+/// audit trail (itr#397): a policy weakening becomes correlatable with the
+/// decisions it produced. `None` when the file is absent/unreadable.
+fn config_snapshot_hash(wisphive_dir: &std::path::Path) -> Option<String> {
+    use sha2::Digest;
+    let bytes = std::fs::read(wisphive_dir.join("config.json")).ok()?;
+    let digest = sha2::Sha256::digest(&bytes);
+    // 16 hex chars (64 bits) is plenty to distinguish config revisions.
+    Some(
+        digest
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+    )
+}
+
+/// How the always-defer classification resolved for a tool (itr#397 audit).
+#[derive(Debug, PartialEq, Eq)]
+enum DeferClass {
+    /// Built-in interactive prompt (questions/plan-mode/elicitations) —
+    /// defers unconditionally.
+    Intrinsic,
+    /// Operator-designated `always_ask` tool — defers under the balanced
+    /// posture.
+    Operator,
+    /// Would have deferred (operator entry) but the `auto_approve_dangerous`
+    /// posture released it — the auto-approve layers decide, and the audit
+    /// record must show the bypass.
+    ReleasedByDangerous,
+    /// Not in the always-defer set.
+    No,
 }
 
 /// Check whether a tool/event must always defer to the agent's native prompt.
@@ -1260,56 +1370,68 @@ fn is_event_auto_approved(
 ///
 /// Operator-designated harmful tools (config.json `always_ask`) also defer, but
 /// they ARE released by the "dangerous" posture or an `always_ask_remove` entry.
-fn is_always_deferred(tool_name: &str, wisphive_dir: &std::path::Path) -> bool {
+fn always_defer_classification(tool_name: &str, wisphive_dir: &std::path::Path) -> DeferClass {
     // Intrinsic interactive prompts win over every config posture — evaluated
     // first so nothing below can un-defer a question/plan/elicitation. (The
     // "dangerous" posture used to re-swallow these, dropping the human's answer.)
     if DEFAULT_ALWAYS_ASK.contains(&tool_name) {
-        return true;
+        return DeferClass::Intrinsic;
     }
 
     let Some(config) = std::fs::read_to_string(wisphive_dir.join("config.json"))
         .ok()
         .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
     else {
-        return false;
+        return DeferClass::No;
     };
 
-    // Dangerous posture: auto-approve everything else, including operator
-    // `always_ask` additions. (Intrinsic prompts already returned above.)
-    if config
+    let dangerous = config
         .get("auto_approve_dangerous")
         .and_then(|v| v.as_bool())
-        == Some(true)
-    {
-        return false;
-    }
+        == Some(true);
 
     // Operator removals win over operator additions.
     if let Some(arr) = config.get("always_ask_remove").and_then(|v| v.as_array())
         && arr.iter().any(|v| v.as_str() == Some(tool_name))
     {
-        return false;
+        return DeferClass::No;
     }
 
-    // Operator additions (e.g. harmful-action tools).
-    config
+    // Operator additions (e.g. harmful-action tools) — released only by the
+    // dangerous posture, and that release is audit-visible.
+    let operator_listed = config
         .get("always_ask")
         .and_then(|v| v.as_array())
-        .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(tool_name)))
+        .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(tool_name)));
+    match (operator_listed, dangerous) {
+        (true, true) => DeferClass::ReleasedByDangerous,
+        (true, false) => DeferClass::Operator,
+        (false, _) => DeferClass::No,
+    }
 }
 
-/// Check if a tool is auto-approved using tiered levels + content-aware rules.
+/// Boolean view of [`always_defer_classification`].
+#[cfg(test)]
+fn is_always_deferred(tool_name: &str, wisphive_dir: &std::path::Path) -> bool {
+    matches!(
+        always_defer_classification(tool_name, wisphive_dir),
+        DeferClass::Intrinsic | DeferClass::Operator
+    )
+}
+
+/// Check if a tool is auto-approved using tiered levels + content-aware rules,
+/// returning the rule that decided (itr#397 audit) or `None` when the tool
+/// must queue for human review.
 ///
 /// Priority: auto_approve_remove → auto_approve_add → level → legacy → defaults.
 /// Then tool_rules override: deny_patterns block auto-approved tools,
 /// allow_patterns approve non-approved tools. Patterns are case-insensitive
 /// substrings matched against the tool input text.
-fn is_auto_approved(
+fn auto_approved_by(
     tool_name: &str,
     tool_input: &serde_json::Value,
     wisphive_dir: &std::path::Path,
-) -> bool {
+) -> Option<String> {
     let config_path = wisphive_dir.join("config.json");
 
     let config: Option<serde_json::Value> = std::fs::read_to_string(&config_path)
@@ -1317,14 +1439,14 @@ fn is_auto_approved(
         .and_then(|c| serde_json::from_str(&c).ok());
 
     // Determine base approval from level/add/remove
-    let base_approved = if let Some(ref config) = config {
+    let base_rule = if let Some(ref config) = config {
         // Check explicit removals first
-        if let Some(arr) = config.get("auto_approve_remove").and_then(|v| v.as_array()) {
-            if arr.iter().any(|v| v.as_str() == Some(tool_name)) {
-                false
-            } else {
-                check_base_approved(config, tool_name, wisphive_dir)
-            }
+        let removed = config
+            .get("auto_approve_remove")
+            .and_then(|v| v.as_array())
+            .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(tool_name)));
+        if removed {
+            None
         } else {
             check_base_approved(config, tool_name, wisphive_dir)
         }
@@ -1341,14 +1463,14 @@ fn is_auto_approved(
         let input_text = tool_input_text(tool_name, tool_input);
         let input_lower = input_text.to_lowercase();
 
-        if base_approved {
+        if base_rule.is_some() {
             // Check deny_patterns — any match blocks auto-approve
             if let Some(patterns) = rule.get("deny_patterns").and_then(|v| v.as_array()) {
                 for p in patterns {
                     if let Some(pat) = p.as_str()
                         && input_lower.contains(&pat.to_lowercase())
                     {
-                        return false;
+                        return None;
                     }
                 }
             }
@@ -1359,49 +1481,64 @@ fn is_auto_approved(
                     if let Some(pat) = p.as_str()
                         && input_lower.contains(&pat.to_lowercase())
                     {
-                        return true;
+                        return Some(format!("tool_rules:{tool_name}:allow_pattern"));
                     }
                 }
             }
         }
     }
 
-    base_approved
+    base_rule
 }
 
-/// Check base approval from explicit additions and tiered level.
+/// Boolean view of [`auto_approved_by`].
+#[cfg(test)]
+fn is_auto_approved(
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+    wisphive_dir: &std::path::Path,
+) -> bool {
+    auto_approved_by(tool_name, tool_input, wisphive_dir).is_some()
+}
+
+/// Check base approval from explicit additions and tiered level, returning
+/// the matching rule identifier.
 fn check_base_approved(
     config: &serde_json::Value,
     tool_name: &str,
     wisphive_dir: &std::path::Path,
-) -> bool {
+) -> Option<String> {
     // Check explicit additions
     if let Some(arr) = config.get("auto_approve_add").and_then(|v| v.as_array())
         && arr.iter().any(|v| v.as_str() == Some(tool_name))
     {
-        return true;
+        return Some("auto_approve_add".to_string());
     }
 
     // Check tiered level
     if let Some(level_str) = config.get("auto_approve_level").and_then(|v| v.as_str())
         && let Ok(level) = level_str.parse::<wisphive_protocol::AutoApproveLevel>()
     {
-        return level.includes(tool_name);
+        return level.includes(tool_name).then(|| format!("level:{level}"));
     }
 
     // Fallback to legacy
     legacy_auto_approved(tool_name, wisphive_dir)
 }
 
-/// Check legacy auto-approve.json and built-in defaults.
-fn legacy_auto_approved(tool_name: &str, wisphive_dir: &std::path::Path) -> bool {
+/// Check legacy auto-approve.json and built-in defaults, returning the rule
+/// identifier for a match.
+fn legacy_auto_approved(tool_name: &str, wisphive_dir: &std::path::Path) -> Option<String> {
     let legacy_path = wisphive_dir.join("auto-approve.json");
     if legacy_path.exists()
         && let Ok(content) = std::fs::read_to_string(&legacy_path)
         && let Ok(config) = serde_json::from_str::<serde_json::Value>(&content)
         && let Some(arr) = config.get("auto_approve").and_then(|v| v.as_array())
     {
-        return arr.iter().any(|v| v.as_str() == Some(tool_name));
+        return arr
+            .iter()
+            .any(|v| v.as_str() == Some(tool_name))
+            .then(|| "legacy_list".to_string());
     }
     // Default fallback (no config.json, no legacy auto-approve.json): the Read
     // tier, sourced from wisphive_protocol so the list lives in exactly one place
@@ -1410,6 +1547,7 @@ fn legacy_auto_approved(tool_name: &str, wisphive_dir: &std::path::Path) -> bool
     wisphive_protocol::AutoApproveLevel::Read
         .tier_tools()
         .contains(&tool_name)
+        .then(|| "default:read_tier".to_string())
 }
 
 /// Log an auto-approved tool call to events.jsonl for daemon ingestion.
@@ -1422,12 +1560,17 @@ struct AutoApprovedLog<'a> {
     tool_input: &'a serde_json::Value,
     event_type: HookEventType,
     agent_type: &'a AgentType,
+    /// Record kind: "auto_approved" (default), "deferred", or "denied".
+    event: &'a str,
+    /// The layer/rule that made the decision (itr#397), e.g. "level:all",
+    /// "always_ask:intrinsic", "event_toggle:auto_approve_stop".
+    decided_by: &'a str,
 }
 
 fn log_auto_approved(wisphive_dir: &std::path::Path, log: AutoApprovedLog<'_>) {
     let path = wisphive_dir.join("events.jsonl");
     let entry = serde_json::json!({
-        "event": "auto_approved",
+        "event": if log.event.is_empty() { "auto_approved" } else { log.event },
         "hook_event_name": log.event_type.to_string(),
         "tool_use_id": log.tool_use_id,
         "agent_id": log.agent_id,
@@ -1435,7 +1578,9 @@ fn log_auto_approved(wisphive_dir: &std::path::Path, log: AutoApprovedLog<'_>) {
         "project": log.project,
         "tool_name": log.tool_name,
         "tool_input": log.tool_input,
-        "timestamp": chrono::Utc::now().to_rfc3339()
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "decided_by": log.decided_by,
+        "config_hash": config_snapshot_hash(wisphive_dir),
     });
     let mut line = serde_json::to_string(&entry).unwrap_or_default();
     line.push('\n');
@@ -1636,6 +1781,92 @@ mod tests {
             &serde_json::Value::Null,
             dir.path()
         ));
+    }
+
+    #[test]
+    fn auto_approved_by_names_the_deciding_rule() {
+        // itr#397: the audit trail must record WHICH layer approved.
+        let dir = dir_with_config(serde_json::json!({
+            "auto_approve_level": "read",
+            "auto_approve_add": ["Bash"],
+            "tool_rules": {"Edit": {"allow_patterns": ["/tmp/scratch"], "deny_patterns": []}},
+        }));
+        assert_eq!(
+            auto_approved_by("Bash", &serde_json::Value::Null, dir.path()).as_deref(),
+            Some("auto_approve_add")
+        );
+        assert_eq!(
+            auto_approved_by("Read", &serde_json::Value::Null, dir.path()).as_deref(),
+            Some("level:read")
+        );
+        assert_eq!(
+            auto_approved_by(
+                "Edit",
+                &serde_json::json!({"file_path": "/tmp/scratch/x"}),
+                dir.path()
+            )
+            .as_deref(),
+            Some("tool_rules:Edit:allow_pattern")
+        );
+        // Not covered by anything → queued for a human, no rule.
+        assert_eq!(
+            auto_approved_by(
+                "Edit",
+                &serde_json::json!({"file_path": "/src/x"}),
+                dir.path()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn defer_classification_distinguishes_intrinsic_operator_and_dangerous_release() {
+        let dir = dir_with_config(serde_json::json!({
+            "auto_approve_level": "all",
+            "always_ask": ["HarmfulTool"],
+        }));
+        assert_eq!(
+            always_defer_classification("AskUserQuestion", dir.path()),
+            DeferClass::Intrinsic
+        );
+        assert_eq!(
+            always_defer_classification("HarmfulTool", dir.path()),
+            DeferClass::Operator
+        );
+        assert_eq!(
+            always_defer_classification("Bash", dir.path()),
+            DeferClass::No
+        );
+
+        // Dangerous posture releases operator entries — visibly (itr#397) —
+        // but never intrinsic prompts.
+        let dir = dir_with_config(serde_json::json!({
+            "auto_approve_level": "all",
+            "auto_approve_dangerous": true,
+            "always_ask": ["HarmfulTool"],
+        }));
+        assert_eq!(
+            always_defer_classification("HarmfulTool", dir.path()),
+            DeferClass::ReleasedByDangerous
+        );
+        assert_eq!(
+            always_defer_classification("AskUserQuestion", dir.path()),
+            DeferClass::Intrinsic
+        );
+    }
+
+    #[test]
+    fn config_snapshot_hash_tracks_config_content() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(config_snapshot_hash(dir.path()), None, "no config → None");
+
+        std::fs::write(dir.path().join("config.json"), "{\"a\":1}").unwrap();
+        let h1 = config_snapshot_hash(dir.path()).unwrap();
+        assert_eq!(h1.len(), 16);
+
+        std::fs::write(dir.path().join("config.json"), "{\"a\":2}").unwrap();
+        let h2 = config_snapshot_hash(dir.path()).unwrap();
+        assert_ne!(h1, h2, "different config content → different hash");
     }
 
     #[test]

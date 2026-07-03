@@ -57,6 +57,24 @@ enum Command {
         action: HistoryAction,
     },
 
+    /// Query the decision audit trail: who/what resolved each decision
+    /// (human, auto-approve tier, tool rule, always-defer, timeout, ...)
+    Audit {
+        /// Only decisions within this window (e.g. 1h, 30m, 2d)
+        #[arg(long)]
+        since: Option<String>,
+        /// Filter by project path (exact match)
+        #[arg(long)]
+        project: Option<String>,
+        /// Filter by deciding layer/rule (substring, e.g. "human", "level:",
+        /// "always_ask", "auto_approve_add", "timeout")
+        #[arg(long)]
+        decided_by: Option<String>,
+        /// Maximum entries to show
+        #[arg(long, default_value = "100")]
+        limit: u32,
+    },
+
     /// View or change daemon configuration
     Config {
         #[command(subcommand)]
@@ -506,6 +524,17 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             })
+        }
+
+        // Audit trail query (itr#397)
+        Command::Audit {
+            since,
+            project,
+            decided_by,
+            limit,
+        } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(commands::history::audit(since, project, decided_by, limit))
         }
 
         // Agent commands (need tokio runtime for socket communication)

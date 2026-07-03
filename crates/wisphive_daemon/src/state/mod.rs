@@ -35,6 +35,8 @@ type DecisionLogRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
+    Option<String>,
 );
 
 /// Row shape for pending_decisions lookups (8 columns).

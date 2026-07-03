@@ -50,10 +50,23 @@ fn send_and_recv(msg: &ClientMessage) -> Result<ServerMessage> {
     let encoded = wisphive_protocol::encode(msg)?;
     writer.write_all(encoded.as_bytes())?;
 
-    let mut response_line = String::new();
-    reader.read_line(&mut response_line)?;
-    let response: ServerMessage = wisphive_protocol::decode(&response_line)?;
-    Ok(response)
+    // The connection shares the daemon's broadcast fan-out, so unrelated
+    // events (AgentConnected, queue updates, alerts) can interleave before
+    // our response. Skip them — bounded so a chatty daemon can't hang us.
+    for _ in 0..256 {
+        let mut response_line = String::new();
+        if reader.read_line(&mut response_line)? == 0 {
+            anyhow::bail!("daemon closed the connection before responding");
+        }
+        let response: ServerMessage = wisphive_protocol::decode(&response_line)?;
+        match response {
+            ServerMessage::HistoryResponse { .. } | ServerMessage::Error { .. } => {
+                return Ok(response);
+            }
+            _ => continue,
+        }
+    }
+    anyhow::bail!("no response from daemon after 256 broadcast events")
 }
 
 /// Search the audit history.
@@ -68,7 +81,7 @@ pub async fn search(
         agent_id,
         tool_name: tool,
         limit: Some(limit),
-        request_id: None,
+        ..Default::default()
     };
 
     let response = send_and_recv(&ClientMessage::SearchHistory(search))?;
@@ -106,6 +119,77 @@ pub async fn recent(limit: u32, agent_id: Option<String>) -> Result<()> {
         _ => anyhow::bail!("unexpected response from daemon"),
     }
     Ok(())
+}
+
+/// Query the decision audit trail (itr#397): every decision with the
+/// layer/rule that resolved it (human, tier, tool rule, always-defer,
+/// timeout, ...) plus the config snapshot hash at decision time.
+pub async fn audit(
+    since: Option<String>,
+    project: Option<String>,
+    decided_by: Option<String>,
+    limit: u32,
+) -> Result<()> {
+    let since = since.map(|s| parse_since(&s)).transpose()?;
+    let search = HistorySearch {
+        limit: Some(limit),
+        since,
+        project,
+        decided_by,
+        ..Default::default()
+    };
+
+    let response = send_and_recv(&ClientMessage::SearchHistory(search))?;
+    let entries = match response {
+        ServerMessage::HistoryResponse { entries, .. } => entries,
+        ServerMessage::Error { message } => anyhow::bail!("audit query failed: {message}"),
+        _ => anyhow::bail!("unexpected response from daemon"),
+    };
+    if entries.is_empty() {
+        println!("No matching audit entries found.");
+        return Ok(());
+    }
+
+    println!(
+        "{:<20} {:<9} {:<34} {:<18} {:<10} DETAIL",
+        "TIME", "DECISION", "DECIDED-BY", "TOOL", "CONFIG"
+    );
+    println!("{}", "-".repeat(120));
+    for entry in &entries {
+        let decision = match entry.decision {
+            wisphive_protocol::Decision::Approve => "APPROVE",
+            wisphive_protocol::Decision::Deny => "DENY",
+            wisphive_protocol::Decision::Ask => "DEFER",
+        };
+        println!(
+            "{:<20} {:<9} {:<34} {:<18} {:<10} {}",
+            entry.resolved_at.format("%Y-%m-%d %H:%M:%S"),
+            decision,
+            // Pre-audit-trail rows have no attribution — say so rather than
+            // showing an empty cell.
+            entry.decided_by.as_deref().unwrap_or("(unattributed)"),
+            entry.tool_name,
+            entry.config_hash.as_deref().unwrap_or("-"),
+            extract_detail(entry),
+        );
+    }
+    Ok(())
+}
+
+/// Parse a human duration ("90s", "30m", "1h", "2d") into the cutoff instant.
+fn parse_since(s: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+    let (num, unit) = s.split_at(s.len().saturating_sub(1));
+    let n: i64 = num
+        .parse()
+        .with_context(|| format!("invalid --since value: {s} (use e.g. 90s, 30m, 1h, 2d)"))?;
+    let delta = match unit {
+        "s" => chrono::Duration::seconds(n),
+        "m" => chrono::Duration::minutes(n),
+        "h" => chrono::Duration::hours(n),
+        "d" => chrono::Duration::days(n),
+        other => anyhow::bail!("invalid --since unit: {other} (use s, m, h, or d)"),
+    };
+    Ok(chrono::Utc::now() - delta)
 }
 
 fn print_entries(entries: &[wisphive_protocol::HistoryEntry]) {

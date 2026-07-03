@@ -90,6 +90,17 @@ impl StateDb {
             .await
             .ok();
 
+        // Audit-trail columns (itr#397): which layer/rule resolved the
+        // decision, and the config.json snapshot hash at decision time.
+        sqlx::query("ALTER TABLE decision_log ADD COLUMN decided_by TEXT")
+            .execute(&self.pool)
+            .await
+            .ok();
+        sqlx::query("ALTER TABLE decision_log ADD COLUMN config_hash TEXT")
+            .execute(&self.pool)
+            .await
+            .ok();
+
         // Terminal session metadata
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS terminal_sessions (

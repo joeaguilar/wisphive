@@ -768,6 +768,8 @@ mod tests {
             tool_use_id: None,
             hook_event_name: None,
             terminal_session_id: None,
+            decided_by: Some("level:all".into()),
+            config_hash: None,
         };
         let msg = ServerMessage::HistoryResponse {
             entries: vec![entry],
@@ -918,6 +920,7 @@ mod tests {
             agent_id: None,
             limit: Some(10),
             request_id: Some("sh-1".into()),
+            ..Default::default()
         };
         let msg = ClientMessage::SearchHistory(search);
         let encoded = encode(&msg).unwrap();

@@ -276,15 +276,25 @@ pub async fn reimport_all(
     Ok(count)
 }
 
-/// Parse a single JSONL line and insert into decision_log as auto-approved.
+/// Parse a single JSONL line and insert into decision_log.
+///
+/// Handles the hook's non-human decision records (itr#397): `auto_approved`
+/// (decision approve), `deferred` (always-defer → decision ask), and `denied`
+/// (fail-closed paths → decision deny). Each carries `decided_by` (the
+/// layer/rule) and `config_hash` when the hook provided them.
 pub async fn ingest_line(line: &str, state_db: &StateDb) -> anyhow::Result<()> {
     let event: serde_json::Value = serde_json::from_str(line)?;
 
     let event_type = event.get("event").and_then(|v| v.as_str()).unwrap_or("");
-    if event_type != "auto_approved" {
-        debug!(event_type, "skipping non-auto-approved event");
-        return Ok(());
-    }
+    let decision = match event_type {
+        "auto_approved" => "approve",
+        "deferred" => "ask",
+        "denied" => "deny",
+        _ => {
+            debug!(event_type, "skipping non-decision event");
+            return Ok(());
+        }
+    };
 
     let agent_id = event
         .get("agent_id")
@@ -309,6 +319,8 @@ pub async fn ingest_line(line: &str, state_db: &StateDb) -> anyhow::Result<()> {
         .unwrap_or("");
     let tool_use_id = event.get("tool_use_id").and_then(|v| v.as_str());
     let hook_event_name = event.get("hook_event_name").and_then(|v| v.as_str());
+    let decided_by = event.get("decided_by").and_then(|v| v.as_str());
+    let config_hash = event.get("config_hash").and_then(|v| v.as_str());
 
     // Serialize agent_type as JSON string to match existing format
     let agent_type_json = format!("\"{}\"", agent_type);
@@ -323,10 +335,16 @@ pub async fn ingest_line(line: &str, state_db: &StateDb) -> anyhow::Result<()> {
             timestamp,
             tool_use_id,
             hook_event_name,
+            decision,
+            decided_by,
+            config_hash,
         })
         .await?;
 
-    debug!(tool_name, agent_id, "ingested auto-approved event");
+    debug!(
+        tool_name,
+        agent_id, decision, "ingested hook decision event"
+    );
     Ok(())
 }
 

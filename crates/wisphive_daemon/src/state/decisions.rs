@@ -15,7 +15,9 @@ type PendingRowWithTerm = (
     Option<String>,
 );
 
-/// Parameters for logging an auto-approved tool call.
+/// Parameters for logging a hook-resolved (non-human) decision from
+/// events.jsonl: an auto-approved tool call, an always-defer deferral, or a
+/// fail-closed denial.
 pub struct AutoApprovedEntry<'a> {
     pub agent_id: &'a str,
     pub agent_type: &'a str,
@@ -25,6 +27,12 @@ pub struct AutoApprovedEntry<'a> {
     pub timestamp: &'a str,
     pub tool_use_id: Option<&'a str>,
     pub hook_event_name: Option<&'a str>,
+    /// Bare decision word: "approve" (default), "ask", or "deny".
+    pub decision: &'a str,
+    /// The layer/rule that made the decision (itr#397), e.g. "level:all".
+    pub decided_by: Option<&'a str>,
+    /// Truncated SHA-256 of config.json at decision time.
+    pub config_hash: Option<&'a str>,
 }
 
 impl StateDb {
@@ -61,10 +69,25 @@ impl StateDb {
     }
 
     /// Remove a pending decision after resolution and log it.
+    ///
+    /// Shorthand for [`Self::resolve_pending_by`] with `decided_by: "human"` —
+    /// the daemon path exists to put a human in the loop, so callers that
+    /// don't say otherwise get the human attribution.
     pub async fn resolve_pending(
         &self,
         id: uuid::Uuid,
         decision: wisphive_protocol::Decision,
+    ) -> Result<()> {
+        self.resolve_pending_by(id, decision, "human").await
+    }
+
+    /// Remove a pending decision after resolution and log it, recording which
+    /// actor/rule resolved it (itr#397): "human", "timeout:approve", etc.
+    pub async fn resolve_pending_by(
+        &self,
+        id: uuid::Uuid,
+        decision: wisphive_protocol::Decision,
+        decided_by: &str,
     ) -> Result<()> {
         // Move from pending to log
         let row = sqlx::query_as::<_, PendingRowWithTerm>(
@@ -88,8 +111,8 @@ impl StateDb {
         )) = row
         {
             sqlx::query(
-                "INSERT OR IGNORE INTO decision_log (id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_use_id, hook_event_name, terminal_session_id)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO decision_log (id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_use_id, hook_event_name, terminal_session_id, decided_by)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(id.to_string())
             .bind(agent_id)
@@ -103,6 +126,7 @@ impl StateDb {
             .bind(tool_use_id)
             .bind(hook_event_name)
             .bind(terminal_session_id)
+            .bind(decided_by)
             .execute(&self.pool)
             .await?;
         }
@@ -128,7 +152,7 @@ impl StateDb {
             match agent_id {
                 Some(aid) => {
                     sqlx::query_as(
-                        "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id, hook_event_name, terminal_session_id
+                        "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id, hook_event_name, terminal_session_id, decided_by, config_hash
                          FROM decision_log WHERE agent_id = ? ORDER BY resolved_at DESC LIMIT ?",
                     )
                     .bind(aid)
@@ -138,7 +162,7 @@ impl StateDb {
                 }
                 None => {
                     sqlx::query_as(
-                        "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id, hook_event_name, terminal_session_id
+                        "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id, hook_event_name, terminal_session_id, decided_by, config_hash
                          FROM decision_log ORDER BY resolved_at DESC LIMIT ?",
                     )
                     .bind(limit)
@@ -238,6 +262,18 @@ impl StateDb {
             conditions.push("agent_id = ?".to_string());
             binds.push(aid.clone());
         }
+        if let Some(since) = search.since {
+            conditions.push("resolved_at >= ?".to_string());
+            binds.push(since.to_rfc3339());
+        }
+        if let Some(ref project) = search.project {
+            conditions.push("project = ?".to_string());
+            binds.push(project.clone());
+        }
+        if let Some(ref rule) = search.decided_by {
+            conditions.push("decided_by LIKE '%' || ? || '%'".to_string());
+            binds.push(rule.clone());
+        }
 
         let where_clause = if conditions.is_empty() {
             "1=1".to_string()
@@ -246,7 +282,7 @@ impl StateDb {
         };
 
         let sql = format!(
-            "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id, hook_event_name, terminal_session_id
+            "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id, hook_event_name, terminal_session_id, decided_by, config_hash
              FROM decision_log WHERE {} ORDER BY resolved_at DESC LIMIT ?",
             where_clause
         );
@@ -289,10 +325,17 @@ impl StateDb {
             ])
             .to_string()
         };
+        // `decision` is stored as a JSON-encoded string to match the rows
+        // resolve_pending writes. auto_approved=1 only for actual approvals —
+        // deferrals/denials are audit rows, not approvals.
+        let decision = match entry.decision {
+            "" => "approve",
+            other => other,
+        };
         sqlx::query(
             "INSERT OR IGNORE INTO decision_log
-             (id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, auto_approved, tool_use_id, hook_event_name)
-             VALUES (?, ?, ?, ?, ?, ?, '\"approve\"', ?, ?, 1, ?, ?)",
+             (id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, auto_approved, tool_use_id, hook_event_name, decided_by, config_hash)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(entry.agent_id)
@@ -300,10 +343,14 @@ impl StateDb {
         .bind(entry.project)
         .bind(entry.tool_name)
         .bind(entry.tool_input)
+        .bind(format!("\"{decision}\""))
         .bind(entry.timestamp)
         .bind(entry.timestamp)
+        .bind(i64::from(decision == "approve"))
         .bind(entry.tool_use_id)
         .bind(entry.hook_event_name.unwrap_or("PreToolUse"))
+        .bind(entry.decided_by)
+        .bind(entry.config_hash)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -328,6 +375,8 @@ pub(super) fn rows_to_entries(rows: Vec<DecisionLogRow>) -> Vec<wisphive_protoco
                 tool_use_id,
                 hook_event_name,
                 terminal_session_id,
+                decided_by,
+                config_hash,
             )| {
                 Some(wisphive_protocol::HistoryEntry {
                     id: id.parse().ok()?,
@@ -350,6 +399,8 @@ pub(super) fn rows_to_entries(rows: Vec<DecisionLogRow>) -> Vec<wisphive_protoco
                     terminal_session_id: terminal_session_id
                         .as_deref()
                         .and_then(|s| uuid::Uuid::parse_str(s).ok()),
+                    decided_by,
+                    config_hash,
                 })
             },
         )

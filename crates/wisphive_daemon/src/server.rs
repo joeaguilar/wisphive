@@ -495,19 +495,22 @@ async fn handle_hook(
                 q.enqueue(req)
             };
 
-            // Block until TUI responds or timeout
+            // Block until TUI responds or timeout. `decided_by` records the
+            // resolving actor for the audit trail (itr#397) — the fallback
+            // approvals are non-human decisions and must be attributed as such.
             let timeout_secs = ctx.hook_timeout_secs;
-            let rich = match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
-                Ok(Ok(rich)) => rich,
-                Ok(Err(_)) => {
-                    warn!(%id, "decision channel dropped, defaulting to approve");
-                    RichDecision::approve()
-                }
-                Err(_) => {
-                    warn!(%id, "hook timed out after {timeout_secs}s, defaulting to approve");
-                    RichDecision::approve()
-                }
-            };
+            let (rich, decided_by) =
+                match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
+                    Ok(Ok(rich)) => (rich, "human"),
+                    Ok(Err(_)) => {
+                        warn!(%id, "decision channel dropped, defaulting to approve");
+                        (RichDecision::approve(), "channel_dropped:approve")
+                    }
+                    Err(_) => {
+                        warn!(%id, "hook timed out after {timeout_secs}s, defaulting to approve");
+                        (RichDecision::approve(), "timeout:approve")
+                    }
+                };
 
             // Persist auto-approve if requested (blocking file I/O off the runtime)
             if rich.always_allow {
@@ -524,7 +527,9 @@ async fn handle_hook(
 
             // Log resolution (skip audit log for Ask/defer decisions)
             if rich.decision != Decision::Ask {
-                ctx.state_db.resolve_pending(id, rich.decision).await?;
+                ctx.state_db
+                    .resolve_pending_by(id, rich.decision, decided_by)
+                    .await?;
             }
 
             // Touch last_seen (agent stays registered, reaped on inactivity)
@@ -558,9 +563,7 @@ async fn handle_hook(
             // ephemeral hook connection.
             let state_db = ctx.state_db.clone();
             tokio::spawn(async move {
-                match attach_tool_result_with_retry(&state_db, &result, ATTACH_RETRY_DELAYS)
-                    .await
-                {
+                match attach_tool_result_with_retry(&state_db, &result, ATTACH_RETRY_DELAYS).await {
                     Ok(Some(id)) => {
                         info!(%id, tool = %result.tool_name, agent = %result.agent_id, "tool result attached");
                     }
@@ -1782,9 +1785,9 @@ fn peer_uid_allowed(peer_uid: u32, daemon_uid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONN_CHANNEL_CAPACITY, MAX_LINE_BYTES, attach_tool_result_with_retry,
-        partition_sudo_gated, peer_uid_allowed, persist_auto_approve, read_capped_line,
-        set_socket_permissions, sweep_stale_session_markers,
+        CONN_CHANNEL_CAPACITY, MAX_LINE_BYTES, attach_tool_result_with_retry, partition_sudo_gated,
+        peer_uid_allowed, persist_auto_approve, read_capped_line, set_socket_permissions,
+        sweep_stale_session_markers,
     };
     use tokio::io::BufReader;
 
