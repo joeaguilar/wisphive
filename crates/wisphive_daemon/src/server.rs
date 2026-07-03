@@ -464,10 +464,9 @@ async fn handle_hook(
             let id = req.id;
             let agent_id = req.agent_id.clone();
             let req_tool_name = req.tool_name.clone();
-            let config_home = std::env::var("HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
-                .join(".wisphive");
+            // The daemon's configured state root, not a fresh $HOME lookup —
+            // they diverge when the daemon runs with a non-default home (itr#360).
+            let config_home = ctx.home_dir.clone();
 
             // Register agent and broadcast to TUI clients (only if new)
             let (agent_info, is_new) = {
@@ -510,11 +509,17 @@ async fn handle_hook(
                 }
             };
 
-            // Persist auto-approve if requested
-            if rich.always_allow
-                && let Err(e) = persist_auto_approve(&req_tool_name, &config_home)
-            {
-                warn!("failed to persist auto-approve: {e}");
+            // Persist auto-approve if requested (blocking file I/O off the runtime)
+            if rich.always_allow {
+                let tool = req_tool_name.clone();
+                let persisted =
+                    tokio::task::spawn_blocking(move || persist_auto_approve(&tool, &config_home))
+                        .await;
+                match persisted {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!("failed to persist auto-approve: {e}"),
+                    Err(e) => warn!("persist auto-approve task panicked: {e}"),
+                }
             }
 
             // Log resolution (skip audit log for Ask/defer decisions)
@@ -1612,12 +1617,50 @@ async fn handle_terminal_command(
     Ok(())
 }
 
-/// Add a tool to the auto-approve list in ~/.wisphive/auto-approve.json.
+/// Persist an "Always Allow" choice so the hook honors it on the next call.
+///
+/// Writes `auto_approve_add` in ~/.wisphive/config.json via an atomic raw-JSON
+/// read-modify-write (unknown keys survive), because the hook stops consulting
+/// the legacy auto-approve.json as soon as config.json carries a parseable
+/// `auto_approve_level` (itr#360). The tool is also dropped from
+/// `auto_approve_remove`, which the hook checks first and which would otherwise
+/// veto the addition. Falls back to the legacy file only when config.json is
+/// absent; a corrupt config.json refuses the update rather than clobbering it
+/// (itr#308).
 fn persist_auto_approve(tool_name: &str, wisphive_dir: &std::path::Path) -> Result<()> {
+    let config_path = wisphive_dir.join("config.json");
+    if config_path.exists() {
+        crate::config::update_config_json(&config_path, |obj| {
+            let add = obj
+                .entry("auto_approve_add")
+                .or_insert(serde_json::json!([]));
+            if let Some(arr) = add.as_array_mut()
+                && !arr.iter().any(|v| v.as_str() == Some(tool_name))
+            {
+                arr.push(serde_json::Value::String(tool_name.to_string()));
+            }
+            if let Some(arr) = obj
+                .get_mut("auto_approve_remove")
+                .and_then(|v| v.as_array_mut())
+            {
+                arr.retain(|v| v.as_str() != Some(tool_name));
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("config.json: {e}"))?;
+        info!(tool = tool_name, "added to auto_approve_add in config.json");
+        return Ok(());
+    }
+
+    // No config.json — the hook is on the legacy/defaults path, so the legacy
+    // file is what it will actually read.
     let path = wisphive_dir.join("auto-approve.json");
     let mut config: serde_json::Value = if path.exists() {
         let content = std::fs::read_to_string(&path)?;
-        serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
+        // A corrupt legacy file is refused, not silently replaced with `{}`
+        // and rewritten (itr#308).
+        serde_json::from_str(&content).map_err(|e| {
+            anyhow::anyhow!("auto-approve.json is not valid JSON ({e}); refusing to overwrite it")
+        })?
     } else {
         serde_json::json!({})
     };
@@ -1632,10 +1675,10 @@ fn persist_auto_approve(tool_name: &str, wisphive_dir: &std::path::Path) -> Resu
 
     if !arr.iter().any(|v| v.as_str() == Some(tool_name)) {
         arr.push(serde_json::Value::String(tool_name.to_string()));
-        info!(tool = tool_name, "added to auto-approve list");
+        info!(tool = tool_name, "added to legacy auto-approve list");
     }
 
-    std::fs::write(&path, serde_json::to_string_pretty(&config)?)?;
+    crate::config::write_config_atomic(&path, &serde_json::to_string_pretty(&config)?)?;
     Ok(())
 }
 
@@ -1698,9 +1741,94 @@ fn peer_uid_allowed(peer_uid: u32, daemon_uid: u32) -> bool {
 mod tests {
     use super::{
         CONN_CHANNEL_CAPACITY, MAX_LINE_BYTES, partition_sudo_gated, peer_uid_allowed,
-        read_capped_line, set_socket_permissions, sweep_stale_session_markers,
+        persist_auto_approve, read_capped_line, set_socket_permissions,
+        sweep_stale_session_markers,
     };
     use tokio::io::BufReader;
+
+    #[test]
+    fn always_allow_writes_config_json_when_present() {
+        // itr#360: once config.json carries an auto_approve_level, the hook
+        // never consults the legacy auto-approve.json — 'Always Allow' must
+        // land in config.json's auto_approve_add or it does nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        std::fs::write(
+            &config_path,
+            serde_json::json!({
+                "auto_approve_level": "read",
+                "auto_approve_remove": ["Bash"],
+                "tool_rules": {"Bash": {"deny_patterns": ["sudo"], "allow_patterns": []}},
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        persist_auto_approve("Bash", dir.path()).unwrap();
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(after["auto_approve_add"][0], "Bash");
+        // The removal veto is lifted, or the addition would be dead on arrival.
+        assert!(after["auto_approve_remove"].as_array().unwrap().is_empty());
+        // Untouched keys survive the read-modify-write.
+        assert_eq!(after["tool_rules"]["Bash"]["deny_patterns"][0], "sudo");
+        assert_eq!(after["auto_approve_level"], "read");
+        // The legacy file is NOT created on this path.
+        assert!(!dir.path().join("auto-approve.json").exists());
+    }
+
+    #[test]
+    fn always_allow_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        std::fs::write(&config_path, "{}").unwrap();
+
+        persist_auto_approve("Edit", dir.path()).unwrap();
+        persist_auto_approve("Edit", dir.path()).unwrap();
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(after["auto_approve_add"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn always_allow_falls_back_to_legacy_file_when_config_absent() {
+        // No config.json → the hook is on the legacy/defaults path, so the
+        // legacy file is the one it will actually read.
+        let dir = tempfile::tempdir().unwrap();
+
+        persist_auto_approve("Bash", dir.path()).unwrap();
+
+        let legacy: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("auto-approve.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(legacy["auto_approve"][0], "Bash");
+        assert!(!dir.path().join("config.json").exists());
+    }
+
+    #[test]
+    fn always_allow_refuses_corrupt_config_json() {
+        // itr#308: never rewrite a corrupt config from a lossy fallback.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        std::fs::write(&config_path, "{ broken").unwrap();
+
+        persist_auto_approve("Bash", dir.path()).expect_err("corrupt config.json must refuse");
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), "{ broken");
+    }
+
+    #[test]
+    fn always_allow_refuses_corrupt_legacy_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("auto-approve.json");
+        std::fs::write(&legacy_path, "not json").unwrap();
+
+        persist_auto_approve("Bash", dir.path())
+            .expect_err("corrupt auto-approve.json must refuse");
+        assert_eq!(std::fs::read_to_string(&legacy_path).unwrap(), "not json");
+    }
 
     fn ids(items: &[(uuid::Uuid, String)]) -> Vec<uuid::Uuid> {
         items.iter().map(|(id, _)| *id).collect()

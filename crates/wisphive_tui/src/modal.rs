@@ -294,7 +294,7 @@ impl Modal {
         Self {
             title: "Always Allow".into(),
             body: format!(
-                "Always allow \"{tool_name}\"?\nThis adds it to ~/.wisphive/auto-approve.json\n\n  Y = always allow  |  N / Esc = cancel"
+                "Always allow \"{tool_name}\"?\nThis adds it to auto_approve_add in ~/.wisphive/config.json\n\n  Y = always allow  |  N / Esc = cancel"
             ),
             action: ModalAction::AlwaysAllow,
             target_id: Some(id),
