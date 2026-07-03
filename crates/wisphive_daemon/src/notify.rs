@@ -30,9 +30,11 @@ pub fn notify_decision(req: &DecisionRequest) {
         wisphive_protocol::HookEventType::TaskCompleted => "Wisphive: task completed".into(),
         _ => format!("Wisphive: {} needs approval", req.tool_name),
     };
+    // Notifications render on the lock screen — never show a live secret
+    // there (itr#89).
     let body = format!(
         "{}\n\nProject: {} ({})",
-        tool_input_summary(req),
+        wisphive_protocol::redact::redact_text(&tool_input_summary(req)),
         project_name,
         req.agent_id
     );

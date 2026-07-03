@@ -52,6 +52,35 @@ async fn persist_and_resolve_pending() {
 }
 
 #[tokio::test]
+async fn persisted_rows_and_results_are_redacted() {
+    // itr#89: secrets in tool_input/tool_result must never reach disk.
+    let db = test_db().await;
+    let mut req = make_request_with_tool_use_id("Bash", "cc-1", "sec-1");
+    req.tool_input = serde_json::json!({"command": "export API_KEY=sk-abc123def456 && deploy"});
+    let id = req.id;
+
+    db.persist_pending(&req).await.unwrap();
+    db.resolve_pending(id, Decision::Approve).await.unwrap();
+    db.attach_tool_result(
+        "cc-1",
+        "Bash",
+        &serde_json::json!({"output": "GITHUB_TOKEN=ghp_zzzzzzzzzzzz exported"}),
+        Some("sec-1"),
+    )
+    .await
+    .unwrap();
+
+    let history = db.query_history(None, 10).await.unwrap();
+    assert_eq!(history.len(), 1);
+    let dump = serde_json::to_string(&history[0]).unwrap();
+    assert!(!dump.contains("sk-abc123"), "secret survived in tool_input");
+    assert!(!dump.contains("ghp_zzzz"), "secret survived in tool_result");
+    assert!(dump.contains("***REDACTED***"));
+    // Non-secret context is preserved for the audit reader.
+    assert!(dump.contains("deploy"));
+}
+
+#[tokio::test]
 async fn persist_pending_never_overwrites_an_existing_row() {
     // itr#370: the id is hook-supplied; a colliding second request must not
     // rewrite the victim's persisted row (was INSERT OR REPLACE).

@@ -1577,7 +1577,9 @@ fn log_auto_approved(wisphive_dir: &std::path::Path, log: AutoApprovedLog<'_>) {
         "agent_type": log.agent_type.to_string(),
         "project": log.project,
         "tool_name": log.tool_name,
-        "tool_input": log.tool_input,
+        // events.jsonl is durable (ingested into decision_log, archived) —
+        // scrub credentials before they leave the hook (itr#89).
+        "tool_input": wisphive_protocol::redact::redact_value(log.tool_input),
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "decided_by": log.decided_by,
         "config_hash": config_snapshot_hash(wisphive_dir),

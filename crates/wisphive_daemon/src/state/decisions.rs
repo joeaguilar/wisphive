@@ -39,14 +39,17 @@ impl StateDb {
     /// Persist a pending decision for crash recovery.
     pub async fn persist_pending(&self, req: &wisphive_protocol::DecisionRequest) -> Result<()> {
         // For events without tool_input (Stop, ConfigChange, etc.), store event_data instead
+        // Secrets are scrubbed before anything touches disk (itr#89): this
+        // row is the source for decision_log, the JSONL archive, and history
+        // queries. The live in-memory queue keeps the full input for review.
         let stored_input = if req.tool_input.is_null() {
             if let Some(ref data) = req.event_data {
-                data.clone()
+                wisphive_protocol::redact::redact_value(data)
             } else {
                 req.tool_input.clone()
             }
         } else {
-            req.tool_input.clone()
+            wisphive_protocol::redact::redact_value(&req.tool_input)
         };
 
         // INSERT OR IGNORE (itr#370): the id is hook-supplied, so a colliding
@@ -201,7 +204,10 @@ impl StateDb {
         tool_result: &serde_json::Value,
         tool_use_id: Option<&str>,
     ) -> Result<Option<uuid::Uuid>> {
-        let result_json = serde_json::to_string(tool_result)?;
+        // Tool responses carry file contents / command output that routinely
+        // include credentials — scrub before persisting (itr#89).
+        let result_json =
+            serde_json::to_string(&wisphive_protocol::redact::redact_value(tool_result))?;
 
         // Try exact match by tool_use_id first
         if let Some(tui) = tool_use_id {
