@@ -85,6 +85,13 @@ Idle → Spawned → Running → Stopped → Verifying ─green→ Complete│
 - The gate runs **in the supervisor, not the agent** — the agent cannot skip it, and its
   output is evidence the agent never authored. (Agents may run the same command themselves
   mid-work; only the supervisor's run counts.)
+- **Gate integrity is a separate, unsolved problem (see ADR-0007).** Supervisor-side
+  execution stops the agent *skipping* the gate; it does not stop the agent *neutering* it
+  by editing the tests, the `justfile`, or `.cargo/config` in the same repo it is working
+  in. A green gate means "the gate as the agent left it passed," not "the work is correct."
+  Closing this needs the gate definition + corpus in agent-unwritable scope, or a review of
+  the diff touching gate-adjacent files — tracked as an open question below. Until then the
+  human diff-review remains the real correctness gate.
 - Captured per run: exit code, duration, last N lines of stderr/stdout (default 100),
   and — when the command is a `gatr run` — the gatr log path.
 - Gate output feeds the next prompt on red. The exact re-prompt template is dogfood-gated
@@ -149,6 +156,11 @@ Run ≥2 real campaigns (blitz or proof-campaign) gated by wisphive; mine the au
 6. **Budget defaults** — are 5 iterations / 1h the right rails for real work?
 7. **Multi-loop scheduling** — serialize loops per project, or lean on the conflict gate
    once it exists?
+8. **Gate integrity** (ADR-0007) — how to stop the agent neutering its own verify gate
+   (editing tests/`justfile`/`.cargo`): gate definition + corpus in agent-unwritable scope,
+   a hash/allowlist of gate-adjacent files checked before accepting green, or a mandatory
+   human diff-review of those files? Until answered, "Complete" is gate-green-as-left, and
+   the human diff-review is the real correctness gate.
 
 ## Implementation order (post-dogfood)
 

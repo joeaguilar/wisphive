@@ -264,10 +264,20 @@ disagree, this section wins.
 A **conflict** exists when a Write/Edit/NotebookEdit request's normalized path equals the
 normalized path of (a) an unexpired claim held by a *different claim key*, or (b) another
 **pending** request in the queue from a different claim key (see S3, Race A). Equality is
-canonical-path equality only — no directory or prefix containment in v1. The **claim key**
-is `agent_id`; note that distinct subagents of one orchestrating session carry distinct
-ids, so an agent's own fan-out conflicts with itself — that is a feature, not a bug (it is
-exactly the parallel-blitz case this gate exists for).
+canonical-path equality only — no directory or prefix containment in v1.
+
+**The claim key must be a daemon-assigned connection identity, NOT the agent-supplied
+`agent_id`.** The threat model (shared with ADR-0005 I5) holds that the agent authors its
+own `agent_id`; if the key were `agent_id`, a second agent could set its `agent_id` equal
+to the claim holder's, collide the key, and write the same file with *no conflict detected*
+— a silent interleave, which is exactly the under-claim S2 forbids. Key instead on the
+identity the daemon assigns to each accepted hook connection (the per-connection handle in
+the registry). Two writes conflict if and only if they arrive on *different daemon
+connections* to the same path. The desirable subagent behavior still holds — distinct subagents connect on
+distinct hook connections, so an orchestrator's own fan-out conflicts with itself (the
+parallel-blitz case this gate exists for) — but it no longer rests on a spoofable field.
+`agent_id`/project remain on the claim as **display** metadata for the TUI banner; they
+never gate.
 
 **Known blind spots, accepted and documented, not silently shipped:** Bash file mutations
 (`sed -i`, `mv`, `rm`, `>`) are invisible to the gate in v1 (only the three structured

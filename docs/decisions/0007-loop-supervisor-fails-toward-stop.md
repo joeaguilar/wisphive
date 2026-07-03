@@ -33,8 +33,17 @@ Stopped-and-loud beats running-and-blind wherever no human is in the loop by des
 
 ## Consequences
 
-- Easier: loop states are trustworthy — a Complete loop always means the supervisor's own
-  gate run exited zero; incident forensics reduce to reading the audit stream.
+- Easier: loop states are trustworthy *about what they actually claim* — a Complete loop
+  means the supervisor's own gate run exited zero, nothing more. It does **not** mean the
+  work is correct: the agent has write access to the project (that is where it does the
+  engineering), so it can weaken the gate itself — edit the tests, the `justfile`, or
+  `.cargo/config` — until `cargo test` passes trivially. Running the gate in the supervisor
+  closes the *skip-the-gate* hole, not the *neuter-the-gate* hole. Trustworthy loop states
+  therefore require the gate definition to live outside agent-writable scope (a gate
+  command and its test corpus the agent cannot edit, or a diff-review step on gate-adjacent
+  files); until that exists, "Complete" is "the gate as the agent left it went green,"
+  which is why a human still reviews the diff. Incident forensics reduce to reading the
+  audit stream.
 - Harder / costs: transient supervisor errors (e.g. a gate binary briefly missing) kill
   loops that could have survived a retry; operators of long unattended runs must watch
   for Abort notifications. A bounded internal retry for the gate *spawn* (not the gate

