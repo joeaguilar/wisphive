@@ -15,6 +15,15 @@ interface Config {
   auto_approve_remove?: string[];
 }
 
+// PUT /api/config is a merge patch (itr#358): only the keys present in the
+// body change; `null` deletes a key; everything else in config.json
+// (tool_rules, event toggles, retention knobs) survives untouched.
+interface ConfigPatch {
+  auto_approve_level: Level;
+  auto_approve_add: string[] | null;
+  auto_approve_remove: string[] | null;
+}
+
 function getToolStatus(tool: string, level: Level, add: string[], remove: string[], levelTools: Record<string, string[]>): { auto: boolean; source: string } {
   const isRemoved = remove.includes(tool);
   const isAdded = add.includes(tool);
@@ -67,16 +76,16 @@ export function ConfigView() {
   useEffect(() => { loadConfig(); }, [loadConfig]);
 
   const saveConfig = useCallback(async (newLevel: Level, newAdd: string[], newRemove: string[]) => {
-    const config: Config = {
+    const patch: ConfigPatch = {
       auto_approve_level: newLevel,
-      auto_approve_add: newAdd.length > 0 ? newAdd : undefined,
-      auto_approve_remove: newRemove.length > 0 ? newRemove : undefined,
+      auto_approve_add: newAdd.length > 0 ? newAdd : null,
+      auto_approve_remove: newRemove.length > 0 ? newRemove : null,
     };
     try {
       await apiFetch(`/api/config`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(config),
+        body: JSON.stringify(patch),
       });
     } catch (e) {
       console.warn("Failed to save config:", e);

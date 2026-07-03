@@ -175,7 +175,14 @@ async fn get_tool_tiers() -> Response {
     axum::Json(wisphive_protocol::ToolTiers::current()).into_response()
 }
 
-/// PUT /api/config — write config.json
+/// PUT /api/config — merge-patch config.json.
+///
+/// The body is applied as an RFC 7386-style JSON merge patch onto the current
+/// file: keys present in the body are set (or deleted when `null`), every
+/// other key survives untouched. A partial body — the SPA sends only the
+/// auto-approve keys — can therefore never wipe tool_rules, event toggles, or
+/// retention knobs the way a full-file replace did (itr#358). A corrupt
+/// existing file refuses the update instead of being clobbered (itr#308).
 async fn put_config(
     axum::extract::State(state): axum::extract::State<AppState>,
     client_ip: ClientIp,
@@ -189,7 +196,31 @@ async fn put_config(
     if let Err(reason) = validate_config_json(&parsed) {
         return (axum::http::StatusCode::BAD_REQUEST, reason).into_response();
     }
-    match write_config_atomic(&state.config_path, &body) {
+
+    let current: serde_json::Value = match std::fs::read_to_string(&state.config_path) {
+        Ok(content) => match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => {
+                return (
+                    axum::http::StatusCode::CONFLICT,
+                    "existing config.json is not valid JSON; refusing to overwrite it — fix or remove the file on disk",
+                )
+                    .into_response();
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("read failed: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    let merged = json_merge_patch(current, parsed);
+    let merged_body = serde_json::to_string_pretty(&merged).unwrap_or_else(|_| "{}".into());
+    match write_config_atomic(&state.config_path, &merged_body) {
         Ok(_) => {
             let _ = state
                 .security
@@ -211,17 +242,49 @@ async fn put_config(
     }
 }
 
+/// Apply `patch` to `target` as an RFC 7386 JSON merge patch: objects merge
+/// recursively, `null` deletes a key, any other value replaces.
+fn json_merge_patch(target: serde_json::Value, patch: serde_json::Value) -> serde_json::Value {
+    match patch {
+        serde_json::Value::Object(patch_obj) => {
+            let mut target_obj = match target {
+                serde_json::Value::Object(obj) => obj,
+                _ => serde_json::Map::new(),
+            };
+            for (key, value) in patch_obj {
+                if value.is_null() {
+                    target_obj.remove(&key);
+                } else {
+                    let existing = target_obj.remove(&key).unwrap_or(serde_json::Value::Null);
+                    target_obj.insert(key, json_merge_patch(existing, value));
+                }
+            }
+            serde_json::Value::Object(target_obj)
+        }
+        other => other,
+    }
+}
+
+/// Validate a config merge patch. Every documented ~/.wisphive/config.json key
+/// must be accepted here — a faithful round-trip of a real config must never
+/// 400 (itr#358). `null` is always allowed (merge-patch key deletion).
 fn validate_config_json(value: &serde_json::Value) -> Result<(), &'static str> {
     let Some(obj) = value.as_object() else {
         return Err("config must be a JSON object");
     };
 
     for (key, value) in obj {
+        if value.is_null() {
+            // Merge-patch deletion of the key.
+            continue;
+        }
         match key.as_str() {
             "notifications"
             | "auto_approve_stop"
             | "auto_approve_user_prompt"
-            | "auto_approve_config_change" => {
+            | "auto_approve_config_change"
+            | "auto_approve_lifecycle"
+            | "auto_approve_dangerous" => {
                 if !value.is_boolean() {
                     return Err("boolean config value must be true or false");
                 }
@@ -230,7 +293,10 @@ fn validate_config_json(value: &serde_json::Value) -> Result<(), &'static str> {
             | "agent_timeout_secs"
             | "retention_max_rows"
             | "retention_max_age_days"
-            | "log_retention_days" => {
+            | "log_retention_days"
+            | "retention_vacuum_max_mb"
+            | "archive_alert_max_mb"
+            | "disk_alert_free_mb" => {
                 if value.as_u64().is_none() {
                     return Err("numeric config value must be an unsigned integer");
                 }
@@ -246,12 +312,16 @@ fn validate_config_json(value: &serde_json::Value) -> Result<(), &'static str> {
                     return Err("auto_approve_level is invalid");
                 }
             }
-            "auto_approve_add" | "auto_approve_remove" | "auto_approve" => {
+            "auto_approve_add"
+            | "auto_approve_remove"
+            | "auto_approve"
+            | "always_ask"
+            | "always_ask_remove" => {
                 let Some(items) = value.as_array() else {
-                    return Err("auto-approve tool lists must be arrays");
+                    return Err("tool-name lists must be arrays");
                 };
                 if !items.iter().all(|item| item.as_str().is_some()) {
-                    return Err("auto-approve tool lists must contain only strings");
+                    return Err("tool-name lists must contain only strings");
                 }
             }
             "tool_rules" => {

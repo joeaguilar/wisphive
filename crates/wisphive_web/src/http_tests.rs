@@ -258,10 +258,12 @@ async fn api_config_put_writes_0600_config_atomically() {
 
     let (status, _) = run_with(state.clone(), r).await;
     assert_eq!(status, StatusCode::OK);
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state.config_path).unwrap()).unwrap();
     assert_eq!(
-        std::fs::read_to_string(&state.config_path).unwrap(),
-        body,
-        "handler should persist the validated JSON body exactly"
+        written,
+        serde_json::json!({"auto_approve_level": "read", "notifications": true}),
+        "handler should persist the validated patch"
     );
     let mode = std::fs::metadata(&state.config_path)
         .unwrap()
@@ -275,6 +277,97 @@ async fn api_config_put_writes_0600_config_atomically() {
     assert_eq!(audit[0].device_id.as_deref(), Some(device_id.as_str()));
     assert_eq!(audit[0].ip.as_deref(), Some("127.0.0.1"));
     drop(tmp);
+}
+
+#[tokio::test]
+async fn api_config_put_merges_instead_of_replacing() {
+    // itr#358: a partial PUT body (the SPA sends only the auto-approve keys)
+    // must not wipe tool_rules / event toggles / retention knobs. The handler
+    // is a merge patch: only keys present in the body change; `null` deletes.
+    let (_tmp, state) = test_state().await;
+    let (token, _id) = seed_device(state.security.state_db(), "laptop").await;
+    std::fs::write(
+        &state.config_path,
+        serde_json::json!({
+            "auto_approve_level": "read",
+            "auto_approve_remove": ["Bash"],
+            "tool_rules": {"Bash": {"deny_patterns": ["rm -rf"], "allow_patterns": []}},
+            "auto_approve_user_prompt": false,
+            "retention_vacuum_max_mb": 512,
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let r = req("PUT", "/api/config")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"auto_approve_level":"all","auto_approve_remove":null}"#,
+        ))
+        .unwrap();
+    let (status, _) = run_with(state.clone(), r).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state.config_path).unwrap()).unwrap();
+    assert_eq!(after["auto_approve_level"], "all");
+    assert!(after.get("auto_approve_remove").is_none(), "null deletes");
+    // Every key the patch didn't mention survives — including security rules.
+    assert_eq!(after["tool_rules"]["Bash"]["deny_patterns"][0], "rm -rf");
+    assert_eq!(after["auto_approve_user_prompt"], false);
+    assert_eq!(after["retention_vacuum_max_mb"], 512);
+}
+
+#[tokio::test]
+async fn api_config_put_accepts_all_documented_keys() {
+    // itr#358: a faithful round-trip of a real config.json (retention knobs,
+    // alert thresholds, posture, always-ask lists) must not 400.
+    let (_tmp, state) = test_state().await;
+    let (token, _id) = seed_device(state.security.state_db(), "laptop").await;
+    let body = serde_json::json!({
+        "auto_approve_level": "all",
+        "auto_approve_dangerous": false,
+        "auto_approve_lifecycle": true,
+        "always_ask": ["DangerTool"],
+        "always_ask_remove": [],
+        "retention_vacuum_max_mb": 256,
+        "archive_alert_max_mb": 10240,
+        "disk_alert_free_mb": 10240,
+    });
+    let r = req("PUT", "/api/config")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, resp_body) = run_with(state, r).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "rejected: {}",
+        String::from_utf8_lossy(&resp_body)
+    );
+}
+
+#[tokio::test]
+async fn api_config_put_refuses_to_clobber_corrupt_file() {
+    // itr#308: a corrupt config.json on disk refuses the update (409) instead
+    // of being silently replaced by the merge result.
+    let (_tmp, state) = test_state().await;
+    let (token, _id) = seed_device(state.security.state_db(), "laptop").await;
+    std::fs::write(&state.config_path, "{ corrupt !!").unwrap();
+
+    let r = req("PUT", "/api/config")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"auto_approve_level":"read"}"#))
+        .unwrap();
+    let (status, _) = run_with(state.clone(), r).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        std::fs::read_to_string(&state.config_path).unwrap(),
+        "{ corrupt !!"
+    );
 }
 
 #[tokio::test]
