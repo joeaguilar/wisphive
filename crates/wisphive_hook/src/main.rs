@@ -378,10 +378,31 @@ fn format_and_exit(resp: &HookResponse) -> i32 {
         }
         Unknown => return format_unknown_event_response(resp),
     }
+    let (json, exit_code) = pre_tool_use_stdout(resp);
+    if let Some(json) = json {
+        print!("{}", json);
+    }
+    exit_code
+}
+
+/// Build the PreToolUse stdout JSON (if any) and exit code for a decision.
+/// Pure so the agent-specific decision mapping is unit-testable.
+fn pre_tool_use_stdout(resp: &HookResponse) -> (Option<serde_json::Value>, i32) {
     match resp.decision {
         Decision::Ask => {
             if resp.agent_type == AgentType::Codex {
-                return 0;
+                // Codex has no native PreToolUse prompt to defer to (it uses
+                // PermissionRequest for native approvals), so "ask" cannot be
+                // expressed — and exit 0 with empty stdout would be a silent
+                // approve. Fail closed with a reason instead (itr#366).
+                let json = serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": "Wisphive cannot defer to a native prompt on Codex; re-run after explicit approval in the Wisphive TUI/web UI."
+                    }
+                });
+                return (Some(json), 0);
             }
             // Defer to native prompt
             let json = serde_json::json!({
@@ -390,8 +411,7 @@ fn format_and_exit(resp: &HookResponse) -> i32 {
                     "permissionDecision": "ask"
                 }
             });
-            print!("{}", json);
-            0
+            (Some(json), 0)
         }
         Decision::Deny => {
             if let Some(ref msg) = resp.message {
@@ -403,10 +423,9 @@ fn format_and_exit(resp: &HookResponse) -> i32 {
                         "permissionDecisionReason": msg
                     }
                 });
-                print!("{}", json);
-                0 // exit 0 because JSON controls behavior
+                (Some(json), 0) // exit 0 because JSON controls behavior
             } else {
-                2 // simple deny, same as before
+                (None, 2) // simple deny, same as before
             }
         }
         Decision::Approve => {
@@ -419,8 +438,7 @@ fn format_and_exit(resp: &HookResponse) -> i32 {
                             "permissionDecisionReason": "Wisphive blocked this tool call because Codex hooks do not support updatedInput yet. Re-run with the edited input."
                         }
                     });
-                    print!("{}", json);
-                    return 0;
+                    return (Some(json), 0);
                 }
 
                 if let Some(ref ctx) = resp.additional_context {
@@ -430,15 +448,12 @@ fn format_and_exit(resp: &HookResponse) -> i32 {
                             "additionalContext": ctx
                         }
                     });
-                    print!("{}", json);
+                    return (Some(json), 0);
                 }
-                return 0;
+                return (None, 0);
             }
 
-            if let Some(json) = pre_tool_use_approve_value(resp) {
-                print!("{}", json);
-            }
-            0
+            (pre_tool_use_approve_value(resp), 0)
         }
     }
 }
@@ -1621,6 +1636,37 @@ mod tests {
             &serde_json::Value::Null,
             dir.path()
         ));
+    }
+
+    #[test]
+    fn codex_ask_fails_closed_with_explicit_deny() {
+        // itr#366: Codex has no native PreToolUse prompt, so Ask cannot defer —
+        // and exit 0 with empty stdout would be a silent approve of a gated
+        // tool. Ask must map to an explicit deny-with-reason for Codex.
+        let resp = HookResponse::new(Decision::Ask, HookEventType::PreToolUse, AgentType::Codex);
+        let (json, exit_code) = pre_tool_use_stdout(&resp);
+        assert_eq!(exit_code, 0);
+        let json = json.expect("Codex Ask must emit an explicit decision, not empty stdout");
+        assert_eq!(json["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(
+            json["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .contains("Codex")
+        );
+
+        // Claude Code still defers to its native prompt.
+        let resp = HookResponse::new(
+            Decision::Ask,
+            HookEventType::PreToolUse,
+            AgentType::ClaudeCode,
+        );
+        let (json, exit_code) = pre_tool_use_stdout(&resp);
+        assert_eq!(exit_code, 0);
+        assert_eq!(
+            json.unwrap()["hookSpecificOutput"]["permissionDecision"],
+            "ask"
+        );
     }
 
     #[test]
