@@ -69,6 +69,18 @@ impl Server {
 
         let db_path = config.db_path.to_string_lossy().to_string();
         let state_db = Arc::new(StateDb::open(&db_path).await?);
+
+        // Crash recovery (itr#299): any pending_decisions row present now is an
+        // in-flight decision from a prior process. Its hook already fail-open-
+        // approved when this socket last died (DaemonUnreachable, ADR-0001), so
+        // there is nothing to re-queue — record the truthful outcome and clear
+        // the table before accepting new work. Runs in `new()`, before `run()`
+        // binds the socket, so no live hook can race the drain.
+        match state_db.drain_orphaned_pending().await {
+            Ok(0) => {}
+            Ok(n) => info!(drained = n, "recovered orphaned pending decisions from prior run"),
+            Err(e) => warn!("failed to drain orphaned pending decisions: {e}"),
+        }
         let process_registry = Arc::new(Mutex::new(ProcessRegistry::new()));
         let agent_registry = Arc::new(Mutex::new(AgentRegistry::new()));
         let terminal_manager = Arc::new(TerminalSessionManager::new(
@@ -608,8 +620,14 @@ async fn handle_hook(
                 }
             }
 
-            // Log resolution (skip audit log for Ask/defer decisions)
-            if rich.decision != Decision::Ask {
+            // Log resolution. An Ask/defer is not an auditable terminal
+            // decision, so it skips decision_log — but the pending row must
+            // still be removed (itr#298), or it leaks: retention never reaps
+            // pending_decisions, and the startup drain (itr#299) would later
+            // mis-record it as a crash orphan.
+            if rich.decision == Decision::Ask {
+                ctx.state_db.delete_pending(id).await?;
+            } else {
                 ctx.state_db
                     .resolve_pending_by(id, rich.decision, &decided_by)
                     .await?;
@@ -2002,6 +2020,48 @@ mod tests {
             "tool_use_id": tool_use_id,
         })
         .to_string()
+    }
+
+    #[tokio::test]
+    async fn restart_drains_orphaned_pending_as_failopen() {
+        // itr#299: a pending row a crashed daemon never resolved is drained on
+        // the next Server::new() and recorded as the truthful fail-open outcome
+        // (the blocked hook already ran the tool via DaemonUnreachable).
+        use crate::DaemonConfig;
+        use crate::state::StateDb;
+        use crate::state::test_support::make_request;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+
+        // First boot: create dirs + schema, nothing to drain.
+        let s1 = super::Server::new(DaemonConfig::new(home.clone())).await.unwrap();
+        let db_path = DaemonConfig::new(home.clone())
+            .db_path
+            .to_string_lossy()
+            .to_string();
+        drop(s1);
+
+        // Leave an unresolved in-flight decision behind (the crash).
+        let req = make_request("Bash", "cc-1", "/muse");
+        {
+            let db = StateDb::open(&db_path).await.unwrap();
+            db.persist_pending(&req).await.unwrap();
+            assert_eq!(db.pending_count().await.unwrap(), 1);
+        }
+
+        // Restart: Server::new must drain the orphan.
+        let _s2 = super::Server::new(DaemonConfig::new(home.clone())).await.unwrap();
+
+        let db = StateDb::open(&db_path).await.unwrap();
+        assert_eq!(db.pending_count().await.unwrap(), 0, "restart must clear orphans");
+        let history = db.query_history(None, 10).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].decision, wisphive_protocol::Decision::Approve);
+        assert_eq!(
+            history[0].decided_by.as_deref(),
+            Some("daemon_restart:failopen")
+        );
     }
 
     #[tokio::test]

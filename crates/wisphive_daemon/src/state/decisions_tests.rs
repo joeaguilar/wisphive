@@ -145,6 +145,102 @@ async fn persist_pending_with_tool_use_id() {
 }
 
 // ════════════════════════════════════════════════════════════
+// pending_decisions cluster (itr#298 / #299 / #300)
+// ════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn ask_defer_removes_pending_row_without_logging() {
+    // itr#298: an Ask/defer must delete the pending row (else it leaks) but
+    // must NOT write a decision_log entry (Ask is not a terminal decision).
+    let db = test_db().await;
+    let req = make_request("Bash", "cc-1", "/muse");
+    let id = req.id;
+
+    db.persist_pending(&req).await.unwrap();
+    assert_eq!(db.pending_count().await.unwrap(), 1);
+
+    db.delete_pending(id).await.unwrap();
+
+    assert_eq!(db.pending_count().await.unwrap(), 0, "pending row must be gone");
+    assert!(
+        db.query_history(None, 10).await.unwrap().is_empty(),
+        "Ask/defer must not land in decision_log"
+    );
+    // Idempotent — deleting again is a no-op.
+    db.delete_pending(id).await.unwrap();
+}
+
+#[tokio::test]
+async fn drain_orphaned_pending_records_failopen_and_clears_table() {
+    // itr#299: on restart, orphaned pending rows are recorded as the truthful
+    // fail-open Approve (the hook already ran the tool) and the table emptied.
+    let db = test_db().await;
+    let a = make_request("Bash", "cc-a", "/muse");
+    let b = make_request("Write", "cc-b", "/muse");
+    db.persist_pending(&a).await.unwrap();
+    db.persist_pending(&b).await.unwrap();
+    assert_eq!(db.pending_count().await.unwrap(), 2);
+
+    let drained = db.drain_orphaned_pending().await.unwrap();
+    assert_eq!(drained, 2);
+    assert_eq!(db.pending_count().await.unwrap(), 0, "table must be cleared");
+
+    let history = db.query_history(None, 10).await.unwrap();
+    assert_eq!(history.len(), 2);
+    for entry in &history {
+        assert_eq!(entry.decision, Decision::Approve, "fail-open outcome, not Deny");
+        assert_eq!(entry.decided_by.as_deref(), Some("daemon_restart:failopen"));
+    }
+
+    // Idempotent: a second drain finds nothing and adds no rows.
+    assert_eq!(db.drain_orphaned_pending().await.unwrap(), 0);
+    assert_eq!(db.query_history(None, 10).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn persist_pending_round_trips_permission_suggestions() {
+    // itr#300: PermissionRequest suggestions must persist into the column and
+    // read back, not be silently dropped.
+    use wisphive_protocol::{PermissionRule, PermissionSuggestion};
+    let db = test_db().await;
+    let mut req = make_request("Bash", "cc-1", "/muse");
+    req.permission_suggestions = Some(vec![
+        PermissionSuggestion {
+            suggestion_type: "addRules".into(),
+            rules: vec![PermissionRule {
+                tool_name: "Bash".into(),
+                rule_content: "npm run build".into(),
+            }],
+            behavior: "allow".into(),
+            destination: "session".into(),
+            mode: None,
+        },
+        PermissionSuggestion {
+            suggestion_type: "setMode".into(),
+            rules: vec![],
+            behavior: "deny".into(),
+            destination: "localSettings".into(),
+            mode: Some("plan".into()),
+        },
+    ]);
+    let id = req.id;
+
+    db.persist_pending(&req).await.unwrap();
+
+    let read = db.pending_permission_suggestions(id).await.unwrap().unwrap();
+    assert_eq!(read.len(), 2, "both suggestions must survive the round-trip");
+    assert_eq!(read[0].suggestion_type, "addRules");
+    assert_eq!(read[0].behavior, "allow");
+    assert_eq!(read[1].mode.as_deref(), Some("plan"));
+
+    // A row with no suggestions reads back as None (not an error).
+    let plain = make_request("Read", "cc-2", "/muse");
+    let plain_id = plain.id;
+    db.persist_pending(&plain).await.unwrap();
+    assert!(db.pending_permission_suggestions(plain_id).await.unwrap().is_none());
+}
+
+// ════════════════════════════════════════════════════════════
 // query_history
 // ════════════════════════════════════════════════════════════
 

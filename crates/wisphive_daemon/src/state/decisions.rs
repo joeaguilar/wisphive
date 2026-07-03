@@ -52,13 +52,22 @@ impl StateDb {
             wisphive_protocol::redact::redact_value(&req.tool_input)
         };
 
+        // permission_suggestions (itr#300): the migration adds the column but
+        // persist used to never bind it, so a PermissionRequest's selectable
+        // options were dropped. Serialize them alongside the row.
+        let suggestions = req
+            .permission_suggestions
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+
         // INSERT OR IGNORE (itr#370): the id is hook-supplied, so a colliding
         // second request must never rewrite the first one's persisted row.
         // The queue rejects the duplicate; keeping the victim's row intact is
         // the defence-in-depth half.
         sqlx::query(
-            "INSERT OR IGNORE INTO pending_decisions (id, agent_id, agent_type, project, tool_name, tool_input, timestamp, tool_use_id, hook_event_name, terminal_session_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO pending_decisions (id, agent_id, agent_type, project, tool_name, tool_input, timestamp, tool_use_id, hook_event_name, terminal_session_id, permission_suggestions)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(req.id.to_string())
         .bind(&req.agent_id)
@@ -70,9 +79,108 @@ impl StateDb {
         .bind(&req.tool_use_id)
         .bind(req.hook_event_name.to_string())
         .bind(req.terminal_session_id.map(|u| u.to_string()))
+        .bind(suggestions)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Read back the permission suggestions persisted for a pending row
+    /// (itr#300). `None` if the row is absent or carried no suggestions.
+    pub async fn pending_permission_suggestions(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<Option<Vec<wisphive_protocol::PermissionSuggestion>>> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT permission_suggestions FROM pending_decisions WHERE id = ?")
+                .bind(id.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        match row.and_then(|(s,)| s) {
+            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Remove a pending row WITHOUT writing to `decision_log` (itr#298).
+    ///
+    /// An Ask/defer is not an auditable terminal decision, so it must not land
+    /// in `decision_log` — but the pending row still has to go, or it leaks:
+    /// retention never reaps `pending_decisions`, and the startup drain
+    /// ([`Self::drain_orphaned_pending`]) would later mis-record it as a crash
+    /// orphan. Idempotent — a missing id is a no-op.
+    pub async fn delete_pending(&self, id: uuid::Uuid) -> Result<()> {
+        sqlx::query("DELETE FROM pending_decisions WHERE id = ?")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Drain pending rows left over from a prior daemon process (itr#299).
+    ///
+    /// `pending_decisions` is transient in-flight bookkeeping, NOT a recovery
+    /// queue. Each row's hook was blocked on a `oneshot` that died when the
+    /// daemon did, and that hook already resolved ITSELF the instant the socket
+    /// closed — an EOF-mid-wait is `DaemonUnreachable`, which fails **open**
+    /// (approve) per ADR-0001 (see `wisphive_hook`). The daemon cannot recreate
+    /// the decision or change what already happened; on restart it can only
+    /// record the truthful outcome. So every orphan is logged as `Approve` /
+    /// `daemon_restart:failopen` and removed.
+    ///
+    /// Recording a `Deny` here (as the hook-*disconnect* path does) would be an
+    /// audit lie: there the tool did NOT run, but here the hook fail-open ran it.
+    /// Returns the number of rows drained.
+    pub async fn drain_orphaned_pending(&self) -> Result<usize> {
+        let ids: Vec<(String,)> = sqlx::query_as("SELECT id FROM pending_decisions")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut drained = 0usize;
+        for (id,) in ids {
+            match id.parse::<uuid::Uuid>() {
+                Ok(uuid) => {
+                    self.resolve_pending_by(
+                        uuid,
+                        wisphive_protocol::Decision::Approve,
+                        "daemon_restart:failopen",
+                    )
+                    .await?;
+                    drained += 1;
+                }
+                Err(_) => {
+                    // An unparseable id can't key a decision_log row; delete it
+                    // so it can't wedge the table across every restart.
+                    tracing::warn!(id, "orphaned pending row with unparseable id; deleting");
+                    self.delete_pending_raw(&id).await?;
+                }
+            }
+        }
+        if drained > 0 {
+            tracing::warn!(
+                drained,
+                "drained orphaned pending decisions as daemon_restart:failopen (itr#299)"
+            );
+        }
+        Ok(drained)
+    }
+
+    /// Delete a pending row by its raw string id (for ids that don't parse as
+    /// UUIDs — see [`Self::drain_orphaned_pending`]).
+    async fn delete_pending_raw(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM pending_decisions WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Number of rows currently in `pending_decisions` (test assertions).
+    #[cfg(test)]
+    pub(crate) async fn pending_count(&self) -> Result<i64> {
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pending_decisions")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(n)
     }
 
     /// Remove a pending decision after resolution and log it.
