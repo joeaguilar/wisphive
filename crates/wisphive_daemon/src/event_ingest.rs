@@ -92,13 +92,28 @@ async fn run_ingest(
 
     info!(path = %events_path.display(), "event ingest watching");
 
-    // Open the file and seek to end (only process pre-existing events once;
-    // new ones arrive via notifications). `offset` tracks our read position so
-    // we can detect truncation/rotation when the file shrinks beneath it.
+    // Capture the length BEFORE the startup reimport: the tail reader seeks
+    // here, so a line appended mid-reimport is never skipped (it is either
+    // caught by the reimport or re-read by the tail — dedup makes the overlap
+    // harmless).
     let start_len = tokio::fs::metadata(&events_path)
         .await
         .map(|m| m.len())
         .unwrap_or(0);
+
+    // Ingest the backlog written while the daemon was down (itr#301). The hook
+    // appends auto-approved events regardless of daemon state; seeking straight
+    // to EOF silently dropped that backlog from the audit log. Idempotent via
+    // the content-hash/tool_use_id dedup, so restarts never double-ingest.
+    match reimport_all(&events_path, &state_db).await {
+        Ok(count) if count > 0 => info!(count, "startup reimport of events.jsonl backlog"),
+        Ok(_) => {}
+        Err(e) => warn!("startup reimport of events.jsonl failed: {e}"),
+    }
+
+    // Tail from `start_len`; new lines arrive via notifications. `offset`
+    // tracks our read position so we can detect truncation/rotation when the
+    // file shrinks beneath it.
     let (mut reader, mut offset) = open_reader_at(&events_path, start_len).await?;
     let mut file_id = file_identity(&events_path).await;
 
@@ -531,6 +546,49 @@ mod tests {
         // No event was lost — both rows were ingested via the rotated segment.
         let history = db.query_history(None, 10).await.unwrap();
         assert_eq!(history.len(), 2);
+    }
+
+    /// itr#301: events appended while the daemon was down must be ingested at
+    /// startup — the tail used to seek straight to EOF and skip the backlog.
+    #[tokio::test]
+    async fn startup_ingests_backlog_written_while_daemon_was_down() {
+        let db = Arc::new(test_db().await);
+        let tmp = tempfile::tempdir().unwrap();
+        let events_path = tmp.path().join("events.jsonl");
+        let log_dir = tmp.path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+
+        // Backlog written before the ingester exists (daemon down).
+        let content = format!(
+            "{}\n{}\n",
+            auto_approved_event("Bash", "cc-1", Some("down-1")),
+            auto_approved_event("Edit", "cc-1", Some("down-2")),
+        );
+        std::fs::write(&events_path, &content).unwrap();
+
+        let handle = spawn_event_ingest(events_path.clone(), log_dir, db.clone());
+
+        // The startup reimport is asynchronous — poll briefly.
+        let mut history = Vec::new();
+        for _ in 0..100 {
+            history = db.query_history(None, 10).await.unwrap();
+            if history.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            history.len(),
+            2,
+            "backlog events must land in decision_log without manual reimport"
+        );
+
+        // A restart over the same file must not double-ingest (dedup).
+        handle.abort();
+        let count = reimport_all(&events_path, &db).await.unwrap();
+        assert_eq!(count, 2, "reimport reads both lines");
+        let history = db.query_history(None, 10).await.unwrap();
+        assert_eq!(history.len(), 2, "no duplicates after restart");
     }
 
     #[tokio::test]

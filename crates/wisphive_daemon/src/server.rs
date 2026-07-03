@@ -553,29 +553,26 @@ async fn handle_hook(
                 let mut reg = ctx.agent_registry.lock().await;
                 reg.touch(&result.agent_id);
             }
-            // Fire-and-forget: attach result to matching decision_log entry
-            match ctx
-                .state_db
-                .attach_tool_result(
-                    &result.agent_id,
-                    &result.tool_name,
-                    &result.tool_result,
-                    result.tool_use_id.as_deref(),
-                )
-                .await
-            {
-                Ok(Some(id)) => {
-                    info!(%id, tool = %result.tool_name, agent = %result.agent_id, "tool result attached");
+            // Fire-and-forget: attach result to matching decision_log entry.
+            // Detached task because the retry schedule (itr#302) outlives this
+            // ephemeral hook connection.
+            let state_db = ctx.state_db.clone();
+            tokio::spawn(async move {
+                match attach_tool_result_with_retry(&state_db, &result, ATTACH_RETRY_DELAYS)
+                    .await
+                {
+                    Ok(Some(id)) => {
+                        info!(%id, tool = %result.tool_name, agent = %result.agent_id, "tool result attached");
+                    }
+                    Ok(None) => {
+                        warn!(tool = %result.tool_name, agent = %result.agent_id,
+                              "tool result dropped: no matching decision appeared within the retry window");
+                    }
+                    Err(e) => {
+                        warn!("failed to store tool result: {e}");
+                    }
                 }
-                Ok(None) => {
-                    // Auto-approved events may still be in the JSONL ingest pipeline
-                    debug!(tool = %result.tool_name, agent = %result.agent_id,
-                          "tool result: no matching decision yet (may be pending ingest)");
-                }
-                Err(e) => {
-                    warn!("failed to store tool result: {e}");
-                }
-            }
+            });
         }
         ClientMessage::AgentRegister {
             agent_id,
@@ -1617,6 +1614,47 @@ async fn handle_terminal_command(
     Ok(())
 }
 
+/// Retry schedule for attaching a tool result whose decision row may still be
+/// in the JSONL ingest pipeline (itr#302): a fast tool can report PostToolUse
+/// before the async ingester inserts its auto-approved decision row, and a
+/// single immediate attempt permanently dropped the result from history. The
+/// total window (~14s) bounds how long an unmatched result lingers — orders of
+/// magnitude beyond notify-based ingest latency, and one detached task per
+/// unmatched result keeps memory bounded.
+const ATTACH_RETRY_DELAYS: [Duration; 4] = [
+    Duration::from_millis(250),
+    Duration::from_secs(1),
+    Duration::from_secs(3),
+    Duration::from_secs(10),
+];
+
+/// Attach a tool result, retrying per `delays` while no decision row matches.
+/// Returns the matched decision id, or `None` once the schedule is exhausted.
+async fn attach_tool_result_with_retry(
+    state_db: &StateDb,
+    result: &wisphive_protocol::ToolResult,
+    delays: impl IntoIterator<Item = Duration>,
+) -> Result<Option<uuid::Uuid>> {
+    let attach = || {
+        state_db.attach_tool_result(
+            &result.agent_id,
+            &result.tool_name,
+            &result.tool_result,
+            result.tool_use_id.as_deref(),
+        )
+    };
+    if let Some(id) = attach().await? {
+        return Ok(Some(id));
+    }
+    for delay in delays {
+        tokio::time::sleep(delay).await;
+        if let Some(id) = attach().await? {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
 /// Persist an "Always Allow" choice so the hook honors it on the next call.
 ///
 /// Writes `auto_approve_add` in ~/.wisphive/config.json via an atomic raw-JSON
@@ -1744,11 +1782,77 @@ fn peer_uid_allowed(peer_uid: u32, daemon_uid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONN_CHANNEL_CAPACITY, MAX_LINE_BYTES, partition_sudo_gated, peer_uid_allowed,
-        persist_auto_approve, read_capped_line, set_socket_permissions,
-        sweep_stale_session_markers,
+        CONN_CHANNEL_CAPACITY, MAX_LINE_BYTES, attach_tool_result_with_retry,
+        partition_sudo_gated, peer_uid_allowed, persist_auto_approve, read_capped_line,
+        set_socket_permissions, sweep_stale_session_markers,
     };
     use tokio::io::BufReader;
+
+    fn tool_result(tool_use_id: &str) -> wisphive_protocol::ToolResult {
+        wisphive_protocol::ToolResult {
+            agent_id: "cc-1".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({"command": "ls"}),
+            tool_result: serde_json::json!({"output": "ok"}),
+            timestamp: chrono::Utc::now(),
+            tool_use_id: Some(tool_use_id.into()),
+        }
+    }
+
+    fn auto_approved_line(tool_use_id: &str) -> String {
+        serde_json::json!({
+            "event": "auto_approved",
+            "agent_id": "cc-1",
+            "agent_type": "claude_code",
+            "project": "/test",
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "timestamp": "2024-01-01T00:00:00Z",
+            "tool_use_id": tool_use_id,
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn tool_result_attaches_after_ingest_via_retry() {
+        // itr#302: a fast tool's PostToolUse can beat the async JSONL ingester;
+        // the retry schedule must attach the result once the decision row lands.
+        let db = crate::state::StateDb::open(":memory:").await.unwrap();
+        let result = tool_result("race-1");
+
+        // No decision row yet — an empty schedule (single attempt) drops it.
+        let attached = attach_tool_result_with_retry(&db, &result, [])
+            .await
+            .unwrap();
+        assert!(attached.is_none(), "no row yet — single attempt must miss");
+
+        // Row lands mid-schedule; the retry picks it up.
+        let ingest = async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            crate::event_ingest::ingest_line(&auto_approved_line("race-1"), &db)
+                .await
+                .unwrap();
+        };
+        let retry = attach_tool_result_with_retry(
+            &db,
+            &result,
+            [
+                std::time::Duration::from_millis(20),
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_millis(200),
+            ],
+        );
+        let (attached, ()) = tokio::join!(retry, ingest);
+        assert!(
+            attached.unwrap().is_some(),
+            "result must attach once the ingested row appears"
+        );
+
+        // And the result is really on the row.
+        let history = db.query_history(None, 10).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(history[0].tool_result.is_some());
+    }
 
     #[test]
     fn always_allow_writes_config_json_when_present() {
