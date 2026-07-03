@@ -66,7 +66,11 @@ fn install_claude(project: &std::path::Path) -> Result<()> {
         serde_json::json!({})
     };
 
-    let hook_command = hook_binary_path();
+    // Hook commands run via `sh -c`, so a binary path with special characters
+    // must be quoted — both for correct execution and so the itr#359 matcher
+    // recognizes our own entry on reinstall/uninstall. Plain paths pass
+    // through unquoted (no churn in existing settings files).
+    let hook_command = shell_quote_command(&hook_binary_path());
 
     // Ensure hooks object exists
     if settings.get("hooks").is_none() {
@@ -441,6 +445,100 @@ fn shell_quote_command(command: &str) -> String {
     format!("'{}'", command.replace('\'', "'\\''"))
 }
 
+/// Whether a hook command string invokes the wisphive-hook binary (itr#359).
+///
+/// Precise on purpose: the old `cmd.contains("wisphive")` matcher rewrote or
+/// deleted any USER hook whose command merely mentioned the word — e.g. a
+/// project-local script living under a directory named `wisphive`, or a
+/// `my-wisphive-logger` wrapper — silently corrupting settings.json on
+/// install/uninstall. We parse instead: strip an `env VAR=...` prefix, take
+/// argv[0], and compare its basename to `wisphive-hook`.
+pub(crate) fn is_wisphive_hook_command(cmd: &str) -> bool {
+    // Strip an `env [flags] VAR=... [flags]` prefix: assignments and flags
+    // precede the actual command word. `-u`/`--unset` consume a NAME operand.
+    let mut rest = cmd.trim_start();
+    let (first, after_env) = split_word(rest);
+    if first == "env" {
+        rest = after_env;
+        loop {
+            let (word, after) = split_word(rest);
+            if word.is_empty() {
+                return false;
+            }
+            if word.starts_with('\'') || word.starts_with('"') {
+                // A quoted word is the command, never an assignment — a
+                // hook path may itself contain '=' (e.g. .../build=debug/).
+                break;
+            } else if word == "-u" || word == "--unset" {
+                let (_, after_name) = split_word(after);
+                rest = after_name;
+            } else if word.contains('=') || word.starts_with('-') {
+                rest = after;
+            } else {
+                break;
+            }
+        }
+    }
+    let Some(argv0) = parse_argv0(rest) else {
+        return false;
+    };
+    let base = std::path::Path::new(&argv0)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(&argv0);
+    base == "wisphive-hook"
+}
+
+/// Pop the next whitespace-delimited word; returns (word, rest-after-word).
+fn split_word(s: &str) -> (&str, &str) {
+    let end = s.find(char::is_whitespace).unwrap_or(s.len());
+    (&s[..end], s[end..].trim_start())
+}
+
+/// Extract argv[0] with shell quoting semantics: concatenated unquoted /
+/// single-quoted / double-quoted segments up to the first unquoted
+/// whitespace, so the installer's own `'\''` apostrophe escape (see
+/// `shell_quote_command`) round-trips. Unterminated quotes yield None.
+fn parse_argv0(s: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut it = s.chars().peekable();
+    while let Some(&c) = it.peek() {
+        match c {
+            c if c.is_whitespace() => break,
+            '\'' => {
+                it.next();
+                loop {
+                    match it.next() {
+                        Some('\'') => break,
+                        Some(ch) => out.push(ch),
+                        None => return None,
+                    }
+                }
+            }
+            '"' => {
+                it.next();
+                loop {
+                    match it.next() {
+                        Some('"') => break,
+                        Some('\\') => out.push(it.next()?),
+                        Some(ch) => out.push(ch),
+                        None => return None,
+                    }
+                }
+            }
+            '\\' => {
+                it.next();
+                out.push(it.next()?);
+            }
+            _ => {
+                out.push(c);
+                it.next();
+            }
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 fn update_existing_wisphive_hooks(
     rules: &mut [serde_json::Value],
     command: &str,
@@ -453,7 +551,7 @@ fn update_existing_wisphive_hooks(
                 let is_wisphive = hook
                     .get("command")
                     .and_then(|v| v.as_str())
-                    .is_some_and(|cmd| cmd.contains("wisphive"));
+                    .is_some_and(is_wisphive_hook_command);
                 if is_wisphive {
                     found = true;
                     update_command_hook(hook, command, timeout);
@@ -463,7 +561,7 @@ fn update_existing_wisphive_hooks(
             let is_wisphive = rule
                 .get("command")
                 .and_then(|v| v.as_str())
-                .is_some_and(|cmd| cmd.contains("wisphive"));
+                .is_some_and(is_wisphive_hook_command);
             if is_wisphive {
                 found = true;
                 update_command_hook(rule, command, timeout);
@@ -486,6 +584,10 @@ fn update_command_hook(hook: &mut serde_json::Value, command: &str, timeout: Opt
 }
 
 /// Remove Wisphive hook entries from the settings JSON.
+///
+/// Surgical on purpose (itr#359): only OUR command hooks are removed from a
+/// rule's nested hooks array; the rule survives if any user hooks remain in
+/// it. A rule is dropped only when nothing of the user's is left in it.
 pub(crate) fn remove_hook_entries(
     settings: &mut serde_json::Value,
     hook_type: &str,
@@ -495,25 +597,46 @@ pub(crate) fn remove_hook_entries(
         && let Some(entries) = hooks.get_mut(hook_type)
         && let Some(arr) = entries.as_array_mut()
     {
-        arr.retain(|rule| !has_wisphive_hook(rule));
+        arr.retain_mut(|rule| {
+            if let Some(hooks_arr) = rule.get_mut("hooks").and_then(|v| v.as_array_mut()) {
+                hooks_arr.retain(|hook| {
+                    !hook
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(is_wisphive_hook_command)
+                });
+                !hooks_arr.is_empty()
+            } else {
+                !rule
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(is_wisphive_hook_command)
+            }
+        });
     }
 }
 
 /// Check if a hook rule entry contains a wisphive hook command.
-/// Handles the nested format: {"matcher": "...", "hooks": [{"type": "command", "command": "...wisphive..."}]}
-fn has_wisphive_hook(rule: &serde_json::Value) -> bool {
-    // Check nested hooks array (correct Claude Code format)
-    if let Some(hooks_arr) = rule.get("hooks").and_then(|v| v.as_array()) {
-        return hooks_arr.iter().any(|hook| {
-            hook.get("command")
-                .and_then(|v| v.as_str())
-                .is_some_and(|cmd| cmd.contains("wisphive"))
+/// Handles the nested format: {"matcher": "...", "hooks": [{"type": "command",
+/// "command": "...wisphive-hook"}]} AND the flat legacy format — both branches
+/// are checked (no early return) so a hybrid rule carrying a flat wisphive
+/// command next to a user hooks array is still detected.
+pub(crate) fn has_wisphive_hook(rule: &serde_json::Value) -> bool {
+    let nested = rule
+        .get("hooks")
+        .and_then(|v| v.as_array())
+        .is_some_and(|hooks_arr| {
+            hooks_arr.iter().any(|hook| {
+                hook.get("command")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(is_wisphive_hook_command)
+            })
         });
-    }
-    // Fallback: check flat format (legacy/simple)
-    rule.get("command")
-        .and_then(|v| v.as_str())
-        .is_some_and(|cmd| cmd.contains("wisphive"))
+    nested
+        || rule
+            .get("command")
+            .and_then(|v| v.as_str())
+            .is_some_and(is_wisphive_hook_command)
 }
 
 #[cfg(test)]
@@ -760,6 +883,166 @@ mod tests {
     }
 
     // ══ install / uninstall filesystem integration ══
+
+    #[test]
+    fn matcher_recognizes_only_the_wisphive_hook_binary() {
+        // itr#359: positives — every form the installer writes.
+        for ours in [
+            "wisphive-hook",
+            "/Users/x/.cargo/bin/wisphive-hook",
+            "env WISPHIVE_AGENT_TYPE=codex /Users/x/.cargo/bin/wisphive-hook",
+            "env WISPHIVE_AGENT_TYPE=codex '/Users/x/my tools/wisphive-hook'",
+            // installer's own '\'' apostrophe escape must round-trip
+            r"env WISPHIVE_AGENT_TYPE=codex '/Users/x/Joe'\''s tools/wisphive-hook'",
+            "\"/Users/x/my tools/wisphive-hook\"",
+            // hand-edited but shell-valid variants
+            "env\tWISPHIVE_AGENT_TYPE=codex /usr/local/bin/wisphive-hook",
+            "env -u FOO WISPHIVE_AGENT_TYPE=codex /usr/local/bin/wisphive-hook",
+            r"/Users/x/my\ tools/wisphive-hook",
+        ] {
+            assert!(is_wisphive_hook_command(ours), "should match: {ours}");
+        }
+        // Negatives — user hooks that merely mention the word.
+        for theirs in [
+            "/Users/x/AI_Projects/wisphive/scripts/precommit.sh",
+            "my-wisphive-logger --verbose",
+            "python3 /opt/wisphive-tools/check.py",
+            "wisphive doctor",
+            "'/unterminated/quote/wisphive-hook",
+            "env FOO=bar",
+            "",
+        ] {
+            assert!(
+                !is_wisphive_hook_command(theirs),
+                "must NOT match: {theirs}"
+            );
+        }
+    }
+
+    #[test]
+    fn matcher_round_trips_installer_quoting() {
+        // Whatever shell_quote_command emits for the hook path — plain,
+        // spaced, or apostrophed — both install forms must be recognized.
+        for path in [
+            "/Users/x/.cargo/bin/wisphive-hook",
+            "/Users/x/my tools/wisphive-hook",
+            "/Users/x/Joe's tools/wisphive-hook",
+            "/Users/x/build=debug/wisphive-hook",
+        ] {
+            let claude_form = shell_quote_command(path);
+            let codex_form = codex_hook_command(path);
+            assert!(
+                is_wisphive_hook_command(&claude_form),
+                "claude form should match: {claude_form}"
+            );
+            assert!(
+                is_wisphive_hook_command(&codex_form),
+                "codex form should match: {codex_form}"
+            );
+        }
+    }
+
+    #[test]
+    fn has_wisphive_hook_checks_both_nested_and_flat() {
+        // Hybrid rule: flat wisphive command next to a user-only hooks array
+        // must still be detected (no early return on the nested branch).
+        let hybrid = json!({
+            "command": "/usr/local/bin/wisphive-hook",
+            "hooks": [{"type": "command", "command": "user-lint.sh"}]
+        });
+        assert!(has_wisphive_hook(&hybrid));
+        let user_only = json!({
+            "matcher": "*",
+            "hooks": [{"type": "command", "command": "user-lint.sh"}]
+        });
+        assert!(!has_wisphive_hook(&user_only));
+    }
+
+    #[test]
+    fn uninstall_keeps_user_hook_sharing_a_rule_with_ours() {
+        // itr#359 destructive class: a user hook grouped into the SAME rule's
+        // hooks array as wisphive-hook must survive uninstall.
+        let mut s = json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "*",
+                    "hooks": [
+                        {"type": "command", "command": "/usr/local/bin/wisphive-hook"},
+                        {"type": "command", "command": "/Users/x/bin/my-lint.sh"}
+                    ]
+                }]
+            }
+        });
+        remove_hook_entries(&mut s, "PreToolUse", "unused");
+        let rules = s["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(
+            rules.len(),
+            1,
+            "rule with a surviving user hook was dropped"
+        );
+        let cmds: Vec<&str> = rules[0]["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|h| h["command"].as_str())
+            .collect();
+        assert_eq!(cmds, vec!["/Users/x/bin/my-lint.sh"]);
+    }
+
+    #[test]
+    fn install_and_uninstall_leave_user_wisphive_named_hooks_alone() {
+        // itr#359 acceptance: a user hook whose command contains "wisphive"
+        // but is not the wisphive-hook binary survives install AND uninstall.
+        let tmp = temp_project();
+        let p = tmp.path().to_path_buf();
+        let user_cmd = "/Users/x/AI_Projects/wisphive/scripts/lint.sh";
+        write_settings(
+            &p,
+            &json!({
+                "hooks": {
+                    "PreToolUse": [
+                        {"matcher": "*", "hooks": [{"type": "command", "command": user_cmd}]}
+                    ]
+                }
+            }),
+        );
+
+        install(Some(p.clone()), false).unwrap();
+        let s = read_settings(&p);
+        let cmds: Vec<String> = s["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|r| r["hooks"].as_array().cloned().unwrap_or_default())
+            .filter_map(|h| h["command"].as_str().map(String::from))
+            .collect();
+        assert!(
+            cmds.iter().any(|c| c == user_cmd),
+            "user hook rewritten by install: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| is_wisphive_hook_command(c)),
+            "wisphive hook not installed: {cmds:?}"
+        );
+
+        uninstall(Some(p.clone()), false).unwrap();
+        let s = read_settings(&p);
+        let cmds: Vec<String> = s["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|r| r["hooks"].as_array().cloned().unwrap_or_default())
+            .filter_map(|h| h["command"].as_str().map(String::from))
+            .collect();
+        assert!(
+            cmds.iter().any(|c| c == user_cmd),
+            "user hook deleted by uninstall: {cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| is_wisphive_hook_command(c)),
+            "wisphive hook not removed: {cmds:?}"
+        );
+    }
 
     #[test]
     fn install_creates_from_scratch() {

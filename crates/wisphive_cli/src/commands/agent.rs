@@ -193,12 +193,28 @@ fn preflight_checks(project: &Path, agent_type: &AgentType) -> Result<()> {
             project.display()
         );
     }
-    // Verify wisphive hook is actually present
-    if let Ok(content) = std::fs::read_to_string(&hooks_path)
-        && !content.contains("wisphive")
-    {
+    // Verify a wisphive hook is actually installed — matched precisely on the
+    // wisphive-hook binary (itr#359), not a substring that a user hook under a
+    // "wisphive" directory would satisfy. Fail closed: an unreadable or
+    // malformed hook file blocks the spawn rather than skipping the check,
+    // and the hook must be on PreToolUse — the event that actually gates
+    // tool calls — not merely on some telemetry event.
+    let content = std::fs::read_to_string(&hooks_path)
+        .with_context(|| format!("could not read {}", hooks_path.display()))?;
+    let settings: serde_json::Value = serde_json::from_str(&content).with_context(|| {
+        format!(
+            "{} is malformed JSON — fix its syntax before starting an agent",
+            hooks_path.display()
+        )
+    })?;
+    let installed = settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get("PreToolUse"))
+        .and_then(|rules| rules.as_array())
+        .is_some_and(|arr| arr.iter().any(super::hooks::has_wisphive_hook));
+    if !installed {
         anyhow::bail!(
-            "Wisphive hooks not installed in {}.\n  fix: wisphive hooks install --project {}",
+            "Wisphive PreToolUse hook not installed in {}.\n  fix: wisphive hooks install --project {}",
             project.display(),
             project.display()
         );

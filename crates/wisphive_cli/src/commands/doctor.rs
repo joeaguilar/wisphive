@@ -208,7 +208,7 @@ fn check_project_hook(
                 .get("hooks")
                 .and_then(|h| h.get("PreToolUse"))
                 .and_then(|arr| arr.as_array())
-                .is_some_and(|arr| arr.iter().any(has_wisphive_hook));
+                .is_some_and(|arr| arr.iter().any(super::hooks::has_wisphive_hook));
 
             if has_hook {
                 eprintln!("  OK  {agent_name} hooks installed");
@@ -238,20 +238,4 @@ fn check_project_hook(
             project.display()
         ));
     }
-}
-
-fn has_wisphive_hook(rule: &serde_json::Value) -> bool {
-    rule.get("hooks")
-        .and_then(|h| h.as_array())
-        .is_some_and(|hooks| {
-            hooks.iter().any(|hook| {
-                hook.get("command")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|cmd| cmd.contains("wisphive"))
-            })
-        })
-        || rule
-            .get("command")
-            .and_then(|v| v.as_str())
-            .is_some_and(|cmd| cmd.contains("wisphive"))
 }
