@@ -1,73 +1,78 @@
-# React + TypeScript + Vite
+# Wisphive Web Frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+React 19 + TypeScript + Vite SPA for the Wisphive control plane. In
+production the Vite build output (`dist/`) is embedded into the Rust
+binary via `rust-embed` and served by `wisphive web serve` (or
+`wisphive daemon start --web`) alongside the `/ws` daemon bridge.
 
-Currently, two official plugins are available:
+## Development
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
-
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+just frontend-install    # npm install
+just frontend-dev        # Vite dev server on :5173 — pair with `just web-dev`
+just frontend-build      # Production build → dist/ (embedded via rust-embed)
+just frontend-lint       # ESLint
+just frontend-test       # Vitest unit tests (jsdom + @testing-library/react)
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+In dev mode (`wisphive web serve --dev`) the Rust process serves only
+`/ws` over plain HTTP and Vite serves the UI. In production mode the
+Rust process serves everything over TLS with a self-signed cert.
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+Rendered agent/tool output is untrusted — see the security notes in the
+repo-root `CLAUDE.md` (no `dangerouslySetInnerHTML` for agent-controlled
+content).
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+## End-to-end tests (Playwright)
+
+Headless-Chromium e2e tests live in `e2e/`, configured by
+`playwright.config.ts`. Run them from the repo root:
+
+```bash
+just e2e                       # full pipeline: build + install browser + run
+just e2e smoke.spec.ts         # extra args are passed to `playwright test`
 ```
+
+`just e2e` does, in order:
+
+1. `npm run build` — produce a fresh `dist/`.
+2. `cargo build -p wisphive_cli --bin wisphive` — debug binary. In debug
+   builds `rust-embed` reads `frontend/dist/` from disk at request time,
+   so the freshly built SPA is what gets tested without a release build.
+3. `npx playwright install chromium` — idempotent browser install.
+4. `npx playwright test` — the suite itself (`npm run test:e2e`).
+
+### How the harness works
+
+There is no `webServer` block in the Playwright config. Each spec boots
+its own real server through `e2e/helpers/server.ts`:
+
+- **State isolation:** the Wisphive state dir resolves purely via
+  `$HOME`, so the helper spawns `wisphive web serve` with
+  `HOME=<fresh mkdtemp dir>`. The real `~/.wisphive` (socket, DB, mode
+  file, certs) is never read or written; teardown deletes the temp dir.
+  The helper refuses to run if the temp dir resolves inside the real
+  home.
+- **No hardcoded ports:** an ephemeral port is allocated per boot.
+- **Server mode:** production embedded-assets mode (TLS, self-signed
+  cert minted into the isolated state dir) — hence `ignoreHTTPSErrors`
+  in the Playwright config. `--no-open` suppresses the first-run
+  browser auto-open.
+- **Readiness:** polls `GET /api/auth/status` (unauthenticated) until
+  it answers 200.
+- **Base URL:** `https://localhost:<port>` — the server redirects UI
+  paths on IP-literal hosts to `localhost`, and passkey affordances are
+  origin-sensitive, so specs should always drive `localhost`.
+
+Binary resolution order: `$WISPHIVE_BIN`, then `target/debug/wisphive`,
+then `target/release/wisphive`.
+
+Writing new specs: import `startWisphiveServer` from
+`./helpers/server` — it takes `extraArgs` (additional CLI flags, e.g.
+future TLS options), `env`, and an optional fixed `port`, so new specs
+should not need to modify the helper. Vitest only picks up
+`src/**/*.{test,spec}.{ts,tsx}` and Playwright only picks up `e2e/`, so
+the two suites never collide.
+
+Artifacts (screenshots, traces on failure) land in `test-results/`
+(gitignored).
