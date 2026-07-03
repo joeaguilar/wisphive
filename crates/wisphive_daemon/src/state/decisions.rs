@@ -52,22 +52,23 @@ impl StateDb {
             wisphive_protocol::redact::redact_value(&req.tool_input)
         };
 
-        // permission_suggestions (itr#300): the migration adds the column but
-        // persist used to never bind it, so a PermissionRequest's selectable
-        // options were dropped. Serialize them alongside the row.
-        let suggestions = req
-            .permission_suggestions
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?;
+        // permission_suggestions (itr#300): intentionally NOT persisted. The
+        // column exists from an old migration, but nothing reads it: #299
+        // establishes that pending_decisions is drained (not re-served) on
+        // restart, so there is no recovery read model to feed, and the live
+        // in-memory queue already holds the full suggestions for review.
+        // Writing them here would only risk a cleartext-secret leak — a
+        // rule_content can carry a command like `curl -H "Authorization:
+        // Bearer …"`, and this write bypassed the redact_value above (itr#89).
+        // So the row deliberately leaves the column NULL.
 
         // INSERT OR IGNORE (itr#370): the id is hook-supplied, so a colliding
         // second request must never rewrite the first one's persisted row.
         // The queue rejects the duplicate; keeping the victim's row intact is
         // the defence-in-depth half.
         sqlx::query(
-            "INSERT OR IGNORE INTO pending_decisions (id, agent_id, agent_type, project, tool_name, tool_input, timestamp, tool_use_id, hook_event_name, terminal_session_id, permission_suggestions)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO pending_decisions (id, agent_id, agent_type, project, tool_name, tool_input, timestamp, tool_use_id, hook_event_name, terminal_session_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(req.id.to_string())
         .bind(&req.agent_id)
@@ -79,27 +80,9 @@ impl StateDb {
         .bind(&req.tool_use_id)
         .bind(req.hook_event_name.to_string())
         .bind(req.terminal_session_id.map(|u| u.to_string()))
-        .bind(suggestions)
         .execute(&self.pool)
         .await?;
         Ok(())
-    }
-
-    /// Read back the permission suggestions persisted for a pending row
-    /// (itr#300). `None` if the row is absent or carried no suggestions.
-    pub async fn pending_permission_suggestions(
-        &self,
-        id: uuid::Uuid,
-    ) -> Result<Option<Vec<wisphive_protocol::PermissionSuggestion>>> {
-        let row: Option<(Option<String>,)> =
-            sqlx::query_as("SELECT permission_suggestions FROM pending_decisions WHERE id = ?")
-                .bind(id.to_string())
-                .fetch_optional(&self.pool)
-                .await?;
-        match row.and_then(|(s,)| s) {
-            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
-            None => Ok(None),
-        }
     }
 
     /// Remove a pending row WITHOUT writing to `decision_log` (itr#298).

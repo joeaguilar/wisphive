@@ -210,59 +210,36 @@ async fn drain_orphaned_pending_records_failopen_and_clears_table() {
 }
 
 #[tokio::test]
-async fn persist_pending_round_trips_permission_suggestions() {
-    // itr#300: PermissionRequest suggestions must persist into the column and
-    // read back, not be silently dropped.
+async fn persist_pending_leaves_permission_suggestions_null() {
+    // itr#300 (resolved by #299): suggestions are intentionally not persisted —
+    // pending_decisions is drained, not re-served, so there is no read model to
+    // feed, and persisting them risked a cleartext-secret leak (itr#89). The
+    // column stays NULL even when the request carries suggestions.
     use wisphive_protocol::{PermissionRule, PermissionSuggestion};
     let db = test_db().await;
     let mut req = make_request("Bash", "cc-1", "/muse");
-    req.permission_suggestions = Some(vec![
-        PermissionSuggestion {
-            suggestion_type: "addRules".into(),
-            rules: vec![PermissionRule {
-                tool_name: "Bash".into(),
-                rule_content: "npm run build".into(),
-            }],
-            behavior: "allow".into(),
-            destination: "session".into(),
-            mode: None,
-        },
-        PermissionSuggestion {
-            suggestion_type: "setMode".into(),
-            rules: vec![],
-            behavior: "deny".into(),
-            destination: "localSettings".into(),
-            mode: Some("plan".into()),
-        },
-    ]);
+    req.permission_suggestions = Some(vec![PermissionSuggestion {
+        suggestion_type: "addRules".into(),
+        rules: vec![PermissionRule {
+            tool_name: "Bash".into(),
+            // A secret in a rule_content must never reach disk here.
+            rule_content: "curl -H 'Authorization: Bearer sk-leak12345'".into(),
+        }],
+        behavior: "allow".into(),
+        destination: "session".into(),
+        mode: None,
+    }]);
     let id = req.id;
 
     db.persist_pending(&req).await.unwrap();
 
-    let read = db
-        .pending_permission_suggestions(id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        read.len(),
-        2,
-        "both suggestions must survive the round-trip"
-    );
-    assert_eq!(read[0].suggestion_type, "addRules");
-    assert_eq!(read[0].behavior, "allow");
-    assert_eq!(read[1].mode.as_deref(), Some("plan"));
-
-    // A row with no suggestions reads back as None (not an error).
-    let plain = make_request("Read", "cc-2", "/muse");
-    let plain_id = plain.id;
-    db.persist_pending(&plain).await.unwrap();
-    assert!(
-        db.pending_permission_suggestions(plain_id)
+    let stored: (Option<String>,) =
+        sqlx::query_as("SELECT permission_suggestions FROM pending_decisions WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_one(&db.pool)
             .await
-            .unwrap()
-            .is_none()
-    );
+            .unwrap();
+    assert!(stored.0.is_none(), "suggestions column must be NULL");
 }
 
 // ════════════════════════════════════════════════════════════
