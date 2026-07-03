@@ -149,3 +149,9 @@ off:
 # Doctor / health check
 doctor:
     wisphive doctor
+
+# Decision-plane integrity red-team (epic #403): ghost-approval, crash mid-stream,
+# secret redaction — against release binaries in an isolated throwaway HOME.
+redteam:
+    cargo build --release --bin wisphive --bin wisphive-hook
+    ./scripts/redteam-decision-plane.sh
