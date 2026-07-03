@@ -114,6 +114,21 @@ async fn static_handler(uri: axum::http::Uri) -> Response {
 
     if let Some(file) = FrontendAssets::get(path) {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
+        // The SPA shell must revalidate on every load: a heuristically-cached
+        // index.html keeps an old bundle alive across server upgrades, and a
+        // stale bundle can speak an outdated /api dialect (e.g. omit-to-clear
+        // bodies against the merge-patch config PUT, itr#358). Hashed assets
+        // stay cacheable; only HTML gets no-cache.
+        if mime.as_ref().starts_with("text/html") {
+            return (
+                [
+                    (axum::http::header::CONTENT_TYPE, mime.as_ref()),
+                    (axum::http::header::CACHE_CONTROL, "no-cache"),
+                ],
+                file.data.to_vec(),
+            )
+                .into_response();
+        }
         return (
             [(axum::http::header::CONTENT_TYPE, mime.as_ref())],
             file.data.to_vec(),
@@ -127,7 +142,11 @@ async fn static_handler(uri: axum::http::Uri) -> Response {
     }
 
     if let Some(file) = FrontendAssets::get("index.html") {
-        Html(std::str::from_utf8(&file.data).unwrap_or("").to_string()).into_response()
+        (
+            [(axum::http::header::CACHE_CONTROL, "no-cache")],
+            Html(std::str::from_utf8(&file.data).unwrap_or("").to_string()),
+        )
+            .into_response()
     } else {
         (axum::http::StatusCode::NOT_FOUND, "not found").into_response()
     }

@@ -36,7 +36,7 @@ fn load_for_write() -> Result<UserConfig> {
     match std::fs::read_to_string(&path) {
         Ok(content) => serde_json::from_str(&content).with_context(|| {
             format!(
-                "{} is not valid JSON; refusing to overwrite it — fix or remove the file",
+                "{} could not be parsed as a Wisphive config (invalid JSON or a wrong-typed field); refusing to overwrite it — fix or remove the file",
                 path.display()
             )
         }),

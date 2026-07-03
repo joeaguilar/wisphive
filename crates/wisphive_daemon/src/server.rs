@@ -1634,9 +1634,12 @@ fn persist_auto_approve(tool_name: &str, wisphive_dir: &std::path::Path) -> Resu
             let add = obj
                 .entry("auto_approve_add")
                 .or_insert(serde_json::json!([]));
-            if let Some(arr) = add.as_array_mut()
-                && !arr.iter().any(|v| v.as_str() == Some(tool_name))
-            {
+            // A wrong-typed existing value is an error, not a silent success —
+            // the hook would never honor the "addition" (itr#308 posture).
+            let arr = add
+                .as_array_mut()
+                .ok_or_else(|| "auto_approve_add exists but is not an array".to_string())?;
+            if !arr.iter().any(|v| v.as_str() == Some(tool_name)) {
                 arr.push(serde_json::Value::String(tool_name.to_string()));
             }
             if let Some(arr) = obj
@@ -1645,6 +1648,7 @@ fn persist_auto_approve(tool_name: &str, wisphive_dir: &std::path::Path) -> Resu
             {
                 arr.retain(|v| v.as_str() != Some(tool_name));
             }
+            Ok(())
         })
         .map_err(|e| anyhow::anyhow!("config.json: {e}"))?;
         info!(tool = tool_name, "added to auto_approve_add in config.json");
@@ -1806,6 +1810,23 @@ mod tests {
         .unwrap();
         assert_eq!(legacy["auto_approve"][0], "Bash");
         assert!(!dir.path().join("config.json").exists());
+    }
+
+    #[test]
+    fn always_allow_refuses_wrong_typed_add_list() {
+        // A hand-edited `"auto_approve_add": "Bash"` (string, not array) must
+        // error, not log success while the hook ignores the "addition".
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        std::fs::write(&config_path, r#"{"auto_approve_add": "Bash"}"#).unwrap();
+
+        persist_auto_approve("Edit", dir.path())
+            .expect_err("non-array auto_approve_add must refuse");
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            r#"{"auto_approve_add": "Bash"}"#,
+            "refused update must not touch the file"
+        );
     }
 
     #[test]

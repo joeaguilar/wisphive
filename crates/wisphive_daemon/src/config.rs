@@ -314,6 +314,9 @@ pub enum ConfigUpdateError {
     Corrupt(serde_json::Error),
     /// The file's top level is valid JSON but not an object.
     NotAnObject,
+    /// The mutation refused the update (e.g. an existing key has the wrong
+    /// type). Nothing is written — no false "saved" (itr#308 posture).
+    Rejected(String),
     Io(std::io::Error),
 }
 
@@ -325,6 +328,7 @@ impl std::fmt::Display for ConfigUpdateError {
                 "config file is not valid JSON ({e}); refusing to overwrite it — fix or remove the file"
             ),
             Self::NotAnObject => write!(f, "config file top level is not a JSON object"),
+            Self::Rejected(reason) => write!(f, "config update refused: {reason}"),
             Self::Io(e) => write!(f, "config I/O error: {e}"),
         }
     }
@@ -337,10 +341,11 @@ impl std::error::Error for ConfigUpdateError {}
 /// (itr#358/#360/#361): the file is read as raw JSON (unknown keys survive),
 /// `mutate` edits the top-level object in place, and the result is written
 /// atomically. A missing file starts from `{}`; a corrupt file refuses the
-/// update instead of being overwritten.
+/// update instead of being overwritten. `mutate` returning `Err` aborts the
+/// update before anything is written (no false "saved").
 pub fn update_config_json(
     path: &Path,
-    mutate: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+    mutate: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>) -> Result<(), String>,
 ) -> Result<(), ConfigUpdateError> {
     let mut root: serde_json::Value = match std::fs::read_to_string(path) {
         Ok(content) => serde_json::from_str(&content).map_err(ConfigUpdateError::Corrupt)?,
@@ -348,7 +353,7 @@ pub fn update_config_json(
         Err(e) => return Err(ConfigUpdateError::Io(e)),
     };
     let obj = root.as_object_mut().ok_or(ConfigUpdateError::NotAnObject)?;
-    mutate(obj);
+    mutate(obj).map_err(ConfigUpdateError::Rejected)?;
     let body = serde_json::to_string_pretty(&root).expect("JSON value always serializes");
     write_config_atomic(path, &body).map_err(ConfigUpdateError::Io)
 }
@@ -410,6 +415,7 @@ mod tests {
 
         update_config_json(&path, |obj| {
             obj.insert("auto_approve_level".into(), "read".into());
+            Ok(())
         })
         .unwrap();
 
@@ -427,6 +433,7 @@ mod tests {
 
         update_config_json(&path, |obj| {
             obj.insert("auto_approve_add".into(), serde_json::json!(["Bash"]));
+            Ok(())
         })
         .unwrap();
 
@@ -445,6 +452,7 @@ mod tests {
 
         let err = update_config_json(&path, |obj| {
             obj.insert("auto_approve_level".into(), "all".into());
+            Ok(())
         })
         .expect_err("corrupt config must refuse the update");
         assert!(matches!(err, ConfigUpdateError::Corrupt(_)));
