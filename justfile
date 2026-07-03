@@ -81,6 +81,27 @@ frontend-lint:
 frontend-test:
     cd crates/wisphive_web/frontend && npm test
 
+# Playwright e2e smoke suite (headless Chromium). Builds the frontend +
+# a debug `wisphive` binary, then boots `wisphive web serve` against a
+# fresh isolated HOME on an ephemeral port — never touches ~/.wisphive.
+e2e *args="":
+    cd crates/wisphive_web/frontend && npm run build
+    cargo build -p wisphive_cli --bin wisphive
+    cd crates/wisphive_web/frontend && npx playwright install chromium
+    cd crates/wisphive_web/frontend && npx playwright test {{args}}
+
+# Full verification gate suite. Every gate runs under its own gatr tag so
+# `gatr last` / `gatr errors` prove the gate was green after the fact.
+# Fail-fast: the first red gate aborts the recipe. Ordered so the debug
+# cargo artifacts from verify-rust are reused by the e2e build step.
+# TUI snapshot tests (crates/wisphive_tui/tests/) run inside verify-rust.
+verify:
+    gatr run --tag verify-fmt -- cargo fmt --all --check
+    gatr run --tag verify-clippy -- cargo clippy --workspace -- -D warnings
+    gatr run --tag verify-rust -- cargo test --workspace
+    gatr run --tag verify-frontend -- bash -c 'cd crates/wisphive_web/frontend && npm run lint && npm test'
+    gatr run --tag verify-e2e -- just e2e
+
 # Install Claude Code hooks into the current project
 hooks-install:
     wisphive hooks install --project .

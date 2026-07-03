@@ -14,7 +14,7 @@ Wisphive is a multiplexed AI agent control plane that gates tool calls from AI a
 - **What's done / in flight / next** → [`docs/ROADMAP.md`](docs/ROADMAP.md) + `itr ready`
 - **A task to work on** → `itr` (`itr ready`, `itr next`, `itr get <ID>`)
 - **What happened in a past milestone** → [`docs/handoff/`](docs/handoff/)
-- **Upcoming-workstream designs** → [`docs/plan-*.md`](docs/) (conflict gate, deterministic analytics, decision plugins, policy learning, mobile pairing, red)
+- **Upcoming-workstream designs** → [`docs/plan-*.md`](docs/) (conflict gate, deterministic analytics, decision plugins, policy learning, loop supervisor, mobile pairing, red)
 - **Exploratory research** → [`docs/research/`](docs/research/) · **Reference notes** → [`claude/`](claude/)
 
 ## Build & Test Commands
@@ -28,7 +28,11 @@ cargo test server_cleans_up      # Run a single test by name
 cargo clippy --workspace -- -D warnings   # Lint (must be warning-free)
 cargo fmt --all                  # Format
 ./install.sh                     # Build release + install to ~/.cargo/bin + codesign on macOS
+just verify                      # Full verify gate suite via gatr (fmt --check, clippy, tests, frontend lint+vitest, e2e)
+just e2e                         # Playwright e2e smoke suite (isolated temp HOME — never touches ~/.wisphive)
 ```
+
+`just verify` is the close-with-evidence gate: it runs every sub-gate under its own gatr tag (`verify-fmt`, `verify-clippy`, `verify-rust`, `verify-frontend`, `verify-e2e`), fails fast on the first red gate, and `gatr last` / `gatr errors` reproduce each tag's result afterward. TUI snapshot tests run inside `verify-rust` (`cargo test --workspace`).
 
 Prefer `just <task>` for common workflows — see `justfile` for the full list (`build`, `test`, `clippy`, `daemon`, `tui`, `web`, `web-dev`, `frontend-dev`, `frontend-build`, `bootstrap`, `reinstall`, `doctor`, `off`, etc.).
 
@@ -153,13 +157,15 @@ Web auth no longer uses a `~/.wisphive/web.token` file. Raw per-device bearer to
 
 - [tui-textarea reference](claude/tui-textarea-reference.md) — API reference, key bindings, and integration notes for the TUI text editing widget
 - [investigation-empty-detail-views](claude/investigation-empty-detail-views.md) — notes on why `ExitPlanMode` and `AskUserQuestion` rendered empty detail views in the TUI
-- [docs/plan-cross-agent-conflict-gate.md](docs/plan-cross-agent-conflict-gate.md), [docs/plan-deterministic-agent-analytics.md](docs/plan-deterministic-agent-analytics.md), [docs/plan-decision-plugins.md](docs/plan-decision-plugins.md), [docs/plan-policy-learning-engine.md](docs/plan-policy-learning-engine.md) — design docs for upcoming workstreams
+- [docs/plan-cross-agent-conflict-gate.md](docs/plan-cross-agent-conflict-gate.md), [docs/plan-deterministic-agent-analytics.md](docs/plan-deterministic-agent-analytics.md), [docs/plan-decision-plugins.md](docs/plan-decision-plugins.md), [docs/plan-policy-learning-engine.md](docs/plan-policy-learning-engine.md), [docs/plan-loop-supervisor.md](docs/plan-loop-supervisor.md) — design docs for upcoming workstreams; the policy-learning, plugin, conflict-gate, and loop-supervisor plans carry **normative** invariant/trust-model/semantics sections backed by ADR-0005–0007
 - [docs/plan-mobile-device-pairing.md](docs/plan-mobile-device-pairing.md) — critical path, sizing, and RP ID design for the phone-pairing milestone (itr#283 epic)
 - [docs/open-source-path.md](docs/open-source-path.md) — OSS positioning and roadmap
 
 ## Session Handoffs
 
 Substantial sessions end with a durable handoff at `docs/handoff/YYYY-MM-DD-<topic>.md` — an append-only milestone breadcrumb for the next implementer (a fresh clone, a collaborator, or a reviewing agent on another machine). Write one when you close an epic/phase **or** when you hand off mid-stream. Each handoff records what shipped, the trade-offs made, the hard rules established, and where to start next, with an "if you only have 60 seconds" pointer and a link to its predecessor. **Handoffs are never rewritten in place** — if the situation changes, write a new dated handoff that links back. Copy `docs/handoff/TEMPLATE.md` to start; get the facts from git (`git show --stat <sha>`), not from memory.
+
+**Human smoke checklist** ([`docs/smoke/CHECKLIST.md`](docs/smoke/CHECKLIST.md)): human verification is batched at phase boundaries, never blocking per-issue. When work has human-only verification residue (notification perception, real-device passkeys, phone pairing, TUI feel), close the issue on the automated gate and append an item to the checklist (steps, expected result, evidence slot, dated sign-off line) in the right phase section; the human burns pending items down in one session per phase and records it in the burn-down log.
 
 ## Architecture Decision Records (ADRs)
 
