@@ -96,14 +96,15 @@ test('login: invalid credentials are rejected, valid credentials reach the queue
   await expect(page.getByRole('alert')).toHaveText('Invalid password.', { timeout: 15_000 })
   await attachShot(page, 'login-invalid')
 
-  // The per-IP throttle locks for 250ms after one failure — wait it out so
-  // the valid attempt isn't bounced with a 429.
-  await page.waitForTimeout(600)
-
-  // Correct password → dashboard shell with the queue view.
-  await page.getByLabel('Password', { exact: true }).fill(PASSWORD)
-  await page.getByRole('button', { name: 'Sign in', exact: true }).click()
-  await expect(page.getByRole('button', { name: /^Queue/ })).toBeVisible({ timeout: 15_000 })
+  // The per-IP throttle briefly locks after a failed attempt. Rather than
+  // encode the backoff schedule as a fixed sleep (which silently starts
+  // flaking if the lockout is ever lengthened), retry the valid login until
+  // it is no longer throttled and the dashboard renders.
+  await expect(async () => {
+    await page.getByLabel('Password', { exact: true }).fill(PASSWORD)
+    await page.getByRole('button', { name: 'Sign in', exact: true }).click()
+    await expect(page.getByRole('button', { name: /^Queue/ })).toBeVisible({ timeout: 3_000 })
+  }).toPass({ timeout: 20_000 })
   await expect(page.locator('.queue-layout')).toBeVisible()
   await expect(page.getByText('No pending decisions')).toBeVisible()
   await attachShot(page, 'login-valid-dashboard')

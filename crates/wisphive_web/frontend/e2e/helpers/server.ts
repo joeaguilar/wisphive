@@ -20,7 +20,7 @@
  * environment, and `port` only if a fixed port is genuinely required.
  */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, rmSync } from 'node:fs'
 import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { request as httpsRequest } from 'node:https'
 import { createServer } from 'node:net'
@@ -109,6 +109,65 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+// --- Orphan reaper ---------------------------------------------------------
+// Within a run, stop() tears servers down cleanly. But if the runner is
+// interrupted (Ctrl-C, a worker crash mid-spec), afterAll may never fire and
+// a live `wisphive` process plus a `wisphive-e2e-*` temp dir would leak. Each
+// server is spawned `detached` (own process group) and tracked here; a
+// process-exit reaper group-kills survivors and removes their temp dirs.
+interface Tracked {
+  pid: number | undefined
+  home: string
+}
+const LIVE = new Set<Tracked>()
+let reaperInstalled = false
+
+function installReaper(): void {
+  if (reaperInstalled) return
+  reaperInstalled = true
+  const reap = (): void => {
+    for (const t of LIVE) {
+      if (t.pid !== undefined) {
+        try {
+          process.kill(-t.pid, 'SIGKILL')
+        } catch {
+          /* group already gone */
+        }
+      }
+      try {
+        rmSync(t.home, { recursive: true, force: true })
+      } catch {
+        /* best effort */
+      }
+    }
+    LIVE.clear()
+  }
+  process.once('exit', reap)
+  // 'exit' does not fire on a bare signal — convert, reap, then exit.
+  process.once('SIGINT', () => {
+    reap()
+    process.exit(130)
+  })
+  process.once('SIGTERM', () => {
+    reap()
+    process.exit(143)
+  })
+}
+
+/** SIGTERM/SIGKILL the whole process group, falling back to the bare pid. */
+function killGroup(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals): void {
+  if (child.pid === undefined) return
+  try {
+    process.kill(-child.pid, signal)
+  } catch {
+    try {
+      child.kill(signal)
+    } catch {
+      /* already dead */
+    }
+  }
+}
+
 /** One readiness probe: GET /api/auth/status over TLS, cert unverified. */
 function probeReady(port: number): Promise<boolean> {
   return new Promise((resolve) => {
@@ -164,7 +223,14 @@ export async function startWisphiveServer(opts: StartOptions = {}): Promise<Wisp
   const child = spawn(bin, args, {
     env: { ...process.env, ...opts.env, HOME: home },
     stdio: ['ignore', 'pipe', 'pipe'],
+    // Own process group so an interrupted runner can group-kill the whole
+    // tree (see the orphan reaper) rather than orphaning the server.
+    detached: true,
   })
+
+  const tracked: Tracked = { pid: child.pid, home }
+  LIVE.add(tracked)
+  installReaper()
 
   let output = ''
   child.stdout.on('data', (d: Buffer) => (output += d.toString()))
@@ -182,6 +248,7 @@ export async function startWisphiveServer(opts: StartOptions = {}): Promise<Wisp
     Promise.race([exitPromise.then(() => true), sleep(ms).then(() => false)])
 
   const cleanup = async () => {
+    LIVE.delete(tracked)
     await rm(home, { recursive: true, force: true })
   }
 
@@ -203,7 +270,7 @@ export async function startWisphiveServer(opts: StartOptions = {}): Promise<Wisp
       await sleep(150)
     }
   } catch (err) {
-    if (!exited) child.kill('SIGKILL')
+    if (!exited) killGroup(child, 'SIGKILL')
     await waitExit(5_000)
     await cleanup()
     throw err
@@ -217,9 +284,9 @@ export async function startWisphiveServer(opts: StartOptions = {}): Promise<Wisp
     output: () => output,
     stop: async () => {
       if (!exited) {
-        child.kill('SIGTERM')
+        killGroup(child, 'SIGTERM')
         if (!(await waitExit(5_000))) {
-          child.kill('SIGKILL')
+          killGroup(child, 'SIGKILL')
           await waitExit(5_000)
         }
       }

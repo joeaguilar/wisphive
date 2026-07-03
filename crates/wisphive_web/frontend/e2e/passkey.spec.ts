@@ -163,6 +163,15 @@ test('enroll passkey via virtual authenticator, sign out, sign back in with pass
   expect(tokenAfterPasskeyLogin).toBeTruthy()
   expect(tokenAfterPasskeyLogin).not.toBe(tokenAfterSetup)
 
+  // Prove the server actually ACCEPTS the freshly-minted bearer on a
+  // subsequent authenticated request — the SPA rendering the queue view is
+  // not sufficient (it renders even with no working backend). Hit a
+  // bearer-gated endpoint directly and require 200.
+  const authed = await page.request.get(`${server.baseURL}/api/devices`, {
+    headers: { Authorization: `Bearer ${tokenAfterPasskeyLogin}` },
+  })
+  expect(authed.status(), 'rotated passkey-login token must be accepted').toBe(200)
+
   // The assertion incremented the authenticator's signature counter and
   // the server accepted it (no counter-regression 401 — we're logged in).
   const afterLogin = await cdp.send('WebAuthn.getCredentials', { authenticatorId })
