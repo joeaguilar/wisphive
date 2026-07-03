@@ -238,9 +238,14 @@ impl StateDb {
                 file.write_all(line.as_bytes())?;
                 archived += 1;
             }
-            file.flush()?;
+            // fsync before the DELETE commits (itr#368): `flush()` on a raw
+            // File is a no-op, so without this the rows exist only in the page
+            // cache while SQLite durably deletes them — a power loss in that
+            // window would lose audit rows from BOTH the DB and the archive,
+            // violating the "audit data is never deleted" invariant (itr#340).
+            file.sync_data()?;
 
-            // Batch delete after archive is flushed to disk
+            // Batch delete after archive is durably on disk
             let delete_sql = format!(
                 "DELETE FROM decision_log WHERE id IN ({})",
                 placeholders.join(",")

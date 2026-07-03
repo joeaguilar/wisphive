@@ -114,7 +114,7 @@ impl StateDb {
             terminal_session_id,
         )) = row
         {
-            sqlx::query(
+            let result = sqlx::query(
                 "INSERT OR IGNORE INTO decision_log (id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_use_id, hook_event_name, terminal_session_id, decided_by)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
@@ -133,6 +133,18 @@ impl StateDb {
             .bind(decided_by)
             .execute(&self.pool)
             .await?;
+            // INSERT OR IGNORE dedupes on the primary key and the unique
+            // tool_use_id index. A dropped row here means this resolution
+            // conflicts with one already recorded — an audit-log gap that must
+            // be loud, not silent (itr#347).
+            if result.rows_affected() == 0 {
+                tracing::warn!(
+                    %id,
+                    decision = ?decision,
+                    decided_by,
+                    "resolution NOT recorded: decision_log already has a row for this id/tool_use_id (itr#347)"
+                );
+            }
         }
 
         sqlx::query("DELETE FROM pending_decisions WHERE id = ?")
