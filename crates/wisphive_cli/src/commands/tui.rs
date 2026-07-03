@@ -128,7 +128,14 @@ async fn run_loop(
                         }
                         InputAction::ApproveAll => {
                             tracing::info!("approved all");
-                            conn.send(&ClientMessage::ApproveAll { filter: None }).await?;
+                            conn.send(&ClientMessage::ApproveAll {
+                                filter: None,
+                                // Only reachable through the bulk-approve
+                                // confirm modal (Y pressed), so the explicit
+                                // confirmation is genuine (itr#88).
+                                confirm: true,
+                            })
+                            .await?;
                             app.queue.clear();
                             app.queue_index = 0;
                             app.rebuild_projects();

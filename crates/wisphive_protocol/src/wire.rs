@@ -97,7 +97,15 @@ pub enum ClientMessage {
 
     /// TUI approves all items matching an optional filter.
     #[serde(rename = "approve_all")]
-    ApproveAll { filter: Option<DecisionFilter> },
+    ApproveAll {
+        filter: Option<DecisionFilter>,
+        /// Explicit confirmation for an UNFILTERED bulk approve (itr#88): the
+        /// daemon rejects `filter: None` without it, so a compromised or buggy
+        /// client can't blanket-approve everything with one message. Old
+        /// clients decode as `false` (serde default) and are rejected.
+        #[serde(default)]
+        confirm: bool,
+    },
 
     /// TUI denies all items matching an optional filter.
     #[serde(rename = "deny_all")]
@@ -858,6 +866,7 @@ mod tests {
     #[test]
     fn round_trip_approve_all_with_filter() {
         let msg = ClientMessage::ApproveAll {
+            confirm: true,
             filter: Some(DecisionFilter {
                 tool_name: Some("Bash".into()),
                 project: Some(PathBuf::from("/proj")),
@@ -867,7 +876,8 @@ mod tests {
         let encoded = encode(&msg).unwrap();
         let decoded: ClientMessage = decode(&encoded).unwrap();
         match decoded {
-            ClientMessage::ApproveAll { filter } => {
+            ClientMessage::ApproveAll { filter, confirm } => {
+                assert!(confirm);
                 let f = filter.unwrap();
                 assert_eq!(f.tool_name.unwrap(), "Bash");
                 assert_eq!(f.project.unwrap(), PathBuf::from("/proj"));

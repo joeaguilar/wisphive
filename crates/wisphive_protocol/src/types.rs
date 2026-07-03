@@ -222,6 +222,11 @@ pub struct RichDecision {
     /// Selected permission suggestion (PermissionRequest only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selected_permission: Option<PermissionSuggestion>,
+    /// Identity of the resolving client for the audit trail (itr#88):
+    /// "human:tui" for the local TUI, "human:web:<device-id>" for an
+    /// authenticated web device. None for internal/fallback resolutions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolver: Option<String>,
 }
 
 impl RichDecision {
@@ -233,6 +238,7 @@ impl RichDecision {
             always_allow: false,
             additional_context: None,
             selected_permission: None,
+            resolver: None,
         }
     }
 
@@ -244,6 +250,7 @@ impl RichDecision {
             always_allow: false,
             additional_context: None,
             selected_permission: None,
+            resolver: None,
         }
     }
 }
@@ -257,6 +264,7 @@ impl From<Decision> for RichDecision {
             always_allow: false,
             additional_context: None,
             selected_permission: None,
+            resolver: None,
         }
     }
 }

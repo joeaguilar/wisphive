@@ -107,11 +107,13 @@ impl DecisionQueue {
     }
 
     /// Resolve all pending decisions matching an optional filter.
-    /// Returns the IDs of resolved decisions.
+    /// Returns the IDs of resolved decisions. `resolver` identifies the
+    /// resolving client for the audit trail (itr#88).
     pub fn resolve_all(
         &mut self,
         filter: &Option<DecisionFilter>,
         decision: Decision,
+        resolver: Option<&str>,
     ) -> Vec<Uuid> {
         let ids: Vec<Uuid> = self
             .pending_items
@@ -121,7 +123,11 @@ impl DecisionQueue {
             .collect();
 
         for id in &ids {
-            self.resolve(*id, RichDecision::from(decision));
+            let rich = RichDecision {
+                resolver: resolver.map(str::to_string),
+                ..RichDecision::from(decision)
+            };
+            self.resolve(*id, rich);
         }
         ids
     }
@@ -361,7 +367,7 @@ mod tests {
         let rx2 = q.enqueue(r2).unwrap();
         let rx3 = q.enqueue(r3).unwrap();
 
-        let ids = q.resolve_all(&None, Decision::Approve);
+        let ids = q.resolve_all(&None, Decision::Approve, None);
         assert_eq!(ids.len(), 3);
         assert_eq!(q.len(), 0);
 
@@ -385,7 +391,7 @@ mod tests {
             tool_name: Some("Bash".into()),
             ..Default::default()
         });
-        let ids = q.resolve_all(&filter, Decision::Deny);
+        let ids = q.resolve_all(&filter, Decision::Deny, None);
 
         assert_eq!(ids.len(), 2);
         assert_eq!(q.len(), 1); // Only Write remains
@@ -410,7 +416,7 @@ mod tests {
             project: Some(PathBuf::from("/muse")),
             ..Default::default()
         });
-        let ids = q.resolve_all(&filter, Decision::Approve);
+        let ids = q.resolve_all(&filter, Decision::Approve, None);
 
         assert_eq!(ids.len(), 2);
         assert_eq!(q.len(), 1);
@@ -430,7 +436,7 @@ mod tests {
             tool_name: Some("NonExistent".into()),
             ..Default::default()
         });
-        let ids = q.resolve_all(&filter, Decision::Approve);
+        let ids = q.resolve_all(&filter, Decision::Approve, None);
 
         assert!(ids.is_empty());
         assert_eq!(q.len(), 1); // Nothing resolved
@@ -439,7 +445,7 @@ mod tests {
     #[test]
     fn resolve_all_on_empty_queue() {
         let mut q = make_queue();
-        let ids = q.resolve_all(&None, Decision::Approve);
+        let ids = q.resolve_all(&None, Decision::Approve, None);
         assert!(ids.is_empty());
     }
 

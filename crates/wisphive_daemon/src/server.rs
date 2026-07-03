@@ -546,14 +546,22 @@ async fn handle_hook(
             };
 
             let (rich, decided_by) = match waited {
-                Waited::Resolved(rich) => (*rich, "human"),
+                Waited::Resolved(rich) => {
+                    // Attribute the resolution to the identified client
+                    // (itr#88); plain "human" only when identity didn't travel.
+                    let label = rich.resolver.clone().unwrap_or_else(|| "human".to_string());
+                    (*rich, label)
+                }
                 Waited::ChannelDropped => {
                     warn!(%id, "decision channel dropped, defaulting to approve");
                     // Remove the leaked queue entry so TUI/web state matches
                     // the audit log (itr#363).
                     let mut q = ctx.queue.lock().await;
                     q.finalize_local(id, Decision::Approve);
-                    (RichDecision::approve(), "channel_dropped:approve")
+                    (
+                        RichDecision::approve(),
+                        "channel_dropped:approve".to_string(),
+                    )
                 }
                 Waited::TimedOut => {
                     warn!(%id, "hook timed out after {timeout_secs}s, defaulting to approve");
@@ -562,7 +570,7 @@ async fn handle_hook(
                     // while the tool already ran (itr#363).
                     let mut q = ctx.queue.lock().await;
                     q.finalize_local(id, Decision::Approve);
-                    (RichDecision::approve(), "timeout:approve")
+                    (RichDecision::approve(), "timeout:approve".to_string())
                 }
                 Waited::Disconnected => {
                     warn!(%id, "hook disconnected while awaiting decision; abandoning");
@@ -595,7 +603,7 @@ async fn handle_hook(
             // Log resolution (skip audit log for Ask/defer decisions)
             if rich.decision != Decision::Ask {
                 ctx.state_db
-                    .resolve_pending_by(id, rich.decision, decided_by)
+                    .resolve_pending_by(id, rich.decision, &decided_by)
                     .await?;
             }
 
@@ -710,13 +718,29 @@ async fn write_msg(
     Ok(())
 }
 
+/// Audit-trail identity of the resolving client (itr#88): the local TUI runs
+/// with the daemon's own uid over the peer-checked socket, web clients carry
+/// their authenticated device id.
+fn resolver_label(device_id: &Option<wisphive_protocol::DeviceId>) -> String {
+    match device_id {
+        Some(dev) => format!("human:web:{}", dev.0),
+        None => "human:tui".to_string(),
+    }
+}
+
 /// Eagerly persist a resolved decision so subsequent history queries see it.
 ///
 /// The hook handler's `resolve_pending` is idempotent (no-op if already done),
 /// so resolving here ahead of the hook is safe. A persistence failure is logged
 /// and swallowed — exactly as the six inline call sites did before extraction.
-async fn eager_persist(state_db: &crate::state::StateDb, id: uuid::Uuid, decision: Decision) {
-    if let Err(e) = state_db.resolve_pending(id, decision).await {
+/// `resolver` lands in decision_log.decided_by (itr#88).
+async fn eager_persist(
+    state_db: &crate::state::StateDb,
+    id: uuid::Uuid,
+    decision: Decision,
+    resolver: &str,
+) {
+    if let Err(e) = state_db.resolve_pending_by(id, decision, resolver).await {
         warn!("eager persist failed for {id}: {e}");
     }
 }
@@ -969,6 +993,7 @@ async fn handle_decision_command(
                 always_allow,
                 additional_context,
                 selected_permission: None,
+                resolver: Some(resolver_label(&device_id)),
             };
             let resolved = {
                 let mut q = ctx.queue.lock().await;
@@ -979,7 +1004,13 @@ async fn handle_decision_command(
             // (already timed out / abandoned, itr#363) must not write an audit
             // row contradicting the recorded outcome.
             if resolved {
-                eager_persist(&ctx.state_db, id, Decision::Approve).await;
+                eager_persist(
+                    &ctx.state_db,
+                    id,
+                    Decision::Approve,
+                    &resolver_label(&device_id),
+                )
+                .await;
             }
         }
         ClientMessage::Deny { id, message } => {
@@ -987,6 +1018,7 @@ async fn handle_decision_command(
             let rich = RichDecision {
                 decision: Decision::Deny,
                 message,
+                resolver: Some(resolver_label(&device_id)),
                 ..RichDecision::deny()
             };
             let resolved = {
@@ -994,7 +1026,13 @@ async fn handle_decision_command(
                 q.resolve(id, rich)
             };
             if resolved {
-                eager_persist(&ctx.state_db, id, Decision::Deny).await;
+                eager_persist(
+                    &ctx.state_db,
+                    id,
+                    Decision::Deny,
+                    &resolver_label(&device_id),
+                )
+                .await;
             }
         }
         ClientMessage::Ask { id } => {
@@ -1003,7 +1041,28 @@ async fn handle_decision_command(
             q.resolve(id, RichDecision::from(Decision::Ask));
             // Ask/defer decisions are not persisted to the audit log
         }
-        ClientMessage::ApproveAll { ref filter } => {
+        ClientMessage::ApproveAll {
+            ref filter,
+            confirm,
+        } => {
+            // An UNFILTERED bulk approve requires explicit confirmation
+            // (itr#88): a buggy or compromised client echoing NewDecision
+            // events must not be able to blanket-approve the whole queue with
+            // one message. The TUI sends confirm=true after its Y/N modal.
+            if filter.is_none() && !confirm {
+                warn!(
+                    ?device_id,
+                    "rejected unfiltered approve_all without confirm (itr#88)"
+                );
+                write_msg(
+                    writer,
+                    &ServerMessage::Error {
+                        message: "approve_all without a filter requires confirm=true".into(),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
             // Web-origin bulk approves get the same sudo-class
             // treatment as single approvals: items in the
             // sudo-class set are held back behind a
@@ -1026,7 +1085,13 @@ async fn handle_decision_command(
                     let mut q = ctx.queue.lock().await;
                     allowed
                         .iter()
-                        .filter(|(id, _)| q.resolve(*id, RichDecision::from(Decision::Approve)))
+                        .filter(|(id, _)| {
+                            let rich = RichDecision {
+                                resolver: Some(resolver_label(&device_id)),
+                                ..RichDecision::from(Decision::Approve)
+                            };
+                            q.resolve(*id, rich)
+                        })
                         .map(|(id, _)| *id)
                         .collect()
                 };
@@ -1037,7 +1102,13 @@ async fn handle_decision_command(
                     "approve_all"
                 );
                 for id in &allowed_ids {
-                    eager_persist(&ctx.state_db, *id, Decision::Approve).await;
+                    eager_persist(
+                        &ctx.state_db,
+                        *id,
+                        Decision::Approve,
+                        &resolver_label(&device_id),
+                    )
+                    .await;
                 }
                 for (id, tool_name) in gated {
                     let reauth_msg = ServerMessage::WebReauthRequired {
@@ -1052,22 +1123,34 @@ async fn handle_decision_command(
             } else {
                 let ids = {
                     let mut q = ctx.queue.lock().await;
-                    q.resolve_all(filter, Decision::Approve)
+                    q.resolve_all(filter, Decision::Approve, Some(&resolver_label(&device_id)))
                 };
                 info!(?device_id, count = ids.len(), "approve_all");
                 for id in ids {
-                    eager_persist(&ctx.state_db, id, Decision::Approve).await;
+                    eager_persist(
+                        &ctx.state_db,
+                        id,
+                        Decision::Approve,
+                        &resolver_label(&device_id),
+                    )
+                    .await;
                 }
             }
         }
         ClientMessage::DenyAll { ref filter } => {
             let ids = {
                 let mut q = ctx.queue.lock().await;
-                q.resolve_all(filter, Decision::Deny)
+                q.resolve_all(filter, Decision::Deny, Some(&resolver_label(&device_id)))
             };
             info!(?device_id, count = ids.len(), "deny_all");
             for id in ids {
-                eager_persist(&ctx.state_db, id, Decision::Deny).await;
+                eager_persist(
+                    &ctx.state_db,
+                    id,
+                    Decision::Deny,
+                    &resolver_label(&device_id),
+                )
+                .await;
             }
         }
         ClientMessage::MarkDeviceFresh => {
@@ -1115,12 +1198,19 @@ async fn handle_decision_command(
                 always_allow: false,
                 additional_context: None,
                 selected_permission: selected,
+                resolver: Some(resolver_label(&device_id)),
             };
             {
                 let mut q = ctx.queue.lock().await;
                 q.resolve(id, rich);
             }
-            eager_persist(&ctx.state_db, id, Decision::Approve).await;
+            eager_persist(
+                &ctx.state_db,
+                id,
+                Decision::Approve,
+                &resolver_label(&device_id),
+            )
+            .await;
         }
         _ => {
             warn!("unexpected message from TUI: {:?}", msg);

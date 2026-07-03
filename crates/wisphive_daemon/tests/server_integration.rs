@@ -299,6 +299,87 @@ async fn hook_sends_request_tui_approves_hook_gets_response() {
 }
 
 #[tokio::test]
+async fn unfiltered_approve_all_without_confirm_is_rejected() {
+    // itr#88: a compromised/buggy client echoing NewDecision events must not
+    // blanket-approve the queue with one unconfirmed message.
+    let (_tmp, config) = temp_config();
+    let socket_path = config.socket_path.clone();
+    let shutdown_tx = start_server(config).await;
+
+    let (mut tui_lines, mut tui_writer) = connect_as_tui(&socket_path).await;
+    let (mut hook_lines, mut hook_writer) = connect_as_hook(&socket_path).await;
+
+    let req = make_decision_request("Bash");
+    let req_id = req.id;
+    let msg = encode(&ClientMessage::DecisionRequest(req)).unwrap();
+    hook_writer.write_all(msg.as_bytes()).await.unwrap();
+    let _ = next_tui_msg(&mut tui_lines, |m| {
+        matches!(m, ServerMessage::NewDecision(_))
+    })
+    .await;
+
+    // Unconfirmed, unfiltered bulk approve → rejected with an Error.
+    let approve_all = encode(&ClientMessage::ApproveAll {
+        filter: None,
+        confirm: false,
+    })
+    .unwrap();
+    tui_writer.write_all(approve_all.as_bytes()).await.unwrap();
+    let err = next_tui_msg(&mut tui_lines, |m| matches!(m, ServerMessage::Error { .. })).await;
+    match err {
+        ServerMessage::Error { message } => assert!(message.contains("confirm")),
+        other => panic!("expected Error, got: {:?}", other),
+    }
+
+    // The decision is still pending — approve it properly and the hook gets it.
+    let approve = encode(&ClientMessage::Approve {
+        id: req_id,
+        message: None,
+        updated_input: None,
+        always_allow: false,
+        additional_context: None,
+    })
+    .unwrap();
+    tui_writer.write_all(approve.as_bytes()).await.unwrap();
+    let hook_resp_line = tokio::time::timeout(Duration::from_secs(2), hook_lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let hook_resp: ServerMessage = decode(&hook_resp_line).unwrap();
+    assert!(matches!(
+        hook_resp,
+        ServerMessage::DecisionResponse {
+            decision: Decision::Approve,
+            ..
+        }
+    ));
+
+    // The audit row names the resolving client (itr#88): a local TUI approve
+    // is attributed as human:tui, not bare "human".
+    let query = encode(&ClientMessage::QueryHistory {
+        agent_id: None,
+        limit: Some(10),
+        request_id: None,
+    })
+    .unwrap();
+    tui_writer.write_all(query.as_bytes()).await.unwrap();
+    let history = next_tui_msg(&mut tui_lines, |m| {
+        matches!(m, ServerMessage::HistoryResponse { .. })
+    })
+    .await;
+    match history {
+        ServerMessage::HistoryResponse { entries, .. } => {
+            let entry = entries.iter().find(|e| e.id == req_id).expect("audit row");
+            assert_eq!(entry.decided_by.as_deref(), Some("human:tui"));
+        }
+        other => panic!("expected HistoryResponse, got: {:?}", other),
+    }
+
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
 async fn hook_sends_request_tui_denies_hook_gets_deny() {
     let (_tmp, config) = temp_config();
     let socket_path = config.socket_path.clone();
@@ -504,7 +585,11 @@ async fn approve_all_resolves_all_pending_hooks() {
     }
 
     // TUI sends ApproveAll
-    let approve_all = encode(&ClientMessage::ApproveAll { filter: None }).unwrap();
+    let approve_all = encode(&ClientMessage::ApproveAll {
+        filter: None,
+        confirm: true,
+    })
+    .unwrap();
     tui_writer.write_all(approve_all.as_bytes()).await.unwrap();
 
     // All hooks should get Approve
@@ -647,8 +732,11 @@ fn encode_web_approve(id: uuid::Uuid, device_id: &str) -> String {
 /// Serialize an ApproveAll wrapped in a ClientCommand envelope tagged
 /// with the given device id.
 fn encode_web_approve_all(filter: Option<DecisionFilter>, device_id: &str) -> String {
-    let cmd = ClientCommand::from(ClientMessage::ApproveAll { filter })
-        .with_device_id(DeviceId::from(device_id));
+    let cmd = ClientCommand::from(ClientMessage::ApproveAll {
+        filter,
+        confirm: true,
+    })
+    .with_device_id(DeviceId::from(device_id));
     encode(&cmd).unwrap()
 }
 

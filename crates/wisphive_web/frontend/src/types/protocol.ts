@@ -136,7 +136,7 @@ export interface SpawnAgentRequest {
 export type ClientMessage =
   | { type: "approve"; id: string; message?: string; updated_input?: unknown; always_allow?: boolean; additional_context?: string }
   | { type: "deny"; id: string; message?: string }
-  | { type: "approve_all"; filter?: unknown }
+  | { type: "approve_all"; filter?: unknown; confirm?: boolean }
   | { type: "deny_all"; filter?: unknown }
   | { type: "query_history"; agent_id?: string; limit?: number; request_id?: string }
   | { type: "query_sessions" }
