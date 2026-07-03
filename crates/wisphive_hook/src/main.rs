@@ -1815,11 +1815,20 @@ fn targets_control_plane(
 
 /// Best-effort test of whether a tool-supplied path resolves inside `dir`.
 /// Expands a leading `~`/`$HOME`/`${HOME}` (relative to `dir`'s parent, i.e. the
-/// home that owns the state dir), lexically normalizes (`.`/`..` collapsed —
-/// without touching the filesystem, since the target may not exist yet), then
-/// checks component-wise containment. Relative paths are left as-is: the agent's
-/// cwd is the project, not the state dir, and the Bash substring backstop covers
-/// spellings this misses.
+/// home that owns the state dir) and lexically collapses `.`/`..`, then resolves
+/// the deepest *existing* ancestor with [`std::fs::canonicalize`] before a
+/// component-wise containment check against the canonicalized `dir`.
+///
+/// Canonicalizing (rather than a lexical `starts_with`) is load-bearing for two
+/// bypasses a lexical check misses: (1) on a case-insensitive filesystem (macOS
+/// APFS/HFS+ default) `~/.Wisphive/config.json` hits the real inode but differs
+/// byte-wise — canonicalize returns the on-disk casing; (2) a symlinked ancestor
+/// whose name isn't `.wisphive` (`ln -s $HOME /tmp/h; write /tmp/h/.wisphive/…`)
+/// is invisible lexically — canonicalize follows it. Residual TOCTOU remains
+/// (the link could change between decision and execution); this is a decision-
+/// time backstop, and the Bash substring check plus human review are the
+/// belt-and-braces. Relative paths are left as-is: the agent's cwd is the
+/// project, not the state dir.
 fn path_in_dir(raw: &str, dir: &std::path::Path) -> bool {
     let home = dir.parent().unwrap_or(dir);
     let expanded = if raw == "~" {
@@ -1834,7 +1843,9 @@ fn path_in_dir(raw: &str, dir: &std::path::Path) -> bool {
     } else {
         PathBuf::from(raw)
     };
-    lexical_normalize(&expanded).starts_with(dir)
+    let target = resolve_existing_ancestor(&lexical_normalize(&expanded));
+    let dir_resolved = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    target.starts_with(&dir_resolved)
 }
 
 /// Collapse `.` and `..` components lexically (no filesystem access).
@@ -1851,6 +1862,34 @@ fn lexical_normalize(p: &std::path::Path) -> PathBuf {
         }
     }
     out
+}
+
+/// Canonicalize the deepest ancestor of `p` that exists on disk (resolving
+/// symlinks and, on case-insensitive filesystems, the real casing), then
+/// re-append the not-yet-existing tail below it. For a target that already
+/// exists (overwriting `config.json`) the whole path canonicalizes; for a new
+/// file the existing directory prefix is resolved and the leaf stays lexical.
+fn resolve_existing_ancestor(p: &std::path::Path) -> PathBuf {
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = p;
+    loop {
+        if let Ok(canonical) = cur.canonicalize() {
+            let mut out = canonical;
+            for name in suffix.iter().rev() {
+                out.push(name);
+            }
+            return out;
+        }
+        match (cur.file_name(), cur.parent()) {
+            (Some(name), Some(parent)) => {
+                suffix.push(name.to_os_string());
+                cur = parent;
+            }
+            // Root, or a relative path with no more parents: nothing on disk
+            // to resolve against — fall back to the lexical form.
+            _ => return p.to_path_buf(),
+        }
+    }
 }
 
 /// Best-effort substring backstop for Bash commands that name the state dir.
@@ -2667,6 +2706,41 @@ mod tests {
         // Component-wise containment: `.wisphive-evil` is NOT inside `.wisphive`.
         let sibling = home.path().join(".wisphive-evil").join("config.json");
         assert!(!targets_control_plane("Write", &write_cmd(sibling.to_str().unwrap()), &state));
+    }
+
+    #[test]
+    fn self_protect_resolves_symlinked_ancestor() {
+        // Bypass: `ln -s $HOME /tmp/h` then write /tmp/h/.wisphive/config.json.
+        // A lexical check misses it; canonicalizing the existing ancestor
+        // follows the symlink back to the real state dir.
+        let (home, state) = home_and_state();
+        let link = home.path().join("linkdir");
+        std::os::unix::fs::symlink(home.path(), &link).unwrap();
+        let through = link.join(".wisphive").join("config.json");
+        assert!(targets_control_plane(
+            "Write",
+            &write_cmd(through.to_str().unwrap()),
+            &state
+        ));
+    }
+
+    #[test]
+    fn self_protect_catches_case_variant_on_case_insensitive_fs() {
+        // Bypass on macOS APFS/HFS+: `~/.Wisphive/config.json` resolves to the
+        // real `.wisphive` inode. Only meaningful where the FS is
+        // case-insensitive; on a case-sensitive FS `.WISPHIVE` is a genuinely
+        // different directory and writing there does not touch the gate.
+        let (home, state) = home_and_state();
+        let upper = home.path().join(".WISPHIVE");
+        if !upper.exists() {
+            return; // case-sensitive filesystem — nothing to catch
+        }
+        let target = upper.join("config.json");
+        assert!(targets_control_plane(
+            "Write",
+            &write_cmd(target.to_str().unwrap()),
+            &state
+        ));
     }
 
     #[test]
