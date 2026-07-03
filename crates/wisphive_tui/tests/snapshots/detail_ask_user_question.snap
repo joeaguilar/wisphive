@@ -1,0 +1,32 @@
+---
+source: crates/wisphive_tui/tests/ui_snapshots.rs
+expression: frame
+---
+┌ Review: AskUserQuestion ─────────────────────────────────────────────────────────────────────────┐
+│  Agent:    claude-a1b2c3 (claude_code)                                                           │
+│  Project:  /tmp/wisphive-demo                                                                    │
+│  Tool:     AskUserQuestion                                                                       │
+│  Time:     [TIMESTAMP] (2h ago)                                                          │
+│                                                                                                  │
+│  [Storage]                                                                                       │
+│  ── Question ──                                                                                  │
+│                                                                                                  │
+│  Which storage backend should the daemon use?                                                    │
+│                                                                                                  │
+│  ── Options ──                                                                                   │
+│                                                                                                  │
+│  [1] SQLite                                                                                      │
+│      Embedded, zero-config                                                                       │
+│  [2] Postgres                                                                                    │
+│      Networked, multi-user                                                                       │
+│  [O] Other (type response)                                                                       │
+│                                                                                                  │
+│  ── Actions ──                                                                                   │
+│                                                                                                  │
+│  [1-2] select an option                                                                          │
+│  [O] type custom response                                                                        │
+│  [D] deny                                                                                        │
+│  [M] deny with message                                                                           │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ [1-2]select [O]ther [D]eny [M]deny+msg [j/k]scroll [Spc]page [g/G]top/end [q/Esc]back [Q]uit [P]rev

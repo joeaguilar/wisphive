@@ -1,0 +1,32 @@
+---
+source: crates/wisphive_tui/tests/ui_snapshots.rs
+expression: frame
+---
+┌ Review: ExitPlanMode ────────────────────────────────────────────────────────────────────────────┐
+│  Agent:    claude-a1b2c3 (claude_code)                                                           │
+│  Project:  /tmp/wisphive-demo                                                                    │
+│  Tool:     ExitPlanMode                                                                          │
+│  Time:     [TIMESTAMP] (2h ago)                                                          │
+│                                                                                                  │
+│  ── Plan ──                                                                                      │
+│                                                                                                  │
+│  # Plan                                                                                          │
+│                                                                                                  │
+│                                                                                                  │
+│  1. Add a TestBackend snapshot harness                                                           │
+│  2. Cover the detail views                                                                       │
+│  3. Enforce the status-bar house rule                                                            │
+│                                                                                                  │
+│  ── Actions ──                                                                                   │
+│                                                                                                  │
+│  [A] accept plan (exit plan mode)                                                                │
+│  [D] reject (continue planning)                                                                  │
+│  [M] reject with feedback                                                                        │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ [A/Enter]accept [D]eny [M]deny+msg [j/k]scroll [Spc]page [g/G]top/end [q/Esc]back [Q]uit [P]review

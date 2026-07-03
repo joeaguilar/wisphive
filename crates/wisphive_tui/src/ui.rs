@@ -289,14 +289,14 @@ fn draw_detail_view(frame: &mut Frame, app: &App) {
         };
 
         use wisphive_protocol::HookEventType;
-        let bar_text = match req.hook_event_name {
+        // Event-specific action keys; the shared tail below carries the
+        // scroll/back/quit keys common to every detail view (house rule:
+        // every keybinding handled in input.rs must appear in the bar).
+        let actions = match req.hook_event_name {
             HookEventType::PermissionRequest => {
                 if let Some(ref suggestions) = req.permission_suggestions {
                     let n = suggestions.len();
-                    format!(
-                        " [1-{}]select [N]deny [M]deny+msg [?]defer [q/Esc]back [Q]uit{}",
-                        n, scroll_info
-                    )
+                    format!("[1-{n}]select [N]deny [M]deny+msg [?]defer")
                 } else if req
                     .tool_input
                     .get("questions")
@@ -312,55 +312,26 @@ fn draw_detail_view(frame: &mut Frame, app: &App) {
                         .and_then(|q| q.get("options"))
                         .and_then(|v| v.as_array())
                         .map_or(0, |o| o.len());
-                    format!(
-                        " [1-{}]select [O]ther [D]eny [M]deny+msg [q/Esc]back [Q]uit{}",
-                        n, scroll_info
-                    )
+                    format!("[1-{n}]select [O]ther [D]eny [M]deny+msg")
                 } else {
                     // ExitPlanMode / generic PermissionRequest
-                    format!(
-                        " [A/Enter]accept [D]eny [M]deny+msg [q/Esc]back [Q]uit{}",
-                        scroll_info
-                    )
+                    "[A/Enter]accept [D]eny [M]deny+msg".to_string()
                 }
             }
             HookEventType::Stop | HookEventType::SubagentStop => {
-                format!(
-                    " [A/Enter]accept [D]deny+msg [q/Esc]back [Q]uit{}",
-                    scroll_info
-                )
+                "[A/Enter]accept [D]deny+msg".to_string()
             }
             HookEventType::UserPromptSubmit | HookEventType::ConfigChange => {
-                format!(
-                    " [A]llow [B]lock [M]block+msg [q/Esc]back [Q]uit{}",
-                    scroll_info
-                )
+                "[A]llow [B]lock [M]block+msg".to_string()
             }
-            HookEventType::Elicitation => {
-                format!(
-                    " [A]ccept [D]ecline [C]ancel [q/Esc]back [Q]uit{}",
-                    scroll_info
-                )
-            }
-            HookEventType::TeammateIdle => {
-                format!(
-                    " [C]ontinue+feedback [S]top [q/Esc]back [Q]uit{}",
-                    scroll_info
-                )
-            }
-            HookEventType::TaskCompleted => {
-                format!(
-                    " [A]ccept [R]eject+feedback [q/Esc]back [Q]uit{}",
-                    scroll_info
-                )
-            }
-            _ => {
-                format!(
-                    " [Y]approve [N]deny [M]deny+msg [!]always [E]edit [C]context [?]defer [q/Esc]back [Q]uit{}",
-                    scroll_info
-                )
-            }
+            HookEventType::Elicitation => "[A]ccept [D]ecline [C]ancel".to_string(),
+            HookEventType::TeammateIdle => "[C]ontinue+feedback [S]top".to_string(),
+            HookEventType::TaskCompleted => "[A]ccept [R]eject+feedback".to_string(),
+            _ => "[Y]approve [N]deny [M]deny+msg [!]always [E]edit [C]context [?]defer".to_string(),
         };
+        let bar_text = format!(
+            " {actions} [j/k]scroll [Spc]page [g/G]top/end [q/Esc]back [Q]uit{scroll_info}"
+        );
         let preview_indicator = if app.markdown_preview {
             " [P]raw"
         } else {
@@ -532,7 +503,7 @@ fn draw_history_detail_view(frame: &mut Frame, app: &App) {
     }
 
     let bar = Paragraph::new(Line::from(Span::styled(
-        " [j/k]scroll [q/Esc]back [Q]uit ",
+        " [j/k]scroll [Spc]page [q/Esc]back [Q]uit ",
         Style::default().fg(Color::White).bg(Color::DarkGray),
     )));
     frame.render_widget(bar, chunks[1]);
@@ -740,7 +711,7 @@ fn draw_config_view(frame: &mut Frame, app: &App) {
     let bar_text = if app.config_rule_input_mode {
         " Type pattern, Enter to add, Esc to cancel ".to_string()
     } else {
-        " [j/k]nav [←/→]level [Space]toggle [+]add rule [-]del rule [q]back ".to_string()
+        " [j/k]nav [←/→]level [Space]toggle [+]add rule [-]del rule [q/Esc]back [Q]uit ".to_string()
     };
     let bar = Paragraph::new(Line::from(Span::styled(
         bar_text,
@@ -1194,7 +1165,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             "disconnected"
         };
         format!(
-            " [y]approve [Enter/a/d]review [A]ll [D]eny-all [n]spawn [P]ick+spawn [h]istory [s]essions [p]rojects [c]onfig [/]filter [Tab]cycle [q]back [Q]uit | {} ",
+            " [j/k]move [y]approve [Enter/a/d]review [A]ll [D]eny-all [n]spawn [P]ick+spawn [t]erminals [T]erm+proj [h]istory [s]essions [p]rojects [c]onfig [/]filter [Tab]cycle [e]fwd [q]back [Q]uit | {} ",
             conn
         )
     };

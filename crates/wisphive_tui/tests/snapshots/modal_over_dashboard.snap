@@ -1,0 +1,28 @@
+---
+source: crates/wisphive_tui/tests/ui_snapshots.rs
+expression: frame
+---
+┌ Queue (4 pending) ───────────────────────────────────────────────────────────────────────────────┐
+│  [claude-a1b2c3] wisphive-demo Bash     cargo test --workspace     2h                            │
+│  [claude-a1b2c3] wisphive-demo Edit     /tmp/wisphive-demo/src/main.rs     2h                    │
+│P [claude-a1b2c3] wisphive-demo AskUserQuestion {"questions":[{"header":"Storage","multiSelect"...│
+│P [claude-a1b2c3] wisphive-demo ExitPlanMode {}     2h                                            │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│         ┌ Confirm Approve All ─────────────────────────────────────────────────────────┐         │
+│         │Approve all 4 pending items?  Y = approve all  |  N / Esc = cancel            │         │
+│         │                                                                              │         │
+│         │                                                                              │         │
+│         │                                                                              │         │
+│         │                                                                              │         │
+└─────────└──────────────────────────────────────────────────────────────────────────────┘─────────┘
+┌ Agents (2) ────────────────────────────────────┐┌ Projects (1) ──────────────────────────────────┐
+│claude-a1b2c3 claude_code ●                     ││● wisphive-demo    2 agents  4 pending          │
+│codex-d4e5f6 claude_code ●                      ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+└────────────────────────────────────────────────┘└────────────────────────────────────────────────┘
+ [j/k]move [y]approve [Enter/a/d]review [A]ll [D]eny-all [n]spawn [P]ick+spawn [t]erminals [T]erm+pr

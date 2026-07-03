@@ -1,0 +1,32 @@
+---
+source: crates/wisphive_tui/tests/ui_snapshots.rs
+expression: frame
+---
+┌ Review: Edit ────────────────────────────────────────────────────────────────────────────────────┐
+│  Agent:    claude-a1b2c3 (claude_code)                                                           │
+│  Project:  /tmp/wisphive-demo                                                                    │
+│  Tool:     Edit                                                                                  │
+│  Time:     [TIMESTAMP] (2h ago)                                                          │
+│                                                                                                  │
+│  File: /tmp/wisphive-demo/src/main.rs                                                            │
+│                                                                                                  │
+│  ── Changes ──                                                                                   │
+│                                                                                                  │
+│    fn main() {                                                                                   │
+│  -     println!("hello");                                                                        │
+│  +     println!("hello, wisphive");                                                              │
+│    }                                                                                             │
+│                                                                                                  │
+│  ── Actions ──                                                                                   │
+│                                                                                                  │
+│  [Y] approve                                                                                     │
+│  [N] deny                                                                                        │
+│  [M] deny with message                                                                           │
+│  [!] always allow                                                                                │
+│  [E] edit input                                                                                  │
+│  [C] add context                                                                                 │
+│  [?] defer to native prompt                                                                      │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ [Y]approve [N]deny [M]deny+msg [!]always [E]edit [C]context [?]defer [j/k]scroll [Spc]page [g/G]top
