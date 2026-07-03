@@ -481,7 +481,8 @@ async fn handle_hook(
                 let _ = ctx.tui_tx.send(ServerMessage::AgentConnected(agent_info));
             }
 
-            // Persist for crash recovery
+            // Persist for crash recovery. INSERT OR IGNORE (itr#370): even if
+            // an id collides, the first request's row is never overwritten.
             ctx.state_db.persist_pending(&req).await?;
 
             // Send passive notification so user knows to check the TUI
@@ -489,28 +490,94 @@ async fn handle_hook(
                 crate::notify::notify_decision(&req);
             }
 
-            // Enqueue and get receiver
+            // Enqueue and get receiver. A duplicate id is rejected fail-closed
+            // (itr#370): the id is hook-supplied, and overwriting would drop
+            // the first request's oneshot — an instant fail-open approve for
+            // the victim — and corrupt its audit row.
             let rx = {
                 let mut q = ctx.queue.lock().await;
                 q.enqueue(req)
             };
+            let Some(rx) = rx else {
+                write_msg(
+                    &mut writer,
+                    &ServerMessage::DecisionResponse {
+                        id,
+                        decision: Decision::Deny,
+                        message: Some(
+                            "Wisphive rejected this request: a decision with the same id is already pending"
+                                .into(),
+                        ),
+                        updated_input: None,
+                        additional_context: None,
+                        selected_permission: None,
+                    },
+                )
+                .await?;
+                return Ok(());
+            };
 
-            // Block until TUI responds or timeout. `decided_by` records the
-            // resolving actor for the audit trail (itr#397) — the fallback
-            // approvals are non-human decisions and must be attributed as such.
+            // Block until a human responds, the timeout fires, or the hook's
+            // socket closes. `decided_by` records the resolving actor for the
+            // audit trail (itr#397) — the fallback resolutions are non-human
+            // decisions and must be attributed as such. Watching the read half
+            // (itr#363) means a dead hook (Ctrl-C'd agent) releases its queue
+            // slot immediately instead of holding it for the full timeout.
             let timeout_secs = ctx.hook_timeout_secs;
-            let (rich, decided_by) =
-                match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
-                    Ok(Ok(rich)) => (rich, "human"),
-                    Ok(Err(_)) => {
-                        warn!(%id, "decision channel dropped, defaulting to approve");
-                        (RichDecision::approve(), "channel_dropped:approve")
+            enum Waited {
+                Resolved(Box<RichDecision>),
+                ChannelDropped,
+                TimedOut,
+                Disconnected,
+            }
+            let waited = {
+                let mut disconnect_buf = Vec::new();
+                tokio::select! {
+                    res = rx => match res {
+                        Ok(rich) => Waited::Resolved(Box::new(rich)),
+                        Err(_) => Waited::ChannelDropped,
+                    },
+                    () = tokio::time::sleep(Duration::from_secs(timeout_secs)) => Waited::TimedOut,
+                    // Hooks send nothing after the request, so ANY completion
+                    // here (EOF, error, or unexpected bytes) means the hook is
+                    // gone or misbehaving — the decision is moot.
+                    _ = read_capped_line(&mut lines, &mut disconnect_buf) => Waited::Disconnected,
+                }
+            };
+
+            let (rich, decided_by) = match waited {
+                Waited::Resolved(rich) => (*rich, "human"),
+                Waited::ChannelDropped => {
+                    warn!(%id, "decision channel dropped, defaulting to approve");
+                    // Remove the leaked queue entry so TUI/web state matches
+                    // the audit log (itr#363).
+                    let mut q = ctx.queue.lock().await;
+                    q.finalize_local(id, Decision::Approve);
+                    (RichDecision::approve(), "channel_dropped:approve")
+                }
+                Waited::TimedOut => {
+                    warn!(%id, "hook timed out after {timeout_secs}s, defaulting to approve");
+                    // Same cleanup: without it the item stays pending forever
+                    // and a later human Deny would contradict the audit log
+                    // while the tool already ran (itr#363).
+                    let mut q = ctx.queue.lock().await;
+                    q.finalize_local(id, Decision::Approve);
+                    (RichDecision::approve(), "timeout:approve")
+                }
+                Waited::Disconnected => {
+                    warn!(%id, "hook disconnected while awaiting decision; abandoning");
+                    {
+                        let mut q = ctx.queue.lock().await;
+                        q.finalize_local(id, Decision::Deny);
                     }
-                    Err(_) => {
-                        warn!(%id, "hook timed out after {timeout_secs}s, defaulting to approve");
-                        (RichDecision::approve(), "timeout:approve")
-                    }
-                };
+                    // The tool did NOT run — the hook died before receiving an
+                    // answer. Record a deny so the audit stream is complete.
+                    ctx.state_db
+                        .resolve_pending_by(id, Decision::Deny, "hook_disconnected:abandoned")
+                        .await?;
+                    return Ok(());
+                }
+            };
 
             // Persist auto-approve if requested (blocking file I/O off the runtime)
             if rich.always_allow {
@@ -903,12 +970,17 @@ async fn handle_decision_command(
                 additional_context,
                 selected_permission: None,
             };
-            {
+            let resolved = {
                 let mut q = ctx.queue.lock().await;
-                q.resolve(id, rich);
+                q.resolve(id, rich)
+            };
+            // Eagerly persist so subsequent history queries see this decision —
+            // but only when the item was actually pending. A stale resolve
+            // (already timed out / abandoned, itr#363) must not write an audit
+            // row contradicting the recorded outcome.
+            if resolved {
+                eager_persist(&ctx.state_db, id, Decision::Approve).await;
             }
-            // Eagerly persist so subsequent history queries see this decision.
-            eager_persist(&ctx.state_db, id, Decision::Approve).await;
         }
         ClientMessage::Deny { id, message } => {
             info!(?device_id, %id, "deny");
@@ -917,11 +989,13 @@ async fn handle_decision_command(
                 message,
                 ..RichDecision::deny()
             };
-            {
+            let resolved = {
                 let mut q = ctx.queue.lock().await;
-                q.resolve(id, rich);
+                q.resolve(id, rich)
+            };
+            if resolved {
+                eager_persist(&ctx.state_db, id, Decision::Deny).await;
             }
-            eager_persist(&ctx.state_db, id, Decision::Deny).await;
         }
         ClientMessage::Ask { id } => {
             info!(?device_id, %id, "ask");

@@ -49,8 +49,12 @@ impl StateDb {
             req.tool_input.clone()
         };
 
+        // INSERT OR IGNORE (itr#370): the id is hook-supplied, so a colliding
+        // second request must never rewrite the first one's persisted row.
+        // The queue rejects the duplicate; keeping the victim's row intact is
+        // the defence-in-depth half.
         sqlx::query(
-            "INSERT OR REPLACE INTO pending_decisions (id, agent_id, agent_type, project, tool_name, tool_input, timestamp, tool_use_id, hook_event_name, terminal_session_id)
+            "INSERT OR IGNORE INTO pending_decisions (id, agent_id, agent_type, project, tool_name, tool_input, timestamp, tool_use_id, hook_event_name, terminal_session_id)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(req.id.to_string())

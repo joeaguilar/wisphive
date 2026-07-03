@@ -29,7 +29,23 @@ impl DecisionQueue {
 
     /// Enqueue a decision request. Returns a oneshot receiver that the hook handler
     /// should await — it will resolve when the TUI sends approve/deny.
-    pub fn enqueue(&mut self, req: DecisionRequest) -> oneshot::Receiver<RichDecision> {
+    ///
+    /// Returns `None` if a request with the same id is already pending: the id
+    /// is chosen by the hook (attacker-influenced over the local socket), and
+    /// silently overwriting would drop the victim's oneshot sender — an
+    /// instant fail-open approve — and leave two items sharing one sender
+    /// (itr#370). The caller must reject the duplicate.
+    pub fn enqueue(&mut self, req: DecisionRequest) -> Option<oneshot::Receiver<RichDecision>> {
+        if self.pending_senders.contains_key(&req.id) {
+            warn!(
+                id = %req.id,
+                agent = %req.agent_id,
+                tool = %req.tool_name,
+                "rejected duplicate decision id (itr#370)"
+            );
+            return None;
+        }
+
         let (tx, rx) = oneshot::channel();
 
         info!(
@@ -46,7 +62,26 @@ impl DecisionQueue {
         // Notify all connected TUIs
         let _ = self.tui_tx.send(ServerMessage::NewDecision(req));
 
-        rx
+        Some(rx)
+    }
+
+    /// Remove a pending decision that was resolved OUTSIDE the queue (hook
+    /// timeout, channel drop, or hook disconnect) and broadcast the outcome so
+    /// TUI/web state stays consistent with the audit log (itr#363). Unlike
+    /// [`Self::resolve`], nothing is sent to the hook — the caller already
+    /// answered it (or it is gone).
+    pub fn finalize_local(&mut self, id: Uuid, decision: Decision) -> bool {
+        let had_sender = self.pending_senders.remove(&id).is_some();
+        let before = self.pending_items.len();
+        self.pending_items.retain(|r| r.id != id);
+        let removed = had_sender || self.pending_items.len() != before;
+        if removed {
+            info!(%id, ?decision, "decision finalized outside the queue");
+            let _ = self
+                .tui_tx
+                .send(ServerMessage::DecisionResolved { id, decision });
+        }
+        removed
     }
 
     /// Resolve a pending decision with a rich response. Returns true if found.
@@ -179,6 +214,59 @@ mod tests {
         assert_eq!(snap[2].tool_name, "Edit");
     }
 
+    #[tokio::test]
+    async fn duplicate_id_is_rejected_and_victim_survives() {
+        // itr#370: a second request reusing a pending id must be rejected —
+        // overwriting would drop the victim's sender (instant fail-open).
+        let mut q = make_queue();
+        let victim = make_request("Bash", "cc-victim", "/muse");
+        let id = victim.id;
+        let victim_rx = q.enqueue(victim).unwrap();
+
+        let mut attacker = make_request("Write", "cc-attacker", "/evil");
+        attacker.id = id;
+        assert!(
+            q.enqueue(attacker).is_none(),
+            "duplicate id must be rejected"
+        );
+
+        // The victim's entry is intact and still resolvable.
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.snapshot()[0].agent_id, "cc-victim");
+        assert!(q.resolve(id, RichDecision::approve()));
+        assert_eq!(victim_rx.await.unwrap().decision, Decision::Approve);
+    }
+
+    #[test]
+    fn finalize_local_removes_entry_and_broadcasts() {
+        // itr#363: a timeout/disconnect resolution outside the queue must
+        // clear the pending entry and tell TUIs, so a later human resolve
+        // can't produce a contradictory state.
+        let (tx, _) = broadcast::channel(64);
+        let mut rx = tx.subscribe();
+        let mut q = DecisionQueue::new(tx);
+
+        let req = make_request("Bash", "cc-1", "/muse");
+        let id = req.id;
+        let _hook_rx = q.enqueue(req);
+        let _ = rx.try_recv(); // skip NewDecision
+
+        assert!(q.finalize_local(id, Decision::Approve));
+        assert_eq!(q.len(), 0, "entry removed from pending items");
+        match rx.try_recv().unwrap() {
+            ServerMessage::DecisionResolved { id: rid, decision } => {
+                assert_eq!(rid, id);
+                assert_eq!(decision, Decision::Approve);
+            }
+            other => panic!("expected DecisionResolved, got {other:?}"),
+        }
+
+        // A later human resolve finds nothing — no second broadcast, no lie.
+        assert!(!q.resolve(id, RichDecision::deny()));
+        assert!(!q.finalize_local(id, Decision::Deny));
+        assert!(rx.try_recv().is_err(), "no broadcast for the stale resolve");
+    }
+
     // ════════════════════════════════════════════════════════════
     // Resolve
     // ════════════════════════════════════════════════════════════
@@ -188,7 +276,7 @@ mod tests {
         let mut q = make_queue();
         let req = make_request("Bash", "cc-1", "/muse");
         let id = req.id;
-        let rx = q.enqueue(req);
+        let rx = q.enqueue(req).unwrap();
 
         assert!(q.resolve(id, RichDecision::approve()));
         let decision = rx.await.unwrap();
@@ -201,7 +289,7 @@ mod tests {
         let mut q = make_queue();
         let req = make_request("Bash", "cc-1", "/muse");
         let id = req.id;
-        let rx = q.enqueue(req);
+        let rx = q.enqueue(req).unwrap();
 
         assert!(q.resolve(id, RichDecision::deny()));
         let decision = rx.await.unwrap();
@@ -248,7 +336,7 @@ mod tests {
         let mut q = make_queue();
         let req = make_request("Bash", "cc-1", "/muse");
         let id = req.id;
-        let rx = q.enqueue(req);
+        let rx = q.enqueue(req).unwrap();
 
         // Drop the receiver (simulates hook disconnecting/timing out)
         drop(rx);
@@ -269,9 +357,9 @@ mod tests {
         let r2 = make_request("Write", "cc-2", "/rpg");
         let r3 = make_request("Edit", "cc-3", "/retro");
 
-        let rx1 = q.enqueue(r1);
-        let rx2 = q.enqueue(r2);
-        let rx3 = q.enqueue(r3);
+        let rx1 = q.enqueue(r1).unwrap();
+        let rx2 = q.enqueue(r2).unwrap();
+        let rx3 = q.enqueue(r3).unwrap();
 
         let ids = q.resolve_all(&None, Decision::Approve);
         assert_eq!(ids.len(), 3);
@@ -289,9 +377,9 @@ mod tests {
         let r2 = make_request("Write", "cc-2", "/rpg");
         let r3 = make_request("Bash", "cc-3", "/retro");
 
-        let rx1 = q.enqueue(r1);
+        let rx1 = q.enqueue(r1).unwrap();
         let _rx2 = q.enqueue(r2);
-        let rx3 = q.enqueue(r3);
+        let rx3 = q.enqueue(r3).unwrap();
 
         let filter = Some(DecisionFilter {
             tool_name: Some("Bash".into()),
@@ -314,8 +402,8 @@ mod tests {
         let r2 = make_request("Write", "cc-2", "/muse");
         let r3 = make_request("Edit", "cc-3", "/rpg");
 
-        let rx1 = q.enqueue(r1);
-        let rx2 = q.enqueue(r2);
+        let rx1 = q.enqueue(r1).unwrap();
+        let rx2 = q.enqueue(r2).unwrap();
         let _rx3 = q.enqueue(r3);
 
         let filter = Some(DecisionFilter {

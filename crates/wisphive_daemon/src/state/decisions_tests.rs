@@ -52,6 +52,26 @@ async fn persist_and_resolve_pending() {
 }
 
 #[tokio::test]
+async fn persist_pending_never_overwrites_an_existing_row() {
+    // itr#370: the id is hook-supplied; a colliding second request must not
+    // rewrite the victim's persisted row (was INSERT OR REPLACE).
+    let db = test_db().await;
+    let victim = make_request("Bash", "cc-victim", "/muse");
+    let id = victim.id;
+    db.persist_pending(&victim).await.unwrap();
+
+    let mut attacker = make_request("Write", "cc-attacker", "/evil");
+    attacker.id = id;
+    db.persist_pending(&attacker).await.unwrap();
+
+    db.resolve_pending(id, Decision::Approve).await.unwrap();
+    let history = db.query_history(None, 10).await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].tool_name, "Bash", "victim's row must survive");
+    assert_eq!(history[0].agent_id, "cc-victim");
+}
+
+#[tokio::test]
 async fn resolve_pending_removes_from_pending() {
     let db = test_db().await;
     let req = make_request("Bash", "cc-1", "/muse");
