@@ -1,6 +1,6 @@
 # Plan: Cross-Agent Conflict Gate
 
-_Last reviewed: 2026-06-14_
+_Last reviewed: 2026-07-03 (semantics pass, itr#424 — see Semantics section)_
 
 ## Problem
 
@@ -252,6 +252,115 @@ Three modes:
 - Decision detail shows conflict warning with holding agent info
 - Claims dashboard (new tab or section in Projects view)
 - Release button per claim
+
+### Semantics (normative — itr#424 pass, 2026-07-03)
+
+The mechanics above are sound; this section pins the definitions and the race analysis an
+implementer would otherwise have to guess at. Where this section and the sketches above
+disagree, this section wins.
+
+#### S1 — Precise conflict definition
+
+A **conflict** exists when a Write/Edit/NotebookEdit request's normalized path equals the
+normalized path of (a) an unexpired claim held by a *different claim key*, or (b) another
+**pending** request in the queue from a different claim key (see S3, Race A). Equality is
+canonical-path equality only — no directory or prefix containment in v1. The **claim key**
+is `agent_id`; note that distinct subagents of one orchestrating session carry distinct
+ids, so an agent's own fan-out conflicts with itself — that is a feature, not a bug (it is
+exactly the parallel-blitz case this gate exists for).
+
+**Known blind spots, accepted and documented, not silently shipped:** Bash file mutations
+(`sed -i`, `mv`, `rm`, `>`) are invisible to the gate in v1 (only the three structured
+file tools participate). Symlinked paths to not-yet-existing files can evade key equality
+(canonicalize falls back to lexical cleaning). On macOS, default-APFS is case-insensitive
+— normalization lowercases path keys on macOS so `Foo.rs`/`foo.rs` collide as they do on
+disk.
+
+#### S2 — Design bias: over-claim, never under-claim
+
+A false positive costs a yellow banner (warn mode) or one human override (block mode). A
+false negative is two agents silently interleaving writes — the exact failure the gate
+exists to prevent. Every ambiguous choice below resolves toward claiming: claims are
+recorded even if the write may never execute, TTLs err long, and abandoned decisions still
+claim briefly rather than risk a miss.
+
+#### S3 — TOCTOU analysis (check-to-execution window)
+
+There are four distinct races between "conflict checked" (enqueue), "claim recorded"
+(approval), and "write actually executes" (whenever the agent runs the tool — unbounded):
+
+- **Race A — pending vs pending.** A and B both enqueue writes to `auth.rs` before either
+  is approved; neither holds a claim, so neither shows a conflict. **Resolution:** the
+  enqueue-time check also scans the pending queue (definition in S1b), and conflict status
+  is **recomputed at resolution time** — the TUI approve action re-checks the map so a
+  claim recorded after enqueue still surfaces before the human commits.
+- **Race B — claim expiry before execution.** The decision timeout is 1 hour; the claim
+  TTL default is 300s. An approval that sat in the queue can post a claim that expires
+  before the agent even executes the write. **Resolution:** TTL is measured from claim
+  recording (approval), default raised to `conflict_ttl_secs: 900`, and a PostToolUse
+  observation (see S4) refreshes the claim — execution proves the claim was live.
+- **Race C — approval delivered to a dead hook.** itr#363 abandons the decision as a deny
+  when the hook socket dies; no write will happen. **Resolution:** claims are recorded
+  only on *successfully delivered* approvals; an abandoned decision records nothing. If
+  delivery-vs-death races anyway, the stale claim expires by TTL — over-claiming is the
+  accepted direction per S2.
+- **Race D — approve B while A's approved write hasn't executed yet.** The human sees A's
+  claim but has no way to know whether A's write already happened. **Resolution:** claims
+  carry a state, `granted → executed`, flipped when the corresponding PostToolUse event
+  (already reported by the hook) is ingested. The TUI banner distinguishes "claimed,
+  write not yet observed" from "written 2m ago" — that is the information the human
+  actually needs to sequence approvals.
+
+#### S4 — Precedence versus the auto-approve layers
+
+The gate can only **narrow**, never widen: a conflict can turn an approval into a warn or
+a deny; it never approves anything. Interaction table:
+
+| Path | Sees the map? | Behavior |
+|---|---|---|
+| Daemon-reviewed request (hook deferred to human) | yes | full warn/block semantics |
+| Hook auto-approved (level/tool_rules/legacy) | no — hook has no map access | not gated in-line; the `events.jsonl` ingest records a **retroactive claim** (lag: seconds), so later daemon-reviewed requests still conflict against auto-approved writes |
+| Future learned rules (ADR-0005) | no | same as auto-approved; ADR-0005 I3's decision-time constraints are about input safety, not conflicts — cross-agent coordination at `write`+ auto-approve tiers remains explicitly out of scope |
+| `conflict_mode: "block"` auto-deny | n/a | applies only to daemon-reviewed requests; attributed `decided_by: conflict_gate:block` in the audit stream, overridable by the human re-approving from the TUI |
+
+The plan's existing note stands: users who want in-line conflict gating for writes must
+keep writes below the auto-approve tier. Retroactive claims close most of the practical
+gap for mixed fleets.
+
+#### S5 — Deny-message contract (block mode)
+
+A blocked agent must be able to act on the denial without a human explaining it. The
+`permissionDecisionReason` is stable and machine-readable, first line exactly:
+
+```
+WISPHIVE_CONFLICT file=<canonical path> holder=<agent_id> claimed_at=<ISO8601> state=<granted|executed>
+```
+
+followed by a prose line: "Another agent currently owns this file. Do not edit it now —
+work on something else and retry after the claim releases (TTL <n>s) or ask the operator
+to release it." Agents pattern-matching the first line can reschedule work; humans reading
+the queue see the second.
+
+#### S6 — Scope cuts made explicit
+
+- The "hold" decision variant mentioned in the lifecycle sketch is **cut from v1** — a
+  hold is just an unresolved pending decision; no new variant needed.
+- `write_count` is display metadata only; it must never feed policy (it is trivially
+  inflatable by the holding agent).
+- Claims are in-memory only (existing non-goal): a daemon restart drops all claims, which
+  is over-forgetting rather than over-blocking — acceptable, but the restart log notes how
+  many claims were dropped so a mid-blitz restart is diagnosable.
+
+#### Edge-case outcomes (delta to the list below)
+
+| Case | Outcome |
+|---|---|
+| Two pending writes, same file, neither approved | Both flagged via pending-scan (Race A); approving either re-checks |
+| Approve delivered, hook already dead | No claim (itr#363 deny); TTL cleans any race remnant |
+| Claim TTL expires between approval and execution | PostToolUse ingest re-establishes `executed` claim (Race B/D) |
+| Same file, case-differing paths on macOS | Conflict (lowercased keys) |
+| Auto-approved write then daemon-reviewed write, same file | Conflict via retroactive ingest claim (lag seconds) |
+| Bash `sed -i` then Write, same file | **Not detected** — documented v1 blind spot (S1) |
 
 ### Implementation Order
 

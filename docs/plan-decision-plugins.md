@@ -1,6 +1,6 @@
 # Plan: Decision Plugins (Extensions for a Control Plane)
 
-_Last reviewed: 2026-06-14_
+_Last reviewed: 2026-07-03 (trust-model pass, itr#423 — see Trust Model section and ADR-0006)_
 
 ## Problem
 
@@ -540,6 +540,91 @@ let config_watcher = spawn_config_watcher(
 ```
 
 When the file changes, re-parse `decision_hooks` from the new config and swap it into the dispatcher via an `Arc<RwLock<HooksConfig>>`.
+
+---
+
+### Trust Model (adversarial pass, 2026-07-03 — itr#423, ADR-0006)
+
+This section is normative; Part D below it survives as informal notes. Implementation of any
+part of this plan is bound by the following. Recorded durably as
+[ADR-0006](decisions/0006-plugin-trust-model.md).
+
+#### T1 — Two plugin classes, and only one exists today
+
+- **Observer plugins** (webhooks, shell hooks): may *watch* decision events, may never
+  *influence* a decision. Their failure, latency, or absence must be invisible to the
+  decision path — fire-and-forget with a 5s webhook timeout, dispatched strictly **after**
+  the decision is resolved and persisted. This is the fail-open telemetry posture, the same
+  tier PostToolUse reporting occupies in ADR-0001.
+- **Decision-influencing plugins** do not exist in this plan and must not be added without a
+  successor ADR. If ever added, they inherit the fail-closed posture: plugin error, timeout,
+  or version skew falls through to human review — never to approve. They would sit on the
+  hook's latency path, so they'd need a hard time budget (≤500ms) and the same
+  decision-time sus constraints as learned rules (ADR-0005 I3).
+
+Part B's richer rules (regex/globs) are **config, not plugins** — they run in-process in the
+hook and are governed by the existing config trust model plus itr#425.
+
+#### T2 — Visibility: plugins see post-redaction data only
+
+Template variables must be rendered from data that has passed the shared scrubber
+(`wisphive_protocol::redact`, itr#89) — never from the in-memory unredacted
+`DecisionRequest`. Dispatch happens at resolution time, where the tempting source is the
+live request object; that object bypasses the redaction boundary that already protects
+persist and notify. Additionally, `tool_input` is **excluded from template variables by
+default**: hooks get metadata (tool name, agent, project, decision, message). A per-hook
+`include_tool_input: true` opts into redacted input content, and the docs state plainly that
+this ships workspace content to an external service.
+
+#### T3 — Shell hooks: no string interpolation, ever
+
+Rendering `{{vars}}` into a shell command line is an injection channel no escaping scheme
+fully closes (the values are authored by the adversary — the gated agent — via tool inputs
+and agent ids). Shell hooks receive variables exclusively as **environment variables**
+(`WISPHIVE_EVENT`, `WISPHIVE_AGENT_ID`, `WISPHIVE_TOOL_NAME`, …); the `command` string from
+config is executed verbatim with no substitution. The `render_template` path in C2 applies
+to webhook bodies only (with JSON escaping).
+
+#### T4 — Webhook destinations and the hot-reload exfiltration window
+
+- URL allowlist: `https://` or `http://localhost`/`http://127.0.0.1` only; reject
+  redirects-to-other-schemes; block obvious SSRF targets (link-local `169.254.0.0/16`).
+- The sharper threat: `decision_hooks` is config, and C4 hot-reloads config. An agent that
+  gets one approved write to `config.json` silently turns the daemon into a live decision
+  feed to an attacker URL — no restart, no visible change. Mitigations, all three:
+  (a) itr#425 (default-deny agent writes to `~/.wisphive`) ships **before** decision hooks;
+  (b) every `decision_hooks` change detected by the hot-reload watcher is an audited event
+  (old/new `config_hash`) **and** raises a TUI/web banner + OS notification naming the new
+  destinations;
+  (c) the active hook list is visible in the TUI/web config panel at all times.
+
+#### T5 — Fail posture summary (references ADR-0001)
+
+| Component | Failure mode | Posture |
+|---|---|---|
+| Webhook delivery | error / timeout (5s) | Fail-open: log warn, decision unaffected |
+| Shell hook | spawn error / nonzero exit | Fail-open: log warn, decision unaffected |
+| Hook config parse error | malformed `decision_hooks` | Fail-safe: disable all hooks, banner + warn — never guess |
+| RPC bridge protocol error | malformed agent event | Fail-closed for that tool call: treat as deny-with-message back to agent |
+| Future decision-influencing plugin | any | Fail-closed to human review (successor ADR required) |
+
+#### T6 — Provenance and audit
+
+Every dispatched hook action is stamped into the audit stream (event type, destination
+host or command name — not the rendered body — and the `config_hash` in effect). Hook
+*config* changes are audited per T4(b). Plugin binaries (RPC agents) carry the same trust
+as any binary the user chooses to spawn — no signing regime; the trust decision is the
+spawn, and it is auditable via the agent registry.
+
+#### T7 — The RPC bridge must not become the tool executor
+
+Part A sketches the bridge either executing tools daemon-side or signaling the agent to
+proceed. These are very different trust postures: today the *agent process* executes tools
+under its own OS footprint, and the control plane only gates. Daemon-side execution would
+concentrate arbitrary code execution inside the control plane itself. The bridge therefore
+uses **approve/deny signaling** wherever the RPC protocol allows the agent to execute its
+own tools; daemon-side execution is out of scope for this plan and would need its own ADR
+(sandboxing, resource limits, cwd/env isolation).
 
 ---
 

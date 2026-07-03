@@ -24,6 +24,9 @@ alternatives, or (c) someone will later ask "why is it done this way." When in d
 | [0002](0002-always-defer-classification.md) | Always-defer classification for questions / plan-mode / elicitations | Accepted | 2026-06-14 | #380 |
 | [0003](0003-enterprise-profile-non-functional-until-tls.md) | Enterprise auth profile non-functional until user-cert TLS lands | Accepted | 2026-06-14 | #310, #270 |
 | [0004](0004-deterministic-agent-analytics-first.md) | Deterministic agent analytics before generated summaries | Accepted | 2026-06-15 | #390, #391, #392, #393, #394, #395 |
+| [0005](0005-policy-learning-security-invariants.md) | Policy-learning security invariants (I1–I10) | Proposed | 2026-07-03 | #422 |
+| [0006](0006-plugin-trust-model.md) | Decision-plugin trust model — observer-only, redacted, env-var shell hooks | Proposed | 2026-07-03 | #423, #425 |
+| [0007](0007-loop-supervisor-fails-toward-stop.md) | Loop supervisor fails toward stop | Proposed | 2026-07-03 | #421 |
 
 ## Status lifecycle
 
