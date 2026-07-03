@@ -553,6 +553,14 @@ async fn handle_hook(
                     (*rich, label)
                 }
                 Waited::ChannelDropped => {
+                    // Intentional fail-open (itr#345): with duplicate ids
+                    // rejected (itr#370) and resolve/finalize always sending
+                    // or consuming the sender, the only way the sender drops
+                    // unsent is queue teardown — the daemon shutting down
+                    // mid-wait. That is the daemon-down case, which fails
+                    // open per ADR-0001 so a control-plane restart can't
+                    // brick every waiting agent. The approve is attributed
+                    // ("channel_dropped:approve") so it stays auditable.
                     warn!(%id, "decision channel dropped, defaulting to approve");
                     // Remove the leaked queue entry so TUI/web state matches
                     // the audit log (itr#363).
@@ -1191,6 +1199,22 @@ async fn handle_decision_command(
                     .and_then(|s| s.get(suggestion_index))
                     .cloned()
             };
+            // Fail closed on a bad index (itr#297): approving with
+            // selected_permission=None would grant the call without any
+            // permission actually chosen. Leave the request pending.
+            if selected.is_none() {
+                warn!(?device_id, %id, suggestion_index, "approve_permission with invalid suggestion index rejected");
+                write_msg(
+                    writer,
+                    &ServerMessage::Error {
+                        message: format!(
+                            "invalid suggestion_index {suggestion_index} for decision {id}; request left pending"
+                        ),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
             let rich = RichDecision {
                 decision: Decision::Approve,
                 message,

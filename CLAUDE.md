@@ -81,7 +81,7 @@ Seven workspace crates with clear dependency flow:
 ## Key Design Decisions
 
 - **Tiered fail posture** (active mode): a *daemon-unreachable* failure (refused/absent socket — the daemon is down) **always fails open** so a crashed control plane can't brick every agent. Other runtime errors (read/parse/protocol) honor `~/.wisphive/fail-mode`, which **defaults to `closed`** (deny) per the security posture in AGENTS.md; set `fail-mode=open` for availability-first. Oversized hook stdin always denies. `PostToolUse` reporting failures always approve (telemetry only). See `response_for_failure` in `wisphive_hook`.
-- **Blocking hooks via oneshot channels**: Each hook connection gets a `tokio::sync::oneshot` receiver; it blocks until a human resolves the decision or timeout (1 hour, defaults to approve).
+- **Blocking hooks via oneshot channels**: Each hook connection gets a `tokio::sync::oneshot` receiver; the daemon `select!`s over it, the timeout (1 hour, defaults to approve, attributed `timeout:approve`), and the hook's socket (a dead hook abandons the decision immediately as a deny, itr#363). A dropped sender (daemon teardown mid-wait) intentionally fails open per ADR-0001, attributed `channel_dropped:approve` (itr#345).
 - **Broadcast fan-out**: TUI clients subscribe to a `tokio::sync::broadcast` channel for real-time events.
 - **SQLite WAL crash recovery**: Pending decisions persist to disk; audit log tracks all resolutions.
 - **Passive notifications**: macOS uses `osascript display notification` (non-intrusive banner); Linux uses `notify-send`. Notifications are informational only — all tool input fields are shown so users have context when switching to the TUI to respond. Notifications do NOT resolve decisions; only the TUI does.

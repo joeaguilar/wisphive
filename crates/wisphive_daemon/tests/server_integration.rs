@@ -299,6 +299,66 @@ async fn hook_sends_request_tui_approves_hook_gets_response() {
 }
 
 #[tokio::test]
+async fn approve_permission_with_invalid_index_is_rejected_and_stays_pending() {
+    // itr#297: a bad suggestion_index must not resolve the request as an
+    // approval with no permission actually selected.
+    let (_tmp, config) = temp_config();
+    let socket_path = config.socket_path.clone();
+    let shutdown_tx = start_server(config).await;
+
+    let (mut tui_lines, mut tui_writer) = connect_as_tui(&socket_path).await;
+    let (mut hook_lines, mut hook_writer) = connect_as_hook(&socket_path).await;
+
+    let mut req = make_decision_request("Bash");
+    req.hook_event_name = wisphive_protocol::HookEventType::PermissionRequest;
+    req.permission_suggestions = Some(vec![]);
+    let req_id = req.id;
+    let msg = encode(&ClientMessage::DecisionRequest(req)).unwrap();
+    hook_writer.write_all(msg.as_bytes()).await.unwrap();
+    let _ = next_tui_msg(&mut tui_lines, |m| {
+        matches!(m, ServerMessage::NewDecision(_))
+    })
+    .await;
+
+    // Invalid index → explicit Error, nothing resolved.
+    let bad = encode(&ClientMessage::ApprovePermission {
+        id: req_id,
+        suggestion_index: 999,
+        message: None,
+    })
+    .unwrap();
+    tui_writer.write_all(bad.as_bytes()).await.unwrap();
+    let err = next_tui_msg(&mut tui_lines, |m| matches!(m, ServerMessage::Error { .. })).await;
+    match err {
+        ServerMessage::Error { message } => assert!(message.contains("suggestion_index")),
+        other => panic!("expected Error, got: {:?}", other),
+    }
+
+    // Still pending: a plain deny resolves it and reaches the hook.
+    let deny = encode(&ClientMessage::Deny {
+        id: req_id,
+        message: None,
+    })
+    .unwrap();
+    tui_writer.write_all(deny.as_bytes()).await.unwrap();
+    let hook_resp_line = tokio::time::timeout(Duration::from_secs(2), hook_lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let hook_resp: ServerMessage = decode(&hook_resp_line).unwrap();
+    assert!(matches!(
+        hook_resp,
+        ServerMessage::DecisionResponse {
+            decision: Decision::Deny,
+            ..
+        }
+    ));
+
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
 async fn unfiltered_approve_all_without_confirm_is_rejected() {
     // itr#88: a compromised/buggy client echoing NewDecision events must not
     // blanket-approve the queue with one unconfirmed message.

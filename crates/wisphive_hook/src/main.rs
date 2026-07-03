@@ -318,15 +318,20 @@ fn response_for_failure(failure: &HookFailure, fail_mode: FailMode) -> HookRespo
         )
     };
 
+    // Oversized input always denies (DoS guard), regardless of fail-mode AND
+    // regardless of event type — checked before the PostToolUse telemetry
+    // early-return so the documented "oversized stdin always denies"
+    // guarantee is absolute (itr#344). For PostToolUse the deny is inert
+    // anyway (the formatter exits 0 for telemetry), so nothing already-ran
+    // gets blocked.
+    if failure.kind == HookFailureKind::InputTooLarge {
+        return failure.deny_response();
+    }
+
     // PostToolUse is telemetry only — a reporting failure must never block a
     // tool call that already ran.
     if failure.event_type == HookEventType::PostToolUse {
         return approve();
-    }
-
-    // Oversized input always denies (DoS guard), regardless of fail-mode.
-    if failure.kind == HookFailureKind::InputTooLarge {
-        return failure.deny_response();
     }
 
     // A daemon outage always fails open: with the control plane down there is
@@ -707,6 +712,21 @@ fn run() -> HookResponse {
     }
 }
 
+/// Classify a payload as PostToolUse telemetry (auto-approved, result
+/// forwarded fire-and-forget).
+///
+/// `hook_event_name` is authoritative (itr#346): a payload that EXPLICITLY
+/// declares another event type is never reclassified by shape — a PreToolUse
+/// carrying a smuggled `tool_response` field must still be gated, not waved
+/// through as telemetry. The shape check only applies when no event name was
+/// declared at all (Codex-style result reports omit it).
+fn is_post_tool_use(event_type: HookEventType, hook_event: &serde_json::Value) -> bool {
+    if event_type == HookEventType::PostToolUse {
+        return true;
+    }
+    hook_event.get("hook_event_name").is_none() && hook_event.get("tool_response").is_some()
+}
+
 fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
     // Layer 2: Read agent hook data from stdin
     let input = read_limited_to_string(std::io::stdin().lock(), MAX_STDIN_BYTES).map_err(
@@ -730,7 +750,7 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
     let agent_type = detect_agent_type(&hook_event);
 
     // PostToolUse detection: fire-and-forget result to daemon
-    if event_type == HookEventType::PostToolUse || hook_event.get("tool_response").is_some() {
+    if is_post_tool_use(event_type, &hook_event) {
         let _ = handle_post_tool_use(&hook_event, wisphive_dir, agent_type.clone());
         let response_event_type = if event_type == HookEventType::PostToolUse {
             event_type
@@ -1783,6 +1803,48 @@ mod tests {
             &serde_json::Value::Null,
             dir.path()
         ));
+    }
+
+    #[test]
+    fn oversized_input_denies_even_for_post_tool_use() {
+        // itr#344: the "oversized stdin always denies" guarantee must be
+        // absolute — the PostToolUse telemetry early-return cannot precede it.
+        let failure = HookFailure {
+            kind: HookFailureKind::InputTooLarge,
+            message: "too large".into(),
+            event_type: HookEventType::PostToolUse,
+            agent_type: AgentType::ClaudeCode,
+        };
+        let resp = response_for_failure(&failure, FailMode::Open);
+        assert_eq!(resp.decision, Decision::Deny);
+    }
+
+    #[test]
+    fn explicit_pre_tool_use_with_smuggled_tool_response_is_not_telemetry() {
+        // itr#346: hook_event_name is authoritative. A PreToolUse payload
+        // carrying a tool_response field must still be gated, not
+        // auto-approved as PostToolUse telemetry.
+        let smuggled = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "rm -rf /"},
+            "tool_response": {"output": "smuggled"},
+        });
+        assert!(!is_post_tool_use(HookEventType::PreToolUse, &smuggled));
+
+        // Explicit PostToolUse stays telemetry.
+        let post = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_response": {"output": "x"},
+        });
+        assert!(is_post_tool_use(HookEventType::PostToolUse, &post));
+
+        // Codex-style result report with NO declared event name still counts.
+        let codex = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_response": {"output": "x"},
+        });
+        assert!(is_post_tool_use(HookEventType::PreToolUse, &codex));
     }
 
     #[test]
