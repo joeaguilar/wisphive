@@ -297,9 +297,28 @@ test('inbox surfaces queued, deferred, and auto-answered decisions across two pr
     expect(alphaColor, 'two projects share a colour rail (not distinguishable)').not.toBe(bravoColor)
     await shot(page, 'ac5-two-projects')
 
-    // AC1: approve in-console → the blocked hook resolves approve, row clears.
-    await queuedRow.click()
-    await queuedRow.locator('.inbox-actions .btn-approve').click()
+    // Full-detail reachability (commit 8f41f1a + the project no-truncation rule):
+    // the collapsed row shows only a one-line summary (here just the pattern),
+    // but selecting the row reveals the FULL untruncated command via DetailView —
+    // every tool_input field + Copy All — so nothing needed to review the command
+    // is hidden. The previous inbox truncated the command; this asserts it no
+    // longer does.
+    await expect(queuedRow.locator('.inbox-summary')).toHaveText('/TODO/')
+    // Select via the topline (a button-free region) so the click expands the row
+    // rather than landing on the inline Approve/Deny.
+    await queuedRow.locator('.inbox-item-topline').click()
+    const detail = queuedRow.locator('.inbox-detail-full')
+    await expect(detail).toBeVisible()
+    // The path is a tool_input field the collapsed summary omitted — it must be
+    // fully visible in the expanded detail.
+    await expect(detail).toContainText(PROJECT_A)
+    // The full-message "Copy All" affordance confirms this is the complete detail.
+    await expect(detail.locator('.copy-btn-header')).toBeVisible()
+    await shot(page, 'ac1-full-detail')
+
+    // AC1: approve in-console via the expanded DetailView → the blocked hook
+    // resolves approve, and the row clears.
+    await detail.locator('.detail-actions .btn-approve').first().click()
     const resolution = await pending.resolution
     expect(resolution.decision).toBe('approve')
     await expect(page.locator('.inbox-item', { hasText: 'Grep' })).toHaveCount(0, { timeout: 15_000 })
