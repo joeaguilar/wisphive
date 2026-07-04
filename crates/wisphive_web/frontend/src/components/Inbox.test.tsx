@@ -155,6 +155,32 @@ describe("Inbox", () => {
     expect(onDeny).toHaveBeenCalledWith("long", "wrong dir");
   });
 
+  it("shows ALL decision info on the selected row — a Write's full content, not just the path", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(NOW));
+
+    const fileContent = "fn main() {\n    println!(\"secret sauce\");\n}\n";
+    renderInbox({
+      items: [
+        request({
+          id: "w1",
+          tool_name: "Write",
+          tool_input: { file_path: "/repo/src/main.rs", content: fileContent },
+        }),
+      ],
+      selectedId: "w1",
+    });
+
+    // The gap that motivated this change: collapsed rows only showed file_path,
+    // hiding the content you actually need to accept a Write. Selected row must
+    // surface the full content (via the shared DetailView/ToolContent renderer).
+    expect(screen.getByText("/repo/src/main.rs")).toBeInTheDocument();
+    expect(screen.getByText(/secret sauce/)).toBeInTheDocument();
+    // Full action set is reachable (richer than plain approve/deny).
+    expect(screen.getByRole("button", { name: "+ Context" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Always Allow" })).toBeInTheDocument();
+  });
+
   it("surfaces a deferred native prompt as a waiting-in-your-terminal row with a focus deep-link", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(NOW));

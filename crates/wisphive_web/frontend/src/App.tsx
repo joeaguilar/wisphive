@@ -194,7 +194,7 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
             auditDecisions={auditDecisions}
             selectedId={selectedId}
             onSelect={setSelectedId}
-            onApprove={(id) => { approve(id); setSelectedId(null); }}
+            onApprove={(id, opts) => { approve(id, opts); setSelectedId(null); }}
             onDeny={(id, msg) => { deny(id, msg); setSelectedId(null); }}
             onFocusTerminal={(termId) => { setFocusTerminalId(termId); setView("terminals"); }}
           />

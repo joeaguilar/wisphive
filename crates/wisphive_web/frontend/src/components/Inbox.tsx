@@ -9,15 +9,14 @@ import {
   timeAgo,
 } from "./queueUtils";
 import { AutoAnswerFeed } from "./AutoAnswerFeed";
-import { DeferredDetailView } from "./DetailView";
-import { TextModal } from "./Modal";
+import { DetailView, DeferredDetailView } from "./DetailView";
 
 interface InboxProps {
   items: DecisionRequest[];
   auditDecisions: AuditDecision[];
   selectedId: string | null;
   onSelect: (id: string) => void;
-  onApprove: (id: string) => void;
+  onApprove: (id: string, opts?: { additional_context?: string; always_allow?: boolean }) => void;
   onDeny: (id: string, message?: string) => void;
   /** Deep-link into a wisphive-spawned terminal session so the human can
    * answer an always-deferred native prompt (AskUserQuestion / ExitPlanMode /
@@ -164,15 +163,13 @@ interface InboxRowProps {
   isOldest: boolean;
   selected: boolean;
   onSelect: (id: string) => void;
-  onApprove: (id: string) => void;
+  onApprove: (id: string, opts?: { additional_context?: string; always_allow?: boolean }) => void;
   onDeny: (id: string, message?: string) => void;
 }
 
 function InboxRow({ item, now, isOldest, selected, onSelect, onApprove, onDeny }: InboxRowProps) {
-  const [showDenyMsg, setShowDenyMsg] = useState(false);
   const prefix = eventPrefix(item.hook_event_name);
   const summary = inputSummary(item);
-  const full = fullInput(item);
   const sessionLabel = sessionLabelFor(item.terminal_session_id, item.agent_id);
   const gkey = groupKey(item.project, sessionLabel);
   const color = groupColor(gkey);
@@ -195,41 +192,27 @@ function InboxRow({ item, now, isOldest, selected, onSelect, onApprove, onDeny }
         </span>
         <span>{item.agent_id.slice(0, 20)}</span>
       </div>
-      {/* Collapsed: an ellipsised one-liner. Selected: the untruncated input so
-          the full command/question is always reachable in-place (no
-          single-place truncation). */}
-      {!selected && summary && <div className="inbox-summary">{summary}</div>}
-      {selected && full && (
-        <div className="inbox-detail">
-          <div className="inbox-detail-label">Full input</div>
-          <pre className="inbox-detail-input">{full}</pre>
+      {/* Collapsed: an ellipsised one-liner + quick approve/deny for fast triage.
+          Selected: the full DetailView — EVERY tool_input field (command, file
+          content, edit diff, all params), project/agent/event metadata, Copy
+          All, and the complete action set (+Context, Deny+Message, Always
+          Allow) — so nothing needed to decide is hidden. */}
+      {!selected ? (
+        <>
+          {summary && <div className="inbox-summary">{summary}</div>}
+          <div className="inbox-actions" aria-label={`Actions for ${item.tool_name}`}>
+            <button className="btn-approve" onClick={(e) => { e.stopPropagation(); onApprove(item.id); }}>
+              Approve
+            </button>
+            <button className="btn-deny" onClick={(e) => { e.stopPropagation(); onDeny(item.id); }}>
+              Deny
+            </button>
+          </div>
+        </>
+      ) : (
+        <div className="inbox-detail-full" onClick={(e) => e.stopPropagation()}>
+          <DetailView request={item} onApprove={onApprove} onDeny={onDeny} />
         </div>
-      )}
-      <div className="inbox-actions" aria-label={`Actions for ${item.tool_name}`}>
-        <button className="btn-approve" onClick={(e) => { e.stopPropagation(); onApprove(item.id); }}>
-          Approve
-        </button>
-        <button className="btn-deny" onClick={(e) => { e.stopPropagation(); onDeny(item.id); }}>
-          Deny
-        </button>
-        {selected && (
-          <button
-            className="btn-secondary"
-            onClick={(e) => { e.stopPropagation(); setShowDenyMsg(true); }}
-          >
-            Deny + Message
-          </button>
-        )}
-      </div>
-      {showDenyMsg && (
-        <TextModal
-          title="Deny with Message"
-          placeholder="Claude will see this as feedback..."
-          submitLabel="Deny"
-          submitClass="btn-deny"
-          onSubmit={(msg) => { onDeny(item.id, msg); setShowDenyMsg(false); }}
-          onClose={() => setShowDenyMsg(false)}
-        />
       )}
     </article>
   );
@@ -332,38 +315,3 @@ function groupDeferred(items: AuditDecision[]): [string, AuditDecision[]][] {
   return [...map.entries()];
 }
 
-// Full, untruncated tool input for the expanded row. Mirrors inputSummary's
-// field preferences but never slices; falls back to pretty JSON so nothing is
-// hidden (no single-place truncation).
-function fullInput(item: DecisionRequest): string | null {
-  const input = item.tool_input;
-  if (!input) return null;
-
-  if (typeof input.command === "string") return input.command;
-  if (typeof input.file_path === "string") return input.file_path;
-  if (typeof input.pattern === "string") return `/${input.pattern as string}/`;
-
-  if (Array.isArray(input.questions)) {
-    const lines: string[] = [];
-    for (const raw of input.questions as Array<Record<string, unknown>>) {
-      if (typeof raw.question === "string") lines.push(raw.question);
-      if (Array.isArray(raw.options)) {
-        for (const opt of raw.options as Array<Record<string, unknown>>) {
-          const label = typeof opt.label === "string" ? opt.label : "";
-          const desc = typeof opt.description === "string" ? ` — ${opt.description}` : "";
-          lines.push(`  • ${label}${desc}`);
-        }
-      }
-    }
-    if (lines.length > 0) return lines.join("\n");
-  }
-
-  if (item.event_data && typeof item.event_data.plan_content === "string") {
-    return item.event_data.plan_content as string;
-  }
-  if (item.event_data && typeof item.event_data.last_assistant_message === "string") {
-    return item.event_data.last_assistant_message as string;
-  }
-
-  return JSON.stringify(input, null, 2);
-}
