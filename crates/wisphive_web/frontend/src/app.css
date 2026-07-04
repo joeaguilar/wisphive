@@ -1597,6 +1597,17 @@ kbd {
   .detail-header h2 { font-size: 14px; }
 }
 
+/* Touch input — 44px WCAG targets keyed to the pointer, not the viewport, so a
+ * touch tablet at any width gets them (layout reflow above stays width-keyed).
+ * Catches the compact controls that opt out of --touch-min for pointer density.
+ * Inline text toggles ((view)/(hide)) keep the WCAG inline-target exemption. */
+@media (pointer: coarse) {
+  :root { --touch-min: 44px; }
+  .md-tab,
+  .copy-btn { min-height: 44px; }
+  .btn-sm { min-height: 44px !important; } /* override the desktop-density cap */
+}
+
 /* ── Terminals view ────────────────────────────────────────────── */
 
 .terminals-layout {
