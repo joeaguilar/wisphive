@@ -1,3 +1,4 @@
+import { memo } from "react";
 import type { AuditDecision, AuditDecisionKind } from "../types/protocol";
 import { shortProject, timeAgo } from "./queueUtils";
 
@@ -22,7 +23,7 @@ const KIND_LABEL: Record<AuditDecisionKind, string> = {
  * newest-first in `useWisphive`. Deliberately no search/pagination — that is the
  * filed fast-follow (itr#436 non-goal).
  */
-export function AutoAnswerFeed({ decisions, now }: AutoAnswerFeedProps) {
+export const AutoAnswerFeed = memo(function AutoAnswerFeed({ decisions, now }: AutoAnswerFeedProps) {
   return (
     <section className="auto-feed" aria-label="Decided without you">
       {decisions.length === 0 ? (
@@ -36,7 +37,7 @@ export function AutoAnswerFeed({ decisions, now }: AutoAnswerFeedProps) {
       )}
     </section>
   );
-}
+});
 
 interface AutoAnswerRowProps {
   decision: AuditDecision;

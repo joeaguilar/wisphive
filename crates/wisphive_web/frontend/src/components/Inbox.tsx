@@ -52,10 +52,22 @@ export function Inbox({
     return () => window.clearInterval(id);
   }, []);
 
+  // The 1s `now` keeps the small pending list's ages live. The hour-windowed
+  // audit work below, though, scans the whole auditDecisions array (up to
+  // `audit_snapshot_limit`, ≤10k rows) and only needs coarse freshness — so
+  // bucket time to 15s and key the memos/feed on that. This stops the O(n)
+  // filters and the "decided without you" feed from re-running on every 1s
+  // tick, while pending ages stay per-second live.
+  const coarseNow = Math.floor(now / 15_000) * 15_000;
+
   const ordered = useMemo(() => orderByAge(items), [items]);
-  const recentAutoCount = auditDecisions.filter(
-    (audit) => audit.kind === "auto_approved" && now - new Date(audit.ts).getTime() <= HOUR_MS,
-  ).length;
+  const recentAutoCount = useMemo(
+    () =>
+      auditDecisions.filter(
+        (audit) => audit.kind === "auto_approved" && coarseNow - new Date(audit.ts).getTime() <= HOUR_MS,
+      ).length,
+    [auditDecisions, coarseNow],
+  );
 
   // Always-deferred native prompts (ADR-0002) never reach the in-console
   // queue — they arrive only as `deferred` AuditDecision events. Surface the
@@ -66,9 +78,9 @@ export function Inbox({
   const deferred = useMemo(
     () =>
       auditDecisions
-        .filter((a) => a.kind === "deferred" && now - new Date(a.ts).getTime() <= HOUR_MS)
+        .filter((a) => a.kind === "deferred" && coarseNow - new Date(a.ts).getTime() <= HOUR_MS)
         .sort((a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime()),
-    [auditDecisions, now],
+    [auditDecisions, coarseNow],
   );
   const deferredGroups = useMemo(() => groupDeferred(deferred), [deferred]);
 
@@ -153,7 +165,7 @@ export function Inbox({
         </>
       )}
 
-      {showFeed && <AutoAnswerFeed decisions={auditDecisions} now={now} />}
+      {showFeed && <AutoAnswerFeed decisions={auditDecisions} now={coarseNow} />}
     </section>
   );
 }

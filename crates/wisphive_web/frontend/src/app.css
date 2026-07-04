@@ -489,6 +489,12 @@ body {
   padding: var(--space-sm) var(--space-md);
   display: grid;
   gap: 2px;
+  /* The "decided without you" feed is unbounded (up to audit_snapshot_limit,
+   * ≤10k rows). Let the browser skip layout/paint for off-screen rows while
+   * keeping the DOM (so find-in-page and the a11y tree still work). The
+   * intrinsic-size estimate keeps the scrollbar stable before a row renders. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 52px;
 }
 
 .auto-feed-topline {
@@ -976,6 +982,11 @@ pre.code-block, pre.plan-content {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: var(--space-sm) var(--space-md);
+  /* History and the agent/session timelines are unbounded decision-log feeds;
+   * skip off-screen layout/paint. `auto` remembers a row's real height once
+   * rendered, so expanded (detail-open) rows size correctly on scroll-back. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 40px;
 }
 
 .history-item:hover { background: var(--bg-card-hover); }
