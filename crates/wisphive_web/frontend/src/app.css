@@ -13,6 +13,13 @@
   --yellow: #ffb74d;
   --border: #333;
 
+  /* Solid fills that carry white text. Darkened from the signal --green/--red
+     so white meets WCAG AA (≥4.5:1) on the affirmative/negative commit surfaces.
+     The signal --green/--red stay as-is for text-on-dark and tinted badges,
+     where they already pass and would fail if darkened. */
+  --approve-fill: #2e7d32; /* white text 5.1:1 */
+  --deny-fill: #c62828;    /* white text 5.6:1 */
+
   /* Layout */
   --sidebar-width: 200px;
   --queue-max-width: 400px;
@@ -36,6 +43,11 @@
   --radius: 4px;
   --radius-lg: 6px;
   --radius-xl: 8px;
+
+  /* Focus — the one canonical keyboard-focus ring (DESIGN.md §5).
+     Full-bleed rows override the offset to -2px so the ring sits inside. */
+  --focus-ring: 2px solid var(--cyan);
+  --focus-ring-offset: 2px;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -422,7 +434,7 @@ body {
 }
 
 .btn-focus:hover { filter: brightness(1.1); }
-.btn-focus:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+.btn-focus:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-ring-offset); }
 
 /* Read-only deferred detail (DetailView.DeferredDetailView). */
 .deferred-detail {
@@ -459,7 +471,7 @@ body {
 }
 
 .inbox-view-toggle:hover { text-decoration: underline; }
-.inbox-view-toggle:focus-visible { outline: 1px solid var(--cyan); outline-offset: 2px; }
+.inbox-view-toggle:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-ring-offset); }
 
 /* "Decided without you" feed — auto-answered / deferred / denied decisions
  * that never reached the human queue (spec §5.1, itr#436). */
@@ -742,7 +754,7 @@ pre.code-block, pre.plan-content {
 
 /* Buttons */
 .btn-approve {
-  background: var(--green);
+  background: var(--approve-fill);
   color: white;
   border: none;
   padding: var(--space-sm) var(--space-lg);
@@ -755,7 +767,7 @@ pre.code-block, pre.plan-content {
 }
 
 .btn-deny {
-  background: var(--red);
+  background: var(--deny-fill);
   color: white;
   border: none;
   padding: var(--space-sm) var(--space-lg);
@@ -769,6 +781,8 @@ pre.code-block, pre.plan-content {
 
 .btn-approve:hover { opacity: 0.9; }
 .btn-deny:hover { opacity: 0.9; }
+.btn-approve:focus-visible,
+.btn-deny:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-ring-offset); }
 
 .placeholder {
   color: var(--text-dim);
@@ -998,7 +1012,7 @@ pre.code-block, pre.plan-content {
 }
 .history-item-toggle { cursor: pointer; }
 .history-item-toggle:hover { color: var(--text); }
-.history-item-toggle:focus-visible { outline: 1px solid var(--cyan); outline-offset: 2px; }
+.history-item-toggle:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-ring-offset); }
 
 .decision-badge {
   font-size: 10px;
@@ -1292,7 +1306,7 @@ pre.code-block, pre.plan-content {
 }
 
 .badge-pending {
-  background: var(--red);
+  background: var(--deny-fill);
   color: white;
 }
 
@@ -1832,8 +1846,17 @@ kbd {
 .terminals-section-header.clickable:focus-visible,
 .inbox-deferred-item:focus-visible,
 .terminal-queue-dock-row-head:focus-visible {
-  outline: 2px solid var(--cyan);
-  outline-offset: -2px;
+  outline: var(--focus-ring);
+  outline-offset: -2px; /* inset: rows are full-bleed, a +2px ring would clip */
+}
+
+/* Quiet/outline controls share the one canonical focus ring. */
+.btn-secondary:focus-visible,
+.btn-cancel:focus-visible,
+.md-tab:focus-visible,
+.copy-btn-overlay:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
 }
 
 .terminals-group-count {
