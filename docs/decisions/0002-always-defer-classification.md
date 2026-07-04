@@ -1,9 +1,9 @@
 # ADR-0002: Always-defer classification for questions / plan-mode / elicitations
 
-- **Status:** Accepted
+- **Status:** Accepted (amended 2026-07-03 — see Amendments)
 - **Date:** 2026-06-14
 - **Deciders:** Josef (PO)
-- **itr:** #380
+- **itr:** #380, #388
 - **Related:** ADR-0001
 
 ## Context
@@ -48,6 +48,31 @@ expressible via `always_ask` / `always_ask_remove`.
 - The `dangerous` posture is genuinely dangerous and has no extra confirmation gate at set time;
   an operator can footgun into auto-answering questions with no selection (a confirmation prompt
   is the obvious future mitigation).
+
+## Amendments
+
+Two statements in the Decision section above were tightened by later bug fixes; the original text
+is preserved for history, but the **current** semantics are:
+
+1. **The guard applies to `PermissionRequest` too** (itr#388, commit `10e78f5`, 2026-06-14).
+   The original "`PermissionRequest` is never deferred by the guard" was itself the bug: with the
+   daemon down, the fail-open path emitted `{"behavior":"allow"}`, silently resolving the native
+   prompt with no selection. `Decision::Ask` on `PermissionRequest` emits **no decision object**,
+   which is what lets Claude's native dialog render the question/plan and capture the answer. The
+   guard therefore fires on **both** `PreToolUse` and `PermissionRequest`.
+2. **Intrinsic entries defer unconditionally** (commit `0530ef1`, 2026-07-01). The original "the
+   only thing that bypasses the guard is the `auto_approve_dangerous` posture" let `dangerous`
+   (and an `always_ask_remove` entry) re-swallow a question's answer — the same "did not answer"
+   dead-end this ADR exists to prevent. The `DEFAULT_ALWAYS_ASK` check now runs ahead of every
+   posture and override: **nothing** can un-defer the intrinsic set. `auto_approve_dangerous` and
+   `always_ask_remove` release only operator-added `always_ask` tools.
+
+Consequence confirmed 2026-07-03 (itr#249/#250/#253 closed as obsoleted): because the intrinsic
+tools always defer before the daemon connection, they can never appear in the daemon decision
+queue or the TUI/web detail views via the shipped hook — UI work targeting those views for these
+tools is dead code (commit `4462bfa`, reverted in `e7ccb5e`). Deferrals are still audited to
+`events.jsonl` (`decided_by: always_ask:intrinsic`, itr#397), which is the correct feed for any
+inbox surface that wants to *show* pending questions (deep-link, not in-console answer — itr#399).
 
 ## Alternatives considered
 
