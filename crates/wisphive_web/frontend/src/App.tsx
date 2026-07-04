@@ -56,9 +56,9 @@ function App() {
 
 function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
   const {
-    connected, queue, agents, projects, auditDecisions, history, agentTimeline, sessionTimeline, sessions, terminals,
+    connected, queue, agents, projects, hookStatus, hookErrors, auditDecisions, history, agentTimeline, sessionTimeline, sessions, terminals,
     pendingReauth, diskAlerts, approve, deny, dismissReauth, retryPendingApprove,
-    spawnAgent, queryProjects, queryHistory, queryAgentTimeline, querySessionTimeline, searchHistory, querySessions,
+    spawnAgent, queryProjects, installHooks, queryProjectHookStatus, queryHistory, queryAgentTimeline, querySessionTimeline, searchHistory, querySessions,
     termList, termCreate, termAttach, termDetach, termInput, termResize, termClose, termReplay, termSetGroup, termReorder, registerTerminalHandler,
   } = useWisphive();
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -252,9 +252,13 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
         {view === "projects" && (
           <Projects
             projects={projects}
+            hookStatus={hookStatus}
+            hookErrors={hookErrors}
             onLoad={queryProjects}
             onSpawnInProject={(project) => { setSpawnDefaultProject(project); setShowSpawn(true); }}
             onDrillDown={(project) => { searchHistory(project); setView("history"); }}
+            onInstallHooks={installHooks}
+            onQueryHookStatus={queryProjectHookStatus}
           />
         )}
         {view === "terminals" && (

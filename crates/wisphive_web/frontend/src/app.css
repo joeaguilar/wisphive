@@ -1286,6 +1286,62 @@ pre.code-block, pre.plan-content {
   margin-left: auto;
 }
 
+/* ── Project hook-gating (itr#460) ──────────────────────────────── */
+.gate-path-bar {
+  display: flex;
+  gap: var(--space-sm);
+  align-items: center;
+  margin-bottom: var(--space-md);
+}
+
+.gate-path-input {
+  flex: 1;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--font-input);
+  padding: var(--space-sm);
+  min-height: var(--touch-min);
+}
+
+.gate-path-input:focus {
+  outline: none;
+  border-color: var(--cyan);
+}
+
+.gate-path-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.gate-badge {
+  border-radius: var(--radius);
+  padding: 1px var(--space-sm);
+  font-size: var(--font-sm);
+  font-weight: bold;
+}
+
+.gate-badge-gated { background: rgba(76, 175, 80, 0.2); color: var(--green); }
+.gate-badge-needs-repair { background: rgba(255, 183, 77, 0.2); color: var(--yellow); }
+.gate-badge-not-gated { background: rgba(244, 67, 54, 0.2); color: var(--red); }
+.gate-badge-unknown { background: var(--bg-card-hover); color: var(--text-dim); }
+
+.gate-repair-btn {
+  margin-left: auto;
+}
+
+.gate-repair-btn + .spawn-project-btn {
+  margin-left: var(--space-sm);
+}
+
+.gate-error {
+  margin-top: var(--space-xs);
+  color: var(--red);
+  font-size: var(--font-sm);
+}
+
 /* Config view */
 .config-view {
   height: 100%;

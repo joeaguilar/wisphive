@@ -118,6 +118,8 @@ export type ServerMessage =
   | { type: "history_response"; entries: HistoryEntry[]; request_id?: string }
   | { type: "sessions_response"; sessions: SessionSummary[] }
   | { type: "projects_response"; projects: ProjectSummary[] }
+  | ({ type: "project_hook_status" } & ProjectHookStatus)
+  | { type: "install_hooks_result"; project: string; status?: ProjectHookStatus; error?: string }
   | { type: "reimport_complete"; count: number }
   | { type: "error"; message: string }
   | { type: "term_created" } & TerminalSessionMeta
@@ -145,6 +147,19 @@ export interface ProjectSummary {
   agent_count: number;
 }
 
+/** Wire mirror of `wisphive_protocol::ProjectHookStatus` (itr#460) — a
+ * project's Wisphive hook install state. `mode` is a label string:
+ * "active" | "off" | "missing" | "invalid: <x>". */
+export interface ProjectHookStatus {
+  project: string;
+  mode: string;
+  claude_installed: boolean;
+  codex_installed: boolean;
+  missing_events: string[];
+  all_installed: boolean;
+  all_enabled: boolean;
+}
+
 export interface SpawnAgentRequest {
   agent_type?: "claude_code" | "codex";
   project: string;
@@ -163,6 +178,8 @@ export type ClientMessage =
   | { type: "query_history"; agent_id?: string; limit?: number; request_id?: string }
   | { type: "query_sessions" }
   | { type: "query_projects" }
+  | { type: "install_hooks"; project: string }
+  | { type: "query_project_hook_status"; project: string }
   | { type: "reimport_events" }
   | { type: "spawn_agent" } & SpawnAgentRequest
   | { type: "search_history"; query?: string; tool_name?: string; agent_id?: string; limit?: number; request_id?: string }

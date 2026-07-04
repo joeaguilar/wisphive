@@ -6,6 +6,7 @@ import type {
   DecisionRequest,
   DiskAlertKind,
   HistoryEntry,
+  ProjectHookStatus,
   ProjectSummary,
   ServerMessage,
   SessionSummary,
@@ -23,6 +24,14 @@ export interface WisphiveState {
   sessionTimeline: HistoryEntry[];
   sessions: SessionSummary[];
   projects: ProjectSummary[];
+  /** Per-project Wisphive hook install state (itr#460), keyed by absolute
+   * project path. Lazily populated by `query_project_hook_status` /
+   * `install_hooks_result`; drives the Projects view gating badges. */
+  hookStatus: Record<string, ProjectHookStatus>;
+  /** Per-project install error string from a failed `install_hooks` (itr#460),
+   * keyed by project path. Cleared on the next successful install for that
+   * project. Server/agent-derived — render as inert text. */
+  hookErrors: Record<string, string>;
   auditDecisions: AuditDecision[];
   terminals: TerminalSessionMeta[];
   /** Set when the daemon refuses a sudo-class approve with
@@ -89,6 +98,12 @@ export function useWisphive() {
   // WebReauthRequired (wire.rs) so we can correlate unambiguously even
   // when two sudo-class approves are in flight back-to-back.
   const approveStashRef = useRef<Map<string, ApproveOpts | undefined>>(new Map());
+  // Pending install-hooks stash (itr#460). `install_hooks` is sudo-gated, so
+  // the daemon may bounce it with `web_reauth_required` (request_id = the
+  // project path, tool_name = "InstallHooks"). We stash the project the
+  // instant we send the install so a successful reauth replays exactly that
+  // install — mirrors approveStashRef for the approve path.
+  const installStashRef = useRef<Set<string>>(new Set());
   const [state, setState] = useState<WisphiveState>({
     connected: false,
     queue: [],
@@ -98,6 +113,8 @@ export function useWisphive() {
     sessionTimeline: [],
     sessions: [],
     projects: [],
+    hookStatus: {},
+    hookErrors: {},
     auditDecisions: [],
     terminals: [],
     pendingReauth: null,
@@ -180,6 +197,38 @@ export function useWisphive() {
 
           case "projects_response":
             return { ...prev, projects: msg.projects };
+
+          case "project_hook_status": {
+            const { type: _, ...status } = msg;
+            return {
+              ...prev,
+              hookStatus: { ...prev.hookStatus, [status.project]: status as ProjectHookStatus },
+            };
+          }
+
+          case "install_hooks_result": {
+            // Success carries the freshly-audited status; failure carries an
+            // error string. Update the badge map on success, surface the
+            // error on failure. Either way the install for this project is no
+            // longer pending reauth, so drop its stash.
+            installStashRef.current.delete(msg.project);
+            if (msg.status) {
+              const nextErrors = { ...prev.hookErrors };
+              delete nextErrors[msg.project];
+              return {
+                ...prev,
+                hookStatus: { ...prev.hookStatus, [msg.project]: msg.status },
+                hookErrors: nextErrors,
+              };
+            }
+            return {
+              ...prev,
+              hookErrors: {
+                ...prev.hookErrors,
+                [msg.project]: msg.error ?? "Install failed.",
+              },
+            };
+          }
 
           case "reimport_complete":
             return prev;
@@ -411,7 +460,12 @@ export function useWisphive() {
   const dismissReauth = useCallback(() => {
     setState((prev) => {
       if (prev.pendingReauth) {
+        // Drop whichever stash the abandoned reauth was gating so a later
+        // success can't replay a call the user cancelled. Only one applies
+        // per request_id, but deleting both is harmless and keeps the branch
+        // simple.
         approveStashRef.current.delete(prev.pendingReauth.request_id);
+        installStashRef.current.delete(prev.pendingReauth.request_id);
       }
       return { ...prev, pendingReauth: null };
     });
@@ -426,6 +480,18 @@ export function useWisphive() {
     setState((prev) => {
       const reauth = prev.pendingReauth;
       if (!reauth) return { ...prev, pendingReauth: null };
+      // Branch on the gated tool. `install_hooks` (itr#460) is sudo-gated too;
+      // its reauth carries request_id = the project path and
+      // tool_name = "InstallHooks", so replay the install rather than an
+      // approve. Everything else replays the stashed approve unchanged.
+      if (reauth.tool_name === "InstallHooks") {
+        const project = reauth.request_id;
+        const wasStashed = installStashRef.current.delete(project);
+        if (wasStashed) {
+          send({ type: "install_hooks", project });
+        }
+        return { ...prev, pendingReauth: null };
+      }
       const opts = approveStashRef.current.get(reauth.request_id);
       approveStashRef.current.delete(reauth.request_id);
       if (prev.queue.some((r) => r.id === reauth.request_id)) {
@@ -470,6 +536,27 @@ export function useWisphive() {
   const queryProjects = useCallback(() => {
     send({ type: "query_projects" });
   }, [send]);
+
+  /** Install (or repair) Wisphive hooks into a project (itr#460). Sudo-gated
+   * server-side: the daemon may bounce with `web_reauth_required`, so we stash
+   * the project before sending — a successful reauth replays exactly this
+   * install via retryPendingApprove. */
+  const installHooks = useCallback(
+    (project: string) => {
+      installStashRef.current.add(project);
+      send({ type: "install_hooks", project });
+    },
+    [send],
+  );
+
+  /** Fetch a project's current hook install state (itr#460); the response
+   * lands as `project_hook_status` and merges into `hookStatus`. */
+  const queryProjectHookStatus = useCallback(
+    (project: string) => {
+      send({ type: "query_project_hook_status", project });
+    },
+    [send],
+  );
 
   const searchHistory = useCallback(
     (query: string, requestId?: string) => {
@@ -574,6 +661,8 @@ export function useWisphive() {
     querySessionTimeline,
     querySessions,
     queryProjects,
+    installHooks,
+    queryProjectHookStatus,
     searchHistory,
     spawnAgent,
     termList,
