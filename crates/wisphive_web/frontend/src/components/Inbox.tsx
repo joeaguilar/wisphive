@@ -10,6 +10,7 @@ import {
 } from "./queueUtils";
 import { AutoAnswerFeed } from "./AutoAnswerFeed";
 import { DetailView, DeferredDetailView } from "./DetailView";
+import { activate } from "./a11y";
 
 interface InboxProps {
   items: DecisionRequest[];
@@ -78,7 +79,7 @@ export function Inbox({
       <div className="inbox-header">
         <div>
           <h2>Inbox</h2>
-          <p className="inbox-count">
+          <p className="inbox-count" role="status" aria-live="polite">
             {items.length} waiting
             {deferred.length > 0 && ` · ${deferred.length} in your terminal`}
             {" · "}
@@ -241,7 +242,9 @@ function DeferredRow({ decision, now, expanded, onToggle, onFocusTerminal }: Def
       className="inbox-item inbox-deferred-item"
       style={{ borderLeftColor: color }}
       aria-expanded={expanded}
+      aria-label={`${decision.tool_name} — waiting in your terminal`}
       onClick={onToggle}
+      {...activate(onToggle)}
     >
       <div className="inbox-item-topline">
         <span className="inbox-deferred-badge">deferred</span>

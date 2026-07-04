@@ -160,9 +160,19 @@ export function ConfigView() {
                     <div
                       key={tool}
                       className={`tool-row ${status.auto ? "auto" : "queued"} ${status.source}`}
+                      role="checkbox"
+                      aria-checked={status.auto}
+                      aria-label={`Auto-approve ${tool}`}
+                      tabIndex={0}
                       onClick={() => toggleTool(tool)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          toggleTool(tool);
+                        }
+                      }}
                     >
-                      <span className={`tool-checkbox ${status.auto ? "checked" : ""}`}>
+                      <span className={`tool-checkbox ${status.auto ? "checked" : ""}`} aria-hidden="true">
                         {status.auto ? "✓" : " "}
                       </span>
                       <span className="tool-name-config">{tool}</span>

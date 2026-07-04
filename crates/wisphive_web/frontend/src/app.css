@@ -81,8 +81,11 @@ body {
   border-radius: 50%;
 }
 
+/* Filled = connected, hollow ring = disconnected: state is carried by shape as
+ * well as colour, so it reads for red/green colourblind users (paired with the
+ * role="status" aria-label in App.tsx). */
 .status-dot.connected { background: var(--green); }
-.status-dot.disconnected { background: var(--red); }
+.status-dot.disconnected { background: transparent; border: 2px solid var(--red); }
 
 .sidebar button {
   background: none;
@@ -1792,12 +1795,35 @@ kbd {
   opacity: 0.75;
 }
 
+/* Real <button> (keyboard-operable rename trigger) reset back to inline text. */
 .terminals-group-name {
   flex: 1 1 auto;
   cursor: text;
+  background: transparent;
+  border: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  padding: 0;
 }
 
 .terminals-group-name:hover { opacity: 1; text-decoration: underline; }
+
+/* ── Keyboard focus rings for rows promoted to role="button"/"checkbox" ──
+ * (itr harden pass). Rows that became keyboard-operable get a visible cyan
+ * ring so keyboard users can see the active target — matching the existing
+ * .btn-focus / toggle focus treatment. */
+.session-item:focus-visible,
+.agent-card:focus-visible,
+.history-item:focus-visible,
+.tool-row:focus-visible,
+.terminals-project-picker-item:focus-visible,
+.terminals-section-header.clickable:focus-visible,
+.inbox-deferred-item:focus-visible,
+.terminal-queue-dock-row-head:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: -2px;
+}
 
 .terminals-group-count {
   background: var(--border);

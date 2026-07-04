@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { AgentInfo, DecisionRequest, HistoryEntry } from "../types/protocol";
+import { activate } from "./a11y";
 
 interface AgentsProps {
   agents: AgentInfo[];
@@ -70,7 +71,7 @@ export function Agents({ agents, queue, timeline, selectedAgent, onSelectAgent, 
         {agent && (
           <div className="agent-detail-header">
             <div className="agent-detail-id">
-              <span className="status-indicator live">●</span>
+              <span className="status-indicator live" aria-hidden="true">●</span>
               <span>{agent.agent_id}</span>
               <span className="agent-card-type">{agent.agent_type}</span>
             </div>
@@ -111,7 +112,7 @@ export function Agents({ agents, queue, timeline, selectedAgent, onSelectAgent, 
           <div className="agent-section">
             <h3>Status</h3>
             <div className="agent-status-idle">
-              <span className="status-indicator live">●</span>
+              <span className="status-indicator live" aria-hidden="true">●</span>
               Agent is working — no pending decisions
             </div>
           </div>
@@ -129,7 +130,14 @@ export function Agents({ agents, queue, timeline, selectedAgent, onSelectAgent, 
                 const cls = d === "approve" ? "badge-approve" : d === "deny" ? "badge-deny" : "badge-defer";
                 const isExpanded = expandedEntry === entry.id;
                 return (
-                  <div key={entry.id} className="history-item" onClick={() => setExpandedEntry(isExpanded ? null : entry.id)}>
+                  <div
+                    key={entry.id}
+                    className="history-item"
+                    aria-expanded={isExpanded}
+                    aria-label={`${entry.tool_name} — ${isExpanded ? "collapse" : "expand"} detail`}
+                    onClick={() => setExpandedEntry(isExpanded ? null : entry.id)}
+                    {...activate(() => setExpandedEntry(isExpanded ? null : entry.id))}
+                  >
                     <div className="history-item-row">
                       <span className={`decision-badge ${cls}`}>{d.toUpperCase()}</span>
                       <span className="tool-name">{entry.tool_name}</span>
@@ -178,12 +186,21 @@ export function Agents({ agents, queue, timeline, selectedAgent, onSelectAgent, 
             const pending = queue.filter((r) => r.agent_id === a.agent_id);
             const lastPending = pending[pending.length - 1];
             return (
-              <div key={a.agent_id} className="agent-card" onClick={() => {
-                onSelectAgent(a.agent_id);
-                onLoadTimeline(a.agent_id);
-              }}>
+              <div
+                key={a.agent_id}
+                className="agent-card"
+                aria-label={`Agent ${a.agent_id.slice(0, 24)}${pending.length > 0 ? ` — ${pending.length} pending` : " — working"}`}
+                onClick={() => {
+                  onSelectAgent(a.agent_id);
+                  onLoadTimeline(a.agent_id);
+                }}
+                {...activate(() => {
+                  onSelectAgent(a.agent_id);
+                  onLoadTimeline(a.agent_id);
+                })}
+              >
                 <div className="agent-card-header">
-                  <span className="status-indicator live">●</span>
+                  <span className="status-indicator live" role="img" aria-label="connected">●</span>
                   <span className="agent-card-id">{a.agent_id.slice(0, 24)}</span>
                   <span className="agent-card-type">{a.agent_type}</span>
                   <span className="time-ago">{duration(a.connected_at, a.last_seen)}</span>

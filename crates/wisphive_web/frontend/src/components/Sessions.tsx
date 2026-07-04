@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { HistoryEntry, SessionSummary } from "../types/protocol";
 import { HistoryEntryItem } from "./HistoryEntryItem";
+import { activate } from "./a11y";
 
 interface SessionsProps {
   sessions: SessionSummary[];
@@ -73,12 +74,25 @@ export function Sessions({ sessions, timeline, selectedAgent, onLoad, onSelectAg
       ) : (
         <div className="sessions-list">
           {sessions.map((s) => (
-            <div key={s.agent_id} className="session-item" onClick={() => {
-              onSelectAgent(s.agent_id);
-              onLoadTimeline(s.agent_id);
-            }}>
+            <div
+              key={s.agent_id}
+              className="session-item"
+              aria-label={`Session ${s.agent_id.slice(0, 20)} — ${s.is_live ? "live" : "ended"}`}
+              onClick={() => {
+                onSelectAgent(s.agent_id);
+                onLoadTimeline(s.agent_id);
+              }}
+              {...activate(() => {
+                onSelectAgent(s.agent_id);
+                onLoadTimeline(s.agent_id);
+              })}
+            >
               <div className="session-header">
-                <span className={`status-indicator ${s.is_live ? "live" : "ended"}`}>
+                <span
+                  className={`status-indicator ${s.is_live ? "live" : "ended"}`}
+                  role="img"
+                  aria-label={s.is_live ? "live" : "ended"}
+                >
                   {s.is_live ? "●" : "○"}
                 </span>
                 <span className="agent-id">{s.agent_id.slice(0, 20)}</span>

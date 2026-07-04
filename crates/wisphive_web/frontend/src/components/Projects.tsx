@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { ProjectHookStatus, ProjectSummary } from "../types/protocol";
 import { ConfirmModal } from "./Modal";
+import { activate } from "./a11y";
 
 interface ProjectsProps {
   projects: ProjectSummary[];
@@ -125,9 +126,19 @@ export function Projects({
             const gateState = deriveGateState(status);
             const error = hookErrors[p.project];
             return (
-              <div key={p.project} className="session-item" onClick={() => onDrillDown(p.project)}>
+              <div
+                key={p.project}
+                className="session-item"
+                aria-label={`Project ${p.project.split("/").pop()} — ${p.agent_count > 0 ? "active" : "idle"}. View history.`}
+                onClick={() => onDrillDown(p.project)}
+                {...activate(() => onDrillDown(p.project))}
+              >
                 <div className="session-header">
-                  <span className={`status-indicator ${p.agent_count > 0 ? "live" : "ended"}`}>
+                  <span
+                    className={`status-indicator ${p.agent_count > 0 ? "live" : "ended"}`}
+                    role="img"
+                    aria-label={p.agent_count > 0 ? "active" : "idle"}
+                  >
                     {p.agent_count > 0 ? "●" : "○"}
                   </span>
                   <span className="project-name-lg">{p.project.split("/").pop()}</span>

@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { DecisionRequest } from "../types/protocol";
 import { DetailView } from "./DetailView";
 import { eventPrefix, inputSummary, timeAgo } from "./queueUtils";
+import { activate } from "./a11y";
 
 interface Props {
   terminalPending: DecisionRequest[];
@@ -51,7 +52,10 @@ export function TerminalQueueDock({
           >
             <div
               className="terminal-queue-dock-row-head"
+              aria-expanded={isExpanded}
+              aria-label={`${row.tool_name} — ${isExpanded ? "collapse" : "expand"} detail`}
               onClick={() => setRequestedExpandedId(isExpanded ? null : row.id)}
+              {...activate(() => setRequestedExpandedId(isExpanded ? null : row.id))}
             >
               {prefix && <span className="event-prefix">{prefix}</span>}
               <span className="tool-name">{row.tool_name}</span>

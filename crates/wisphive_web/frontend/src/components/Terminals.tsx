@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { DecisionRequest, ProjectSummary, TerminalSessionMeta } from "../types/protocol";
 import { TerminalView } from "./TerminalView";
 import { TerminalQueueDock } from "./TerminalQueueDock";
+import { activate } from "./a11y";
 
 interface TerminalsProps {
   terminals: TerminalSessionMeta[];
@@ -277,7 +278,7 @@ export function Terminals(props: TerminalsProps) {
           <div className="terminals-project-picker">
             <div className="terminals-project-picker-header">
               <strong>Open terminal in project</strong>
-              <button onClick={() => setShowProjectPicker(false)}>×</button>
+              <button onClick={() => setShowProjectPicker(false)} aria-label="Close project picker">×</button>
             </div>
             {projects.length === 0 && (
               <div className="terminals-project-picker-empty">
@@ -288,7 +289,9 @@ export function Terminals(props: TerminalsProps) {
               <div
                 key={p.project}
                 className="terminals-project-picker-item"
+                aria-label={`Open terminal in ${p.project}`}
                 onClick={() => handleCreateInProject(p)}
+                {...activate(() => handleCreateInProject(p))}
               >
                 <strong>{p.project.split("/").filter(Boolean).pop() ?? p.project}</strong>
                 <div className="path">{p.project}</div>
@@ -337,18 +340,21 @@ export function Terminals(props: TerminalsProps) {
                             />
                           ) : (
                             <>
-                              <span
+                              <button
+                                type="button"
                                 className="terminals-group-name"
                                 onClick={() => startRenameGroup(groupKey)}
                                 title="Click to rename"
+                                aria-label={`Rename group ${groupKey}`}
                               >
                                 {groupKey}
-                              </span>
+                              </button>
                               <span className="terminals-group-count">{bucket.length}</span>
                               <button
                                 className="terminals-group-ungroup"
                                 onClick={() => ungroupAll(groupKey)}
                                 title="Ungroup all"
+                                aria-label={`Ungroup all in ${groupKey}`}
                               >×</button>
                             </>
                           )}
@@ -386,9 +392,12 @@ export function Terminals(props: TerminalsProps) {
             <section className="terminals-section">
               <header
                 className="terminals-section-header clickable"
+                aria-expanded={orphanedOpen}
+                aria-label={`Orphaned terminals — ${orphanedOpen ? "collapse" : "expand"}`}
                 onClick={() => setOrphanedOpen((o) => !o)}
+                {...activate(() => setOrphanedOpen((o) => !o))}
               >
-                <span className="terminals-section-caret">{orphanedOpen ? "▼" : "▶"}</span>
+                <span className="terminals-section-caret" aria-hidden="true">{orphanedOpen ? "▼" : "▶"}</span>
                 <span className="terminals-section-title">Orphaned</span>
                 <span className="terminals-section-count">{orphaned.length}</span>
               </header>
@@ -416,9 +425,12 @@ export function Terminals(props: TerminalsProps) {
             <section className="terminals-section">
               <header
                 className="terminals-section-header clickable"
+                aria-expanded={archivedOpen}
+                aria-label={`Archived terminals — ${archivedOpen ? "collapse" : "expand"}`}
                 onClick={() => setArchivedOpen((o) => !o)}
+                {...activate(() => setArchivedOpen((o) => !o))}
               >
-                <span className="terminals-section-caret">{archivedOpen ? "▼" : "▶"}</span>
+                <span className="terminals-section-caret" aria-hidden="true">{archivedOpen ? "▼" : "▶"}</span>
                 <span className="terminals-section-title">Archived</span>
                 <span className="terminals-section-count">{archived.length}</span>
               </header>
@@ -509,7 +521,7 @@ function SidebarItem(p: SidebarItemProps) {
       onDragOver={onDragOver}
     >
       <div className="row">
-        {draggable && <span className="drag-handle" title="Drag to reorder">⋮⋮</span>}
+        {draggable && <span className="drag-handle" title="Drag to reorder" aria-hidden="true">⋮⋮</span>}
         <strong>{t.label ?? "(no label)"}</strong>
         <span className={`term-status term-status-${t.status}`}>{t.status}</span>
         {pending > 0 && (

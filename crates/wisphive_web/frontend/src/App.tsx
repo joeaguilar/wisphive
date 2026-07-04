@@ -11,6 +11,7 @@ import { Sessions } from "./components/Sessions";
 import { Projects } from "./components/Projects";
 import { Agents } from "./components/Agents";
 import { SpawnModal } from "./components/SpawnModal";
+import { Modal } from "./components/Modal";
 import { ConfigView } from "./components/Config";
 import { Terminals } from "./components/Terminals";
 import { Login } from "./components/Login";
@@ -144,7 +145,12 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
       <nav className="sidebar">
         <div className="sidebar-header">
           <h1>wisphive</h1>
-          <span className={`status-dot ${connected ? "connected" : "disconnected"}`} />
+          <span
+            className={`status-dot ${connected ? "connected" : "disconnected"}`}
+            role="status"
+            aria-label={connected ? "Daemon connected" : "Daemon disconnected — reconnecting"}
+            title={connected ? "Daemon connected" : "Daemon disconnected — reconnecting"}
+          />
         </div>
         <button className={view === "inbox" ? "active" : ""} onClick={() => setView("inbox")}>
           Inbox {queue.length > 0 && <span className="badge">{queue.length}</span>}
@@ -289,39 +295,33 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
       </main>
 
       {showHelp && (
-        <div className="modal-overlay" onClick={() => setShowHelp(false)}>
-          <div className="modal-content help-modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-header">
-              <h2>Keyboard Shortcuts</h2>
-              <button className="modal-close" onClick={() => setShowHelp(false)}>×</button>
+        <Modal title="Keyboard Shortcuts" className="help-modal" onClose={() => setShowHelp(false)}>
+          <div className="help-grid">
+            <div className="help-section">
+              <h3>Navigation</h3>
+              <div className="help-row"><kbd>j</kbd> / <kbd>↓</kbd> Next item</div>
+              <div className="help-row"><kbd>k</kbd> / <kbd>↑</kbd> Previous item</div>
+              <div className="help-row"><kbd>Enter</kbd> Select / expand</div>
+              <div className="help-row"><kbd>Esc</kbd> Back / close</div>
             </div>
-            <div className="help-grid">
-              <div className="help-section">
-                <h3>Navigation</h3>
-                <div className="help-row"><kbd>j</kbd> / <kbd>↓</kbd> Next item</div>
-                <div className="help-row"><kbd>k</kbd> / <kbd>↑</kbd> Previous item</div>
-                <div className="help-row"><kbd>Enter</kbd> Select / expand</div>
-                <div className="help-row"><kbd>Esc</kbd> Back / close</div>
-              </div>
-              <div className="help-section">
-                <h3>Actions</h3>
-                <div className="help-row"><kbd>y</kbd> Approve selected</div>
-                <div className="help-row"><kbd>n</kbd> Deny selected</div>
-                <div className="help-row"><kbd>N</kbd> Spawn agent</div>
-              </div>
-              <div className="help-section">
-                <h3>Views</h3>
-                <div className="help-row"><kbd>1</kbd> Queue</div>
-                <div className="help-row"><kbd>2</kbd> History</div>
-                <div className="help-row"><kbd>3</kbd> Sessions</div>
-                <div className="help-row"><kbd>4</kbd> Projects</div>
-                <div className="help-row"><kbd>5</kbd> Agents</div>
-                <div className="help-row"><kbd>6</kbd> Config</div>
-                <div className="help-row"><kbd>?</kbd> This help</div>
-              </div>
+            <div className="help-section">
+              <h3>Actions</h3>
+              <div className="help-row"><kbd>y</kbd> Approve selected</div>
+              <div className="help-row"><kbd>n</kbd> Deny selected</div>
+              <div className="help-row"><kbd>N</kbd> Spawn agent</div>
+            </div>
+            <div className="help-section">
+              <h3>Views</h3>
+              <div className="help-row"><kbd>1</kbd> Queue</div>
+              <div className="help-row"><kbd>2</kbd> History</div>
+              <div className="help-row"><kbd>3</kbd> Sessions</div>
+              <div className="help-row"><kbd>4</kbd> Projects</div>
+              <div className="help-row"><kbd>5</kbd> Agents</div>
+              <div className="help-row"><kbd>6</kbd> Config</div>
+              <div className="help-row"><kbd>?</kbd> This help</div>
             </div>
           </div>
-        </div>
+        </Modal>
       )}
 
       {showSpawn && (
