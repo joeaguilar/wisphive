@@ -7,8 +7,9 @@ use std::collections::HashMap;
 
 use crate::types::{
     AgentInfo, AgentType, AuditDecision, Decision, DecisionFilter, DecisionRequest, HistoryEntry,
-    HistorySearch, ManagedAgent, PermissionSuggestion, ProjectSummary, SessionSummary,
-    SpawnAgentRequest, TerminalDirection, TerminalSessionMeta, TerminalStatus, ToolResult,
+    HistorySearch, ManagedAgent, PermissionSuggestion, ProjectHookStatus, ProjectSummary,
+    SessionSummary, SpawnAgentRequest, TerminalDirection, TerminalSessionMeta, TerminalStatus,
+    ToolResult,
 };
 
 /// Identifies the type of client connecting to the daemon.
@@ -152,6 +153,19 @@ pub enum ClientMessage {
     /// Query project summaries (aggregated across all agents).
     #[serde(rename = "query_projects")]
     QueryProjects,
+
+    /// Web UI asks the daemon to install Wisphive hooks into `project`
+    /// (itr#460). Sudo-class: the write lands in the project's
+    /// `.claude/settings.json` / `.codex/hooks.json`, so the daemon requires a
+    /// fresh web reauth (the originating `device_id` travels on the
+    /// [`ClientCommand`] envelope). TUI origins bypass the gate.
+    #[serde(rename = "install_hooks")]
+    InstallHooks { project: PathBuf },
+
+    /// Read-only query for `project`'s current Wisphive hook install status.
+    /// No gate — returns a [`ServerMessage::ProjectHookStatus`].
+    #[serde(rename = "query_project_hook_status")]
+    QueryProjectHookStatus { project: PathBuf },
 
     /// Hook registers an agent session (fire-and-forget, no response expected).
     #[serde(rename = "agent_register")]
@@ -391,6 +405,23 @@ pub enum ServerMessage {
     /// Response to QueryProjects: list of project summaries.
     #[serde(rename = "projects_response")]
     ProjectsResponse { projects: Vec<ProjectSummary> },
+
+    /// Response to [`ClientMessage::QueryProjectHookStatus`]: the project's
+    /// current hook install state (itr#460).
+    #[serde(rename = "project_hook_status")]
+    ProjectHookStatus(ProjectHookStatus),
+
+    /// Result of an [`ClientMessage::InstallHooks`] command (itr#460). On
+    /// success `status` carries the freshly-audited hook state and `error` is
+    /// None; on failure `status` is None and `error` carries the message.
+    #[serde(rename = "install_hooks_result")]
+    InstallHooksResult {
+        project: PathBuf,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        status: Option<ProjectHookStatus>,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        error: Option<String>,
+    },
 
     /// Full snapshot of currently registered agents, sent to TUI on connect.
     #[serde(rename = "agents_snapshot")]
@@ -1030,6 +1061,108 @@ mod tests {
         let encoded = encode(&msg).unwrap();
         let decoded: ClientMessage = decode(&encoded).unwrap();
         assert!(matches!(decoded, ClientMessage::QueryProjects));
+    }
+
+    #[test]
+    fn round_trip_install_hooks() {
+        let msg = ClientMessage::InstallHooks {
+            project: PathBuf::from("/Users/test/proj"),
+        };
+        let encoded = encode(&msg).unwrap();
+        assert!(encoded.contains("\"type\":\"install_hooks\""));
+        let decoded: ClientMessage = decode(&encoded).unwrap();
+        match decoded {
+            ClientMessage::InstallHooks { project } => {
+                assert_eq!(project, PathBuf::from("/Users/test/proj"));
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_query_project_hook_status() {
+        let msg = ClientMessage::QueryProjectHookStatus {
+            project: PathBuf::from("/Users/test/proj"),
+        };
+        let encoded = encode(&msg).unwrap();
+        assert!(encoded.contains("\"type\":\"query_project_hook_status\""));
+        let decoded: ClientMessage = decode(&encoded).unwrap();
+        match decoded {
+            ClientMessage::QueryProjectHookStatus { project } => {
+                assert_eq!(project, PathBuf::from("/Users/test/proj"));
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    fn sample_hook_status() -> crate::types::ProjectHookStatus {
+        crate::types::ProjectHookStatus {
+            project: PathBuf::from("/Users/test/proj"),
+            mode: "active".into(),
+            claude_installed: true,
+            codex_installed: false,
+            missing_events: vec!["PreToolUse".into(), "Stop".into()],
+            all_installed: false,
+            all_enabled: false,
+        }
+    }
+
+    #[test]
+    fn round_trip_project_hook_status() {
+        let status = sample_hook_status();
+        let msg = ServerMessage::ProjectHookStatus(status.clone());
+        let encoded = encode(&msg).unwrap();
+        assert!(encoded.contains("\"type\":\"project_hook_status\""));
+        let decoded: ServerMessage = decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::ProjectHookStatus(s) => assert_eq!(s, status),
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_install_hooks_result_success() {
+        let status = sample_hook_status();
+        let msg = ServerMessage::InstallHooksResult {
+            project: PathBuf::from("/Users/test/proj"),
+            status: Some(status.clone()),
+            error: None,
+        };
+        let encoded = encode(&msg).unwrap();
+        assert!(encoded.contains("\"type\":\"install_hooks_result\""));
+        assert!(!encoded.contains("\"error\""));
+        let decoded: ServerMessage = decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::InstallHooksResult {
+                project,
+                status: st,
+                error,
+            } => {
+                assert_eq!(project, PathBuf::from("/Users/test/proj"));
+                assert_eq!(st.unwrap(), status);
+                assert!(error.is_none());
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_install_hooks_result_error() {
+        let msg = ServerMessage::InstallHooksResult {
+            project: PathBuf::from("/Users/test/proj"),
+            status: None,
+            error: Some("permission denied".into()),
+        };
+        let encoded = encode(&msg).unwrap();
+        assert!(!encoded.contains("\"status\""));
+        let decoded: ServerMessage = decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::InstallHooksResult { status, error, .. } => {
+                assert!(status.is_none());
+                assert_eq!(error.unwrap(), "permission denied");
+            }
+            _ => panic!("unexpected variant"),
+        }
     }
 
     #[test]

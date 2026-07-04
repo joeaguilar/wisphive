@@ -1320,6 +1320,133 @@ async fn web_origin_approve_all_partitions_on_sudo_class() {
     let _ = shutdown_tx.send(true);
 }
 
+// ── Cockpit hook-gating: web-driven InstallHooks (itr#460) ──────────
+//
+// Installing hooks writes .claude/settings.json into a filesystem path from a
+// web device, so it is sudo-gated exactly like a Bash/Write approve. A stale
+// reauth must bounce WebReauthRequired and write nothing; after MarkDeviceFresh
+// the install proceeds and the fresh audit comes back on InstallHooksResult.
+#[tokio::test]
+async fn web_origin_install_hooks_reauth_gated_then_installs() {
+    let (_tmp, config) = temp_config();
+    let socket_path = config.socket_path.clone();
+    let shutdown_tx = start_server(config).await;
+
+    let (mut tui_lines, mut tui_writer) = connect_as_tui(&socket_path).await;
+
+    let project = tempfile::tempdir().unwrap();
+    let project_path = project.path().to_path_buf();
+    let settings = project_path.join(".claude").join("settings.json");
+
+    let install_cmd = encode(
+        &ClientCommand::from(ClientMessage::InstallHooks {
+            project: project_path.clone(),
+        })
+        .with_device_id(DeviceId::from("dev-phone")),
+    )
+    .unwrap();
+
+    // 1. Stale reauth -> bounced, nothing written.
+    tui_writer.write_all(install_cmd.as_bytes()).await.unwrap();
+    let reauth = next_tui_msg(&mut tui_lines, |m| {
+        matches!(m, ServerMessage::WebReauthRequired { .. })
+    })
+    .await;
+    match reauth {
+        ServerMessage::WebReauthRequired {
+            device_id,
+            request_id,
+            tool_name,
+            ..
+        } => {
+            assert_eq!(device_id, "dev-phone");
+            assert_eq!(tool_name, "InstallHooks");
+            // request_id is the project path so the browser can map the retry.
+            assert_eq!(request_id, project_path.to_string_lossy());
+        }
+        _ => unreachable!(),
+    }
+    assert!(
+        !settings.exists(),
+        "gated install must not write settings.json"
+    );
+
+    // 2. Mark the device fresh, wait for ack.
+    let mark_fresh = encode(
+        &ClientCommand::from(ClientMessage::MarkDeviceFresh)
+            .with_device_id(DeviceId::from("dev-phone")),
+    )
+    .unwrap();
+    tui_writer.write_all(mark_fresh.as_bytes()).await.unwrap();
+    let _ = next_tui_msg(&mut tui_lines, |m| {
+        matches!(m, ServerMessage::MarkDeviceFreshAck { .. })
+    })
+    .await;
+
+    // 3. Retry -> installs and returns a status with all_installed = true.
+    tui_writer.write_all(install_cmd.as_bytes()).await.unwrap();
+    let result = next_tui_msg(&mut tui_lines, |m| {
+        matches!(m, ServerMessage::InstallHooksResult { .. })
+    })
+    .await;
+    match result {
+        ServerMessage::InstallHooksResult {
+            project: p,
+            status,
+            error,
+        } => {
+            assert_eq!(p, project_path);
+            assert!(error.is_none(), "install should succeed: {error:?}");
+            let status = status.expect("status present on success");
+            assert!(status.claude_installed);
+            assert!(status.codex_installed);
+            assert!(
+                status.all_installed,
+                "all hooks should be installed: {status:?}"
+            );
+        }
+        _ => unreachable!(),
+    }
+    assert!(settings.exists(), "install must write settings.json");
+
+    let _ = shutdown_tx.send(true);
+}
+
+// A read-only QueryProjectHookStatus is not gated and reflects on-disk state.
+#[tokio::test]
+async fn query_project_hook_status_reports_disk_state() {
+    let (_tmp, config) = temp_config();
+    let socket_path = config.socket_path.clone();
+    let shutdown_tx = start_server(config).await;
+
+    let (mut tui_lines, mut tui_writer) = connect_as_tui(&socket_path).await;
+
+    let project = tempfile::tempdir().unwrap();
+    let project_path = project.path().to_path_buf();
+
+    // Fresh project: nothing installed.
+    let query = encode(&ClientMessage::QueryProjectHookStatus {
+        project: project_path.clone(),
+    })
+    .unwrap();
+    tui_writer.write_all(query.as_bytes()).await.unwrap();
+    let status = next_tui_msg(&mut tui_lines, |m| {
+        matches!(m, ServerMessage::ProjectHookStatus(_))
+    })
+    .await;
+    match status {
+        ServerMessage::ProjectHookStatus(s) => {
+            assert_eq!(s.project, project_path);
+            assert!(!s.claude_installed);
+            assert!(!s.all_installed);
+            assert!(!s.missing_events.is_empty());
+        }
+        _ => unreachable!(),
+    }
+
+    let _ = shutdown_tx.send(true);
+}
+
 #[tokio::test]
 async fn server_cleans_up_socket_on_shutdown() {
     let (_tmp, config) = temp_config();

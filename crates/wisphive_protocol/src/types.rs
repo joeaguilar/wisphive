@@ -810,6 +810,31 @@ impl DecisionFilter {
     }
 }
 
+/// Wire-only summary of a project's Wisphive hook install state (itr#460).
+///
+/// A flattened mirror of the hook section of
+/// `wisphive_daemon::project_audit::ProjectAudit`, kept in the protocol crate
+/// so it can travel on a [`crate::ServerMessage`] without the protocol crate
+/// depending on the daemon (that would be a dependency cycle). The daemon maps
+/// its richer `ProjectAudit` down to this before sending.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectHookStatus {
+    /// The audited project directory.
+    pub project: PathBuf,
+    /// Global gating mode label ("active" / "off" / "missing" / "invalid: ...").
+    pub mode: String,
+    /// All expected Claude Code hook events are installed.
+    pub claude_installed: bool,
+    /// All expected Codex hook events are installed.
+    pub codex_installed: bool,
+    /// Union of Claude + Codex hook events that are still missing.
+    pub missing_events: Vec<String>,
+    /// Both agents have every expected hook installed.
+    pub all_installed: bool,
+    /// Both agents' hooks are installed and gating mode is active.
+    pub all_enabled: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

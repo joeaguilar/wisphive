@@ -958,7 +958,8 @@ async fn dispatch_command(
         | ClientMessage::ApproveAll { .. }
         | ClientMessage::DenyAll { .. }
         | ClientMessage::ApprovePermission { .. }
-        | ClientMessage::MarkDeviceFresh => {
+        | ClientMessage::MarkDeviceFresh
+        | ClientMessage::InstallHooks { .. } => {
             handle_decision_command(writer, ctx, device_id, msg).await?;
         }
         ClientMessage::SpawnAgent(_)
@@ -970,7 +971,8 @@ async fn dispatch_command(
         ClientMessage::QueryHistory { .. }
         | ClientMessage::SearchHistory(_)
         | ClientMessage::QuerySessions
-        | ClientMessage::QueryProjects => {
+        | ClientMessage::QueryProjects
+        | ClientMessage::QueryProjectHookStatus { .. } => {
             handle_query_command(writer, ctx, msg).await?;
         }
         ClientMessage::TermCreate { .. }
@@ -1282,11 +1284,95 @@ async fn handle_decision_command(
             )
             .await;
         }
+        ClientMessage::InstallHooks { project } => {
+            info!(?device_id, project = %project.display(), "install_hooks");
+
+            // Sudo gate (itr#460): installing hooks writes into the project's
+            // `.claude/settings.json` / `.codex/hooks.json` — a filesystem
+            // write driven by a web device, so it's unconditionally sudo-class
+            // (no per-tool check like the approve gate; the *action* is the
+            // sudo-class thing). A web origin whose reauth grace has lapsed is
+            // bounced with WebReauthRequired and nothing is written. TUI origin
+            // (device_id = None) is local/trusted and bypasses, same as approve.
+            if let Some(ref dev) = device_id
+                && !ctx.reauth.is_fresh(dev).await
+            {
+                let reauth_msg = ServerMessage::WebReauthRequired {
+                    device_id: dev.0.clone(),
+                    // The browser keys the retry on the project path string.
+                    request_id: project.to_string_lossy().into_owned(),
+                    tool_name: "InstallHooks".into(),
+                    at: chrono::Utc::now(),
+                };
+                write_msg(writer, &reauth_msg).await?;
+                debug!(project = %project.display(), device_id = %dev.0, "sudo gate: reauth required (install_hooks)");
+                return Ok(());
+            }
+
+            let result = match crate::hook_install::install_hooks(&project) {
+                Ok(()) => {
+                    let audit = crate::project_audit::audit_project(&project);
+                    ServerMessage::InstallHooksResult {
+                        project: project.clone(),
+                        status: Some(project_hook_status(&audit)),
+                        error: None,
+                    }
+                }
+                Err(e) => {
+                    warn!(project = %project.display(), error = %e, "install_hooks failed");
+                    ServerMessage::InstallHooksResult {
+                        project: project.clone(),
+                        status: None,
+                        error: Some(e.to_string()),
+                    }
+                }
+            };
+            write_msg(writer, &result).await?;
+        }
         _ => {
             warn!("unexpected message from TUI: {:?}", msg);
         }
     }
     Ok(())
+}
+
+/// Map the daemon's rich [`crate::project_audit::ProjectAudit`] onto the
+/// wire-only [`wisphive_protocol::ProjectHookStatus`] mirror (itr#460).
+fn project_hook_status(
+    audit: &crate::project_audit::ProjectAudit,
+) -> wisphive_protocol::ProjectHookStatus {
+    use crate::project_audit::HookMode;
+    let mode = match &audit.hooks.mode {
+        HookMode::Active => "active".to_string(),
+        HookMode::Off => "off".to_string(),
+        HookMode::Missing => "missing".to_string(),
+        HookMode::Invalid(value) => format!("invalid: {value}"),
+    };
+
+    // Union of both agents' missing events, de-duplicated while preserving
+    // first-seen order (Claude's list first, then any Codex-only extras).
+    let mut missing_events: Vec<String> = Vec::new();
+    for event in audit
+        .hooks
+        .claude
+        .missing_events
+        .iter()
+        .chain(audit.hooks.codex.missing_events.iter())
+    {
+        if !missing_events.contains(event) {
+            missing_events.push(event.clone());
+        }
+    }
+
+    wisphive_protocol::ProjectHookStatus {
+        project: audit.project_dir.clone(),
+        mode,
+        claude_installed: audit.hooks.claude.installed,
+        codex_installed: audit.hooks.codex.installed,
+        missing_events,
+        all_installed: audit.hooks.all_installed,
+        all_enabled: audit.hooks.all_enabled,
+    }
 }
 
 /// Dispatch agent-process commands: spawn, list, stop, and event re-import.
@@ -1575,6 +1661,16 @@ async fn handle_query_command(
                     .await?;
                 }
             }
+        }
+        ClientMessage::QueryProjectHookStatus { ref project } => {
+            // Read-only: audit the project on disk and reply. No sudo gate —
+            // this reads config files, it never writes (itr#460).
+            let audit = crate::project_audit::audit_project(project);
+            write_msg(
+                writer,
+                &ServerMessage::ProjectHookStatus(project_hook_status(&audit)),
+            )
+            .await?;
         }
         _ => {
             warn!("unexpected message from TUI: {:?}", msg);
