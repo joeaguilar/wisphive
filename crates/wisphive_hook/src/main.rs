@@ -939,28 +939,17 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
     // Extract event-specific data for non-PreToolUse events
     let mut event_data = extract_event_data(event_type, &hook_event);
 
-    // For ExitPlanMode, extract plan content from the transcript. On failure
-    // (missing path, unreadable file, no assistant text) set a STRUCTURED error
-    // into plan_content so the TUI/web render an explicit "plan unavailable"
-    // state instead of a silently empty detail view (itr#253).
-    if tool_name == "ExitPlanMode" {
+    // For ExitPlanMode, extract plan content from transcript
+    if tool_name == "ExitPlanMode"
+        && let Some(plan) = hook_event
+            .get("transcript_path")
+            .and_then(|v| v.as_str())
+            .and_then(extract_plan_from_transcript)
+    {
         let data =
             event_data.get_or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
         if let Some(obj) = data.as_object_mut() {
-            let plan_value = match hook_event.get("transcript_path").and_then(|v| v.as_str()) {
-                Some(path) => match extract_plan_from_transcript(path) {
-                    Ok(plan) => serde_json::Value::String(plan),
-                    Err(reason) => {
-                        eprintln!("Wisphive: ExitPlanMode plan extraction failed: {reason}");
-                        serde_json::json!({ "error": reason, "path": path })
-                    }
-                },
-                None => {
-                    eprintln!("Wisphive: ExitPlanMode hook event missing transcript_path");
-                    serde_json::json!({ "error": "hook event missing transcript_path", "path": null })
-                }
-            };
-            obj.insert("plan_content".into(), plan_value);
+            obj.insert("plan_content".into(), serde_json::Value::String(plan));
         }
     }
 
@@ -1764,14 +1753,9 @@ fn extract_event_data(
 ///
 /// Reads the file backwards, looking for the most recent assistant message
 /// that contains text content. Returns the concatenated text blocks.
-/// Extract the plan text from an ExitPlanMode transcript, or a human-readable
-/// reason it couldn't be (itr#253). The caller turns the `Err` into a structured
-/// `plan_content` error so the UI shows an explicit failure instead of an empty
-/// detail view, rather than silently dropping the field.
-fn extract_plan_from_transcript(path: &str) -> Result<String, String> {
+fn extract_plan_from_transcript(path: &str) -> Option<String> {
     use std::io::BufRead;
-    let file =
-        std::fs::File::open(path).map_err(|e| format!("transcript unreadable ({path}): {e}"))?;
+    let file = std::fs::File::open(path).ok()?;
     let reader = std::io::BufReader::new(file);
 
     // Collect all lines, then iterate backwards to find the last assistant text.
@@ -1789,16 +1773,10 @@ fn extract_plan_from_transcript(path: &str) -> Result<String, String> {
             continue;
         }
 
-        // A content-less assistant entry must not abort the whole backward scan
-        // (the old `?` here dropped every plan when any later message lacked a
-        // content array); skip it and keep looking for the last text block.
-        let Some(content) = entry
+        let content = entry
             .get("message")
             .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_array())
-        else {
-            continue;
-        };
+            .and_then(|c| c.as_array())?;
 
         // Collect all text blocks from this message
         let mut text_parts = Vec::new();
@@ -1811,11 +1789,11 @@ fn extract_plan_from_transcript(path: &str) -> Result<String, String> {
         }
 
         if !text_parts.is_empty() {
-            return Ok(text_parts.join("\n"));
+            return Some(text_parts.join("\n"));
         }
     }
 
-    Err("no assistant plan text found in transcript".to_string())
+    None
 }
 
 fn home_dir() -> PathBuf {
@@ -2994,63 +2972,5 @@ mod tests {
             Decision::Deny,
             "garbage response must fail closed under fail-mode=closed"
         );
-    }
-
-    // ── ExitPlanMode plan extraction (itr#253) ──────────────────────────────
-
-    fn transcript_with(lines: &[serde_json::Value]) -> (tempfile::TempDir, String) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("transcript.jsonl");
-        let body: String = lines
-            .iter()
-            .map(|l| l.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(&path, body).unwrap();
-        let p = path.to_str().unwrap().to_string();
-        (dir, p)
-    }
-
-    fn assistant_text(text: &str) -> serde_json::Value {
-        json!({"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}})
-    }
-
-    #[test]
-    fn plan_extraction_returns_last_assistant_text() {
-        let (_d, path) = transcript_with(&[
-            json!({"type": "user", "message": {"content": "go"}}),
-            assistant_text("# The Plan\nstep one"),
-        ]);
-        assert_eq!(
-            extract_plan_from_transcript(&path).unwrap(),
-            "# The Plan\nstep one"
-        );
-    }
-
-    #[test]
-    fn plan_extraction_skips_content_less_assistant_entry() {
-        // Regression (itr#253): a later content-less assistant entry used to
-        // abort the whole backward scan via `?`, dropping an earlier real plan.
-        let (_d, path) = transcript_with(&[
-            assistant_text("the actual plan"),
-            json!({"type": "assistant", "message": {"role": "assistant"}}), // no content array
-        ]);
-        assert_eq!(
-            extract_plan_from_transcript(&path).unwrap(),
-            "the actual plan"
-        );
-    }
-
-    #[test]
-    fn plan_extraction_missing_file_is_err_with_reason() {
-        let err = extract_plan_from_transcript("/no/such/transcript.jsonl").unwrap_err();
-        assert!(err.contains("unreadable"), "reason should explain: {err}");
-    }
-
-    #[test]
-    fn plan_extraction_no_assistant_text_is_err() {
-        let (_d, path) = transcript_with(&[json!({"type": "user", "message": {"content": "hi"}})]);
-        let err = extract_plan_from_transcript(&path).unwrap_err();
-        assert!(err.contains("no assistant plan text"), "got: {err}");
     }
 }

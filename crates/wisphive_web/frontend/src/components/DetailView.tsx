@@ -7,41 +7,18 @@ import { CopyButton } from "./CopyButton";
 
 interface DetailViewProps {
   request: DecisionRequest;
-  onApprove: (
-    id: string,
-    opts?: { additional_context?: string; always_allow?: boolean; updated_input?: unknown },
-  ) => void;
+  onApprove: (id: string, opts?: { additional_context?: string; always_allow?: boolean }) => void;
   onDeny: (id: string, message?: string) => void;
 }
 
 // Safe string extraction from unknown values
 const str = (v: unknown): string => (typeof v === "string" ? v : String(v ?? ""));
 
-// Mirror of the TUI's build_ask_answer (wisphive_tui/src/input.rs): embed the
-// chosen option as the answer to its question so the daemon forwards it to
-// Claude as updatedInput (itr#250). PreToolUse cannot pass the answer back — it
-// must ride the PermissionRequest response's updatedInput.
-const buildAskAnswer = (
-  toolInput: Record<string, unknown>,
-  question: string,
-  answer: string,
-): Record<string, unknown> => ({ ...toolInput, answers: { [question]: answer } });
-
 export function DetailView({ request, onApprove, onDeny }: DetailViewProps) {
   const [modal, setModal] = useState<"deny-msg" | "context" | "always" | null>(null);
   const { tool_name, tool_input: rawInput, agent_id, project, timestamp, hook_event_name, event_data } = request;
   const tool_input = rawInput ?? {};
-  // plan_content is either the plan text (string) or, when extraction failed,
-  // a structured { error, path } object the hook set so we render an explicit
-  // failure rather than an empty view (itr#253).
-  const pc = event_data?.plan_content;
-  const planContent = typeof pc === "string" ? pc : null;
-  const planError =
-    pc && typeof pc === "object" && "error" in (pc as object)
-      ? (pc as { error?: unknown; path?: unknown })
-      : null;
-  const isPlanTool = tool_name === "ExitPlanMode";
-  const isAskQuestion = Array.isArray(tool_input.questions);
+  const planContent = typeof event_data?.plan_content === "string" ? event_data.plan_content : null;
 
   const buildFullText = (): string => {
     const lines: string[] = [];
@@ -84,32 +61,8 @@ export function DetailView({ request, onApprove, onDeny }: DetailViewProps) {
         </div>
       )}
 
-      {/* ExitPlanMode: structured extraction failure (itr#253) */}
-      {planError && (
-        <div className="detail-section detail-section-error">
-          <h3>Plan unavailable</h3>
-          <p className="plan-error">
-            Wisphive could not read the plan from the transcript
-            {str(planError.error) ? `: ${str(planError.error)}` : "."}
-            {str(planError.path) ? ` (path: ${str(planError.path)})` : ""}
-          </p>
-        </div>
-      )}
-
-      {/* ExitPlanMode limitation note (itr#249): Claude's native plan prompt
-          offers richer choices, but the hook layer only carries allow/deny. */}
-      {isPlanTool && (
-        <p className="plan-note">
-          Claude's native plan prompt offers richer choices (auto-accept edits, review each
-          edit, keep planning). Wisphive gates it at the hook layer, which only supports
-          <strong> Approve</strong> (accept the plan; Claude proceeds in its current mode) or
-          <strong> Deny</strong> (reject; Claude keeps planning). The finer options aren't
-          expressible through the gate.
-        </p>
-      )}
-
       {/* AskUserQuestion */}
-      {isAskQuestion && (
+      {Array.isArray(tool_input.questions) && (
         <div className="detail-section">
           {(tool_input.questions as Array<Record<string, unknown>>).map((q, i) => (
             <div key={i}>
@@ -118,15 +71,7 @@ export function DetailView({ request, onApprove, onDeny }: DetailViewProps) {
               {Array.isArray(q.options) && (
                 <div className="options-list">
                   {(q.options as Array<Record<string, string>>).map((opt, j) => (
-                    <button
-                      key={j}
-                      className="option-btn"
-                      onClick={() =>
-                        onApprove(request.id, {
-                          updated_input: buildAskAnswer(tool_input, str(q.question), str(opt.label)),
-                        })
-                      }
-                    >
+                    <button key={j} className="option-btn" onClick={() => onApprove(request.id)}>
                       <strong>{opt.label}</strong>
                       {opt.description && <span> — {opt.description}</span>}
                     </button>
@@ -139,7 +84,7 @@ export function DetailView({ request, onApprove, onDeny }: DetailViewProps) {
       )}
 
       {/* Shared tool/event content (unless handled above) */}
-      {!planContent && !planError && !isAskQuestion && (
+      {!planContent && !Array.isArray(tool_input.questions) && (
         <ToolContent
           toolName={tool_name}
           toolInput={rawInput}
@@ -153,14 +98,6 @@ export function DetailView({ request, onApprove, onDeny }: DetailViewProps) {
           <button className="btn-approve" onClick={() => onApprove(request.id)}>
             Accept (Stop)
           </button>
-        ) : isAskQuestion ? (
-          // The option buttons above ARE the approve path (they carry the
-          // answer). A bare Approve here would resolve with no answer (itr#250),
-          // so offer only Deny / Deny + Message.
-          <>
-            <button className="btn-deny" onClick={() => onDeny(request.id)}>Deny</button>
-            <button className="btn-secondary" onClick={() => setModal("deny-msg")}>Deny + Message</button>
-          </>
         ) : hook_event_name === "UserPromptSubmit" || hook_event_name === "ConfigChange" ? (
           <>
             <button className="btn-approve" onClick={() => onApprove(request.id)}>Allow</button>
