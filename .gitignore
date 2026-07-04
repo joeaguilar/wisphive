@@ -12,3 +12,8 @@ crates/wisphive_web/frontend/dist/
 # Python bytecode cache
 __pycache__/
 *.pyc
+
+# Impeccable skill local artifacts (durable outputs — PRODUCT.md, DESIGN.md,
+# .impeccable/design.json, .impeccable/live/config.json — are committed).
+**/.impeccable/hook.cache.json
+.impeccable/config.local.json

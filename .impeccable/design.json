@@ -1,0 +1,145 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-07-04T00:00:00Z",
+  "title": "Design System: Wisphive",
+  "extensions": {
+    "colorMeta": {
+      "instrument-cyan": { "role": "primary", "displayName": "Instrument Cyan", "canonical": "#00bcd4", "tonalRamp": ["#002d33", "#004a54", "#006775", "#008498", "#00a1b9", "#00bcd4", "#4dd0e1", "#99e5ef"] },
+      "go-green": { "role": "secondary", "displayName": "Go Green", "canonical": "#4caf50", "tonalRamp": ["#12250f", "#1d3e1a", "#285826", "#347331", "#409244", "#4caf50", "#7fc784", "#b3dfb5"] },
+      "abort-red": { "role": "secondary", "displayName": "Abort Red", "canonical": "#f44336", "tonalRamp": ["#3a0d09", "#5e120c", "#851810", "#ad2419", "#d13224", "#f44336", "#f87b71", "#fcb4ae"] },
+      "caution-amber": { "role": "secondary", "displayName": "Caution Amber", "canonical": "#ffb74d", "tonalRamp": ["#3a2600", "#5e3d00", "#855700", "#ad7300", "#d19100", "#ffb74d", "#ffcd82", "#ffe3b8"] },
+      "cockpit-black": { "role": "neutral", "displayName": "Cockpit Black", "canonical": "#0a0a0a", "tonalRamp": ["#0a0a0a", "#161616", "#242424", "#333333", "#555555", "#888888", "#b8b8b8", "#e0e0e0"] },
+      "instrument-surface": { "role": "neutral", "displayName": "Instrument Surface", "canonical": "#1a1a1a", "tonalRamp": ["#0a0a0a", "#111111", "#1a1a1a", "#222222", "#333333", "#555555", "#888888", "#e0e0e0"] },
+      "selection-wash": { "role": "neutral", "displayName": "Selection Wash", "canonical": "#1a3a2a", "tonalRamp": ["#0d1f16", "#12291d", "#1a3a2a", "#245039", "#2e6749", "#3a8159", "#57a97a", "#8fcaa6"] },
+      "readout-grey": { "role": "neutral", "displayName": "Readout Grey", "canonical": "#e0e0e0", "tonalRamp": ["#1a1a1a", "#333333", "#555555", "#777777", "#999999", "#bbbbbb", "#d0d0d0", "#e0e0e0"] },
+      "dim-label": { "role": "neutral", "displayName": "Dim Label", "canonical": "#888888", "tonalRamp": ["#1a1a1a", "#2e2e2e", "#444444", "#5a5a5a", "#707070", "#888888", "#a8a8a8", "#c8c8c8"] },
+      "hairline": { "role": "neutral", "displayName": "Hairline", "canonical": "#333333", "tonalRamp": ["#0a0a0a", "#161616", "#222222", "#333333", "#4a4a4a", "#666666", "#888888", "#aaaaaa"] }
+    },
+    "typographyMeta": {
+      "headline": { "displayName": "Headline", "purpose": "Section headers — Inbox title, detail-view h2. The largest type in the app." },
+      "title": { "displayName": "Title", "purpose": "Brand mark, modal titles, view toolbars." },
+      "body": { "displayName": "Body", "purpose": "Default readout — decision detail, list content, form values." },
+      "label": { "displayName": "Label", "purpose": "Metadata, timestamps, field captions, uppercase kickers." }
+    },
+    "shadows": [
+      { "name": "modal-scrim", "value": "rgba(0,0,0,0.7)", "purpose": "Flat dim behind modals — the only overlay. Not a blur, not a drop shadow." },
+      { "name": "selection-ring", "value": "0 0 0 1px #00bcd4", "purpose": "1px cyan ring on the keyboard-selected / focused row. A focus indicator, not elevation." }
+    ],
+    "motion": [
+      { "name": "surface-transition", "value": "background 0.1s", "purpose": "Fast hover feedback on rows and cards." },
+      { "name": "control-transition", "value": "border-color 0.1s, color 0.1s, background 0.1s", "purpose": "Ghost controls committing to cyan on hover/intent." }
+    ],
+    "breakpoints": [
+      { "name": "tablet", "value": "1024px" },
+      { "name": "mobile", "value": "768px" },
+      { "name": "phone", "value": "480px" },
+      { "name": "small-phone", "value": "400px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Approve Button",
+      "kind": "button",
+      "refersTo": "button-approve",
+      "description": "The affirmative commit on a pending decision.",
+      "html": "<button class=\"ds-btn-approve\">Approve</button>",
+      "css": ".ds-btn-approve { background: #4caf50; color: #fff; border: none; padding: 8px 16px; border-radius: 4px; font-family: 'SF Mono','Fira Code',ui-monospace,monospace; font-weight: bold; font-size: 13px; min-height: 36px; cursor: pointer; } .ds-btn-approve:hover { opacity: 0.9; } .ds-btn-approve:focus-visible { outline: 2px solid #00bcd4; outline-offset: 2px; }"
+    },
+    {
+      "name": "Deny Button",
+      "kind": "button",
+      "refersTo": "button-deny",
+      "description": "The negative commit on a pending decision.",
+      "html": "<button class=\"ds-btn-deny\">Deny</button>",
+      "css": ".ds-btn-deny { background: #f44336; color: #fff; border: none; padding: 8px 16px; border-radius: 4px; font-family: 'SF Mono','Fira Code',ui-monospace,monospace; font-weight: bold; font-size: 13px; min-height: 36px; cursor: pointer; } .ds-btn-deny:hover { opacity: 0.9; } .ds-btn-deny:focus-visible { outline: 2px solid #00bcd4; outline-offset: 2px; }"
+    },
+    {
+      "name": "Primary / Focus Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Cyan CTA that routes the operator to the next action (focus / submit).",
+      "html": "<button class=\"ds-btn-primary\">Go to terminal</button>",
+      "css": ".ds-btn-primary { background: #00bcd4; color: #000; border: none; border-radius: 4px; padding: 6px 12px; font-family: 'SF Mono','Fira Code',ui-monospace,monospace; font-size: 11px; font-weight: 600; cursor: pointer; } .ds-btn-primary:hover { filter: brightness(1.1); } .ds-btn-primary:focus-visible { outline: 2px solid #00bcd4; outline-offset: 2px; }"
+    },
+    {
+      "name": "Secondary Button",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "The quiet default control — rests dim, commits to cyan on hover.",
+      "html": "<button class=\"ds-btn-secondary\">Details</button>",
+      "css": ".ds-btn-secondary { background: #1a1a1a; color: #888; border: 1px solid #333; padding: 8px 12px; border-radius: 4px; font-family: 'SF Mono','Fira Code',ui-monospace,monospace; font-size: 11px; min-height: 36px; cursor: pointer; transition: border-color 0.1s, color 0.1s; } .ds-btn-secondary:hover { border-color: #00bcd4; color: #e0e0e0; }"
+    },
+    {
+      "name": "Status Badge",
+      "kind": "chip",
+      "refersTo": "card",
+      "description": "Decision-outcome chip. Color + word together carry the state (Redundant Signal Rule).",
+      "html": "<span class=\"ds-badge ds-badge-approve\">approve</span> <span class=\"ds-badge ds-badge-deny\">deny</span> <span class=\"ds-badge ds-badge-defer\">defer</span>",
+      "css": ".ds-badge { font-size: 10px; font-weight: bold; padding: 1px 6px; border-radius: 3px; min-width: 70px; text-align: center; display: inline-block; font-family: 'SF Mono','Fira Code',ui-monospace,monospace; } .ds-badge-approve { background: rgba(76,175,80,0.2); color: #4caf50; } .ds-badge-deny { background: rgba(244,67,54,0.2); color: #f44336; } .ds-badge-defer { background: rgba(255,183,77,0.2); color: #ffb74d; }"
+    },
+    {
+      "name": "Decision Row",
+      "kind": "card",
+      "refersTo": "card",
+      "description": "The signature component — a pending-decision row that expands in place to full detail. Selected state shown.",
+      "html": "<div class=\"ds-row ds-row-selected\"><div class=\"ds-row-head\"><span class=\"ds-tool\">Bash</span><span class=\"ds-route\">wisphive · sess-4f · 2m</span></div><div class=\"ds-summary\">cargo test --workspace</div></div>",
+      "css": ".ds-row { background: #1a1a1a; border: 1px solid #333; border-left-width: 3px; border-radius: 6px; padding: 12px; display: grid; gap: 8px; cursor: pointer; font-family: 'SF Mono','Fira Code',ui-monospace,monospace; } .ds-row:hover { background: #222; } .ds-row-selected { border-color: #00bcd4; box-shadow: 0 0 0 1px #00bcd4; } .ds-row-head { display: flex; align-items: center; gap: 8px; } .ds-tool { font-weight: bold; color: #00bcd4; font-size: 13px; } .ds-route { color: #888; font-size: 11px; } .ds-summary { color: #e0e0e0; background: #0a0a0a; border-radius: 4px; padding: 8px; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }"
+    },
+    {
+      "name": "Search Input",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "Recessed text field — Cockpit Black well, border shifts to cyan on focus.",
+      "html": "<input class=\"ds-input\" type=\"text\" placeholder=\"Search history\" />",
+      "css": ".ds-input { background: #0a0a0a; color: #e0e0e0; border: 1px solid #333; border-radius: 4px; padding: 8px 12px; font-family: 'SF Mono','Fira Code',ui-monospace,monospace; font-size: 13px; min-height: 36px; } .ds-input::placeholder { color: #888; } .ds-input:focus { outline: none; border-color: #00bcd4; }"
+    },
+    {
+      "name": "Sidebar Nav Item",
+      "kind": "nav",
+      "refersTo": "nav-item",
+      "description": "Ghost nav button — dim at rest, cyan text when active, with an inline count badge.",
+      "html": "<nav class=\"ds-nav\"><button class=\"ds-nav-item ds-nav-active\">Inbox <span class=\"ds-nav-badge\">3</span></button><button class=\"ds-nav-item\">History</button></nav>",
+      "css": ".ds-nav { background: #111; display: flex; flex-direction: column; gap: 4px; padding: 12px; } .ds-nav-item { background: none; border: none; color: #888; text-align: left; padding: 8px; border-radius: 4px; cursor: pointer; font-family: 'SF Mono','Fira Code',ui-monospace,monospace; font-size: 13px; min-height: 36px; display: flex; align-items: center; gap: 4px; } .ds-nav-item:hover { background: #222; color: #e0e0e0; } .ds-nav-active { background: #222; color: #00bcd4; } .ds-nav-badge { background: #00bcd4; color: #0a0a0a; border-radius: 10px; padding: 1px 6px; font-size: 11px; margin-left: 4px; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Flight Deck",
+    "overview": "Wisphive is an instrument panel, not an app. The operator is running many autonomous agents and needs to read the state of the fleet and commit a decision — approve, deny, defer — the way a pilot reads a gauge and moves a switch: at a glance, under load, with total confidence in what the control does. Every surface is dark so the lit elements carry the eye straight to what needs attention; density is a virtue, because more true information per screen means fewer glances to a decision. The palette is near-black canvas with a single cyan signal color and a three-color status vocabulary borrowed from real instrumentation; type is monospace throughout, sized for a readout, never a headline. It should feel like professional tooling that respects the user's competence and disappears into the task.",
+    "keyCharacteristics": [
+      "Dark, near-black canvas so signal color and status do the wayfinding.",
+      "Monospace everywhere; type sized for an instrument readout (11–18px).",
+      "One accent (cyan) for action and selection; status carried by a green/red/amber vocabulary.",
+      "Flat surfaces built from tonal layering and 1px hairlines — no decorative shadow.",
+      "Dense by design: full detail reachable, nothing consequential hidden behind a summary."
+    ],
+    "rules": [
+      { "name": "The Signal-Only Rule", "body": "Color is state or action, never decoration. Cyan means 'act here' or 'this is selected'; green/red/amber mean a specific status. If a color isn't telling the operator something true, it doesn't belong on the panel.", "section": "colors" },
+      { "name": "The Redundant Signal Rule", "body": "Status is never carried by hue alone. Approve/deny and every status color must be paired with a label, icon, shape, or position so a red/green colorblind operator reads the identical signal.", "section": "colors" },
+      { "name": "The Instrument-Panel Rule", "body": "Type is sized for a dense panel, not a landing page. The ceiling is ~22px; nothing shouts. Add hierarchy with weight, color, and spacing before reaching for size.", "section": "typography" },
+      { "name": "The One Voice Rule", "body": "One monospace family, full stop. Do not pair it with a sans or serif for contrast — the mono grid is the identity.", "section": "typography" },
+      { "name": "The Flat-Panel Rule", "body": "Surfaces are flat. Depth comes from one tonal step and a hairline, never from a blurred shadow.", "section": "elevation" },
+      { "name": "The No-Glass Rule", "body": "No glassmorphism, no decorative backdrop-filter. The only scrim is the modal overlay, and it is a flat dim, not a frosted blur.", "section": "elevation" }
+    ],
+    "dos": [
+      "Do keep the canvas near-black (#0a0a0a) and let lit elements do the wayfinding.",
+      "Do reserve Instrument Cyan for action and current-selection only; treat it as a scarce signal.",
+      "Do pair every status color with a label, icon, or shape so approve/deny reads for colorblind operators.",
+      "Do size type for a dense instrument panel; add hierarchy with weight, color, and spacing before size, ceiling ~22px.",
+      "Do keep surfaces flat — one tonal step (#1a1a1a → #222) plus a hairline (#333) — for depth.",
+      "Do expand the full, untruncated detail of any decision in place; a summary is a pointer, never a substitute.",
+      "Do honor prefers-reduced-motion on every transition, and keep motion at 150–250ms in service of state and feedback only.",
+      "Do ship parity of capability across phone-web, desktop-web, and TUI; let the interaction idiom differ, not the power."
+    ],
+    "donts": [
+      "Don't make it a rounded, pastel B2B SaaS dashboard — no soft gradients, friendly illustrations, or marketing polish.",
+      "Don't make it a gamified notification center — no streaks, engagement badges, confetti, or celebration animation.",
+      "Don't perform enterprise security theater — no shields-and-locks iconography or badge-everything compliance aesthetic.",
+      "Don't use large, shouty display copy — oversized headings undercut the seriousness and read as consumer marketing.",
+      "Don't carry status by hue alone; red-and-green with no label, icon, or shape is forbidden.",
+      "Don't add a colored border-left as decoration — the 3px left rail is earned because it encodes session identity; never add another stripe for flavor.",
+      "Don't introduce drop shadows, glassmorphism, or decorative backdrop-filter; depth is tonal.",
+      "Don't pair the monospace with a second font family for contrast — the mono grid is the identity.",
+      "Don't hide the thing being judged behind a truncated summary with no path to the full input."
+    ]
+  }
+}

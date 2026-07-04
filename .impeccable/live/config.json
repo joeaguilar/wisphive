@@ -1,0 +1,6 @@
+{
+  "files": ["crates/wisphive_web/frontend/index.html"],
+  "insertBefore": "</body>",
+  "commentSyntax": "html",
+  "cspChecked": true
+}
