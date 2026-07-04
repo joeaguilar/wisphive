@@ -45,10 +45,64 @@
 - **S5 correctness oracle:** because live-session queue content is non-deterministic, S5 judges correctness by invariants cross-checked against `wisphive audit --since 10m` (deterministic oracle over live data).
 
 ## Outcomes
-<!-- Populated by /sprint-review after /blitz runs. -->
+
+**Goal achievement:** yes
+**Reviewed:** 2026-07-04
+**Stories:** 5/5 closed, 0 quarantined, 0 open
+
+| ID | Title | Status | Closed | Notes |
+|----|-------|--------|--------|-------|
+| itr#434 | S1 Stream auto-answered + deferred audit events to clients | closed | 2026-07-04 | All 6 AC; reimport resilience regression caught by /code-review + fixed; redaction preserved. |
+| itr#435 | S2 Inbox view: unified waiting-on-you queue | closed | 2026-07-04 | Shipped partial first (truncation + keyboard bug); /code-review caught it; keyboard fixed, truncation/grouping re-homed to #437. |
+| itr#436 | S3 Auto-answer feed panel + empty-state | closed | 2026-07-04 | Feed shows decided_by behind `(view)`; live; no over-build. |
+| itr#437 | S4 Deferred affordance + (absorbed) untruncated detail + grouping | closed | 2026-07-04 | Deep-link chain real; absorbed #435 truncation gap genuinely fixed (`<pre>` full input + DeferredDetailView); colour grouping. Required mid-blitz wire change (Wave 2.5). |
+| itr#438 | S5 Runtime evidence + close #399 (dynamic smoke) | closed | 2026-07-04 | Real daemon+web+hook-binary e2e (inbox-command-center.spec.ts); all 5 AC + `wisphive audit` oracle; 6 screenshots. Centerpiece #399 + epic #433 closed. |
+
+**Centerpiece:** itr#399 (Waiting-on-you inbox) delivered and closed with §10 runtime evidence.
+
+**Untracked changes (in git diff but not tied to a story):**
+- `Terminals.tsx` (+19) — deep-link "Focus terminal" target wiring for #437 (accepted scope expansion, logged as a Wave 2 intervention).
+- `core-flows.spec.ts` / `smoke.spec.ts` (minor) — e2e selector updates because Inbox became the default view (itr#446, filed + fixed inline).
 
 ## Demo
-<!-- Populated by /sprint-review. -->
+
+| ID | Title | PO Decision | Notes |
+|----|-------|-------------|-------|
+| itr#434 | Audit stream (S1) | accepted | — |
+| itr#435 | Inbox view (S2) | accepted | truncation/grouping delivered via #437 |
+| itr#436 | Auto-answer feed (S3) | accepted | — |
+| itr#437 | Deferred affordance + detail + grouping (S4) | accepted | NIT → itr#449 |
+| itr#438 | Runtime evidence (S5) | accepted | checklist wording → itr#450 |
+
+**Bugs surfaced during demo/verification:**
+- itr#449 — deferred deep-link silently no-ops for a stale/non-embedded terminal session (#437 NIT).
+- itr#450 — smoke CHECKLIST overstates AC1 (real-wire fixture, not hook binary) — transparency fix (#438).
+- itr#446 — e2e regression from #435's default-view change (filed + fixed inline during the blitz).
 
 ## Retro
-<!-- Populated by /sprint-review. -->
+
+**Triggered by:** blitz interventions (out-of-owned-file wiring, mid-blitz wire gap → Wave 2.5, sudo-gate discovery) + a bug filed during the sprint (itr#446).
+
+### Plan vs. actual
+- 5/5 closed (100%), goal achieved.
+- #435 shipped partial first (green vitest ≠ spec-complete); caught by /code-review, fixed, gaps re-homed to #437.
+- Mid-blitz wire-protocol change (Wave 2.5): #434 AC excluded `tool_input` from the wire; #437 AC required showing the deferred question — a plannable contradiction that surfaced at execution time.
+- Accepted scope expansion: #437 touched `App.tsx` + `Terminals.tsx` (undeclared) to make the deep-link real.
+
+### Friction log
+| Event | Source | Root cause |
+|-------|--------|------------|
+| #437 wire gap → Wave 2.5 protocol change | blitz Wave 2 | #434 AC (no `tool_input` on wire) contradicts #437 AC (show question text); not caught at plan time. |
+| itr#446 e2e regression | blitz Wave 3 | #435 made Inbox the default view; e2e specs asserted old `.queue-layout`; e2e not in the per-story verify gate. |
+| #435 partial-ship | /code-review | Green vitest ≠ spec-complete; truncation + invisible-selection keyboard bug had no test coverage. |
+| Sudo-gate hang in smoke | blitz Wave 3 | AC1 picked a sudo-class tool (Bash); reauth modal intercepts. Switched to Grep. |
+
+### Process improvements (filed as retro action items)
+- itr#451 — Add the e2e suite to the per-story verify gate for view/routing/nav changes (root cause of #446).
+- itr#452 — Plan-time AC-contradiction check across dependent data→UI stories (root cause of Wave 2.5).
+- itr#453 — Require a "full X reachable" test when a story AC says "user sees X" (root cause of #435; promoted to global ~/.claude/CLAUDE.md).
+
+### Agent-specific learnings
+- The blitz self-closed the sprint epic + #399 without running /sprint-review — correct work, wrong authority: epic close + PO acceptance is the review's job.
+- Stop-and-report worked well — the #437 agent hit the wire gap and escalated instead of silently patching the backend out of scope. Keep this pattern.
+- Out-of-owned-file additive wiring (App/Terminals) was handled well: logged, diff-reviewed, tagged to the story, kept.

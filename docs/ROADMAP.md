@@ -1,7 +1,7 @@
 # Roadmap - Wisphive
 
-_Last updated: 2026-07-02 (Command Center program adopted; backlog rectified into sequenced epics)_
-_Last reviewed: 2026-07-02_
+_Last updated: 2026-07-04 (Sprint-2 closed: Command Center inbox #399 shipped; Phase 3 now partial)_
+_Last reviewed: 2026-07-04_
 
 > Cross-sprint product map. Bridges the repo's product docs, sprint history, and live `itr` backlog.
 > Read at the start of every `/sprint`. Update at the end of every `/sprint-review`.
@@ -36,7 +36,7 @@ hard technical dependencies are encoded as `itr` blocker edges, program order li
 |---|---|---|---|---|---|
 | **1** | ✅ Decision-plane trust — Command Center P0 | wisphive **#396** (closed 2026-07-03) | critical | Five silent-weakening config bugs #358 #360 #361 #366 #308 + auto-answer audit trail #397 — all closed with evidence; spec §4 red-team check passed (see itr#396 notes + docs/handoff/2026-07-03-decision-plane-trust-phase1.md). Follow-ups: #407 #408 #409. | — |
 | **2** | Decision-plane integrity — P0.5 | wisphive **#403** | high | Audit correctness & durability (#363 ghost approvals, #370 dup-id corruption, ~~#301/#302 ingest loss~~ ✅ done 2026-07-03, #368 fsync, #88 resolver identity, #347), secret redaction #89, hook fail-safety (#344 #345 #346 #337 #359), pending-decision persistence (#297–#300). Can start alongside Phase 1; **blocks the inbox (#399)**. | — |
-| **3** | Command Center Layer 1 — live ops console | wisphive **#398** | high | Waiting-on-you inbox #399 (centerpiece), agent liveness board #400, working-tree strip #401, burn meter #402, + answer-path correctness #249 #250 #253. | #396; #399 also blocked by #403, #249, #250, #253, #397 |
+| **3** | 🟡 Command Center Layer 1 — live ops console | wisphive **#398** | high | **✅ Waiting-on-you inbox #399 (centerpiece) — shipped Sprint-2 (2026-07-04), real-daemon+hook e2e evidence.** Remaining: agent liveness board #400, working-tree strip #401, burn meter #402. Answer-path correctness #249 #250 #253 ✅ done. Sprint-2 follow-ups: #439 #440 #441 #449–#453. | #396; #399 also blocked by #403, #249, #250, #253, #397 |
 | **4** | Command Center Layer 2 — durable state of play | **werkit#5** (stories werkit#6 #7 #8) | high | State-of-play Stop-hook + start render, cross-project re-entry digest, promise ledger. Daemon-independent renderer; do not ship the Stop hook until Phase 1 lands (spec §6.1). | wisphive #396 (hook safety) |
 | **5** | Remote access — scrollback + mobile pairing | wisphive **#284** → **#283** | high | Scrollback replay chain #285–#287 (+privacy #288 #289), then pairing: #266 (#270 #271 #272), enterprise enroll #313, Devices UI #220, smoke #316. The inbox-on-the-phone is the payoff (85% of sessions are remote-triggered). | #283 blocked by #284, #227, #270–#272, #313 |
 | **6** | Project discovery, audit & seeding | wisphive **#349** | high | #353 #354 #355 — onboarding more projects into gating; feeds the command center's active-project list. | — |
