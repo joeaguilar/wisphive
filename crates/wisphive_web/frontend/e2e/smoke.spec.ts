@@ -56,8 +56,10 @@ test('first-run: set-password page loads, password sets, queue view renders', as
     await skipEnroll.click()
   }
 
-  // Dashboard shell: sidebar nav + queue layout with the empty state.
+  // Dashboard shell: sidebar nav + queue layout with the empty state. The
+  // default view is the Inbox (itr#435), so click through to the Queue view.
   await expect(queueNav).toBeVisible()
+  await queueNav.click()
   await expect(page.locator('.queue-layout')).toBeVisible()
   await expect(page.getByText('No pending decisions')).toBeVisible()
   const queueShot = test.info().outputPath('queue-view.png')

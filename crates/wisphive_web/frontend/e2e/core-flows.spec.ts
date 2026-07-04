@@ -48,7 +48,11 @@ async function openDashboard(page: Page, deviceName: string): Promise<void> {
     token,
   )
   await page.goto(`${server.baseURL}/`)
-  await expect(page.getByRole('button', { name: /^Queue/ })).toBeVisible({ timeout: 15_000 })
+  // Inbox is the default view (itr#435); this spec drives the Queue view, so
+  // navigate to it before asserting the queue layout.
+  const queueNav = page.getByRole('button', { name: /^Queue/ })
+  await expect(queueNav).toBeVisible({ timeout: 15_000 })
+  await queueNav.click()
   await expect(page.locator('.queue-layout')).toBeVisible()
 }
 
@@ -105,6 +109,8 @@ test('login: invalid credentials are rejected, valid credentials reach the queue
     await page.getByRole('button', { name: 'Sign in', exact: true }).click()
     await expect(page.getByRole('button', { name: /^Queue/ })).toBeVisible({ timeout: 3_000 })
   }).toPass({ timeout: 20_000 })
+  // Default view is the Inbox (itr#435); switch to the Queue view this test asserts.
+  await page.getByRole('button', { name: /^Queue/ }).click()
   await expect(page.locator('.queue-layout')).toBeVisible()
   await expect(page.getByText('No pending decisions')).toBeVisible()
   await attachShot(page, 'login-valid-dashboard')
