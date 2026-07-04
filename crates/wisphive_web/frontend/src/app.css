@@ -308,6 +308,230 @@ body {
   justify-content: flex-end;
 }
 
+/* Colour-coded left rail per project·session so concurrent sessions are
+ * visually distinguished at a glance (#435 AC4). Colour is set inline from a
+ * hash of the group key; here we just widen the rail. */
+.inbox-item {
+  border-left-width: 3px;
+}
+
+/* Per-(project·session) colour chip in the route line — the "grouped by"
+ * signal beyond a plain text route. */
+.inbox-group-chip {
+  font-weight: 600;
+}
+
+/* Expanded (selected) row: untruncated tool input so nothing is hidden. */
+.inbox-detail {
+  background: var(--bg);
+  border-radius: var(--radius);
+  padding: var(--space-sm);
+  display: grid;
+  gap: 4px;
+}
+
+.inbox-detail-label {
+  color: var(--text-dim);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.inbox-detail-input {
+  margin: 0;
+  color: var(--text);
+  font-family: var(--font-mono, monospace);
+  font-size: var(--font-sm);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow: auto;
+}
+
+/* ── Deferred (answer-in-your-terminal) section ─────────────────────── */
+.inbox-subhead {
+  color: var(--yellow);
+  font-size: var(--font-sm);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-top: var(--space-md);
+}
+
+.inbox-deferred {
+  display: grid;
+  gap: var(--space-sm);
+}
+
+.inbox-group {
+  display: grid;
+  gap: var(--space-sm);
+}
+
+.inbox-group-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  font-size: var(--font-sm);
+  font-weight: 600;
+  padding-bottom: 2px;
+  border-bottom: 1px solid var(--border);
+}
+
+.inbox-group-count {
+  color: var(--text-dim);
+  font-weight: 400;
+}
+
+.inbox-deferred-badge {
+  font-size: 10px;
+  font-weight: bold;
+  padding: 1px 6px;
+  border-radius: 3px;
+  text-transform: uppercase;
+  background: rgba(255, 183, 77, 0.2);
+  color: var(--yellow);
+}
+
+.inbox-deferred-note {
+  color: var(--text-dim);
+  font-size: var(--font-sm);
+}
+
+.inbox-goto-pointer {
+  color: var(--text-dim);
+  font-size: var(--font-sm);
+}
+
+.inbox-goto-pointer strong {
+  color: var(--cyan);
+}
+
+/* Deep-link/focus CTA — routes the human to where a deferred prompt lives. */
+.btn-focus {
+  background: var(--cyan);
+  color: #000;
+  border: none;
+  border-radius: var(--radius);
+  padding: 6px 12px;
+  font-size: var(--font-sm);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.btn-focus:hover { filter: brightness(1.1); }
+.btn-focus:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+
+/* Read-only deferred detail (DetailView.DeferredDetailView). */
+.deferred-detail {
+  display: grid;
+  gap: var(--space-sm);
+  background: var(--bg);
+  border-radius: var(--radius);
+  padding: var(--space-sm);
+}
+
+.deferred-detail-note {
+  color: var(--text);
+  font-size: var(--font-sm);
+}
+
+.deferred-goto-pointer {
+  color: var(--text-dim);
+  font-size: var(--font-sm);
+}
+
+.deferred-goto-pointer strong {
+  color: var(--cyan);
+}
+
+/* '(view)' toggle in the inbox count line — reveals the auto-answer feed. */
+.inbox-view-toggle {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--cyan);
+  font-size: var(--font-sm);
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.inbox-view-toggle:hover { text-decoration: underline; }
+.inbox-view-toggle:focus-visible { outline: 1px solid var(--cyan); outline-offset: 2px; }
+
+/* "Decided without you" feed — auto-answered / deferred / denied decisions
+ * that never reached the human queue (spec §5.1, itr#436). */
+.auto-feed {
+  margin-top: var(--space-md);
+  padding-top: var(--space-md);
+  border-top: 1px solid var(--border);
+}
+
+.auto-feed-empty {
+  color: var(--text-dim);
+  font-size: var(--font-sm);
+  padding: var(--space-md) 0;
+}
+
+.auto-feed-list {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 2px;
+  list-style: none;
+}
+
+.auto-feed-item {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-sm) var(--space-md);
+  display: grid;
+  gap: 2px;
+}
+
+.auto-feed-topline {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.auto-feed-kind {
+  font-size: 10px;
+  font-weight: bold;
+  padding: 1px 6px;
+  border-radius: 3px;
+  text-transform: uppercase;
+}
+
+.auto-feed-kind.kind-auto_approved { background: rgba(76, 175, 80, 0.2); color: var(--green); }
+.auto-feed-kind.kind-deferred { background: rgba(255, 183, 77, 0.2); color: var(--yellow); }
+.auto-feed-kind.kind-denied { background: rgba(244, 67, 54, 0.2); color: var(--red); }
+
+.auto-feed-age {
+  margin-left: auto;
+  color: var(--yellow);
+  font-size: var(--font-sm);
+}
+
+.auto-feed-route {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-sm);
+  color: var(--text-dim);
+  font-size: var(--font-sm);
+}
+
+.auto-feed-route span:not(:last-child)::after {
+  content: "·";
+  margin-left: var(--space-sm);
+  color: var(--border);
+}
+
+.auto-feed-rule {
+  color: var(--cyan);
+  font-family: var(--font-mono, monospace);
+}
+
 /* Detail view */
 .detail-view {
   flex: 2;

@@ -453,7 +453,10 @@ pub struct HistoryEntry {
 /// A compact live/snapshot audit event for decisions Wisphive resolved without
 /// direct in-console action: auto-approved hook decisions, always-deferred
 /// native prompts, and hook-side denials.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// `Eq` is intentionally omitted: `tool_input` is a `serde_json::Value`, which is
+// `PartialEq` but not `Eq`. Nothing keys an `AuditDecision` in a HashMap/HashSet,
+// so `PartialEq` alone is sufficient.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditDecision {
     pub kind: AuditDecisionKind,
     pub decided_by: Option<String>,
@@ -463,6 +466,12 @@ pub struct AuditDecision {
     pub terminal_session_id: Option<Uuid>,
     pub tool_name: String,
     pub ts: DateTime<Utc>,
+    /// Redacted tool input for DEFERRED native prompts (AskUserQuestion / ExitPlanMode /
+    /// Elicitation), so the inbox can show the literal question + options. Present only
+    /// for kind == Deferred; None for auto-approved/denied to keep the wire lean. Already
+    /// secret-redacted upstream (hook redact::redact_value + itr#89).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_input: Option<serde_json::Value>,
 }
 
 /// Category for [`AuditDecision`].

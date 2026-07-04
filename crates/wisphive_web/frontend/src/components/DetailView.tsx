@@ -1,9 +1,10 @@
 import { useState } from "react";
-import type { DecisionRequest } from "../types/protocol";
+import type { AuditDecision, DecisionRequest } from "../types/protocol";
 import { TextModal, ConfirmModal } from "./Modal";
 import { ToolContent } from "./ToolContent";
 import { MarkdownText } from "./MarkdownText";
 import { CopyButton } from "./CopyButton";
+import { parseDeferredPrompt, shortProject } from "./queueUtils";
 
 interface DetailViewProps {
   request: DecisionRequest;
@@ -13,6 +14,97 @@ interface DetailViewProps {
 
 // Safe string extraction from unknown values
 const str = (v: unknown): string => (typeof v === "string" ? v : String(v ?? ""));
+
+interface DeferredDetailProps {
+  decision: AuditDecision;
+  onFocusTerminal: (terminalSessionId: string) => void;
+}
+
+/**
+ * Read-only detail for an always-deferred native prompt (AskUserQuestion /
+ * ExitPlanMode / Elicitation). These never enter the in-console queue
+ * (ADR-0002), so this renders NO approve/deny/answer control — only a
+ * deep-link/focus CTA (wisphive terminal) or a go-to-terminal pointer
+ * (hook-only session). The literal question text/options ARE carried on the
+ * `AuditDecision` wire as the (already-redacted, itr#89) `tool_input` for
+ * deferred items, so we render the full untruncated prompt here read-only —
+ * agent output is UNTRUSTED and rendered only as inert React text nodes.
+ */
+export function DeferredDetailView({ decision, onFocusTerminal }: DeferredDetailProps) {
+  const { tool_name, agent_id, project, decided_by, terminal_session_id, ts } = decision;
+  const sessionLabel = terminal_session_id
+    ? `term ${terminal_session_id.slice(0, 8)}`
+    : `session ${agent_id.slice(0, 8)}`;
+  const prompt = parseDeferredPrompt(decision.tool_input);
+
+  return (
+    <div className="deferred-detail" aria-label={`Deferred detail for ${tool_name}`}>
+      <p className="deferred-detail-note">
+        <strong>{tool_name}</strong> was deferred to the agent&apos;s native prompt (ADR-0002)
+        and never entered the in-console queue, so it cannot be answered here. The full question
+        and options are shown below (read-only) and in the agent&apos;s own terminal prompt — use
+        the route below to answer.
+      </p>
+
+      {/* Full, untruncated prompt. Read-only: NO approve/deny/answer control. */}
+      {prompt.kind === "questions" && (
+        <div className="deferred-prompt" aria-label="Deferred question">
+          {prompt.questions.map((q, i) => (
+            <div key={i} className="deferred-question">
+              {q.header && <h4 className="deferred-question-header">{q.header}</h4>}
+              {q.question && <p className="deferred-question-text">{q.question}</p>}
+              {q.options.length > 0 && (
+                <ul className="deferred-options">
+                  {q.options.map((opt, j) => (
+                    <li key={j} className="deferred-option">
+                      <strong>{opt.label}</strong>
+                      {opt.description && <span> — {opt.description}</span>}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      {prompt.kind === "plan" && (
+        <div className="deferred-prompt" aria-label="Deferred plan">
+          <h4 className="deferred-question-header">Plan</h4>
+          <pre className="deferred-plan">{prompt.plan}</pre>
+        </div>
+      )}
+      {prompt.kind === "raw" && (
+        <div className="deferred-prompt" aria-label="Deferred prompt">
+          <pre className="deferred-plan">{prompt.text}</pre>
+        </div>
+      )}
+      {prompt.kind === "none" && (
+        <p className="deferred-detail-note">
+          The question details are not available here — see the prompt in your terminal.
+        </p>
+      )}
+
+      <div className="detail-meta">
+        <div><strong>Agent:</strong> {agent_id}</div>
+        <div><strong>Project:</strong> {str(project)}</div>
+        <div><strong>Session:</strong> {sessionLabel}</div>
+        {decided_by && <div><strong>Deferred by:</strong> {decided_by}</div>}
+        <div><strong>Time:</strong> {new Date(ts).toLocaleTimeString()}</div>
+      </div>
+      <div className="detail-actions">
+        {terminal_session_id ? (
+          <button className="btn-focus" onClick={() => onFocusTerminal(terminal_session_id)}>
+            Focus terminal
+          </button>
+        ) : (
+          <span className="deferred-goto-pointer">
+            Answer in your <strong>{shortProject(str(project))}</strong> terminal
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
 
 export function DetailView({ request, onApprove, onDeny }: DetailViewProps) {
   const [modal, setModal] = useState<"deny-msg" | "context" | "always" | null>(null);

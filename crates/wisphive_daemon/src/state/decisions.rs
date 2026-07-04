@@ -482,6 +482,9 @@ impl StateDb {
                             .and_then(|s| uuid::Uuid::parse_str(s).ok()),
                         tool_name,
                         ts,
+                        // Snapshot seed is served from SQLite; the redacted
+                        // deferred tool_input rides the live ingest wire only.
+                        tool_input: None,
                     })
                 },
             )

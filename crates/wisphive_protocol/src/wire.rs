@@ -816,6 +816,7 @@ mod tests {
             terminal_session_id: Some(uuid::Uuid::new_v4()),
             tool_name: "Read".into(),
             ts: chrono::Utc::now(),
+            tool_input: None,
         };
 
         let msg = ServerMessage::AuditDecision(audit.clone());
@@ -833,6 +834,35 @@ mod tests {
         let decoded: ServerMessage = decode(&encoded).unwrap();
         match decoded {
             ServerMessage::AuditSnapshot { items } => assert_eq!(items, vec![audit]),
+            _ => panic!("unexpected variant"),
+        }
+
+        // A deferred decision carries the redacted tool_input so the inbox can
+        // render the literal question/options; assert it survives round-trip.
+        let deferred = AuditDecision {
+            kind: crate::types::AuditDecisionKind::Deferred,
+            decided_by: Some("always_ask:intrinsic".into()),
+            project: PathBuf::from("/proj"),
+            agent_id: "cc-2".into(),
+            terminal_session_id: None,
+            tool_name: "AskUserQuestion".into(),
+            ts: chrono::Utc::now(),
+            tool_input: Some(serde_json::json!({
+                "questions": [
+                    { "question": "Ship it?", "options": [{ "label": "Yes" }] }
+                ]
+            })),
+        };
+        let encoded = encode(&ServerMessage::AuditDecision(deferred.clone())).unwrap();
+        let decoded: ServerMessage = decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::AuditDecision(decoded) => {
+                assert_eq!(decoded, deferred);
+                assert_eq!(
+                    decoded.tool_input.as_ref().unwrap()["questions"][0]["question"],
+                    serde_json::json!("Ship it?")
+                );
+            }
             _ => panic!("unexpected variant"),
         }
     }

@@ -21,6 +21,11 @@ interface TerminalsProps {
   onApprove: (id: string, opts?: { additional_context?: string; always_allow?: boolean }) => void;
   onDeny: (id: string, message?: string) => void;
   onJumpToQueue: () => void;
+  /** External deep-link focus (itr#437): when set to a live terminal's id the
+   * Terminals view auto-selects + attaches it, so the inbox "Focus terminal"
+   * CTA lands on the exact session. `onFocusHandled` clears it upstream. */
+  focusSessionId?: string;
+  onFocusHandled?: () => void;
   registerHandler: (
     id: string,
     handler: (id: string, direction: "chunk" | "catchup" | "replay_chunk", bytes: Uint8Array) => void,
@@ -41,7 +46,7 @@ export function Terminals(props: TerminalsProps) {
   const {
     terminals, queue, projects, onRefresh, onRefreshProjects, onCreate, onAttach, onDetach,
     onClose, onReplay, onInput, onResize, onSetGroup, onReorder,
-    onApprove, onDeny, onJumpToQueue, registerHandler,
+    onApprove, onDeny, onJumpToQueue, focusSessionId, onFocusHandled, registerHandler,
   } = props;
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [replayMode, setReplayMode] = useState(false);
@@ -147,6 +152,18 @@ export function Terminals(props: TerminalsProps) {
     if (replay) onReplay(t.id);
     else onAttach(t.id);
   };
+
+  // Honour an inbox deep-link focus (itr#437). Waits for the target session to
+  // appear in `terminals` (term_list may not have arrived yet), then selects +
+  // live-attaches it and clears the request upstream so it won't re-fire.
+  useEffect(() => {
+    if (!focusSessionId) return;
+    const target = terminals.find((t) => t.id === focusSessionId);
+    if (!target) return;
+    handleSelect(target, false);
+    onFocusHandled?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusSessionId, terminals]);
 
   const handleNewGroup = () => {
     const name = prompt("Name for the new group?");

@@ -56,6 +56,11 @@ export interface AuditDecision {
   terminal_session_id?: string;
   tool_name: string;
   ts: string;
+  /** Redacted tool input for DEFERRED native prompts (AskUserQuestion /
+   * ExitPlanMode / Elicitation) so the inbox can render the literal question +
+   * options. Present only for kind === "deferred"; absent otherwise. Already
+   * secret-redacted upstream (hook redact + itr#89). */
+  tool_input?: Record<string, unknown> | null;
 }
 
 export interface AgentInfo {

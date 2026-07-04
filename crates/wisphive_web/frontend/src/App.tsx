@@ -63,6 +63,11 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
   } = useWisphive();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [view, setView] = useState<View>("inbox");
+  // Deep-link target for the inbox "Focus terminal" affordance on deferred
+  // native prompts (itr#437): setting it navigates to the Terminals view and
+  // tells Terminals which session to auto-select. Cleared once Terminals
+  // honours it so the same session can be re-focused later.
+  const [focusTerminalId, setFocusTerminalId] = useState<string | null>(null);
   const [showSpawn, setShowSpawn] = useState(false);
   const [spawnDefaultProject, setSpawnDefaultProject] = useState<string | undefined>();
   const [sessionAgent, setSessionAgent] = useState<string | null>(null);
@@ -190,7 +195,8 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
             selectedId={selectedId}
             onSelect={setSelectedId}
             onApprove={(id) => { approve(id); setSelectedId(null); }}
-            onDeny={(id) => { deny(id); setSelectedId(null); }}
+            onDeny={(id, msg) => { deny(id, msg); setSelectedId(null); }}
+            onFocusTerminal={(termId) => { setFocusTerminalId(termId); setView("terminals"); }}
           />
         )}
         {view === "queue" && (
@@ -270,6 +276,8 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
             onApprove={(id, opts) => approve(id, opts)}
             onDeny={(id, msg) => deny(id, msg)}
             onJumpToQueue={() => setView("queue")}
+            focusSessionId={focusTerminalId ?? undefined}
+            onFocusHandled={() => setFocusTerminalId(null)}
             registerHandler={registerTerminalHandler}
           />
         )}

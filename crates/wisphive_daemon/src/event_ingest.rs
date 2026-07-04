@@ -373,6 +373,17 @@ pub async fn ingest_line(line: &str, state_db: &StateDb) -> anyhow::Result<Optio
         .map(|dt| dt.with_timezone(&chrono::Utc))
         .unwrap_or_else(|_| chrono::Utc::now());
 
+    // Forward the (already-redacted, see hook redact::redact_value + itr#89)
+    // tool_input onto the wire ONLY for deferred native prompts, so the inbox
+    // can render the literal AskUserQuestion / ExitPlanMode / Elicitation
+    // question + options. Auto-approved/denied stay None to keep the wire lean.
+    // A deferred event may carry `tool_input: null` (e.g. elicitations) — that
+    // passes through gracefully as Some(Null) / None without crashing.
+    let wire_tool_input = match kind {
+        AuditDecisionKind::Deferred => event.get("tool_input").cloned(),
+        AuditDecisionKind::AutoApproved | AuditDecisionKind::Denied => None,
+    };
+
     Ok(Some(AuditDecision {
         kind,
         decided_by: decided_by.map(str::to_owned),
@@ -381,6 +392,7 @@ pub async fn ingest_line(line: &str, state_db: &StateDb) -> anyhow::Result<Optio
         terminal_session_id,
         tool_name: tool_name.to_owned(),
         ts,
+        tool_input: wire_tool_input,
     }))
 }
 
@@ -424,11 +436,51 @@ mod tests {
         assert_eq!(audit.kind, AuditDecisionKind::AutoApproved);
         assert_eq!(audit.decided_by.as_deref(), None);
         assert_eq!(audit.tool_name, "Bash");
+        // Auto-approved decisions keep the wire lean — no tool_input forwarded.
+        assert_eq!(audit.tool_input, None);
 
         let history = db.query_history(None, 10).await.unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].tool_name, "Bash");
         assert_eq!(history[0].agent_id, "cc-1");
+    }
+
+    #[tokio::test]
+    async fn ingest_deferred_forwards_redacted_tool_input() {
+        let db = test_db().await;
+        // A deferred AskUserQuestion carries the (already-redacted) tool_input so
+        // the inbox can render the literal question + options.
+        let line = r#"{"event": "deferred", "agent_id": "cc-9", "tool_name": "AskUserQuestion", "tool_input": {"questions": [{"question": "Ship it?", "options": [{"label": "Yes"}]}]}, "timestamp": "2024-01-01T00:00:00Z", "tool_use_id": "def-1", "decided_by": "always_ask:intrinsic"}"#;
+        let audit = ingest_line(line, &db)
+            .await
+            .unwrap()
+            .expect("deferred event should produce audit decision");
+        assert_eq!(audit.kind, AuditDecisionKind::Deferred);
+        let input = audit
+            .tool_input
+            .expect("deferred decision must carry tool_input");
+        assert_eq!(
+            input["questions"][0]["question"],
+            serde_json::json!("Ship it?")
+        );
+        assert_eq!(
+            input["questions"][0]["options"][0]["label"],
+            serde_json::json!("Yes")
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_deferred_null_tool_input_is_graceful() {
+        let db = test_db().await;
+        // Elicitations may arrive with tool_input: null — it passes through as
+        // Some(Null) without crashing.
+        let line = r#"{"event": "deferred", "agent_id": "cc-9", "tool_name": "Elicitation", "tool_input": null, "timestamp": "2024-01-01T00:00:00Z", "tool_use_id": "def-2", "decided_by": "always_ask:intrinsic"}"#;
+        let audit = ingest_line(line, &db)
+            .await
+            .unwrap()
+            .expect("deferred event should produce audit decision");
+        assert_eq!(audit.kind, AuditDecisionKind::Deferred);
+        assert_eq!(audit.tool_input, Some(serde_json::Value::Null));
     }
 
     #[tokio::test]
