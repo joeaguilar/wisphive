@@ -41,6 +41,21 @@ export interface HistoryEntry {
   tool_result?: Record<string, unknown>;
   tool_use_id?: string;
   hook_event_name?: string;
+  terminal_session_id?: string;
+  decided_by?: string;
+  config_hash?: string;
+}
+
+export type AuditDecisionKind = "auto_approved" | "deferred" | "denied";
+
+export interface AuditDecision {
+  kind: AuditDecisionKind;
+  decided_by?: string;
+  project: string;
+  agent_id: string;
+  terminal_session_id?: string;
+  tool_name: string;
+  ts: string;
 }
 
 export interface AgentInfo {
@@ -90,6 +105,8 @@ export type ServerMessage =
   | { type: "queue_snapshot"; items: DecisionRequest[] }
   | { type: "new_decision" } & DecisionRequest
   | { type: "decision_resolved"; id: string; decision: string }
+  | { type: "audit_snapshot"; items: AuditDecision[] }
+  | { type: "audit_decision" } & AuditDecision
   | { type: "agent_connected" } & AgentInfo
   | { type: "agent_disconnected"; agent_id: string }
   | { type: "agents_snapshot"; agents: AgentInfo[] }

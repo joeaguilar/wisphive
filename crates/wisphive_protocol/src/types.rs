@@ -450,6 +450,30 @@ pub struct HistoryEntry {
     pub config_hash: Option<String>,
 }
 
+/// A compact live/snapshot audit event for decisions Wisphive resolved without
+/// direct in-console action: auto-approved hook decisions, always-deferred
+/// native prompts, and hook-side denials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditDecision {
+    pub kind: AuditDecisionKind,
+    pub decided_by: Option<String>,
+    pub project: PathBuf,
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_session_id: Option<Uuid>,
+    pub tool_name: String,
+    pub ts: DateTime<Utc>,
+}
+
+/// Category for [`AuditDecision`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditDecisionKind {
+    AutoApproved,
+    Deferred,
+    Denied,
+}
+
 // ── Terminal sessions ───────────────────────────────────────────────
 
 /// Lifecycle status of a daemon-managed terminal session.

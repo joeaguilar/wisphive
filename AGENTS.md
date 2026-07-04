@@ -70,7 +70,7 @@ Claude Code / Codex → wisphive-hook (subprocess) → Unix socket → wisphive 
 
 Seven workspace crates with clear dependency flow:
 
-- **wisphive_protocol** — Shared types and newline-delimited JSON wire protocol. `DecisionRequest`, `Decision`, `ClientMessage`/`ServerMessage`, `SpawnAgentRequest`, terminal events. All other crates depend on this.
+- **wisphive_protocol** — Shared types and newline-delimited JSON wire protocol. `DecisionRequest`, `Decision`, `ClientMessage`/`ServerMessage`, `SpawnAgentRequest`, terminal events, and live audit events (`AuditSnapshot`/`AuditDecision`). All other crates depend on this.
 - **wisphive_daemon** — Async Tokio server on `~/.wisphive/wisphive.sock`. Accepts hook connections (blocking until decision), TUI/web connections (bidirectional streaming via broadcast channel), persists state to SQLite (`~/.wisphive/wisphive.db`), spawns headless agents via the process registry, manages `portable-pty` terminal sessions, sends platform notifications.
 - **wisphive_hook** — Lightweight binary that runs as a Claude Code or Codex hook subprocess. Four-layer decision logic: (1) check `~/.wisphive/mode` file, (2) read `~/.wisphive/fail-mode` for active-mode error posture, (3) auto-approve safe tools via `~/.wisphive/auto-approve.json`, (4) connect to daemon for human review. Exit codes: 0=approve or rich JSON response, 2=deny, 1=error. In active mode, missing/invalid `fail-mode` defaults to `closed`, so hook read/parse/protocol failures deny instead of silently approving; `fail-mode=open` preserves fail-open behavior for availability-first local use. **Exception**: a *daemon-unreachable* failure (refused/absent socket — the daemon is down) always fails open regardless of `fail-mode`, since fail-closing a crashed control plane would brick every agent.
 - **wisphive_tui** — Ratatui terminal UI. Connects to daemon as a streaming client. Panels include queue, agents, projects, terminals. Keys: `a`/`d` approve/deny, `A`/`D` bulk, `/` filter, Tab switch panels.
@@ -126,7 +126,7 @@ The `wisphive-hook` binary runs as both `PreToolUse` and `PostToolUse` hook. Cod
 
 Unix socket at `~/.wisphive/wisphive.sock`. Newline-delimited JSON. Two client types:
 - **Hook**: ephemeral — sends Hello + DecisionRequest, blocks for DecisionResponse, exits.
-- **TUI**: long-lived — sends Hello, receives QueueSnapshot, then bidirectional streaming of commands and events.
+- **TUI/web bridge**: long-lived — sends Hello, receives AgentsSnapshot, QueueSnapshot, and a bounded recent AuditSnapshot, then bidirectional streaming of commands and events. `AuditDecision` broadcasts carry non-human hook decisions (`auto_approved`, `deferred`, `denied`) with `decided_by`, project, agent, optional terminal session, tool, and timestamp for the Command Center inbox/feed.
 
 ## Runtime Files
 
@@ -136,6 +136,7 @@ All under `~/.wisphive/`:
 - `wisphive.db` — SQLite state/audit database
 - `mode` — "active" or "off" (global kill switch)
 - `fail-mode` — "closed" or "open" for active-mode hook failures. Missing/invalid means "closed"; "open" restores availability-first approval on runtime failures. A daemon-unreachable (refused/absent socket) failure always fails open regardless. Oversized hook stdin is denied regardless.
+- `config.json` — User-editable daemon/hook configuration. `audit_snapshot_limit` caps the recent audit rows sent to TUI/web clients on connect (default 500, clamped 10–10000).
 - `auto-approve.json` — List of tool names that skip daemon review
 - `web.cert.pem` / `web.key.pem` — Self-signed TLS cert/key for the web UI (key is mode 0600). Validity is capped at 397 days; rotation writes atomically under `web.cert.lock` (flock) with metadata in `web.cert.meta.json`. See `crates/wisphive_web/src/tls.rs`.
 

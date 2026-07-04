@@ -315,7 +315,8 @@ fn validate_config_json(value: &serde_json::Value) -> Result<(), &'static str> {
             | "log_retention_days"
             | "retention_vacuum_max_mb"
             | "archive_alert_max_mb"
-            | "disk_alert_free_mb" => {
+            | "disk_alert_free_mb"
+            | "audit_snapshot_limit" => {
                 if value.as_u64().is_none() {
                     return Err("numeric config value must be an unsigned integer");
                 }

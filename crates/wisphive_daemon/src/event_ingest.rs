@@ -3,8 +3,9 @@ use std::sync::Arc;
 
 use notify::{EventKind, RecursiveMode, Watcher};
 use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
+use wisphive_protocol::{AuditDecision, AuditDecisionKind, ServerMessage};
 
 use crate::state::StateDb;
 
@@ -27,9 +28,10 @@ pub fn spawn_event_ingest(
     events_path: PathBuf,
     log_dir: PathBuf,
     state_db: Arc<StateDb>,
+    tui_tx: broadcast::Sender<ServerMessage>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = run_ingest(events_path, log_dir, state_db).await {
+        if let Err(e) = run_ingest(events_path, log_dir, state_db, tui_tx).await {
             error!("event ingest task failed: {e}");
         }
     })
@@ -62,6 +64,7 @@ async fn run_ingest(
     events_path: PathBuf,
     log_dir: PathBuf,
     state_db: Arc<StateDb>,
+    tui_tx: broadcast::Sender<ServerMessage>,
 ) -> anyhow::Result<()> {
     // Create the events file if it doesn't exist
     if !events_path.exists() {
@@ -161,8 +164,12 @@ async fn run_ingest(
                     if trimmed.is_empty() {
                         continue;
                     }
-                    if let Err(e) = ingest_line(trimmed, &state_db).await {
-                        warn!("failed to ingest event line: {e}");
+                    match ingest_line(trimmed, &state_db).await {
+                        Ok(Some(audit)) => {
+                            let _ = tui_tx.send(ServerMessage::AuditDecision(audit));
+                        }
+                        Ok(None) => {}
+                        Err(e) => warn!("failed to ingest event line: {e}"),
                     }
                 }
                 Err(e) => {
@@ -267,8 +274,17 @@ pub async fn reimport_all(
         if trimmed.is_empty() {
             continue;
         }
-        if ingest_line(trimmed, state_db).await.is_ok() {
-            count += 1;
+        // A single malformed/torn JSON line must not abort the whole reimport
+        // (a partial append is exactly what the tailing design tolerates). Skip
+        // parse errors and keep going, but still propagate a genuine DB/systemic
+        // error so the caller escalates the segment to `.failed.jsonl` (itr#336).
+        match ingest_line(trimmed, state_db).await {
+            Ok(Some(_audit)) => count += 1,
+            Ok(None) => {}
+            Err(e) if e.downcast_ref::<serde_json::Error>().is_some() => {
+                warn!("skipping malformed event line during reimport: {e}");
+            }
+            Err(e) => return Err(e),
         }
     }
 
@@ -282,17 +298,17 @@ pub async fn reimport_all(
 /// (decision approve), `deferred` (always-defer → decision ask), and `denied`
 /// (fail-closed paths → decision deny). Each carries `decided_by` (the
 /// layer/rule) and `config_hash` when the hook provided them.
-pub async fn ingest_line(line: &str, state_db: &StateDb) -> anyhow::Result<()> {
+pub async fn ingest_line(line: &str, state_db: &StateDb) -> anyhow::Result<Option<AuditDecision>> {
     let event: serde_json::Value = serde_json::from_str(line)?;
 
     let event_type = event.get("event").and_then(|v| v.as_str()).unwrap_or("");
-    let decision = match event_type {
-        "auto_approved" => "approve",
-        "deferred" => "ask",
-        "denied" => "deny",
+    let (decision, kind) = match event_type {
+        "auto_approved" => ("approve", AuditDecisionKind::AutoApproved),
+        "deferred" => ("ask", AuditDecisionKind::Deferred),
+        "denied" => ("deny", AuditDecisionKind::Denied),
         _ => {
             debug!(event_type, "skipping non-decision event");
-            return Ok(());
+            return Ok(None);
         }
     };
 
@@ -321,11 +337,15 @@ pub async fn ingest_line(line: &str, state_db: &StateDb) -> anyhow::Result<()> {
     let hook_event_name = event.get("hook_event_name").and_then(|v| v.as_str());
     let decided_by = event.get("decided_by").and_then(|v| v.as_str());
     let config_hash = event.get("config_hash").and_then(|v| v.as_str());
+    let terminal_session_id = event
+        .get("terminal_session_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| uuid::Uuid::parse_str(s).ok());
 
     // Serialize agent_type as JSON string to match existing format
     let agent_type_json = format!("\"{}\"", agent_type);
 
-    state_db
+    let inserted = state_db
         .log_auto_approved(&crate::state::AutoApprovedEntry {
             agent_id,
             agent_type: &agent_type_json,
@@ -345,7 +365,23 @@ pub async fn ingest_line(line: &str, state_db: &StateDb) -> anyhow::Result<()> {
         tool_name,
         agent_id, decision, "ingested hook decision event"
     );
-    Ok(())
+    if !inserted {
+        return Ok(None);
+    }
+
+    let ts = chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| chrono::Utc::now());
+
+    Ok(Some(AuditDecision {
+        kind,
+        decided_by: decided_by.map(str::to_owned),
+        project: PathBuf::from(project),
+        agent_id: agent_id.to_owned(),
+        terminal_session_id,
+        tool_name: tool_name.to_owned(),
+        ts,
+    }))
 }
 
 #[cfg(test)]
@@ -381,7 +417,13 @@ mod tests {
     async fn ingest_auto_approved_event() {
         let db = test_db().await;
         let line = auto_approved_event("Bash", "cc-1", Some("tui-1"));
-        ingest_line(&line, &db).await.unwrap();
+        let audit = ingest_line(&line, &db)
+            .await
+            .unwrap()
+            .expect("new event should produce audit decision");
+        assert_eq!(audit.kind, AuditDecisionKind::AutoApproved);
+        assert_eq!(audit.decided_by.as_deref(), None);
+        assert_eq!(audit.tool_name, "Bash");
 
         let history = db.query_history(None, 10).await.unwrap();
         assert_eq!(history.len(), 1);
@@ -393,7 +435,7 @@ mod tests {
     async fn ingest_skips_non_auto_approved() {
         let db = test_db().await;
         let line = r#"{"event": "session_start", "agent_id": "cc-1"}"#;
-        ingest_line(line, &db).await.unwrap();
+        assert!(ingest_line(line, &db).await.unwrap().is_none());
 
         let history = db.query_history(None, 10).await.unwrap();
         assert!(
@@ -482,8 +524,7 @@ mod tests {
         std::fs::write(&events_path, &content).unwrap();
 
         let count = reimport_all(&events_path, &db).await.unwrap();
-        // All 3 lines "succeed" (INSERT OR IGNORE doesn't error)
-        assert_eq!(count, 3);
+        assert_eq!(count, 1);
 
         // But only 1 row should be in the DB thanks to dedup
         let history = db.query_history(None, 10).await.unwrap();
@@ -584,7 +625,8 @@ mod tests {
         );
         std::fs::write(&events_path, &content).unwrap();
 
-        let handle = spawn_event_ingest(events_path.clone(), log_dir, db.clone());
+        let (tui_tx, _) = broadcast::channel(16);
+        let handle = spawn_event_ingest(events_path.clone(), log_dir, db.clone(), tui_tx);
 
         // The startup reimport is asynchronous — poll briefly.
         let mut history = Vec::new();
@@ -604,7 +646,10 @@ mod tests {
         // A restart over the same file must not double-ingest (dedup).
         handle.abort();
         let count = reimport_all(&events_path, &db).await.unwrap();
-        assert_eq!(count, 2, "reimport reads both lines");
+        assert_eq!(
+            count, 0,
+            "reimport sees both lines but inserts no duplicates"
+        );
         let history = db.query_history(None, 10).await.unwrap();
         assert_eq!(history.len(), 2, "no duplicates after restart");
     }
@@ -668,10 +713,8 @@ mod tests {
         );
         std::fs::write(&events_path, &content).unwrap();
 
-        // reimport_all counts all lines where ingest_line returns Ok,
-        // including skipped non-auto-approved events (they return Ok too).
         let count = reimport_all(&events_path, &db).await.unwrap();
-        assert_eq!(count, 3, "all valid JSON lines return Ok from ingest_line");
+        assert_eq!(count, 1, "only inserted decision events are counted");
 
         // But only the auto_approved event should be in the DB
         let history = db.query_history(None, 10).await.unwrap();

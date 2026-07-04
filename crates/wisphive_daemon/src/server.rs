@@ -45,6 +45,7 @@ struct ConnectionContext {
     hook_timeout_secs: u64,
     notifications_enabled: bool,
     home_dir: PathBuf,
+    audit_snapshot_limit: u32,
 }
 
 /// The main daemon server. Listens on a Unix socket and dispatches
@@ -161,6 +162,7 @@ impl Server {
             events_path,
             self.config.log_dir.clone(),
             self.state_db.clone(),
+            self.tui_tx.clone(),
         );
 
         let mut reap_interval = tokio::time::interval(Duration::from_secs(5));
@@ -307,6 +309,7 @@ impl Server {
                                 hook_timeout_secs: self.config.hook_timeout_secs,
                                 notifications_enabled: self.config.notifications_enabled,
                                 home_dir: self.config.home_dir.clone(),
+                                audit_snapshot_limit: self.config.audit_snapshot_limit,
                             });
                             tokio::spawn(async move {
                                 if let Err(e) = handle_connection(stream, &ctx).await {
@@ -782,6 +785,10 @@ async fn handle_tui(
 ) -> Result<()> {
     use tokio::sync::mpsc;
 
+    // Subscribe before sending snapshots so live events that land during the
+    // snapshot writes are still delivered by the select loop afterward.
+    let mut tui_rx = ctx.tui_tx.subscribe();
+
     // Send agents snapshot
     let agents_snap = {
         let reg = ctx.agent_registry.lock().await;
@@ -806,8 +813,26 @@ async fn handle_tui(
     )
     .await?;
 
-    // Subscribe to broadcast events for this TUI
-    let mut tui_rx = ctx.tui_tx.subscribe();
+    // Send bounded recent audit rows so web/TUI can render auto-answered counts
+    // immediately instead of waiting for the next live ingest tick.
+    let since = chrono::Utc::now() - chrono::Duration::hours(1);
+    match ctx
+        .state_db
+        .recent_audit_decisions(since, ctx.audit_snapshot_limit)
+        .await
+    {
+        Ok(items) => {
+            write_msg(&mut writer, &ServerMessage::AuditSnapshot { items }).await?;
+        }
+        Err(e) => {
+            warn!("failed to load recent audit snapshot: {e}");
+            write_msg(
+                &mut writer,
+                &ServerMessage::AuditSnapshot { items: Vec::new() },
+            )
+            .await?;
+        }
+    }
 
     // Per-connection channel for messages produced by worker tasks
     // (e.g. per-session terminal forwarders). The select loop drains this

@@ -37,6 +37,8 @@ pub struct DaemonConfig {
     /// Free-space floor (bytes) on the state filesystem; a low-disk alert is
     /// raised when available space drops below this. `0` disables it.
     pub disk_alert_free_bytes: u64,
+    /// Maximum audit decisions sent in the recent-audit connect snapshot.
+    pub audit_snapshot_limit: u32,
 }
 
 /// User-editable config loaded from ~/.wisphive/config.json.
@@ -94,6 +96,9 @@ pub struct UserConfig {
     /// `0` disables.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_alert_free_mb: Option<u64>,
+    /// Maximum audit decisions sent to TUI/web clients on connect (default 500).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_snapshot_limit: Option<u32>,
     /// Keys this struct doesn't model (event toggles like `auto_approve_stop`,
     /// future additions). Captured so a load→save round-trip never strips them
     /// — the hook reads several of these as raw top-level keys (itr#361).
@@ -192,6 +197,12 @@ impl DaemonConfig {
         );
         let archive_alert_max_bytes = archive_alert_max_mb.saturating_mul(1024 * 1024);
         let disk_alert_free_bytes = disk_alert_free_mb.saturating_mul(1024 * 1024);
+        let audit_snapshot_limit = clamp_config(
+            "audit_snapshot_limit",
+            u64::from(user.audit_snapshot_limit.unwrap_or(500)),
+            10,
+            10_000,
+        ) as u32;
 
         Self {
             socket_path: home_dir.join("wisphive.sock"),
@@ -208,6 +219,7 @@ impl DaemonConfig {
             retention_vacuum_max_bytes,
             archive_alert_max_bytes,
             disk_alert_free_bytes,
+            audit_snapshot_limit,
             home_dir,
         }
     }

@@ -415,6 +415,66 @@ async fn log_auto_approved_dedup_without_tool_use_id() {
     );
 }
 
+#[tokio::test]
+async fn recent_audit_decisions_returns_auto_and_deferred_not_human_denies() {
+    let db = test_db().await;
+
+    log_auto(
+        &db,
+        "cc-1",
+        "\"claude_code\"",
+        "/muse",
+        "Read",
+        "{}",
+        "2024-01-01T00:00:00Z",
+        Some("auto-1"),
+        Some("PreToolUse"),
+    )
+    .await;
+
+    db.log_auto_approved(&AutoApprovedEntry {
+        agent_id: "cc-2",
+        agent_type: "\"claude_code\"",
+        project: "/muse",
+        tool_name: "AskUserQuestion",
+        tool_input: "{}",
+        timestamp: "2024-01-01T00:01:00Z",
+        tool_use_id: Some("defer-1"),
+        hook_event_name: Some("PreToolUse"),
+        decision: "ask",
+        decided_by: Some("always_ask:intrinsic"),
+        config_hash: None,
+    })
+    .await
+    .unwrap();
+
+    let req = make_request("Bash", "cc-human", "/muse");
+    db.persist_pending(&req).await.unwrap();
+    db.resolve_pending_by(req.id, Decision::Deny, "human:tui")
+        .await
+        .unwrap();
+
+    let since = chrono::DateTime::parse_from_rfc3339("2023-12-31T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let recent = db.recent_audit_decisions(since, 10).await.unwrap();
+
+    assert_eq!(recent.len(), 2);
+    assert_eq!(
+        recent[0].kind,
+        wisphive_protocol::AuditDecisionKind::Deferred
+    );
+    assert_eq!(
+        recent[0].decided_by.as_deref(),
+        Some("always_ask:intrinsic")
+    );
+    assert_eq!(
+        recent[1].kind,
+        wisphive_protocol::AuditDecisionKind::AutoApproved
+    );
+    assert_eq!(recent[1].decided_by.as_deref(), Some("level:all"));
+}
+
 // ════════════════════════════════════════════════════════════
 // attach_tool_result
 // ════════════════════════════════════════════════════════════

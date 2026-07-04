@@ -1,8 +1,8 @@
 import type { DecisionRequest } from "../types/protocol";
 
-export function timeAgo(timestamp: string): string {
+export function timeAgo(timestamp: string, nowMs = Date.now()): string {
   const seconds = Math.floor(
-    (Date.now() - new Date(timestamp).getTime()) / 1000,
+    (nowMs - new Date(timestamp).getTime()) / 1000,
   );
   if (seconds < 60) return `${seconds}s`;
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
@@ -58,4 +58,12 @@ export function inputSummary(item: DecisionRequest): string | null {
 export function shortProject(project: string): string {
   const parts = project.split("/");
   return parts[parts.length - 1] || project;
+}
+
+// Oldest-first ordering for the inbox. Shared by the Inbox render and the
+// App keyboard navigation so j/k/y/n operate on exactly the on-screen order.
+export function orderByAge(items: DecisionRequest[]): DecisionRequest[] {
+  return [...items].sort(
+    (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
+  );
 }

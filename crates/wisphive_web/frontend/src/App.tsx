@@ -3,6 +3,8 @@ import { useWisphive } from "./hooks/useWisphive";
 import { useKeyboard } from "./hooks/useKeyboard";
 import { useAuth } from "./hooks/useAuth";
 import { Queue } from "./components/Queue";
+import { Inbox } from "./components/Inbox";
+import { orderByAge } from "./components/queueUtils";
 import { DetailView } from "./components/DetailView";
 import { History } from "./components/History";
 import { Sessions } from "./components/Sessions";
@@ -16,7 +18,7 @@ import { SudoModal } from "./components/SudoModal";
 import { DiskAlertBanner } from "./components/DiskAlertBanner";
 import "./app.css";
 
-type View = "queue" | "history" | "sessions" | "projects" | "agents" | "config" | "terminals";
+type View = "inbox" | "queue" | "history" | "sessions" | "projects" | "agents" | "config" | "terminals";
 
 function App() {
   const auth = useAuth();
@@ -54,13 +56,13 @@ function App() {
 
 function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
   const {
-    connected, queue, agents, projects, history, agentTimeline, sessionTimeline, sessions, terminals,
+    connected, queue, agents, projects, auditDecisions, history, agentTimeline, sessionTimeline, sessions, terminals,
     pendingReauth, diskAlerts, approve, deny, dismissReauth, retryPendingApprove,
     spawnAgent, queryProjects, queryHistory, queryAgentTimeline, querySessionTimeline, searchHistory, querySessions,
     termList, termCreate, termAttach, termDetach, termInput, termResize, termClose, termReplay, termSetGroup, termReorder, registerTerminalHandler,
   } = useWisphive();
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [view, setView] = useState<View>("queue");
+  const [view, setView] = useState<View>("inbox");
   const [showSpawn, setShowSpawn] = useState(false);
   const [spawnDefaultProject, setSpawnDefaultProject] = useState<string | undefined>();
   const [sessionAgent, setSessionAgent] = useState<string | null>(null);
@@ -69,31 +71,38 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
 
   const selectedRequest = queue.find((r) => r.id === selectedId);
 
-  // Queue index for keyboard navigation
-  const queueIndex = queue.findIndex((r) => r.id === selectedId);
+  // The keyboard-navigation list must match the on-screen order of the active
+  // view: the Inbox renders oldest-first (orderByAge), the Queue renders raw
+  // insertion order. Walking the wrong order made j/k/y/n act on an item other
+  // than the one highlighted.
+  const navList = useMemo(
+    () => (view === "inbox" ? orderByAge(queue) : queue),
+    [view, queue],
+  );
+  const navIndex = navList.findIndex((r) => r.id === selectedId);
 
   const handleNext = useCallback(() => {
-    if (view === "queue" && queue.length > 0) {
-      const next = Math.min(queueIndex + 1, queue.length - 1);
-      setSelectedId(queue[next >= 0 ? next : 0].id);
+    if ((view === "queue" || view === "inbox") && navList.length > 0) {
+      const next = Math.min(navIndex + 1, navList.length - 1);
+      setSelectedId(navList[next >= 0 ? next : 0].id);
     }
-  }, [view, queue, queueIndex]);
+  }, [view, navList, navIndex]);
 
   const handlePrev = useCallback(() => {
-    if (view === "queue" && queue.length > 0) {
-      const prev = Math.max(queueIndex - 1, 0);
-      setSelectedId(queue[prev].id);
+    if ((view === "queue" || view === "inbox") && navList.length > 0) {
+      const prev = Math.max(navIndex - 1, 0);
+      setSelectedId(navList[prev].id);
     }
-  }, [view, queue, queueIndex]);
+  }, [view, navList, navIndex]);
 
   const keyActions = useMemo(() => ({
     onNext: handleNext,
     onPrev: handlePrev,
     onApprove: () => {
-      if (selectedId && view === "queue") { approve(selectedId); setSelectedId(null); }
+      if (selectedId && (view === "queue" || view === "inbox")) { approve(selectedId); setSelectedId(null); }
     },
     onDeny: () => {
-      if (selectedId && view === "queue") { deny(selectedId); setSelectedId(null); }
+      if (selectedId && (view === "queue" || view === "inbox")) { deny(selectedId); setSelectedId(null); }
     },
     onBack: () => {
       if (showHelp) { setShowHelp(false); return; }
@@ -103,8 +112,8 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
       if (sessionAgent) { setSessionAgent(null); return; }
     },
     onSelect: () => {
-      if (view === "queue" && queue.length > 0 && !selectedId) {
-        setSelectedId(queue[0].id);
+      if ((view === "queue" || view === "inbox") && navList.length > 0 && !selectedId) {
+        setSelectedId(navList[0].id);
       }
     },
     onViewQueue: () => setView("queue"),
@@ -116,7 +125,7 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
     onViewTerminals: () => setView("terminals"),
     onSpawn: () => setShowSpawn(true),
     onHelp: () => setShowHelp((v) => !v),
-  }), [handleNext, handlePrev, selectedId, view, queue, approve, deny, showHelp, showSpawn, agentDrilldown, sessionAgent]);
+  }), [handleNext, handlePrev, selectedId, view, navList, approve, deny, showHelp, showSpawn, agentDrilldown, sessionAgent]);
 
   useKeyboard(keyActions);
 
@@ -132,6 +141,9 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
           <h1>wisphive</h1>
           <span className={`status-dot ${connected ? "connected" : "disconnected"}`} />
         </div>
+        <button className={view === "inbox" ? "active" : ""} onClick={() => setView("inbox")}>
+          Inbox {queue.length > 0 && <span className="badge">{queue.length}</span>}
+        </button>
         <button className={view === "queue" ? "active" : ""} onClick={() => setView("queue")}>
           Queue {queue.length > 0 && <span className="badge">{queue.length}</span>}
         </button>
@@ -171,6 +183,16 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
 
       <main className="content">
         <DiskAlertBanner alerts={diskAlerts} />
+        {view === "inbox" && (
+          <Inbox
+            items={queue}
+            auditDecisions={auditDecisions}
+            selectedId={selectedId}
+            onSelect={setSelectedId}
+            onApprove={(id) => { approve(id); setSelectedId(null); }}
+            onDeny={(id) => { deny(id); setSelectedId(null); }}
+          />
+        )}
         {view === "queue" && (
           <div className="queue-layout">
             <Queue

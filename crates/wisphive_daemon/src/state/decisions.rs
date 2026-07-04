@@ -15,6 +15,19 @@ type PendingRowWithTerm = (
     Option<String>,
 );
 
+/// Decision-log row shape for compact recent audit snapshots.
+type AuditDecisionRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    i64,
+);
+
 /// Parameters for logging a hook-resolved (non-human) decision from
 /// events.jsonl: an auto-approved tool call, an always-defer deferral, or a
 /// fail-closed denial.
@@ -410,10 +423,75 @@ impl StateDb {
         Ok(rows_to_entries(rows))
     }
 
+    /// Recent non-human audit decisions for live clients joining the stream.
+    pub async fn recent_audit_decisions(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        limit: u32,
+    ) -> Result<Vec<wisphive_protocol::AuditDecision>> {
+        let rows: Vec<AuditDecisionRow> = sqlx::query_as(
+            "SELECT agent_id, project, tool_name, decision, resolved_at, requested_at,
+                    terminal_session_id, decided_by, auto_approved
+             FROM decision_log
+             WHERE resolved_at >= ?
+               AND (
+                    auto_approved = 1
+                    OR decision = '\"ask\"'
+                    OR (
+                        decision = '\"deny\"'
+                        AND decided_by IS NOT NULL
+                        AND decided_by NOT LIKE 'human:%'
+                        AND decided_by != 'human'
+                    )
+               )
+             ORDER BY resolved_at DESC
+             LIMIT ?",
+        )
+        .bind(since.to_rfc3339())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(
+                |(
+                    agent_id,
+                    project,
+                    tool_name,
+                    decision,
+                    resolved_at,
+                    requested_at,
+                    terminal_session_id,
+                    decided_by,
+                    auto_approved,
+                )| {
+                    let kind =
+                        audit_kind_from_row(auto_approved, &decision, decided_by.as_deref())?;
+                    let ts = chrono::DateTime::parse_from_rfc3339(&resolved_at)
+                        .or_else(|_| chrono::DateTime::parse_from_rfc3339(&requested_at))
+                        .ok()?
+                        .with_timezone(&chrono::Utc);
+                    Some(wisphive_protocol::AuditDecision {
+                        kind,
+                        decided_by,
+                        project: std::path::PathBuf::from(project),
+                        agent_id,
+                        terminal_session_id: terminal_session_id
+                            .as_deref()
+                            .and_then(|s| uuid::Uuid::parse_str(s).ok()),
+                        tool_name,
+                        ts,
+                    })
+                },
+            )
+            .collect())
+    }
+
     /// Get the underlying pool for direct queries.
     /// Insert an auto-approved tool call directly into decision_log.
     /// Called by the event ingest task when processing events.jsonl.
-    pub async fn log_auto_approved(&self, entry: &AutoApprovedEntry<'_>) -> Result<()> {
+    pub async fn log_auto_approved(&self, entry: &AutoApprovedEntry<'_>) -> Result<bool> {
         // Generate a deterministic UUID so repeated reimports of the same event
         // hit the PRIMARY KEY conflict and are ignored. This fixes bug #58.
         // When tool_use_id is present, derive from it; otherwise hash the content.
@@ -445,7 +523,7 @@ impl StateDb {
             "" => "approve",
             other => other,
         };
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT OR IGNORE INTO decision_log
              (id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, auto_approved, tool_use_id, hook_event_name, decided_by, config_hash)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -466,7 +544,24 @@ impl StateDb {
         .bind(entry.config_hash)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
+    }
+}
+
+fn audit_kind_from_row(
+    auto_approved: i64,
+    decision: &str,
+    decided_by: Option<&str>,
+) -> Option<wisphive_protocol::AuditDecisionKind> {
+    if auto_approved == 1 {
+        return Some(wisphive_protocol::AuditDecisionKind::AutoApproved);
+    }
+    match decision {
+        "\"ask\"" => Some(wisphive_protocol::AuditDecisionKind::Deferred),
+        "\"deny\"" if decided_by.is_some_and(|by| by != "human" && !by.starts_with("human:")) => {
+            Some(wisphive_protocol::AuditDecisionKind::Denied)
+        }
+        _ => None,
     }
 }
 

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   AgentInfo,
+  AuditDecision,
   ClientMessage,
   DecisionRequest,
   DiskAlertKind,
@@ -22,6 +23,7 @@ export interface WisphiveState {
   sessionTimeline: HistoryEntry[];
   sessions: SessionSummary[];
   projects: ProjectSummary[];
+  auditDecisions: AuditDecision[];
   terminals: TerminalSessionMeta[];
   /** Set when the daemon refuses a sudo-class approve with
    * `web_reauth_required`. The App renders SudoModal while this is non-null;
@@ -96,6 +98,7 @@ export function useWisphive() {
     sessionTimeline: [],
     sessions: [],
     projects: [],
+    auditDecisions: [],
     terminals: [],
     pendingReauth: null,
     diskAlerts: [],
@@ -135,6 +138,17 @@ export function useWisphive() {
             const filtered = prev.queue.filter((r) => r.id !== msg.id);
             document.title = filtered.length > 0 ? `(${filtered.length}) Wisphive` : "Wisphive";
             return { ...prev, queue: filtered };
+          }
+
+          case "audit_snapshot":
+            return { ...prev, auditDecisions: mergeAuditDecisions([], msg.items) };
+
+          case "audit_decision": {
+            const { type: _, ...audit } = msg;
+            return {
+              ...prev,
+              auditDecisions: mergeAuditDecisions([audit as AuditDecision], prev.auditDecisions),
+            };
           }
 
           case "agents_snapshot":
@@ -589,4 +603,31 @@ function encodeBase64(bytes: Uint8Array): string {
   let binary = "";
   for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
   return btoa(binary);
+}
+
+function auditKey(audit: AuditDecision): string {
+  return [
+    audit.kind,
+    audit.ts,
+    audit.project,
+    audit.agent_id,
+    audit.terminal_session_id ?? "",
+    audit.tool_name,
+    audit.decided_by ?? "",
+  ].join("\u0000");
+}
+
+function mergeAuditDecisions(
+  primary: AuditDecision[],
+  secondary: AuditDecision[],
+): AuditDecision[] {
+  const seen = new Set<string>();
+  return [...primary, ...secondary]
+    .filter((audit) => {
+      const key = auditKey(audit);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime());
 }

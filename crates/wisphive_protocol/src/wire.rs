@@ -6,9 +6,9 @@ use std::path::PathBuf;
 use std::collections::HashMap;
 
 use crate::types::{
-    AgentInfo, AgentType, Decision, DecisionFilter, DecisionRequest, HistoryEntry, HistorySearch,
-    ManagedAgent, PermissionSuggestion, ProjectSummary, SessionSummary, SpawnAgentRequest,
-    TerminalDirection, TerminalSessionMeta, TerminalStatus, ToolResult,
+    AgentInfo, AgentType, AuditDecision, Decision, DecisionFilter, DecisionRequest, HistoryEntry,
+    HistorySearch, ManagedAgent, PermissionSuggestion, ProjectSummary, SessionSummary,
+    SpawnAgentRequest, TerminalDirection, TerminalSessionMeta, TerminalStatus, ToolResult,
 };
 
 /// Identifies the type of client connecting to the daemon.
@@ -343,6 +343,14 @@ pub enum ServerMessage {
     /// A decision was resolved (approved or denied).
     #[serde(rename = "decision_resolved")]
     DecisionResolved { id: Uuid, decision: Decision },
+
+    /// Bounded recent audit snapshot sent to TUI/web clients on connect.
+    #[serde(rename = "audit_snapshot")]
+    AuditSnapshot { items: Vec<AuditDecision> },
+
+    /// Live audit event for auto-answered/deferred/denied hook decisions.
+    #[serde(rename = "audit_decision")]
+    AuditDecision(AuditDecision),
 
     /// An agent connected (new hook session started).
     #[serde(rename = "agent_connected")]
@@ -794,6 +802,37 @@ mod tests {
                 assert_eq!(entries[0].tool_name, "Bash");
                 assert_eq!(request_id.unwrap(), "req-123");
             }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_audit_messages() {
+        let audit = AuditDecision {
+            kind: crate::types::AuditDecisionKind::AutoApproved,
+            decided_by: Some("level:all".into()),
+            project: PathBuf::from("/proj"),
+            agent_id: "cc-1".into(),
+            terminal_session_id: Some(uuid::Uuid::new_v4()),
+            tool_name: "Read".into(),
+            ts: chrono::Utc::now(),
+        };
+
+        let msg = ServerMessage::AuditDecision(audit.clone());
+        let encoded = encode(&msg).unwrap();
+        let decoded: ServerMessage = decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::AuditDecision(decoded) => assert_eq!(decoded, audit),
+            _ => panic!("unexpected variant"),
+        }
+
+        let snapshot = ServerMessage::AuditSnapshot {
+            items: vec![audit.clone()],
+        };
+        let encoded = encode(&snapshot).unwrap();
+        let decoded: ServerMessage = decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::AuditSnapshot { items } => assert_eq!(items, vec![audit]),
             _ => panic!("unexpected variant"),
         }
     }

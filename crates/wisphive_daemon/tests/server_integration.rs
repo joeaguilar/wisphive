@@ -53,6 +53,17 @@ async fn connect_as_tui(
     tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
     tokio::net::unix::OwnedWriteHalf,
 ) {
+    let (lines, writer, _) = connect_as_tui_with_audit(socket_path).await;
+    (lines, writer)
+}
+
+async fn connect_as_tui_with_audit(
+    socket_path: &std::path::Path,
+) -> (
+    tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    tokio::net::unix::OwnedWriteHalf,
+    Vec<AuditDecision>,
+) {
     let stream = UnixStream::connect(socket_path).await.unwrap();
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -88,7 +99,15 @@ async fn connect_as_tui(
         other => panic!("expected QueueSnapshot, got: {:?}", other),
     }
 
-    (lines, writer)
+    // Read initial recent-audit snapshot.
+    let audit_line = lines.next_line().await.unwrap().unwrap();
+    let audit: ServerMessage = decode(&audit_line).unwrap();
+    let audit_items = match audit {
+        ServerMessage::AuditSnapshot { items } => items,
+        other => panic!("expected AuditSnapshot, got: {:?}", other),
+    };
+
+    (lines, writer, audit_items)
 }
 
 /// Read TUI broadcast messages until we find one matching the predicate.
@@ -129,6 +148,40 @@ fn make_decision_request(tool_name: &str) -> DecisionRequest {
         event_data: None,
         terminal_session_id: None,
     }
+}
+
+fn hook_decision_event(
+    event: &str,
+    tool_name: &str,
+    agent_id: &str,
+    tool_use_id: &str,
+    decided_by: &str,
+) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "event": event,
+        "agent_id": agent_id,
+        "agent_type": "claude_code",
+        "project": "/test/audit",
+        "tool_name": tool_name,
+        "tool_input": {"path": "/tmp/example"},
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "tool_use_id": tool_use_id,
+        "hook_event_name": "PreToolUse",
+        "decided_by": decided_by,
+    }))
+    .unwrap()
+}
+
+async fn append_event_line(events_path: &std::path::Path, line: &str) {
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(events_path)
+        .await
+        .unwrap();
+    file.write_all(line.as_bytes()).await.unwrap();
+    file.write_all(b"\n").await.unwrap();
+    file.flush().await.unwrap();
 }
 
 /// Start a server in the background, return the shutdown sender and socket path.
@@ -755,6 +808,114 @@ async fn tui_snapshot_reflects_pending_decisions() {
             assert_eq!(items[0].tool_name, "Bash");
         }
         other => panic!("expected QueueSnapshot with 1 item, got: {:?}", other),
+    }
+
+    let audit_line = lines.next_line().await.unwrap().unwrap();
+    let audit: ServerMessage = decode(&audit_line).unwrap();
+    match audit {
+        ServerMessage::AuditSnapshot { items } => assert!(items.is_empty()),
+        other => panic!("expected AuditSnapshot, got: {:?}", other),
+    }
+
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn tui_receives_recent_audit_snapshot_on_connect() {
+    let (_tmp, config) = temp_config();
+    let socket_path = config.socket_path.clone();
+    let events_path = config.home_dir.join("events.jsonl");
+    let shutdown_tx = start_server(config).await;
+
+    append_event_line(
+        &events_path,
+        &hook_decision_event(
+            "auto_approved",
+            "Read",
+            "cc-audit",
+            "snapshot-1",
+            "level:all",
+        ),
+    )
+    .await;
+
+    // Force deterministic ingestion for the snapshot setup. The background tail
+    // may also see the line; reimport is idempotent either way.
+    let (mut first_lines, mut first_writer) = connect_as_tui(&socket_path).await;
+    first_writer
+        .write_all(encode(&ClientMessage::ReimportEvents).unwrap().as_bytes())
+        .await
+        .unwrap();
+    let _ = next_tui_msg(&mut first_lines, |m| {
+        matches!(m, ServerMessage::ReimportComplete { .. })
+    })
+    .await;
+
+    let (_lines, _writer, audit_items) = connect_as_tui_with_audit(&socket_path).await;
+    let audit = audit_items
+        .iter()
+        .find(|item| item.agent_id == "cc-audit")
+        .expect("recent audit snapshot should include imported auto-approval");
+    assert_eq!(audit.kind, AuditDecisionKind::AutoApproved);
+    assert_eq!(audit.decided_by.as_deref(), Some("level:all"));
+    assert_eq!(audit.project, PathBuf::from("/test/audit"));
+    assert_eq!(audit.tool_name, "Read");
+
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn tui_receives_live_audit_decisions_from_events_tail() {
+    let (_tmp, config) = temp_config();
+    let socket_path = config.socket_path.clone();
+    let events_path = config.home_dir.join("events.jsonl");
+    let shutdown_tx = start_server(config).await;
+
+    let (mut tui_lines, _tui_writer) = connect_as_tui(&socket_path).await;
+
+    append_event_line(
+        &events_path,
+        &hook_decision_event("auto_approved", "Read", "cc-live", "live-1", "level:all"),
+    )
+    .await;
+    let auto = next_tui_msg(&mut tui_lines, |m| {
+        matches!(m, ServerMessage::AuditDecision(_))
+    })
+    .await;
+    match auto {
+        ServerMessage::AuditDecision(audit) => {
+            assert_eq!(audit.kind, AuditDecisionKind::AutoApproved);
+            assert_eq!(audit.decided_by.as_deref(), Some("level:all"));
+            assert_eq!(audit.agent_id, "cc-live");
+            assert_eq!(audit.project, PathBuf::from("/test/audit"));
+            assert_eq!(audit.tool_name, "Read");
+        }
+        other => panic!("expected AuditDecision, got: {:?}", other),
+    }
+
+    append_event_line(
+        &events_path,
+        &hook_decision_event(
+            "deferred",
+            "AskUserQuestion",
+            "cc-live",
+            "live-2",
+            "always_ask:intrinsic",
+        ),
+    )
+    .await;
+    let deferred = next_tui_msg(&mut tui_lines, |m| {
+        matches!(m, ServerMessage::AuditDecision(_))
+    })
+    .await;
+    match deferred {
+        ServerMessage::AuditDecision(audit) => {
+            assert_eq!(audit.kind, AuditDecisionKind::Deferred);
+            assert_eq!(audit.decided_by.as_deref(), Some("always_ask:intrinsic"));
+            assert_eq!(audit.agent_id, "cc-live");
+            assert_eq!(audit.tool_name, "AskUserQuestion");
+        }
+        other => panic!("expected AuditDecision, got: {:?}", other),
     }
 
     let _ = shutdown_tx.send(true);
