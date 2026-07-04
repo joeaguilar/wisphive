@@ -248,6 +248,21 @@ body {
   margin-bottom: var(--space-lg);
 }
 
+/* ExitPlanMode plan-extraction failure (itr#253) + hook-layer note (itr#249) */
+.detail-section-error h3 { color: var(--red); }
+.plan-error {
+  color: var(--red);
+  font-size: 13px;
+}
+.plan-note {
+  color: var(--fg-dim);
+  font-size: 12px;
+  font-style: italic;
+  margin-bottom: var(--space-md);
+  line-height: 1.5;
+}
+.plan-note strong { color: var(--fg); font-style: normal; }
+
 .detail-section h3 {
   color: var(--cyan);
   font-size: 13px;

@@ -17,13 +17,13 @@ expression: frame
 │  2. Cover the detail views                                                                       │
 │  3. Enforce the status-bar house rule                                                            │
 │                                                                                                  │
+│  Note: Claude's finer plan options aren't available via the gate — accept or keep planning only. │
+│                                                                                                  │
 │  ── Actions ──                                                                                   │
 │                                                                                                  │
 │  [A] accept plan (exit plan mode)                                                                │
 │  [D] reject (continue planning)                                                                  │
 │  [M] reject with feedback                                                                        │
-│                                                                                                  │
-│                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │

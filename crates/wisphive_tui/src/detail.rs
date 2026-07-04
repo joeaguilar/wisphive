@@ -301,25 +301,47 @@ fn push_ask_question_detail(lines: &mut Vec<Line<'static>>, req: &DecisionReques
     }
 }
 
-/// Check if event_data contains plan content (ExitPlanMode).
+/// Check if event_data carries ExitPlanMode plan content — either the plan text
+/// or a structured extraction-error object (itr#253), both of which route to the
+/// plan detail view (the error case shows an explicit failure, not an empty panel).
 fn has_plan_content(req: &DecisionRequest) -> bool {
     req.event_data
         .as_ref()
         .and_then(|d| d.get("plan_content"))
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.is_empty())
+        .is_some_and(|v| v.as_str().is_some_and(|s| !s.is_empty()) || v.is_object())
 }
 
 fn push_plan_detail(lines: &mut Vec<Line<'static>>, req: &DecisionRequest, markdown_preview: bool) {
+    let plan_content = req.event_data.as_ref().and_then(|d| d.get("plan_content"));
+
+    // itr#253: a structured { error, path } object means transcript extraction
+    // failed — surface it explicitly instead of rendering an empty panel.
+    if let Some(err) = plan_content
+        .and_then(|v| v.get("error"))
+        .and_then(|v| v.as_str())
+    {
+        push_section_label(lines, "Plan unavailable");
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  Could not read the plan: {err}"),
+            Style::default().fg(Color::Red),
+        )));
+        if let Some(path) = plan_content
+            .and_then(|v| v.get("path"))
+            .and_then(|v| v.as_str())
+        {
+            lines.push(Line::from(Span::styled(
+                format!("  path: {path}"),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        return;
+    }
+
     push_section_label(lines, "Plan");
     lines.push(Line::from(""));
 
-    if let Some(plan) = req
-        .event_data
-        .as_ref()
-        .and_then(|d| d.get("plan_content"))
-        .and_then(|v| v.as_str())
-    {
+    if let Some(plan) = plan_content.and_then(|v| v.as_str()) {
         if markdown_preview {
             push_markdown_lines(lines, plan);
         } else {
@@ -331,6 +353,15 @@ fn push_plan_detail(lines: &mut Vec<Line<'static>>, req: &DecisionRequest, markd
             }
         }
     }
+
+    // itr#249: the hook layer only carries allow/deny for ExitPlanMode — Claude's
+    // finer native plan choices (auto-accept edits, manual review) aren't
+    // expressible through the gate. Say so rather than implying more.
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Note: Claude's finer plan options aren't available via the gate — accept or keep planning only.",
+        Style::default().fg(Color::DarkGray),
+    )));
 }
 
 fn push_generic_detail(lines: &mut Vec<Line<'static>>, req: &DecisionRequest) {
