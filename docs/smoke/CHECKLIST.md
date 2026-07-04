@@ -89,6 +89,26 @@ Copy this block into the appropriate phase section:
 - **Evidence:** _itr#323 note link_
 - [ ] Verified — signed off: _______
 
+### Command Center inbox: real daily two-session perception (added 2026-07-04, source: itr#438/#399, Sprint-2)
+- **Steps:** Automated §10 runtime evidence already captured — `crates/wisphive_web/frontend/e2e/inbox-command-center.spec.ts`
+  drives a REAL `wisphive daemon start --web` (isolated HOME) with the REAL `wisphive-hook`
+  binary authoring deferred + auto-approved `events.jsonl` records across two projects,
+  proving all five #438 ACs + the `wisphive audit` oracle; screenshots in
+  `sprint/sprint-2-2026-07-03-command-center-inbox/blitz/evidence/`. This human item is the
+  residual perception pass: run `wisphive daemon start --web`, open the Inbox in a real
+  browser, and work with **two genuine concurrent Claude/Codex sessions** in different
+  projects during normal use. Trigger a real gated decision in one and a real AskUserQuestion
+  in the other.
+- **Expected:** The gated decision surfaces within ~5 s with a live-ticking age and correct
+  project/session label; in-console approve unblocks the agent and clears the row. The real
+  AskUserQuestion surfaces as a deferred "waiting in your terminal" row showing the actual
+  question text/options; the go-to-terminal pointer (or Focus terminal for wisphive sessions)
+  lands you where you can answer. The auto-answer feed and `0 waiting · N auto-answered…`
+  header read true at a glance. Overall: the inbox _feels_ like a trustworthy single pane, not
+  a lagging mirror.
+- **Evidence:** _automated: e2e spec + `blitz/evidence/*.png` (attached to itr#399); human: subjective note + screenshot from a real two-session session_
+- [ ] Verified — signed off: _______
+
 ---
 
 ## Phase 5 — Remote access: scrollback + mobile pairing (upcoming; park until the phase lands)
