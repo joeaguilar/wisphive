@@ -23,12 +23,18 @@ export function TerminalView({ session, replayMode, onInput, onResize, registerH
   useEffect(() => {
     if (!containerRef.current) return;
 
+    // xterm renders to a canvas and can't resolve CSS custom properties, so
+    // read the canvas colour from the --bg design token at mount instead of
+    // hard-coding it (keeps the terminal in step with the theme).
+    const terminalBg =
+      getComputedStyle(document.documentElement).getPropertyValue("--bg").trim() || "#0a0a0a";
+
     const term = new Terminal({
       cols: session.cols,
       rows: session.rows,
       fontFamily: "Menlo, Monaco, Consolas, monospace",
       fontSize: 13,
-      theme: { background: "#0a0a12" },
+      theme: { background: terminalBg },
       cursorBlink: !replayMode,
       disableStdin: replayMode,
       scrollback: 5000,
@@ -105,17 +111,17 @@ export function TerminalView({ session, replayMode, onInput, onResize, registerH
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
-      <div style={{ padding: 6, fontSize: 12, background: "#0d0d18" }}>
+      <div style={{ padding: 6, fontSize: 12, background: "var(--bg-sidebar)" }}>
         <strong>{session.label ?? session.id.slice(0, 8)}</strong>
         {" · "}
         {session.command} {session.args.join(" ")}
         {" · "}
         <span className={`term-status term-status-${session.status}`}>{session.status}</span>
-        {replayMode && <span style={{ marginLeft: 8, color: "#b48ef0" }}>(replay)</span>}
+        {replayMode && <span style={{ marginLeft: 8, color: "var(--yellow)" }}>(replay)</span>}
       </div>
       <div
         ref={containerRef}
-        style={{ flex: 1, minHeight: 0, background: "#0a0a12" }}
+        style={{ flex: 1, minHeight: 0, background: "var(--bg)" }}
       />
     </div>
   );
