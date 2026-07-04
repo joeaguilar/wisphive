@@ -1,6 +1,7 @@
 pub mod config;
 pub mod disk_alert;
 pub mod event_ingest;
+pub mod hook_install;
 pub mod logging;
 pub mod notify;
 pub mod process_registry;

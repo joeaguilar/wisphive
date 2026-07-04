@@ -208,7 +208,10 @@ fn check_project_hook(
                 .get("hooks")
                 .and_then(|h| h.get("PreToolUse"))
                 .and_then(|arr| arr.as_array())
-                .is_some_and(|arr| arr.iter().any(super::hooks::has_wisphive_hook));
+                .is_some_and(|arr| {
+                    arr.iter()
+                        .any(wisphive_daemon::hook_install::has_wisphive_hook)
+                });
 
             if has_hook {
                 eprintln!("  OK  {agent_name} hooks installed");

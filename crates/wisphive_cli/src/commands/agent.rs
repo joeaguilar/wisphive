@@ -211,7 +211,10 @@ fn preflight_checks(project: &Path, agent_type: &AgentType) -> Result<()> {
         .get("hooks")
         .and_then(|hooks| hooks.get("PreToolUse"))
         .and_then(|rules| rules.as_array())
-        .is_some_and(|arr| arr.iter().any(super::hooks::has_wisphive_hook));
+        .is_some_and(|arr| {
+            arr.iter()
+                .any(wisphive_daemon::hook_install::has_wisphive_hook)
+        });
     if !installed {
         anyhow::bail!(
             "Wisphive PreToolUse hook not installed in {}.\n  fix: wisphive hooks install --project {}",
