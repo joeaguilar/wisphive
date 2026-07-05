@@ -183,7 +183,7 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
           Sign out
         </button>
         <div className="sidebar-agents">
-          <h3>Agents ({agents.length})</h3>
+          <h2>Agents ({agents.length})</h2>
           {agents.map((a) => (
             <div key={a.agent_id} className="agent-item">
               {a.agent_id.slice(0, 12)}

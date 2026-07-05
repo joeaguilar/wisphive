@@ -133,7 +133,9 @@ body {
   padding-top: 8px;
 }
 
-.sidebar-agents h3 {
+/* h2, not h3: this sits directly under the brand <h1>, so an h3 would skip a
+ * level (WCAG 1.3.1). Styled small by intent — a sidebar section label. */
+.sidebar-agents h2 {
   font-size: 11px;
   color: var(--text-dim);
   margin-bottom: 4px;
@@ -1868,6 +1870,7 @@ kbd {
 .tool-row:focus-visible,
 .terminals-project-picker-item:focus-visible,
 .terminals-section-header.clickable:focus-visible,
+.inbox-item:focus-visible,
 .inbox-deferred-item:focus-visible,
 .terminal-queue-dock-row-head:focus-visible {
   outline: var(--focus-ring);

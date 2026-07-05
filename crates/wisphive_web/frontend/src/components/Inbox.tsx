@@ -217,6 +217,7 @@ function InboxRow({ item, now, isOldest, selected, onSelect, onApprove, onDeny }
       style={{ borderLeftColor: color }}
       aria-current={selected}
       onClick={() => onSelect(item.id)}
+      {...activate(() => onSelect(item.id))}
     >
       <div className="inbox-item-topline">
         {prefix && <span className="event-prefix">{prefix}</span>}
