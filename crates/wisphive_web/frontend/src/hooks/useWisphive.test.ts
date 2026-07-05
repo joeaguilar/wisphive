@@ -134,6 +134,70 @@ describe("useWisphive hook-gating (itr#460)", () => {
     expect(result.current.hookErrors[PROJECT]).toBe("settings.json not writable");
   });
 
+  it("deferred_resolved removes the matching deferred row, leaving others (itr#461)", async () => {
+    const { result } = await mountOpen();
+
+    const mk = (tool_use_id: string) => ({
+      kind: "deferred" as const,
+      decided_by: "always_ask:intrinsic",
+      project: "/proj",
+      agent_id: "cc-1",
+      tool_name: "AskUserQuestion",
+      ts: "2026-07-04T11:58:00Z",
+      tool_use_id,
+    });
+
+    act(() =>
+      latest().emit({ type: "audit_snapshot", items: [mk("toolu_a"), mk("toolu_b")] }),
+    );
+    expect(result.current.auditDecisions).toHaveLength(2);
+
+    act(() =>
+      latest().emit({
+        type: "deferred_resolved",
+        tool_use_id: "toolu_a",
+        agent_id: "cc-1",
+        tool_name: "AskUserQuestion",
+        ts: "2026-07-04T12:00:00Z",
+        answer_summary: "Hey there!",
+      }),
+    );
+
+    // Only the answered row is dropped; the other still waits.
+    expect(result.current.auditDecisions).toHaveLength(1);
+    expect(result.current.auditDecisions[0].tool_use_id).toBe("toolu_b");
+  });
+
+  it("deferred_resolved for an unknown tool_use_id leaves all rows intact (itr#461)", async () => {
+    const { result } = await mountOpen();
+    act(() =>
+      latest().emit({
+        type: "audit_snapshot",
+        items: [
+          {
+            kind: "deferred",
+            decided_by: "always_ask:intrinsic",
+            project: "/proj",
+            agent_id: "cc-1",
+            tool_name: "AskUserQuestion",
+            ts: "2026-07-04T11:58:00Z",
+            tool_use_id: "toolu_keep",
+          },
+        ],
+      }),
+    );
+    act(() =>
+      latest().emit({
+        type: "deferred_resolved",
+        tool_use_id: "toolu_nope",
+        agent_id: "cc-1",
+        tool_name: "AskUserQuestion",
+        ts: "2026-07-04T12:00:00Z",
+      }),
+    );
+    expect(result.current.auditDecisions).toHaveLength(1);
+  });
+
   it("an InstallHooks reauth bounce stashes and, on reauth success, replays install_hooks", async () => {
     const { result } = await mountOpen();
 

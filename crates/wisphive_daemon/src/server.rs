@@ -669,10 +669,30 @@ async fn handle_hook(
             // Detached task because the retry schedule (itr#302) outlives this
             // ephemeral hook connection.
             let state_db = ctx.state_db.clone();
+            let tui_tx = ctx.tui_tx.clone();
             tokio::spawn(async move {
                 match attach_tool_result_with_retry(&state_db, &result, ATTACH_RETRY_DELAYS).await {
-                    Ok(Some(id)) => {
-                        info!(%id, tool = %result.tool_name, agent = %result.agent_id, "tool result attached");
+                    Ok(Some(attached)) => {
+                        let matched_id = attached.id;
+                        info!(id = %matched_id, tool = %result.tool_name, agent = %result.agent_id, "tool result attached");
+                        // A DEFERRED native prompt just got answered in the terminal —
+                        // tell clients so the inbox clears its "waiting in your terminal"
+                        // row (itr#461). Requires a tool_use_id to key the clear on; the
+                        // exact-match path always has one, the fuzzy fallback may not.
+                        if attached.was_deferred
+                            && let Some(tool_use_id) = result.tool_use_id.clone()
+                        {
+                            let _ = tui_tx.send(ServerMessage::DeferredResolved {
+                                tool_use_id,
+                                agent_id: result.agent_id.clone(),
+                                tool_name: result.tool_name.clone(),
+                                ts: chrono::Utc::now(),
+                                answer_summary: summarize_deferred_answer(
+                                    &result.tool_name,
+                                    &result.tool_result,
+                                ),
+                            });
+                        }
                     }
                     Ok(None) => {
                         warn!(tool = %result.tool_name, agent = %result.agent_id,
@@ -1961,13 +1981,47 @@ const ATTACH_RETRY_DELAYS: [Duration; 4] = [
     Duration::from_secs(10),
 ];
 
+/// Best-effort one-line summary of what the human chose when answering a
+/// deferred native prompt, for the `DeferredResolved` broadcast (itr#461).
+///
+/// AskUserQuestion's `tool_response.answers` is a `{ question: chosen }` map — we
+/// join the chosen values. ExitPlanMode/Elicitation carry no meaningful selection
+/// (the answer is just "proceed"), so they yield None. The response is redacted
+/// first (itr#89) since it may echo tool output; the result is truncated so a
+/// pathological answer can't bloat the broadcast.
+fn summarize_deferred_answer(
+    tool_name: &str,
+    tool_result: &serde_json::Value,
+) -> Option<String> {
+    if tool_name != "AskUserQuestion" {
+        return None;
+    }
+    let redacted = wisphive_protocol::redact::redact_value(tool_result);
+    let answers = redacted.get("answers")?.as_object()?;
+    let joined = answers
+        .values()
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    if joined.is_empty() {
+        return None;
+    }
+    const MAX: usize = 200;
+    if joined.chars().count() > MAX {
+        Some(joined.chars().take(MAX).collect::<String>() + "…")
+    } else {
+        Some(joined)
+    }
+}
+
 /// Attach a tool result, retrying per `delays` while no decision row matches.
-/// Returns the matched decision id, or `None` once the schedule is exhausted.
+/// Returns the matched row (id + whether it was a deferral), or `None` once the
+/// schedule is exhausted.
 async fn attach_tool_result_with_retry(
     state_db: &StateDb,
     result: &wisphive_protocol::ToolResult,
     delays: impl IntoIterator<Item = Duration>,
-) -> Result<Option<uuid::Uuid>> {
+) -> Result<Option<crate::state::AttachedResult>> {
     let attach = || {
         state_db.attach_tool_result(
             &result.agent_id,
@@ -1976,13 +2030,13 @@ async fn attach_tool_result_with_retry(
             result.tool_use_id.as_deref(),
         )
     };
-    if let Some(id) = attach().await? {
-        return Ok(Some(id));
+    if let Some(attached) = attach().await? {
+        return Ok(Some(attached));
     }
     for delay in delays {
         tokio::time::sleep(delay).await;
-        if let Some(id) = attach().await? {
-            return Ok(Some(id));
+        if let Some(attached) = attach().await? {
+            return Ok(Some(attached));
         }
     }
     Ok(None)

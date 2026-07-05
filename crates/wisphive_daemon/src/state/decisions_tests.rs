@@ -475,6 +475,55 @@ async fn recent_audit_decisions_returns_auto_and_deferred_not_human_denies() {
     assert_eq!(recent[1].decided_by.as_deref(), Some("level:all"));
 }
 
+#[tokio::test]
+async fn deferred_row_attach_flags_was_deferred_and_resolved() {
+    // itr#461: answering a deferred native prompt in the terminal arrives as a
+    // PostToolUse ToolResult. attach_tool_result must flag the matched row as a
+    // deferral (so the server broadcasts DeferredResolved), and a subsequent
+    // snapshot must mark that row resolved so a reconnect does not re-show it.
+    let db = test_db().await;
+
+    db.log_auto_approved(&AutoApprovedEntry {
+        agent_id: "cc-2",
+        agent_type: "\"claude_code\"",
+        project: "/muse",
+        tool_name: "AskUserQuestion",
+        tool_input: "{}",
+        timestamp: "2024-01-01T00:01:00Z",
+        tool_use_id: Some("defer-42"),
+        hook_event_name: Some("PreToolUse"),
+        decision: "ask",
+        decided_by: Some("always_ask:intrinsic"),
+        config_hash: None,
+    })
+    .await
+    .unwrap();
+
+    let since = chrono::DateTime::parse_from_rfc3339("2023-12-31T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    // Before answering: the deferral is surfaced as NOT resolved.
+    let before = db.recent_audit_decisions(since, 10).await.unwrap();
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].resolved, Some(false));
+    assert_eq!(before[0].tool_use_id.as_deref(), Some("defer-42"));
+
+    // The answer arrives (exact tool_use_id match); the row is a deferral.
+    let answer = serde_json::json!({"answers": {"Greeting?": "Hey there!"}});
+    let matched = db
+        .attach_tool_result("cc-2", "AskUserQuestion", &answer, Some("defer-42"))
+        .await
+        .unwrap()
+        .expect("deferred row should match");
+    assert!(matched.was_deferred);
+
+    // After answering: the same row is surfaced as resolved.
+    let after = db.recent_audit_decisions(since, 10).await.unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].resolved, Some(true));
+}
+
 // ════════════════════════════════════════════════════════════
 // attach_tool_result
 // ════════════════════════════════════════════════════════════
@@ -493,7 +542,10 @@ async fn attach_tool_result_by_tool_use_id() {
         .await
         .unwrap();
     assert!(matched.is_some());
-    assert_eq!(matched.unwrap(), id);
+    let matched = matched.unwrap();
+    assert_eq!(matched.id, id);
+    // An approved (non-deferred) row must not be flagged as a deferral.
+    assert!(!matched.was_deferred);
 
     let history = db.query_history(None, 10).await.unwrap();
     assert!(history[0].tool_result.is_some());

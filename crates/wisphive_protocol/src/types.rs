@@ -466,6 +466,18 @@ pub struct AuditDecision {
     pub terminal_session_id: Option<Uuid>,
     pub tool_name: String,
     pub ts: DateTime<Utc>,
+    /// The Claude Code `tool_use_id` of the gated call, when the source row carried one.
+    /// For a DEFERRED native prompt this is the stable key that a later
+    /// [`ServerMessage::DeferredResolved`] correlates against so the inbox can clear the
+    /// exact "waiting in your terminal" row once the prompt is answered (itr#440 / #462).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_use_id: Option<String>,
+    /// Set on a DEFERRED row that has since been ANSWERED in the native prompt: the daemon
+    /// stamped its `tool_result` (via `attach_tool_result`) so a reconnect snapshot can mark
+    /// the deferral resolved rather than re-showing it as waiting (itr#461). None = still
+    /// waiting (or not a deferral).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<bool>,
     /// Redacted tool input for DEFERRED native prompts (AskUserQuestion / ExitPlanMode /
     /// Elicitation), so the inbox can show the literal question + options. Present only
     /// for kind == Deferred; None for auto-approved/denied to keep the wire lean. Already

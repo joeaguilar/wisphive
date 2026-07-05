@@ -214,6 +214,34 @@ describe("Inbox", () => {
     expect(within(section).queryByRole("button", { name: "Deny" })).not.toBeInTheDocument();
   });
 
+  it("omits an already-answered (resolved) deferral from the waiting list (itr#461)", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(NOW));
+
+    render(
+      <Inbox
+        items={[]}
+        auditDecisions={[
+          // Answered on a prior connect — the reconnect snapshot marks it resolved.
+          deferred({ tool_use_id: "toolu_done", resolved: true }),
+          // Still waiting — must remain visible.
+          deferred({ tool_use_id: "toolu_wait", tool_name: "ExitPlanMode" }),
+        ]}
+        selectedId={null}
+        onSelect={vi.fn()}
+        onApprove={vi.fn()}
+        onDeny={vi.fn()}
+        onFocusTerminal={vi.fn()}
+      />,
+    );
+
+    const section = screen.getByLabelText("Waiting in your terminal");
+    expect(within(section).getByText("ExitPlanMode")).toBeInTheDocument();
+    expect(within(section).queryByText("AskUserQuestion")).not.toBeInTheDocument();
+    // Header counts only the one still-waiting row.
+    expect(screen.getByRole("status").textContent).toContain("1 in your terminal");
+  });
+
   it("shows a go-to-terminal pointer naming the project for a hook-only deferred item", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(NOW));

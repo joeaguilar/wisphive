@@ -168,6 +168,19 @@ export function useWisphive() {
             };
           }
 
+          case "deferred_resolved": {
+            // A deferred native prompt was answered in the terminal (itr#461).
+            // Mirror the Queue's splice-on-resolve (see "decision_resolved"
+            // above): drop the matching deferred row so it leaves "waiting in
+            // your terminal" immediately. The answered outcome stays discoverable
+            // in History (the decision_log row now carries tool_result). Keyed on
+            // tool_use_id, the stable id the daemon correlated the answer against.
+            const resolvedDeferrals = prev.auditDecisions.filter(
+              (a) => !(a.kind === "deferred" && a.tool_use_id === msg.tool_use_id),
+            );
+            return { ...prev, auditDecisions: resolvedDeferrals };
+          }
+
           case "agents_snapshot":
             return { ...prev, agents: msg.agents };
 
@@ -703,6 +716,11 @@ function auditKey(audit: AuditDecision): string {
     audit.terminal_session_id ?? "",
     audit.tool_name,
     audit.decided_by ?? "",
+    // tool_use_id distinguishes two genuinely distinct calls that otherwise share
+    // every field (e.g. two AskUserQuestions in the same session at the same
+    // second). It is also the key deferred_resolved correlates on, so collapsing
+    // them here would let one resolution clear the wrong/both rows (itr#461).
+    audit.tool_use_id ?? "",
   ].join("\u0000");
 }
 

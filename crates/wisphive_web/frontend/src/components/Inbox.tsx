@@ -72,13 +72,27 @@ export function Inbox({
   // Always-deferred native prompts (ADR-0002) never reach the in-console
   // queue — they arrive only as `deferred` AuditDecision events. Surface the
   // recent ones as their own "waiting in your terminal" section, distinct from
-  // the daemon-queued rows that CAN be approved/denied here. Bounded to the
-  // last hour because wisphive gets no signal when a native prompt is answered
-  // (itr#440), so stale rows would otherwise pile up.
+  // the daemon-queued rows that CAN be approved/denied here.
+  //
+  // Bounded to the last hour as a backstop: a prompt answered in the terminal
+  // DOES signal back — PostToolUse fires and the daemon stamps the answer onto
+  // the deferred row via attach_tool_result (spike itr#442, GO) — but the
+  // resolution broadcast + row-clear is not wired yet (itr#440 → #461/#462/#463).
+  // Until it lands, the hour window keeps answered/abandoned rows from piling up.
+  // (Abandoned prompts — session killed mid-prompt, no PostToolUse — are handled
+  // by the dead-session fade, itr#464.)
   const deferred = useMemo(
     () =>
       auditDecisions
-        .filter((a) => a.kind === "deferred" && coarseNow - new Date(a.ts).getTime() <= HOUR_MS)
+        .filter(
+          (a) =>
+            a.kind === "deferred" &&
+            // A reconnect snapshot marks already-answered deferrals resolved
+            // (itr#461); those are no longer "waiting" — keep them out of this
+            // list so a refresh/second device doesn't re-surface answered rows.
+            !a.resolved &&
+            coarseNow - new Date(a.ts).getTime() <= HOUR_MS,
+        )
         .sort((a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime()),
     [auditDecisions, coarseNow],
   );

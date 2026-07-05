@@ -26,7 +26,32 @@ type AuditDecisionRow = (
     Option<String>,
     Option<String>,
     i64,
+    // tool_use_id — stable key a `deferred_resolved` correlates against (itr#462)
+    Option<String>,
+    // tool_result — non-NULL on a deferral means it was answered (itr#461)
+    Option<String>,
 );
+
+/// Outcome of [`StateDb::attach_tool_result`]: the matched decision_log row's id
+/// and whether it was a DEFERRED native prompt (`decision = "ask"`), which the
+/// server uses to decide whether to broadcast a `DeferredResolved` (itr#461).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachedResult {
+    pub id: uuid::Uuid,
+    pub was_deferred: bool,
+}
+
+impl AttachedResult {
+    /// Build from the raw `id` + `decision` columns. Returns None only if the id
+    /// fails to parse (unreachable for daemon-written rows, kept for total safety).
+    fn from_row(id_str: &str, decision: &str) -> Option<Self> {
+        Some(Self {
+            id: id_str.parse().ok()?,
+            // `decision` is stored JSON-encoded, so a deferral is the literal `"ask"`.
+            was_deferred: decision == "\"ask\"",
+        })
+    }
+}
 
 /// Parameters for logging a hook-resolved (non-human) decision from
 /// events.jsonl: an auto-approved tool call, an always-defer deferral, or a
@@ -301,13 +326,18 @@ impl StateDb {
     ///
     /// If `tool_use_id` is provided, does an exact match. Otherwise falls back
     /// to fuzzy correlation by agent_id + tool_name + recency.
+    ///
+    /// Returns the matched row's id plus whether it was a DEFERRED native prompt
+    /// (`decision = "ask"`). A deferred match means the human just answered a
+    /// prompt that the inbox is still showing as "waiting in your terminal", so
+    /// the caller broadcasts `DeferredResolved` to clear it (itr#461).
     pub async fn attach_tool_result(
         &self,
         agent_id: &str,
         tool_name: &str,
         tool_result: &serde_json::Value,
         tool_use_id: Option<&str>,
-    ) -> Result<Option<uuid::Uuid>> {
+    ) -> Result<Option<AttachedResult>> {
         // Tool responses carry file contents / command output that routinely
         // include credentials — scrub before persisting (itr#89).
         let result_json =
@@ -315,8 +345,8 @@ impl StateDb {
 
         // Try exact match by tool_use_id first
         if let Some(tui) = tool_use_id {
-            let row: Option<(String,)> = sqlx::query_as(
-                "SELECT id FROM decision_log
+            let row: Option<(String, String)> = sqlx::query_as(
+                "SELECT id, decision FROM decision_log
                  WHERE tool_use_id = ? AND tool_result IS NULL
                  LIMIT 1",
             )
@@ -324,20 +354,20 @@ impl StateDb {
             .fetch_optional(&self.pool)
             .await?;
 
-            if let Some((id_str,)) = row {
+            if let Some((id_str, decision)) = row {
                 sqlx::query("UPDATE decision_log SET tool_result = ? WHERE id = ?")
                     .bind(&result_json)
                     .bind(&id_str)
                     .execute(&self.pool)
                     .await?;
-                return Ok(id_str.parse().ok());
+                return Ok(AttachedResult::from_row(&id_str, &decision));
             }
         }
 
         // Fallback: fuzzy match by agent_id + tool_name + recency
         let cutoff = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT id FROM decision_log
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT id, decision FROM decision_log
              WHERE agent_id = ? AND tool_name = ? AND tool_result IS NULL
              AND resolved_at > ?
              ORDER BY resolved_at DESC LIMIT 1",
@@ -348,13 +378,13 @@ impl StateDb {
         .fetch_optional(&self.pool)
         .await?;
 
-        if let Some((id_str,)) = row {
+        if let Some((id_str, decision)) = row {
             sqlx::query("UPDATE decision_log SET tool_result = ? WHERE id = ?")
                 .bind(&result_json)
                 .bind(&id_str)
                 .execute(&self.pool)
                 .await?;
-            Ok(id_str.parse().ok())
+            Ok(AttachedResult::from_row(&id_str, &decision))
         } else {
             Ok(None)
         }
@@ -431,7 +461,7 @@ impl StateDb {
     ) -> Result<Vec<wisphive_protocol::AuditDecision>> {
         let rows: Vec<AuditDecisionRow> = sqlx::query_as(
             "SELECT agent_id, project, tool_name, decision, resolved_at, requested_at,
-                    terminal_session_id, decided_by, auto_approved
+                    terminal_session_id, decided_by, auto_approved, tool_use_id, tool_result
              FROM decision_log
              WHERE resolved_at >= ?
                AND (
@@ -465,6 +495,8 @@ impl StateDb {
                     terminal_session_id,
                     decided_by,
                     auto_approved,
+                    tool_use_id,
+                    tool_result,
                 )| {
                     let kind =
                         audit_kind_from_row(auto_approved, &decision, decided_by.as_deref())?;
@@ -472,6 +504,16 @@ impl StateDb {
                         .or_else(|_| chrono::DateTime::parse_from_rfc3339(&requested_at))
                         .ok()?
                         .with_timezone(&chrono::Utc);
+                    // For a DEFERRED row, a non-NULL tool_result means the native prompt
+                    // was answered (the daemon stamped it via attach_tool_result), so a
+                    // client reconnecting mid-hour renders it resolved rather than waiting
+                    // (itr#461). Only meaningful for deferrals; None otherwise.
+                    let resolved = match kind {
+                        wisphive_protocol::AuditDecisionKind::Deferred => {
+                            Some(tool_result.is_some())
+                        }
+                        _ => None,
+                    };
                     Some(wisphive_protocol::AuditDecision {
                         kind,
                         decided_by,
@@ -482,6 +524,8 @@ impl StateDb {
                             .and_then(|s| uuid::Uuid::parse_str(s).ok()),
                         tool_name,
                         ts,
+                        tool_use_id,
+                        resolved,
                         // Snapshot seed is served from SQLite; the redacted
                         // deferred tool_input rides the live ingest wire only.
                         tool_input: None,

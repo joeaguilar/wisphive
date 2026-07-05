@@ -56,6 +56,15 @@ export interface AuditDecision {
   terminal_session_id?: string;
   tool_name: string;
   ts: string;
+  /** Claude Code tool_use_id of the gated call, when present. For a DEFERRED
+   * prompt this is the stable key a later `deferred_resolved` correlates against
+   * so the inbox can clear the exact "waiting in your terminal" row (itr#462). */
+  tool_use_id?: string;
+  /** Set on a DEFERRED row that has since been ANSWERED in the native prompt
+   * (daemon stamped its tool_result). True → resolved; a reconnect snapshot uses
+   * this so an already-answered deferral is not re-shown as waiting (itr#461).
+   * Absent = still waiting or not a deferral. */
+  resolved?: boolean;
   /** Redacted tool input for DEFERRED native prompts (AskUserQuestion /
    * ExitPlanMode / Elicitation) so the inbox can render the literal question +
    * options. Present only for kind === "deferred"; absent otherwise. Already
@@ -112,6 +121,14 @@ export type ServerMessage =
   | { type: "decision_resolved"; id: string; decision: string }
   | { type: "audit_snapshot"; items: AuditDecision[] }
   | { type: "audit_decision" } & AuditDecision
+  | {
+      type: "deferred_resolved";
+      tool_use_id: string;
+      agent_id: string;
+      tool_name: string;
+      ts: string;
+      answer_summary?: string;
+    }
   | { type: "agent_connected" } & AgentInfo
   | { type: "agent_disconnected"; agent_id: string }
   | { type: "agents_snapshot"; agents: AgentInfo[] }

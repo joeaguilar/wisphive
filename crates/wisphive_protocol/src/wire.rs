@@ -366,6 +366,22 @@ pub enum ServerMessage {
     #[serde(rename = "audit_decision")]
     AuditDecision(AuditDecision),
 
+    /// A previously DEFERRED native prompt (AskUserQuestion / ExitPlanMode / Elicitation)
+    /// was ANSWERED in the agent's terminal. Emitted when the daemon correlates a
+    /// PostToolUse `ToolResult` onto the deferred `decision_log` row (via `tool_use_id`).
+    /// Lets the inbox clear the matching "waiting in your terminal" row; the outcome then
+    /// surfaces in the audit/History feed (itr#440 / #461). `answer_summary` is a redacted,
+    /// human-readable one-liner of the chosen option(s), when derivable.
+    #[serde(rename = "deferred_resolved")]
+    DeferredResolved {
+        tool_use_id: String,
+        agent_id: String,
+        tool_name: String,
+        ts: chrono::DateTime<chrono::Utc>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answer_summary: Option<String>,
+    },
+
     /// An agent connected (new hook session started).
     #[serde(rename = "agent_connected")]
     AgentConnected(AgentInfo),
@@ -847,6 +863,8 @@ mod tests {
             terminal_session_id: Some(uuid::Uuid::new_v4()),
             tool_name: "Read".into(),
             ts: chrono::Utc::now(),
+            tool_use_id: None,
+            resolved: None,
             tool_input: None,
         };
 
@@ -878,6 +896,8 @@ mod tests {
             terminal_session_id: None,
             tool_name: "AskUserQuestion".into(),
             ts: chrono::Utc::now(),
+            tool_use_id: Some("toolu_abc123".into()),
+            resolved: None,
             tool_input: Some(serde_json::json!({
                 "questions": [
                     { "question": "Ship it?", "options": [{ "label": "Yes" }] }

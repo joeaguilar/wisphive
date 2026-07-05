@@ -392,6 +392,12 @@ pub async fn ingest_line(line: &str, state_db: &StateDb) -> anyhow::Result<Optio
         terminal_session_id,
         tool_name: tool_name.to_owned(),
         ts,
+        // Carry tool_use_id so a later `deferred_resolved` (itr#461) can match this
+        // exact waiting row. A freshly-ingested deferral is by definition not yet
+        // answered, so `resolved` stays None here (Some(true) is set only on the
+        // reconnect snapshot for rows whose tool_result was later stamped).
+        tool_use_id: tool_use_id.map(str::to_owned),
+        resolved: None,
         tool_input: wire_tool_input,
     }))
 }

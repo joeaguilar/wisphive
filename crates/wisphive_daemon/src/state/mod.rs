@@ -12,7 +12,7 @@ mod terminals;
 mod web_auth;
 mod web_passkeys;
 
-pub use decisions::AutoApprovedEntry;
+pub use decisions::{AttachedResult, AutoApprovedEntry};
 pub use retention::RetentionOutcome;
 pub use web_auth::{WebAuditRow, WebAuthError, WebAuthResult, WebDeviceRow};
 pub use web_passkeys::WebPasskeyRow;
