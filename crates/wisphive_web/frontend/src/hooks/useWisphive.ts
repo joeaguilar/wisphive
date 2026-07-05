@@ -33,6 +33,13 @@ export interface WisphiveState {
    * project. Server/agent-derived — render as inert text. */
   hookErrors: Record<string, string>;
   auditDecisions: AuditDecision[];
+  /** Agent ids the daemon has told us DISCONNECTED (registry reap →
+   * `agent_disconnected`) and have not since reconnected. Positive "session is
+   * gone" evidence — a deferred prompt from such a session can never be answered,
+   * so the inbox drops it (itr#464). Deliberately built only from observed
+   * disconnects (not "absent from the live snapshot"), so a session that merely
+   * hasn't registered yet is never falsely treated as gone. */
+  endedAgentIds: string[];
   terminals: TerminalSessionMeta[];
   /** Set when the daemon refuses a sudo-class approve with
    * `web_reauth_required`. The App renders SudoModal while this is non-null;
@@ -116,6 +123,7 @@ export function useWisphive() {
     hookStatus: {},
     hookErrors: {},
     auditDecisions: [],
+    endedAgentIds: [],
     terminals: [],
     pendingReauth: null,
     diskAlerts: [],
@@ -181,18 +189,35 @@ export function useWisphive() {
             return { ...prev, auditDecisions: resolvedDeferrals };
           }
 
-          case "agents_snapshot":
-            return { ...prev, agents: msg.agents };
+          case "agents_snapshot": {
+            // Any agent that is live in the snapshot is, by definition, not gone —
+            // reconcile it out of the ended set (itr#464).
+            const liveIds = new Set(msg.agents.map((a) => a.agent_id));
+            return {
+              ...prev,
+              agents: msg.agents,
+              endedAgentIds: prev.endedAgentIds.filter((id) => !liveIds.has(id)),
+            };
+          }
 
           case "agent_connected": {
             const { type: _, ...info } = msg;
-            return { ...prev, agents: [...prev.agents, info as AgentInfo] };
+            return {
+              ...prev,
+              agents: [...prev.agents, info as AgentInfo],
+              // Reconnected → no longer gone.
+              endedAgentIds: prev.endedAgentIds.filter((id) => id !== info.agent_id),
+            };
           }
 
           case "agent_disconnected":
             return {
               ...prev,
               agents: prev.agents.filter((a) => a.agent_id !== msg.agent_id),
+              // Record positive "session gone" evidence for the inbox (itr#464).
+              endedAgentIds: prev.endedAgentIds.includes(msg.agent_id)
+                ? prev.endedAgentIds
+                : [...prev.endedAgentIds, msg.agent_id],
             };
 
           case "history_response": {

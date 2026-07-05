@@ -242,6 +242,32 @@ describe("Inbox", () => {
     expect(screen.getByRole("status").textContent).toContain("1 in your terminal");
   });
 
+  it("drops a deferred row whose session the daemon reported gone (itr#464)", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(NOW));
+
+    render(
+      <Inbox
+        items={[]}
+        auditDecisions={[
+          deferred({ agent_id: "cc-gone", tool_use_id: "toolu_gone" }),
+          deferred({ agent_id: "cc-live", tool_use_id: "toolu_live", tool_name: "ExitPlanMode" }),
+        ]}
+        endedAgentIds={["cc-gone"]}
+        selectedId={null}
+        onSelect={vi.fn()}
+        onApprove={vi.fn()}
+        onDeny={vi.fn()}
+        onFocusTerminal={vi.fn()}
+      />,
+    );
+
+    const section = screen.getByLabelText("Waiting in your terminal");
+    expect(within(section).getByText("ExitPlanMode")).toBeInTheDocument();
+    expect(within(section).queryByText("AskUserQuestion")).not.toBeInTheDocument();
+    expect(screen.getByRole("status").textContent).toContain("1 in your terminal");
+  });
+
   it("shows a go-to-terminal pointer naming the project for a hook-only deferred item", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(NOW));

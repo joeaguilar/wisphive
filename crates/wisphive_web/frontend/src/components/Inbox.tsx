@@ -15,6 +15,10 @@ import { activate } from "./a11y";
 interface InboxProps {
   items: DecisionRequest[];
   auditDecisions: AuditDecision[];
+  /** Agent ids whose session the daemon has reported gone (itr#464). A deferred
+   * prompt from a dead session can never be answered in its terminal, so it is
+   * dropped from the waiting list rather than left as a dead pointer. */
+  endedAgentIds?: string[];
   selectedId: string | null;
   onSelect: (id: string) => void;
   onApprove: (id: string, opts?: { additional_context?: string; always_allow?: boolean }) => void;
@@ -32,6 +36,7 @@ const HOUR_MS = 60 * 60 * 1000;
 export function Inbox({
   items,
   auditDecisions,
+  endedAgentIds,
   selectedId,
   onSelect,
   onApprove,
@@ -81,6 +86,7 @@ export function Inbox({
   // Until it lands, the hour window keeps answered/abandoned rows from piling up.
   // (Abandoned prompts — session killed mid-prompt, no PostToolUse — are handled
   // by the dead-session fade, itr#464.)
+  const endedAgents = useMemo(() => new Set(endedAgentIds ?? []), [endedAgentIds]);
   const deferred = useMemo(
     () =>
       auditDecisions
@@ -91,10 +97,14 @@ export function Inbox({
             // (itr#461); those are no longer "waiting" — keep them out of this
             // list so a refresh/second device doesn't re-surface answered rows.
             !a.resolved &&
+            // The originating session is gone (itr#464): the prompt can never be
+            // answered in its terminal, so drop the row rather than leave a dead
+            // "Answer in your terminal" pointer.
+            !endedAgents.has(a.agent_id) &&
             coarseNow - new Date(a.ts).getTime() <= HOUR_MS,
         )
         .sort((a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime()),
-    [auditDecisions, coarseNow],
+    [auditDecisions, coarseNow, endedAgents],
   );
   const deferredGroups = useMemo(() => groupDeferred(deferred), [deferred]);
 

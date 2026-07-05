@@ -198,6 +198,30 @@ describe("useWisphive hook-gating (itr#460)", () => {
     expect(result.current.auditDecisions).toHaveLength(1);
   });
 
+  it("agent_disconnected records a gone session; reconnect clears it (itr#464)", async () => {
+    const { result } = await mountOpen();
+
+    act(() => latest().emit({ type: "agent_disconnected", agent_id: "cc-gone" }));
+    expect(result.current.endedAgentIds).toContain("cc-gone");
+
+    // A repeat disconnect must not duplicate the id.
+    act(() => latest().emit({ type: "agent_disconnected", agent_id: "cc-gone" }));
+    expect(result.current.endedAgentIds.filter((id) => id === "cc-gone")).toHaveLength(1);
+
+    // Reconnecting the same agent clears the gone flag.
+    act(() =>
+      latest().emit({
+        type: "agent_connected",
+        agent_id: "cc-gone",
+        agent_type: "claude_code",
+        project: "/proj",
+        connected_at: "2026-07-04T12:00:00Z",
+        last_seen: "2026-07-04T12:00:00Z",
+      }),
+    );
+    expect(result.current.endedAgentIds).not.toContain("cc-gone");
+  });
+
   it("an InstallHooks reauth bounce stashes and, on reauth success, replays install_hooks", async () => {
     const { result } = await mountOpen();
 

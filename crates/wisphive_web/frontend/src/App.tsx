@@ -57,7 +57,7 @@ function App() {
 
 function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
   const {
-    connected, queue, agents, projects, hookStatus, hookErrors, auditDecisions, history, agentTimeline, sessionTimeline, sessions, terminals,
+    connected, queue, agents, projects, hookStatus, hookErrors, auditDecisions, endedAgentIds, history, agentTimeline, sessionTimeline, sessions, terminals,
     pendingReauth, diskAlerts, approve, deny, dismissReauth, retryPendingApprove,
     spawnAgent, queryProjects, installHooks, queryProjectHookStatus, queryHistory, queryAgentTimeline, querySessionTimeline, searchHistory, querySessions,
     termList, termCreate, termAttach, termDetach, termInput, termResize, termClose, termReplay, termSetGroup, termReorder, registerTerminalHandler,
@@ -198,6 +198,7 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
           <Inbox
             items={queue}
             auditDecisions={auditDecisions}
+            endedAgentIds={endedAgentIds}
             selectedId={selectedId}
             onSelect={setSelectedId}
             onApprove={(id, opts) => { approve(id, opts); setSelectedId(null); }}
