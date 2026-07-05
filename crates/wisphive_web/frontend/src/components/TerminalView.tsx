@@ -98,26 +98,29 @@ export function TerminalView({ session, replayMode, onInput, onResize, registerH
     resizeObserver.observe(containerRef.current);
 
     // Touch-to-scroll (itr#445). xterm's viewport scrolls via the wheel or the
-    // scrollbar, but a phone/tablet has neither — so a vertical touch-drag has
-    // to be translated into a scrollback scroll by hand. xterm 6 renders through
-    // a custom (Monaco-style) scrollable, NOT a native overflow:auto viewport —
-    // so writing `.xterm-viewport.scrollTop` is ignored. We drive the public
-    // `term.scrollLines()` API instead, converting the finger's pixel travel
-    // into whole-row deltas (px-per-row = viewport height / rows) and tracking
-    // how many rows we've already applied this gesture so the content follows
-    // the finger smoothly. Listeners are native + capture phase with
-    // { passive: false } because React's synthetic touch handlers are passive
-    // and cannot preventDefault; stopPropagation keeps xterm from starting a
-    // text selection mid-scroll. A tap (no movement past the threshold) is never
-    // intercepted, so tap-to-focus + the on-screen keyboard keep working.
-    // `touch-action: none` on the container (set inline below) stops an ancestor
-    // overflow:auto pane from claiming the gesture first.
+    // scrollbar, but a phone/tablet has neither — and xterm 6's own touch
+    // Gesture does not scroll this build — so a vertical touch-drag has to be
+    // translated into a scrollback scroll by hand. We drive the public
+    // `term.scrollToLine()` API with an ABSOLUTE target computed from the
+    // gesture's anchor (the viewport-top buffer line captured at touchstart)
+    // plus the finger's pixel travel in rows. Absolute positioning — rather than
+    // an accumulated per-move delta — means a boundary clamp at the top of
+    // history or the live tail cannot desync the gesture: xterm clamps
+    // scrollToLine internally and a reversal still tracks the finger (itr#477;
+    // the old accumulator advanced by *requested* rows and drifted at clamps).
+    // Listeners are native + capture phase with { passive: false } because
+    // React's synthetic touch handlers are passive and cannot preventDefault;
+    // stopPropagation keeps xterm from starting a text selection mid-scroll. A
+    // tap (no movement past the threshold) is never intercepted, so tap-to-focus
+    // + the on-screen keyboard keep working. `touch-action: pinch-zoom` on the
+    // container (set inline below) keeps an ancestor overflow:auto pane from
+    // claiming the single-finger pan while still allowing pinch-zoom (itr#478).
     const container = containerRef.current;
     const viewport = container.querySelector<HTMLElement>(".xterm-viewport");
     const SCROLL_LOCK_PX = 6; // movement before a drag commits to scrolling
     let activeTouchId: number | null = null;
     let startY = 0;
-    let appliedRows = 0; // rows already scrolled this gesture (signed)
+    let anchorTop = 0; // viewport-top buffer line captured at gesture start
     let scrolling = false;
 
     // Height of one terminal row in CSS px. The viewport is exactly rows tall,
@@ -135,7 +138,7 @@ export function TerminalView({ session, replayMode, onInput, onResize, registerH
       const t = e.touches[0];
       activeTouchId = t.identifier;
       startY = t.clientY;
-      appliedRows = 0;
+      anchorTop = term.buffer.active.viewportY;
       scrolling = false;
     };
     const onTouchMove = (e: TouchEvent) => {
@@ -145,14 +148,10 @@ export function TerminalView({ session, replayMode, onInput, onResize, registerH
       const dy = t.clientY - startY;
       if (!scrolling && Math.abs(dy) < SCROLL_LOCK_PX) return;
       scrolling = true;
-      // Drag down (dy>0) → reveal earlier scrollback → scroll up (negative
-      // scrollLines). Track applied rows so we only emit the incremental delta.
-      const targetRows = Math.round(-dy / rowHeight());
-      const delta = targetRows - appliedRows;
-      if (delta !== 0) {
-        term.scrollLines(delta);
-        appliedRows = targetRows;
-      }
+      // Drag down (dy>0) → reveal earlier scrollback (a smaller line index).
+      // Command an absolute target from the anchor; xterm clamps at the bounds.
+      const offsetRows = Math.round(-dy / rowHeight());
+      term.scrollToLine(anchorTop + offsetRows);
       e.preventDefault();
       e.stopPropagation();
     };
@@ -160,7 +159,6 @@ export function TerminalView({ session, replayMode, onInput, onResize, registerH
       if (activeTouchId === null) return;
       if (Array.from(e.touches).some((x) => x.identifier === activeTouchId)) return;
       activeTouchId = null;
-      appliedRows = 0;
       scrolling = false;
     };
     container.addEventListener("touchstart", onTouchStart, { capture: true, passive: true });
@@ -196,9 +194,10 @@ export function TerminalView({ session, replayMode, onInput, onResize, registerH
       </div>
       <div
         ref={containerRef}
-        // touchAction: none — the touch-to-scroll handler (itr#445) owns
-        // vertical drags, so the browser must not also pan an ancestor pane.
-        style={{ flex: 1, minHeight: 0, background: "var(--bg)", touchAction: "none" }}
+        // touchAction: pinch-zoom — the handler (itr#445) owns single-finger
+        // vertical drags (so no ancestor overflow pane pans), while two-finger
+        // pinch-zoom of the terminal stays available for low-vision users (itr#478).
+        style={{ flex: 1, minHeight: 0, background: "var(--bg)", touchAction: "pinch-zoom" }}
       />
     </div>
   );

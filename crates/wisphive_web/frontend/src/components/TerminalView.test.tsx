@@ -72,13 +72,14 @@ function mountView() {
   );
 }
 
-let scrollLines: ReturnType<typeof vi.spyOn>;
+let scrollToLine: ReturnType<typeof vi.spyOn>;
 
 beforeEach(() => {
-  // xterm 6 renders through a custom scrollable (not native scrollTop), so the
-  // handler drives the public scrollLines() API — spy on it. mockImplementation
-  // also avoids the canvas path jsdom can't run.
-  scrollLines = vi.spyOn(Terminal.prototype, "scrollLines").mockImplementation(() => {});
+  // The handler drives xterm's public scrollToLine() with an absolute target
+  // (anchor + row offset). Spy on it; mockImplementation also avoids the canvas
+  // path jsdom can't run. The anchor is `term.buffer.active.viewportY`, which is
+  // 0 on a fresh empty terminal, so scrollToLine is called with the bare offset.
+  scrollToLine = vi.spyOn(Terminal.prototype, "scrollToLine").mockImplementation(() => {});
   // Silence xterm's noisy renderer warnings under jsdom (no real canvas).
   vi.spyOn(console, "warn").mockImplementation(() => {});
   vi.spyOn(console, "error").mockImplementation(() => {});
@@ -89,7 +90,7 @@ afterEach(() => {
 });
 
 describe("TerminalView touch-to-scroll (itr#445)", () => {
-  it("translates a vertical touch-drag into scrollLines(rows) up into scrollback", () => {
+  it("translates a vertical touch-drag into scrollToLine(anchor + rows)", () => {
     const { container } = mountView();
     expect(container.querySelector(".xterm-viewport"), "xterm viewport should mount").not.toBeNull();
     primeViewport(container);
@@ -99,24 +100,41 @@ describe("TerminalView touch-to-scroll (itr#445)", () => {
     const move = touch("touchmove", 800); // dy = +300px, 20px/row → 15 rows
     mount.dispatchEvent(move);
 
-    // Drag DOWN reveals earlier scrollback → scroll UP → negative scrollLines.
-    expect(scrollLines).toHaveBeenCalledWith(-15);
+    // Drag DOWN reveals earlier scrollback → smaller line index (anchor 0 → -15).
+    expect(scrollToLine).toHaveBeenCalledWith(-15);
     expect(move.defaultPrevented).toBe(true); // page/pane scroll suppressed
 
     mount.dispatchEvent(touch("touchend", 800));
   });
 
-  it("emits only the incremental row delta as the finger keeps moving", () => {
+  it("commands an absolute target from the anchor as the finger keeps moving", () => {
     const { container } = mountView();
     primeViewport(container);
 
     const mount = container.querySelector<HTMLElement>("div[style*='touch-action']")!;
     mount.dispatchEvent(touch("touchstart", 500));
-    mount.dispatchEvent(touch("touchmove", 600)); // dy=100 → -5 rows
-    mount.dispatchEvent(touch("touchmove", 700)); // dy=200 → -10 rows, delta -5
+    mount.dispatchEvent(touch("touchmove", 600)); // dy=100 → offset -5 → line -5
+    mount.dispatchEvent(touch("touchmove", 700)); // dy=200 → offset -10 → line -10
     mount.dispatchEvent(touch("touchend", 700));
 
-    expect(scrollLines.mock.calls).toEqual([[-5], [-5]]); // cumulative -10, no double-count
+    // Absolute (anchor + offset), not an accumulated delta.
+    expect(scrollToLine.mock.calls).toEqual([[-5], [-10]]);
+  });
+
+  it("tracks the finger back on reversal without accumulator drift (itr#477)", () => {
+    const { container } = mountView();
+    primeViewport(container);
+
+    const mount = container.querySelector<HTMLElement>("div[style*='touch-action']")!;
+    mount.dispatchEvent(touch("touchstart", 500));
+    mount.dispatchEvent(touch("touchmove", 900)); // dy=400 → offset -20 → line -20
+    mount.dispatchEvent(touch("touchmove", 600)); // reverse: dy=100 → offset -5 → line -5
+    mount.dispatchEvent(touch("touchend", 600));
+
+    // The reversal lands on the absolute line the finger points at (-5), not a
+    // clamp-corrupted delta. With the old requested-row accumulator a boundary
+    // clamp on the first move could desync this second target.
+    expect(scrollToLine.mock.calls).toEqual([[-20], [-5]]);
   });
 
   it("ignores a tap (sub-threshold movement) so tap-to-focus still works", () => {
@@ -128,8 +146,15 @@ describe("TerminalView touch-to-scroll (itr#445)", () => {
     const move = touch("touchmove", 503); // dy = +3px, below the 6px lock
     mount.dispatchEvent(move);
 
-    expect(scrollLines).not.toHaveBeenCalled();
+    expect(scrollToLine).not.toHaveBeenCalled();
     expect(move.defaultPrevented).toBe(false); // gesture left for xterm/tap
     mount.dispatchEvent(touch("touchend", 503));
+  });
+
+  it("sets touch-action:pinch-zoom on the mount so pinch-zoom stays available (itr#478)", () => {
+    const { container } = mountView();
+    const mount = container.querySelector<HTMLElement>("div[style*='touch-action']");
+    expect(mount).not.toBeNull();
+    expect(mount!.style.touchAction).toBe("pinch-zoom");
   });
 });
