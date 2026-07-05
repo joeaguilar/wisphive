@@ -117,7 +117,9 @@ Copy this block into the appropriate phase section:
 - **Expected:** Dragging down reveals earlier scrollback (content follows the finger); dragging
   **up** returns to the live tail. The page/outer pane does **not** scroll instead of the
   terminal. After scrolling, tap-to-focus and on-screen-keyboard input still work — no gesture
-  gets stuck, no accidental text selection during the drag. Automated coverage today is
+  gets stuck, no accidental text selection during the drag. A **tiny jitter** (a ~6-8px finger
+  slip that is not enough to scroll a whole row) followed by a lift must **still focus** the
+  terminal — the drag must not swallow that near-tap (itr#480). Automated coverage today is
   **unit-only**: `TerminalView.test.tsx` asserts the drag drives xterm's public `term.scrollLines()`
   with the right signed row delta, but against a mock (jsdom does no layout) — it does **not** prove
   the real viewport scrolls. Real-app touch scroll was verified **interactively during development**

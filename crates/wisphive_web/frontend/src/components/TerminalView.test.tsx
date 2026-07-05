@@ -151,6 +151,23 @@ describe("TerminalView touch-to-scroll (itr#445)", () => {
     mount.dispatchEvent(touch("touchend", 503));
   });
 
+  it("does not swallow a jitter that clears the lock but rounds to zero rows (itr#480)", () => {
+    const { container } = mountView();
+    primeViewport(container); // 20px/row
+
+    const mount = container.querySelector<HTMLElement>("div[style*='touch-action']")!;
+    mount.dispatchEvent(touch("touchstart", 500));
+    // dy = +8px: past the 6px SCROLL_LOCK but round(-8/20) = 0 rows. The old
+    // handler latched scrolling and preventDefault-ed here while applying no
+    // scroll — a dead zone that swallowed a tap.
+    const move = touch("touchmove", 508);
+    mount.dispatchEvent(move);
+
+    expect(scrollToLine).not.toHaveBeenCalled();
+    expect(move.defaultPrevented).toBe(false); // tap/native gesture left intact
+    mount.dispatchEvent(touch("touchend", 508)); // lift → still a focusing tap
+  });
+
   it("sets touch-action:pinch-zoom on the mount so pinch-zoom stays available (itr#478)", () => {
     const { container } = mountView();
     const mount = container.querySelector<HTMLElement>("div[style*='touch-action']");

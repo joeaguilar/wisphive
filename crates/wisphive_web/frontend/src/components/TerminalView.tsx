@@ -122,6 +122,7 @@ export function TerminalView({ session, replayMode, onInput, onResize, registerH
     let startY = 0;
     let anchorTop = 0; // viewport-top buffer line captured at gesture start
     let scrolling = false;
+    let appliedOffset = 0; // rows already applied this gesture (vs anchor)
 
     // Height of one terminal row in CSS px. The viewport is exactly rows tall,
     // so its clientHeight / rows is the cell height; fall back to a font-size
@@ -140,6 +141,7 @@ export function TerminalView({ session, replayMode, onInput, onResize, registerH
       startY = t.clientY;
       anchorTop = term.buffer.active.viewportY;
       scrolling = false;
+      appliedOffset = 0;
     };
     const onTouchMove = (e: TouchEvent) => {
       if (activeTouchId === null) return;
@@ -147,10 +149,17 @@ export function TerminalView({ session, replayMode, onInput, onResize, registerH
       if (!t) return;
       const dy = t.clientY - startY;
       if (!scrolling && Math.abs(dy) < SCROLL_LOCK_PX) return;
-      scrolling = true;
       // Drag down (dy>0) → reveal earlier scrollback (a smaller line index).
-      // Command an absolute target from the anchor; xterm clamps at the bounds.
       const offsetRows = Math.round(-dy / rowHeight());
+      // Only intercept once the gesture actually moves the viewport by a row.
+      // A 6-8px finger jitter rounds to zero rows with a ~17px row height, so
+      // preventDefault-ing there would swallow a tap without scrolling (itr#480).
+      // Once a non-zero delta has been applied we keep tracking the finger —
+      // including back through the anchor — so a reversal still follows (itr#477).
+      if (offsetRows === appliedOffset) return;
+      scrolling = true;
+      appliedOffset = offsetRows;
+      // Command an absolute target from the anchor; xterm clamps at the bounds.
       term.scrollToLine(anchorTop + offsetRows);
       e.preventDefault();
       e.stopPropagation();
@@ -160,6 +169,7 @@ export function TerminalView({ session, replayMode, onInput, onResize, registerH
       if (Array.from(e.touches).some((x) => x.identifier === activeTouchId)) return;
       activeTouchId = null;
       scrolling = false;
+      appliedOffset = 0;
     };
     container.addEventListener("touchstart", onTouchStart, { capture: true, passive: true });
     container.addEventListener("touchmove", onTouchMove, { capture: true, passive: false });
