@@ -109,6 +109,20 @@ Copy this block into the appropriate phase section:
 - **Evidence:** _automated: e2e spec + `blitz/evidence/*.png` (attached to itr#399); human: subjective note + screenshot from a real two-session session_
 - [ ] Verified — signed off: _______
 
+### Terminal touch-to-scroll on a real phone/tablet (added 2026-07-05, source: itr#445, commit <sha>)
+- **Steps:** On a real touch device (or Chrome DevTools mobile emulation with touch enabled),
+  open the Terminals view, attach to a running session with scrollback beyond one screen
+  (run e.g. `seq 200` inside it). Vertical-drag up/down inside the terminal pane. Then tap the
+  pane and type a command on the on-screen keyboard.
+- **Expected:** Dragging down reveals earlier scrollback (content follows the finger); dragging
+  back down returns to the live tail. The page/outer pane does **not** scroll instead of the
+  terminal. After scrolling, tap-to-focus and on-screen-keyboard input still work — no gesture
+  gets stuck, no accidental text selection during the drag. Automated proof exists
+  (`TerminalView.test.tsx` drives the real `.xterm-viewport` scrollTop); this covers real-hardware
+  touch feel that jsdom can't.
+- **Evidence:** _phone/tablet screenshots (before/after scroll) + subjective note_
+- [ ] Verified — signed off: _______
+
 ---
 
 ## Phase 5 — Remote access: scrollback + mobile pairing (upcoming; park until the phase lands)
