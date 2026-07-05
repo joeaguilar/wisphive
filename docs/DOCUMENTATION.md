@@ -33,6 +33,7 @@ The fix is two things:
 | **What v1 is / scope boundary** | `CLAUDE.md` (de-facto spec) + `docs/ROADMAP.md` "Release boundary" |
 | **What happened in a past milestone** | `docs/handoff/YYYY-MM-DD-<topic>.md` |
 | **An upcoming workstream's design** | `docs/plan-*.md` (cross-agent conflict gate, deterministic analytics, decision plugins, policy learning, mobile pairing, red support) |
+| **What a Wisphive-specific term means** | [`docs/GLOSSARY.md`](GLOSSARY.md) (tie-breaker for overloaded terms: transcript, TUI, session) |
 | **Exploratory analysis / landscape scans** | `docs/research/` |
 | **OSS positioning and roadmap** | `docs/open-source-path.md` |
 | **TUI widget / investigation reference notes** | `claude/` (tui-textarea reference, empty-detail-views investigation) |
@@ -50,6 +51,7 @@ link instead.
 | Scope / "what v1 is" | `CLAUDE.md` (de-facto spec) + ROADMAP release boundary | PO | on scope change |
 | Roadmap (done/in-flight/next, section grain) | `docs/ROADMAP.md` | `/roadmap`, `scripts/roadmap_sync_check.py`, `/sprint-review` | every sprint |
 | Backlog (task grain) | `itr` | everyone | continuous |
+| Term definitions (shared vocabulary) | `docs/GLOSSARY.md` | whoever coins/redefines a term | at coin time |
 | **Decisions (the _why_)** | `docs/decisions/ADR-NNNN-*.md` + index | the decider | at decision time |
 | Milestone narratives | `docs/handoff/YYYY-MM-DD-*` | implementer | per milestone |
 | Upcoming-workstream designs | `docs/plan-*.md` | author | as the design evolves |
