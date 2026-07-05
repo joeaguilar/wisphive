@@ -149,6 +149,18 @@ Run ≥2 real campaigns (blitz or proof-campaign) gated by wisphive; mine the au
    (Cost, drift, and context-poisoning trade-offs cut both ways.)
 3. **Stop-vs-stall detection** — is the Stop hook event reliable enough across
    claude_code/codex, or does the supervisor need an idle-timeout heuristic?
+   > **Codex gating constraint (proved 2026-07-04, itr#467).** A loop that drives
+   > Codex must spawn it such that the Wisphive hook actually runs. Codex
+   > *silently skips* hooks it has not been granted persisted trust for (via an
+   > interactive `/hooks` step), so a naive `codex exec` spawn runs the agent
+   > **completely ungated**. The managed-spawn path now (a) fails closed unless the
+   > project has the Wisphive Codex hook installed and (b) passes
+   > `--dangerously-bypass-hook-trust` so the daemon-vetted hook runs headlessly.
+   > Any Codex-backed loop inherits this: gating is only real when both hold.
+   > Open sub-question — bypassing trust runs *every* hook in that project's
+   > `.codex/hooks.json`, not only Wisphive's; per-hook trust provisioning
+   > (writing `[hooks.state]` trusted-hashes) would be tighter but is
+   > codex-version-brittle.
 4. **Escalation UX** — what does the human actually need in the queue item to make a
    30-second decision? (Candidate: goal, iteration, gate tail, diff stat.)
 5. **itr integration** — should a loop claim/close an itr issue as its unit of work

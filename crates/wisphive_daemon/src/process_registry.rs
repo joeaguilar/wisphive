@@ -32,6 +32,29 @@ impl ProcessRegistry {
         let session_id = uuid::Uuid::new_v4();
         let agent_type = req.agent_type.clone();
 
+        // itr#467: Codex silently SKIPS hooks it has not been granted persisted
+        // trust for. We pass `--dangerously-bypass-hook-trust` below so the
+        // daemon-installed (and therefore vetted) Wisphive hook actually runs —
+        // but that bypass only gates anything if the hook is present. If the
+        // project has no Wisphive Codex hook, a spawned agent would run
+        // completely UNGATED while appearing "managed". Fail closed rather than
+        // present an ungated agent as controlled.
+        if matches!(agent_type, AgentType::Codex)
+            && !crate::hook_install::codex_pretooluse_hook_installed(&req.project)
+        {
+            // Strict, fail-closed check (itr#467 review): matches the
+            // wisphive-hook binary precisely, not a "wisphive" substring — the
+            // web/loop/TUI spawn paths don't run the CLI preflight, so this
+            // guard is their only gate and must be at least as strict.
+            anyhow::bail!(
+                "refusing to spawn Codex into {}: no Wisphive PreToolUse hook is \
+                 installed there, so the agent's tool calls would bypass the control \
+                 plane. Run `wisphive hooks install --project {}` first.",
+                req.project.display(),
+                req.project.display()
+            );
+        }
+
         let mut cmd = match &agent_type {
             AgentType::ClaudeCode => {
                 let mut cmd = Command::new("claude");
@@ -99,8 +122,21 @@ impl ProcessRegistry {
                 let project = req.project.display().to_string();
 
                 cmd.arg("exec");
-                cmd.args(["--ask-for-approval", "never"]);
+                // `codex exec` is already non-interactive and never prompts for
+                // approval; the previous `--ask-for-approval never` is NOT a valid
+                // `codex exec` flag and aborted the spawn at arg-parse (itr#467).
                 cmd.args(["--sandbox", "workspace-write"]);
+                // A daemon-controlled spawn targets an arbitrary project dir that
+                // may not be a git repo; without this, codex refuses with "Not
+                // inside a trusted directory" (itr#467).
+                cmd.arg("--skip-git-repo-check");
+                // Force the Wisphive hook to run without an interactive
+                // `/hooks`-trust step. Codex skips untrusted hooks silently, which
+                // would leave the agent UNGATED. This is the documented path for
+                // "automation that already vets its hook sources" — the daemon
+                // installs the hook itself, and the fail-closed check in
+                // spawn_agent guarantees it is present before we get here (itr#467).
+                cmd.arg("--dangerously-bypass-hook-trust");
                 cmd.arg("-C");
                 cmd.arg(&project);
 
@@ -248,5 +284,41 @@ impl ProcessRegistry {
 impl Default for ProcessRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// itr#467: spawning Codex into a project without the Wisphive Codex hook
+    /// must fail closed — an ungated agent would bypass the control plane — and
+    /// it must do so *before* any process is launched (so no `codex` binary is
+    /// required for this to hold).
+    #[tokio::test]
+    async fn codex_spawn_fails_closed_without_wisphive_hook() {
+        let proj = tempfile::tempdir().unwrap();
+        let req: SpawnAgentRequest = serde_json::from_value(serde_json::json!({
+            "agent_type": "codex",
+            "project": proj.path().to_string_lossy(),
+            "prompt": "noop",
+        }))
+        .expect("request should deserialize");
+
+        let mut registry = ProcessRegistry::new();
+        let err = registry
+            .spawn_agent(req)
+            .await
+            .expect_err("Codex spawn into an unhooked project must be refused");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Codex") && msg.contains("hooks install"),
+            "refusal should name Codex and the install fix, got: {msg}"
+        );
+        assert!(
+            registry.is_empty(),
+            "no process should be tracked after a fail-closed refusal"
+        );
     }
 }

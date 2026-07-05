@@ -43,23 +43,48 @@ fn connect_to_daemon() -> Result<(BufReader<UnixStream>, UnixStream)> {
     Ok((reader, writer))
 }
 
+/// True for the snapshot messages the daemon proactively pushes to a TUI-type
+/// client on connect. These arrive before the reply to our request and must be
+/// skipped over.
+fn is_connect_snapshot(msg: &ServerMessage) -> bool {
+    matches!(
+        msg,
+        ServerMessage::AgentsSnapshot { .. }
+            | ServerMessage::QueueSnapshot { .. }
+            | ServerMessage::AuditSnapshot { .. }
+    )
+}
+
 /// Send a message and read one response.
 fn send_and_recv(msg: &ClientMessage) -> Result<ServerMessage> {
     let (mut reader, mut writer) = connect_to_daemon()?;
 
-    // Drain the initial AgentsSnapshot and QueueSnapshot that handle_tui sends.
-    for _ in 0..2 {
-        let mut snapshot_line = String::new();
-        reader.read_line(&mut snapshot_line)?;
-    }
-
     let encoded = wisphive_protocol::encode(msg)?;
     writer.write_all(encoded.as_bytes())?;
 
-    let mut response_line = String::new();
-    reader.read_line(&mut response_line)?;
-    let response: ServerMessage = wisphive_protocol::decode(&response_line)?;
-    Ok(response)
+    // handle_tui pushes a burst of snapshot messages on connect (AgentsSnapshot,
+    // QueueSnapshot, AuditSnapshot — and possibly more later). Skip any of them
+    // rather than draining a hard-coded count: that count silently grew from 2 to
+    // 3 when AuditSnapshot was added and made every agent command misread the
+    // AuditSnapshot as its response (itr#468).
+    //
+    // Caveat (itr#470): this connects as a Tui client, so the daemon may also
+    // interleave *broadcast* events on this socket. Those are not skipped here, so
+    // a concurrent event of the same variant as the reply can still be misread.
+    // The real fix is request/response correlation or a non-subscribed CLI client
+    // type; tracked separately.
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            anyhow::bail!("daemon closed the connection before responding");
+        }
+        let response: ServerMessage = wisphive_protocol::decode(&line)?;
+        if is_connect_snapshot(&response) {
+            continue;
+        }
+        return Ok(response);
+    }
 }
 
 /// Start an agent process via the daemon.

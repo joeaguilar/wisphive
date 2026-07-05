@@ -516,6 +516,31 @@ pub fn has_wisphive_hook(rule: &serde_json::Value) -> bool {
             .is_some_and(is_wisphive_hook_command)
 }
 
+/// True iff `project` has a Wisphive **PreToolUse** hook installed in
+/// `.codex/hooks.json`, matched strictly on the `wisphive-hook` binary
+/// (itr#359) — not a substring a user hook under a "wisphive" directory would
+/// satisfy. PreToolUse specifically, because that is the event that actually
+/// gates tool calls.
+///
+/// Fail-closed: a missing, unreadable, or malformed hooks file returns `false`.
+/// This is the authoritative check a security gate should use before spawning a
+/// Codex agent with hook-trust bypassed (itr#467) — the substring matcher in
+/// `project_audit` is deliberately looser and must not be trusted for gating.
+pub fn codex_pretooluse_hook_installed(project: &Path) -> bool {
+    let hooks_path = project.join(".codex").join("hooks.json");
+    let Ok(content) = std::fs::read_to_string(&hooks_path) else {
+        return false;
+    };
+    let Ok(settings) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return false;
+    };
+    settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get("PreToolUse"))
+        .and_then(|rules| rules.as_array())
+        .is_some_and(|arr| arr.iter().any(has_wisphive_hook))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,6 +598,51 @@ mod tests {
     /// Build a Claude Code-format hook rule.
     fn cc_rule(command: &str) -> serde_json::Value {
         json!({"matcher": "", "hooks": [{"type": "command", "command": command}]})
+    }
+
+    // ══ codex_pretooluse_hook_installed — security gate (itr#467) ══
+
+    #[test]
+    fn codex_gate_true_after_real_install() {
+        let tmp = temp_project();
+        install_codex(tmp.path()).unwrap();
+        assert!(codex_pretooluse_hook_installed(tmp.path()));
+    }
+
+    #[test]
+    fn codex_gate_false_for_substring_only_hook() {
+        // itr#467 P2-A: a PreToolUse hook whose command merely CONTAINS the
+        // substring "wisphive" (e.g. a tool under a wisphive-named directory)
+        // but is not the wisphive-hook binary must NOT satisfy the gate — else
+        // Codex would spawn with hook-trust bypassed and no real gating hook.
+        let tmp = temp_project();
+        write_codex_hooks(
+            tmp.path(),
+            &json!({"hooks": {"PreToolUse": [cc_rule("/opt/wisphive-tools/lint.sh")]}}),
+        );
+        assert!(!codex_pretooluse_hook_installed(tmp.path()));
+    }
+
+    #[test]
+    fn codex_gate_false_when_only_on_non_gating_event() {
+        // A wisphive hook on a telemetry-only event does not gate tool calls.
+        let tmp = temp_project();
+        write_codex_hooks(
+            tmp.path(),
+            &json!({"hooks": {"PostToolUse": [cc_rule("wisphive-hook")]}}),
+        );
+        assert!(!codex_pretooluse_hook_installed(tmp.path()));
+    }
+
+    #[test]
+    fn codex_gate_fails_closed_when_missing_or_malformed() {
+        let tmp = temp_project();
+        // No .codex/hooks.json at all.
+        assert!(!codex_pretooluse_hook_installed(tmp.path()));
+        // Malformed JSON must fail closed, not pass.
+        fs::create_dir_all(tmp.path().join(".codex")).unwrap();
+        fs::write(tmp.path().join(".codex").join("hooks.json"), "{not json").unwrap();
+        assert!(!codex_pretooluse_hook_installed(tmp.path()));
     }
 
     // ══ add_hook_entry (writes correct nested format) ══
