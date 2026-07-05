@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { DecisionRequest, ProjectSummary, TerminalSessionMeta } from "../types/protocol";
 import { TerminalView } from "./TerminalView";
 import { TerminalQueueDock } from "./TerminalQueueDock";
@@ -146,8 +146,14 @@ export function Terminals(props: TerminalsProps) {
     setShowProjectPicker(false);
   };
 
+  // Where the user was before the mobile sub-window opened, so closing it
+  // can hand focus back instead of dropping it on <body> (the tapped list
+  // item goes display:none while the sub-window is open).
+  const returnFocusRef = useRef<HTMLElement | null>(null);
+
   const handleSelect = (t: TerminalSessionMeta, replay: boolean) => {
     if (selectedId && selectedId !== t.id) onDetach(selectedId);
+    returnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     setSelectedId(t.id);
     setReplayMode(replay);
     if (replay) onReplay(t.id);
@@ -158,10 +164,14 @@ export function Terminals(props: TerminalsProps) {
   // terminal opens it full-screen (CSS keys on the `terminal-open` class);
   // "back" closes the sub-window by clearing the selection, returning to the
   // list. Detach so the daemon stops streaming to a pane nobody is viewing.
+  // No Escape-to-close: inside a terminal, Escape belongs to the PTY.
   const handleBack = () => {
     if (selectedId) onDetach(selectedId);
     setSelectedId(null);
     setReplayMode(false);
+    const el = returnFocusRef.current;
+    returnFocusRef.current = null;
+    if (el?.isConnected) el.focus();
   };
 
   // Honour an inbox deep-link focus (itr#437). Waits for the target session to
@@ -477,12 +487,15 @@ export function Terminals(props: TerminalsProps) {
                 type="button"
                 className="terminals-mobile-back"
                 onClick={handleBack}
-                aria-label="Back to terminal list"
+                // Accessible name contains the visible text "Terminals"
+                // (WCAG 2.5.3 Label in Name — voice-control users say what
+                // they see).
+                aria-label="Terminals — back to session list"
               >
                 ‹ Terminals
               </button>
               <strong className="terminals-mobile-title">
-                {selected.label ?? selected.id.slice(0, 8)}
+                {selected.label || "(no label)"}
               </strong>
             </div>
             <TerminalQueueDock

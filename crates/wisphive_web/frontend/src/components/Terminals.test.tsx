@@ -99,18 +99,23 @@ describe("Terminals two-step mobile workflow (itr#487)", () => {
     // The header carries the way back plus the session identity (full label —
     // the sub-window is the only surface on mobile, so nothing is truncated
     // structurally; CSS ellipsis only guards pathological widths).
-    expect(screen.getByRole("button", { name: "Back to terminal list" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Terminals — back to session list" })).toBeTruthy();
     expect(container.querySelector(".terminals-mobile-title")!.textContent).toBe("claude");
   });
 
-  it("back returns to the list: clears terminal-open and detaches the session", () => {
+  it("back returns to the list: clears terminal-open, detaches, and restores focus", () => {
     const { container, onDetach } = mountTerminals();
-    fireEvent.click(container.querySelector(".terminals-sidebar-item")!);
-    fireEvent.click(screen.getByRole("button", { name: "Back to terminal list" }));
+    // Open via the item's Attach button with real focus on it, the way a
+    // keyboard user would — back must hand focus to that button, not <body>.
+    const attach = screen.getByRole("button", { name: "Attach" });
+    attach.focus();
+    fireEvent.click(attach);
+    fireEvent.click(screen.getByRole("button", { name: "Terminals — back to session list" }));
 
     const layout = container.querySelector(".terminals-layout")!;
     expect(layout.classList.contains("terminal-open")).toBe(false);
     expect(container.querySelector(".terminals-mobile-header")).toBeNull();
     expect(onDetach).toHaveBeenCalledWith(session.id);
+    expect(document.activeElement).toBe(attach);
   });
 });

@@ -5,6 +5,13 @@ import { useSyncExternalStore } from "react";
 // app.css (`@media (max-width: 900px)`) — change both together. Other
 // features that need breakpoint-conditional behavior should import from here
 // rather than hand-rolling their own matchMedia query.
+//
+// Two-tier reality: this is the *pane-reflow* breakpoint (where side-by-side
+// layouts like the Terminals two-step workflow collapse to one pane at a
+// time). The app shell's compact chrome (sidebar→top-bar etc.) kicks in
+// lower, at app.css's 768px tier — so 769-900px is "mobile" here while the
+// shell still wears desktop chrome. That is intentional: pane splits run out
+// of room before the nav does.
 export const MOBILE_BREAKPOINT_PX = 900;
 
 const MOBILE_QUERY = `(max-width: ${MOBILE_BREAKPOINT_PX}px)`;
@@ -32,10 +39,14 @@ function subscribe(onChange: () => void): () => void {
     syncRootFlags(mql.matches);
     onChange();
   };
-  // Older matchMedia stubs (and Safari < 14) lack addEventListener.
   if (typeof mql.addEventListener === "function") {
     mql.addEventListener("change", handler);
     return () => mql.removeEventListener("change", handler);
+  }
+  // Safari < 14 (and some test stubs) only expose the legacy listener API.
+  if (typeof mql.addListener === "function") {
+    mql.addListener(handler);
+    return () => mql.removeListener(handler);
   }
   return () => {};
 }
