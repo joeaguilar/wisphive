@@ -115,13 +115,16 @@ Copy this block into the appropriate phase section:
   (run e.g. `seq 400` inside it — see caveat). Vertical-drag up/down inside the terminal pane.
   Then tap the pane and type a command on the on-screen keyboard.
 - **Expected:** Dragging down reveals earlier scrollback (content follows the finger); dragging
-  back down returns to the live tail. The page/outer pane does **not** scroll instead of the
+  **up** returns to the live tail. The page/outer pane does **not** scroll instead of the
   terminal. After scrolling, tap-to-focus and on-screen-keyboard input still work — no gesture
-  gets stuck, no accidental text selection during the drag. Automated proof exists
-  (`TerminalView.test.tsx` asserts the drag drives xterm's public `term.scrollLines()`; a real-app
-  Playwright CDP-touch test confirmed a finger-drag scrolls a live terminal's scrollback — xterm 6
-  uses a custom scrollable and its own touch Gesture does NOT scroll this build, so the handler is
-  required); this item covers only real-hardware touch feel that automation can't.
+  gets stuck, no accidental text selection during the drag. Automated coverage today is
+  **unit-only**: `TerminalView.test.tsx` asserts the drag drives xterm's public `term.scrollLines()`
+  with the right signed row delta, but against a mock (jsdom does no layout) — it does **not** prove
+  the real viewport scrolls. Real-app touch scroll was verified **interactively during development**
+  (isolated daemon+web over TLS, live PTY, Playwright CDP `Input.dispatchTouchEvent`), but that
+  harness was scratch-only and is **not committed** — a committed regression is tracked in **itr#479**.
+  Context: xterm 6 uses a custom scrollable and its own touch Gesture does NOT scroll this build, so
+  the JS handler is required. This item covers only real-hardware touch feel that automation can't.
 - **CAVEAT (itr#284, not this item):** re-attaching a terminal (switching away and back) restores
   only the current screen — no scrollback — so **both wheel and touch have nothing to scroll after
   a switch** until you generate new output. That is the server-authoritative-scrollback-on-attach
