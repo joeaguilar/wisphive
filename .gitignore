@@ -16,4 +16,4 @@ __pycache__/
 # Impeccable skill local artifacts (durable outputs — PRODUCT.md, DESIGN.md,
 # .impeccable/design.json, .impeccable/live/config.json — are committed).
 **/.impeccable/hook.cache.json
-.impeccable/config.local.json
+**/.impeccable/config.local.json
