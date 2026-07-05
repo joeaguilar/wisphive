@@ -85,7 +85,9 @@ impl Server {
             ),
             Err(e) => warn!("failed to drain orphaned pending decisions: {e}"),
         }
-        let process_registry = Arc::new(Mutex::new(ProcessRegistry::new()));
+        let process_registry = Arc::new(Mutex::new(ProcessRegistry::new(
+            config.codex_allow_foreign_hooks,
+        )));
         let agent_registry = Arc::new(Mutex::new(AgentRegistry::new()));
         let terminal_manager = Arc::new(TerminalSessionManager::new(
             state_db.clone(),
@@ -1989,10 +1991,7 @@ const ATTACH_RETRY_DELAYS: [Duration; 4] = [
 /// (the answer is just "proceed"), so they yield None. The response is redacted
 /// first (itr#89) since it may echo tool output; the result is truncated so a
 /// pathological answer can't bloat the broadcast.
-fn summarize_deferred_answer(
-    tool_name: &str,
-    tool_result: &serde_json::Value,
-) -> Option<String> {
+fn summarize_deferred_answer(tool_name: &str, tool_result: &serde_json::Value) -> Option<String> {
     if tool_name != "AskUserQuestion" {
         return None;
     }

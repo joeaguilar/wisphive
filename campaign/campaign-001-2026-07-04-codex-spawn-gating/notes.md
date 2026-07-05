@@ -33,6 +33,25 @@ Verdict: no P0/P1. One security should-fix applied, rest filed.
 - **P2-B → #471:** `--dangerously-bypass-hook-trust` runs *all* project hooks headlessly; guard only checks wisphive presence. + TOCTOU. 
 - **P3 → #472:** daemon guard doesn't check kill-switch `mode` like the CLI preflight does.
 
+## itr#471 — Codex trust-bypass blast radius [security] — VERIFIED
+The #467 fix passes `--dangerously-bypass-hook-trust`, which suppresses Codex's trust prompt for **every** hook in the project's `.codex/hooks.json`, not just Wisphive's — a cloned/untrusted repo's own hooks would run headlessly.
+
+Design fork settled: kept the bypass (reliable gating) + **detect foreign hooks, warn always, refuse by default** with named opt-in. Rejected per-hook trust-hash provisioning — codex-version-brittle, and a hash mismatch would silently un-gate. (`codex exec` has no `--hooks-file` override, so a daemon-owned hooks set isn't possible.)
+
+Fix:
+- `hook_install.rs`: `codex_foreign_hook_commands()` — non-wisphive commands across all events/rules (strict matcher, fail-safe).
+- `process_registry.rs`: guard warns + refuses unless opted in; `codex_allow_foreign_hooks` threaded from config.
+- `config.rs`: `codex_allow_foreign_hooks` (bool, default false, captured at start).
+- `CLAUDE.md` + `plan-loop-supervisor.md` updated.
+
+**Runtime evidence (isolated daemon, real CLI→daemon path):**
+- Default config → **refused**: `Failed to start agent: refusing to spawn Codex into /private/tmp/whproj: its .codex/hooks.json carries non-Wisphive hook(s) [/usr/bin/evil-third-party.sh] … set "codex_allow_foreign_hooks": true …`.
+- `codex_allow_foreign_hooks: true` + restart → **Agent started** (PID assigned). Proves the flag flips behavior live.
+
+Tests: `codex_spawn_refuses_foreign_hooks_without_opt_in`, 4× `foreign_hooks_*`, `codex_allow_foreign_hooks_loads_from_config_json`. Gate green.
+
+Residual (accepted): TOCTOU between guard read and codex's re-read of hooks.json is uncloseable without codex honoring a pinned hash — same trust boundary (project-dir owner controls the file), noted not fixed.
+
 ## Incidental
 - Pre-existing fmt drift in `crates/wisphive_daemon/src/server.rs:1989` (not my change) — reformatted to unblock the fmt gate; committed separately from the feature.
 

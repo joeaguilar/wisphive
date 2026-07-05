@@ -39,6 +39,11 @@ pub struct DaemonConfig {
     pub disk_alert_free_bytes: u64,
     /// Maximum audit decisions sent in the recent-audit connect snapshot.
     pub audit_snapshot_limit: u32,
+    /// Opt-in: allow a managed Codex spawn into a project whose
+    /// `.codex/hooks.json` carries non-Wisphive hooks (itr#471). Fail-safe
+    /// default false — refuse rather than run un-vetted hooks headlessly under
+    /// the trust bypass. Captured at daemon start; changing it needs a restart.
+    pub codex_allow_foreign_hooks: bool,
 }
 
 /// User-editable config loaded from ~/.wisphive/config.json.
@@ -73,6 +78,12 @@ pub struct UserConfig {
     /// level. Off by default; pairs with `auto_approve_level: all`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub auto_approve_dangerous: bool,
+    /// Allow a managed Codex spawn to proceed even when the target project's
+    /// `.codex/hooks.json` carries non-Wisphive hook commands. Off by default:
+    /// the spawn passes `--dangerously-bypass-hook-trust`, which would otherwise
+    /// run those foreign hooks headlessly without Codex's trust prompt (itr#471).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub codex_allow_foreign_hooks: bool,
     /// Content-aware rules per tool (deny/allow patterns on tool input).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_rules: Option<std::collections::HashMap<String, wisphive_protocol::ToolRule>>,
@@ -220,6 +231,7 @@ impl DaemonConfig {
             archive_alert_max_bytes,
             disk_alert_free_bytes,
             audit_snapshot_limit,
+            codex_allow_foreign_hooks: user.codex_allow_foreign_hooks,
             home_dir,
         }
     }
@@ -409,6 +421,22 @@ mod tests {
         assert_eq!(round_tripped["auto_approve_stop"], true);
         assert_eq!(round_tripped["some_future_key"]["nested"][1], 2);
         assert_eq!(round_tripped["auto_approve_level"], "all");
+    }
+
+    #[test]
+    fn codex_allow_foreign_hooks_loads_from_config_json() {
+        // itr#471: the daemon guard reads this flag off the resolved config, so
+        // it must round-trip config.json → UserConfig → DaemonConfig.
+        let dir = tempfile::tempdir().unwrap();
+        // Missing key → fail-safe default false.
+        assert!(!DaemonConfig::new(dir.path().to_path_buf()).codex_allow_foreign_hooks);
+
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::json!({ "codex_allow_foreign_hooks": true }).to_string(),
+        )
+        .unwrap();
+        assert!(DaemonConfig::new(dir.path().to_path_buf()).codex_allow_foreign_hooks);
     }
 
     #[test]

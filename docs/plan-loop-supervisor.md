@@ -157,10 +157,14 @@ Run ≥2 real campaigns (blitz or proof-campaign) gated by wisphive; mine the au
    > project has the Wisphive Codex hook installed and (b) passes
    > `--dangerously-bypass-hook-trust` so the daemon-vetted hook runs headlessly.
    > Any Codex-backed loop inherits this: gating is only real when both hold.
-   > Open sub-question — bypassing trust runs *every* hook in that project's
-   > `.codex/hooks.json`, not only Wisphive's; per-hook trust provisioning
-   > (writing `[hooks.state]` trusted-hashes) would be tighter but is
-   > codex-version-brittle.
+   > Blast radius (itr#471, resolved): bypassing trust runs *every* hook in that
+   > project's `.codex/hooks.json`, not only Wisphive's. The managed spawn now
+   > detects non-Wisphive hook commands and **refuses by default** (opt-in
+   > `codex_allow_foreign_hooks` in `config.json`), always `warn!`-ing what would
+   > run. Per-hook trust provisioning (writing only Wisphive's `[hooks.state]`
+   > trusted-hash and dropping the blanket bypass) would be tighter still, but is
+   > codex-version-brittle and a hash mismatch would silently un-gate — rejected
+   > for now in favour of the reliable bypass + fail-safe refusal.
 4. **Escalation UX** — what does the human actually need in the queue item to make a
    30-second decision? (Candidate: goal, iteration, gate tail, diff stat.)
 5. **itr integration** — should a loop claim/close an itr issue as its unit of work

@@ -541,6 +541,63 @@ pub fn codex_pretooluse_hook_installed(project: &Path) -> bool {
         .is_some_and(|arr| arr.iter().any(has_wisphive_hook))
 }
 
+/// Every hook command in `project`'s `.codex/hooks.json` — across all events
+/// and rules, nested or flat — that is **not** the `wisphive-hook` binary.
+///
+/// A managed Codex spawn passes `--dangerously-bypass-hook-trust`, which
+/// suppresses Codex's trust prompt for *every* hook in that file, not only
+/// Wisphive's (itr#471). This lists the hooks that would run headlessly so the
+/// caller can warn or refuse. Returns empty for a missing/malformed file (the
+/// caller already fail-closes on the wisphive-hook-present check) and
+/// de-duplicates repeated commands. Order is deterministic (by event name, then
+/// position within the event) but not otherwise meaningful.
+pub fn codex_foreign_hook_commands(project: &Path) -> Vec<String> {
+    let hooks_path = project.join(".codex").join("hooks.json");
+    let Ok(content) = std::fs::read_to_string(&hooks_path) else {
+        return Vec::new();
+    };
+    let Ok(settings) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return Vec::new();
+    };
+    let Some(events) = settings.get("hooks").and_then(|h| h.as_object()) else {
+        return Vec::new();
+    };
+
+    let mut foreign = Vec::new();
+    for rules in events.values() {
+        let Some(rules) = rules.as_array() else {
+            continue;
+        };
+        for rule in rules {
+            for cmd in rule_hook_commands(rule) {
+                if !is_wisphive_hook_command(cmd) && !foreign.iter().any(|f| f == cmd) {
+                    foreign.push(cmd.to_string());
+                }
+            }
+        }
+    }
+    foreign
+}
+
+/// All hook command strings carried by one rule entry — both the nested
+/// `{"hooks": [{"command": ...}]}` form and the flat legacy `{"command": ...}`
+/// form (a hybrid rule may carry both).
+fn rule_hook_commands(rule: &serde_json::Value) -> Vec<&str> {
+    let mut cmds: Vec<&str> = rule
+        .get("hooks")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|hook| hook.get("command").and_then(|v| v.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(flat) = rule.get("command").and_then(|v| v.as_str()) {
+        cmds.push(flat);
+    }
+    cmds
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -643,6 +700,55 @@ mod tests {
         fs::create_dir_all(tmp.path().join(".codex")).unwrap();
         fs::write(tmp.path().join(".codex").join("hooks.json"), "{not json").unwrap();
         assert!(!codex_pretooluse_hook_installed(tmp.path()));
+    }
+
+    // ══ codex_foreign_hook_commands — trust-bypass blast radius (itr#471) ══
+
+    #[test]
+    fn foreign_hooks_empty_for_wisphive_only_install() {
+        let tmp = temp_project();
+        install_codex(tmp.path()).unwrap();
+        assert!(codex_foreign_hook_commands(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn foreign_hooks_lists_non_wisphive_across_all_events() {
+        let tmp = temp_project();
+        write_codex_hooks(
+            tmp.path(),
+            &json!({"hooks": {
+                "PreToolUse": [cc_rule("/x/wisphive-hook"), cc_rule("/usr/bin/pre.sh")],
+                "PostToolUse": [cc_rule("/usr/bin/post.sh")],
+            }}),
+        );
+        let mut foreign = codex_foreign_hook_commands(tmp.path());
+        foreign.sort();
+        assert_eq!(foreign, vec!["/usr/bin/post.sh", "/usr/bin/pre.sh"]);
+    }
+
+    #[test]
+    fn foreign_hooks_dedupes_repeated_commands() {
+        let tmp = temp_project();
+        write_codex_hooks(
+            tmp.path(),
+            &json!({"hooks": {
+                "PreToolUse": [cc_rule("/usr/bin/dup.sh")],
+                "Stop": [cc_rule("/usr/bin/dup.sh")],
+            }}),
+        );
+        assert_eq!(
+            codex_foreign_hook_commands(tmp.path()),
+            vec!["/usr/bin/dup.sh"]
+        );
+    }
+
+    #[test]
+    fn foreign_hooks_empty_when_missing_or_malformed() {
+        let tmp = temp_project();
+        assert!(codex_foreign_hook_commands(tmp.path()).is_empty());
+        fs::create_dir_all(tmp.path().join(".codex")).unwrap();
+        fs::write(tmp.path().join(".codex").join("hooks.json"), "{bad").unwrap();
+        assert!(codex_foreign_hook_commands(tmp.path()).is_empty());
     }
 
     // ══ add_hook_entry (writes correct nested format) ══

@@ -10,6 +10,11 @@ use wisphive_protocol::{AgentType, ManagedAgent, SpawnAgentRequest};
 /// Tracks agent processes spawned by the daemon.
 pub struct ProcessRegistry {
     processes: HashMap<String, ManagedProcess>,
+    /// itr#471: operator opt-in to allow managed Codex spawns into projects
+    /// whose `.codex/hooks.json` carries non-Wisphive hooks (which the trust
+    /// bypass would run headlessly). Fail-safe default is `false` (refuse).
+    /// Captured from config at daemon start.
+    codex_allow_foreign_hooks: bool,
 }
 
 struct ManagedProcess {
@@ -18,9 +23,10 @@ struct ManagedProcess {
 }
 
 impl ProcessRegistry {
-    pub fn new() -> Self {
+    pub fn new(codex_allow_foreign_hooks: bool) -> Self {
         Self {
             processes: HashMap::new(),
+            codex_allow_foreign_hooks,
         }
     }
 
@@ -39,20 +45,45 @@ impl ProcessRegistry {
         // project has no Wisphive Codex hook, a spawned agent would run
         // completely UNGATED while appearing "managed". Fail closed rather than
         // present an ungated agent as controlled.
-        if matches!(agent_type, AgentType::Codex)
-            && !crate::hook_install::codex_pretooluse_hook_installed(&req.project)
-        {
+        if matches!(agent_type, AgentType::Codex) {
             // Strict, fail-closed check (itr#467 review): matches the
             // wisphive-hook binary precisely, not a "wisphive" substring — the
             // web/loop/TUI spawn paths don't run the CLI preflight, so this
             // guard is their only gate and must be at least as strict.
-            anyhow::bail!(
-                "refusing to spawn Codex into {}: no Wisphive PreToolUse hook is \
-                 installed there, so the agent's tool calls would bypass the control \
-                 plane. Run `wisphive hooks install --project {}` first.",
-                req.project.display(),
-                req.project.display()
-            );
+            if !crate::hook_install::codex_pretooluse_hook_installed(&req.project) {
+                anyhow::bail!(
+                    "refusing to spawn Codex into {}: no Wisphive PreToolUse hook is \
+                     installed there, so the agent's tool calls would bypass the control \
+                     plane. Run `wisphive hooks install --project {}` first.",
+                    req.project.display(),
+                    req.project.display()
+                );
+            }
+
+            // itr#471: `--dangerously-bypass-hook-trust` (passed below) suppresses
+            // Codex's trust prompt for EVERY hook in the project's
+            // `.codex/hooks.json`, not just Wisphive's. Refuse to run un-vetted
+            // third-party hooks headlessly unless the operator opts in.
+            let foreign = crate::hook_install::codex_foreign_hook_commands(&req.project);
+            if !foreign.is_empty() {
+                warn!(
+                    project = %req.project.display(),
+                    foreign_hooks = ?foreign,
+                    "Codex managed spawn: non-Wisphive hook(s) present; \
+                     --dangerously-bypass-hook-trust would run them headlessly"
+                );
+                if !self.codex_allow_foreign_hooks {
+                    anyhow::bail!(
+                        "refusing to spawn Codex into {}: its .codex/hooks.json carries \
+                         non-Wisphive hook(s) [{}] that --dangerously-bypass-hook-trust \
+                         would run headlessly without Codex's trust prompt. Review them, \
+                         then set \"codex_allow_foreign_hooks\": true in \
+                         ~/.wisphive/config.json to allow.",
+                        req.project.display(),
+                        foreign.join(", ")
+                    );
+                }
+            }
         }
 
         let mut cmd = match &agent_type {
@@ -283,13 +314,37 @@ impl ProcessRegistry {
 
 impl Default for ProcessRegistry {
     fn default() -> Self {
-        Self::new()
+        // Fail-safe: refuse foreign Codex hooks unless explicitly opted in.
+        Self::new(false)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn codex_req(project: &std::path::Path) -> SpawnAgentRequest {
+        serde_json::from_value(serde_json::json!({
+            "agent_type": "codex",
+            "project": project.to_string_lossy(),
+            "prompt": "noop",
+        }))
+        .expect("request should deserialize")
+    }
+
+    fn write_codex_hooks(project: &std::path::Path, hooks: serde_json::Value) {
+        let dir = project.join(".codex");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("hooks.json"),
+            serde_json::to_string(&hooks).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn rule(command: &str) -> serde_json::Value {
+        serde_json::json!({"matcher": "", "hooks": [{"type": "command", "command": command}]})
+    }
 
     /// itr#467: spawning Codex into a project without the Wisphive Codex hook
     /// must fail closed — an ungated agent would bypass the control plane — and
@@ -298,16 +353,9 @@ mod tests {
     #[tokio::test]
     async fn codex_spawn_fails_closed_without_wisphive_hook() {
         let proj = tempfile::tempdir().unwrap();
-        let req: SpawnAgentRequest = serde_json::from_value(serde_json::json!({
-            "agent_type": "codex",
-            "project": proj.path().to_string_lossy(),
-            "prompt": "noop",
-        }))
-        .expect("request should deserialize");
-
-        let mut registry = ProcessRegistry::new();
+        let mut registry = ProcessRegistry::new(false);
         let err = registry
-            .spawn_agent(req)
+            .spawn_agent(codex_req(proj.path()))
             .await
             .expect_err("Codex spawn into an unhooked project must be refused");
 
@@ -319,6 +367,39 @@ mod tests {
         assert!(
             registry.is_empty(),
             "no process should be tracked after a fail-closed refusal"
+        );
+    }
+
+    /// itr#471: when the project has the Wisphive hook AND a foreign hook, and
+    /// the operator has not opted in, refuse — the trust bypass would run the
+    /// foreign hook headlessly. Refusal happens before any spawn.
+    #[tokio::test]
+    async fn codex_spawn_refuses_foreign_hooks_without_opt_in() {
+        let proj = tempfile::tempdir().unwrap();
+        write_codex_hooks(
+            proj.path(),
+            serde_json::json!({"hooks": {"PreToolUse": [
+                rule("/opt/bin/wisphive-hook"),
+                rule("/usr/bin/third-party-hook.sh"),
+            ]}}),
+        );
+
+        let mut registry = ProcessRegistry::new(false);
+        let err = registry
+            .spawn_agent(codex_req(proj.path()))
+            .await
+            .expect_err("foreign hook + no opt-in must be refused");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("non-Wisphive")
+                && msg.contains("third-party-hook.sh")
+                && msg.contains("codex_allow_foreign_hooks"),
+            "refusal should name the foreign hook and the opt-in, got: {msg}"
+        );
+        assert!(
+            registry.is_empty(),
+            "no process should be tracked on refusal"
         );
     }
 }
