@@ -825,34 +825,53 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
     // itr#388 (regression on the itr#380 / ADR-0002 always-defer work).
     let defer_class = always_defer_classification(&tool_name, wisphive_dir);
     if matches!(defer_class, DeferClass::Intrinsic | DeferClass::Operator) {
-        // Audit the deferral (itr#397): this decision was made by policy, not
-        // a human, and used to leave no trace anywhere. On the Codex PreToolUse
-        // path Ask cannot defer (itr#366) — the real effect is a fail-closed
-        // deny, and the audit record says so.
-        let base = match defer_class {
-            DeferClass::Intrinsic => "always_ask:intrinsic",
-            _ => "always_ask:operator",
-        };
-        let (event, decided_by) =
-            if agent_type == AgentType::Codex && event_type == HookEventType::PreToolUse {
-                ("denied", format!("codex_ask_fail_closed:{base}"))
-            } else {
-                ("deferred", base.to_string())
+        // A Claude Code PermissionRequest for an always-defer tool is a DUPLICATE
+        // of the PreToolUse defer that already fired for the same call — Claude
+        // Code emits BOTH events for AskUserQuestion / ExitPlanMode. Crucially the
+        // PermissionRequest carries a NULL tool_use_id, so the answered-signal
+        // (PostToolUse ToolResult correlated by tool_use_id, itr#461) can never
+        // match it: the inbox row it spawns is structurally unresolvable and sticks
+        // in "waiting in your terminal" forever. The itr#440 epic cleared only the
+        // resolvable PreToolUse twin, leaving this orphan behind (the live bug the
+        // green tests missed — they never modeled the null-id PermissionRequest
+        // duplicate). We STILL return Decision::Ask (Claude's native dialog must
+        // render and capture the selection — itr#388), but skip the duplicate audit
+        // record so no orphan inbox row is created; the PreToolUse record remains
+        // the canonical, resolvable audit entry. Codex is unchanged: its
+        // PermissionRequest IS the native-approval path (its PreToolUse fail-closed
+        // denies, itr#366), so for Codex that record is the canonical one to keep.
+        let is_duplicate_permission_request =
+            is_permission_request && agent_type == AgentType::ClaudeCode;
+        if !is_duplicate_permission_request {
+            // Audit the deferral (itr#397): this decision was made by policy, not
+            // a human, and used to leave no trace anywhere. On the Codex PreToolUse
+            // path Ask cannot defer (itr#366) — the real effect is a fail-closed
+            // deny, and the audit record says so.
+            let base = match defer_class {
+                DeferClass::Intrinsic => "always_ask:intrinsic",
+                _ => "always_ask:operator",
             };
-        log_auto_approved(
-            wisphive_dir,
-            AutoApprovedLog {
-                tool_use_id: &tool_use_id,
-                agent_id: &agent_id,
-                project: &project,
-                tool_name: &tool_name,
-                tool_input: &tool_input,
-                event_type,
-                agent_type: &agent_type,
-                event,
-                decided_by: &decided_by,
-            },
-        );
+            let (event, decided_by) =
+                if agent_type == AgentType::Codex && event_type == HookEventType::PreToolUse {
+                    ("denied", format!("codex_ask_fail_closed:{base}"))
+                } else {
+                    ("deferred", base.to_string())
+                };
+            log_auto_approved(
+                wisphive_dir,
+                AutoApprovedLog {
+                    tool_use_id: &tool_use_id,
+                    agent_id: &agent_id,
+                    project: &project,
+                    tool_name: &tool_name,
+                    tool_input: &tool_input,
+                    event_type,
+                    agent_type: &agent_type,
+                    event,
+                    decided_by: &decided_by,
+                },
+            );
+        }
         return Ok(HookResponse::new(Decision::Ask, event_type, agent_type));
     }
 
