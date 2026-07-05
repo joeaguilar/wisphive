@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useWisphive } from "./hooks/useWisphive";
 import { useKeyboard } from "./hooks/useKeyboard";
 import { useAuth } from "./hooks/useAuth";
+import { useIsMobile } from "./hooks/useViewport";
 import { Queue } from "./components/Queue";
 import { Inbox } from "./components/Inbox";
 import { orderByAge } from "./components/queueUtils";
@@ -64,6 +65,10 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
   } = useWisphive();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [view, setView] = useState<View>("inbox");
+  // App-lifetime breakpoint subscriber (itr#487): keeps the :root
+  // `--is-mobile` / `data-viewport` flags synced for any CSS that keys on
+  // them, independent of which view is mounted.
+  useIsMobile();
   // Deep-link target for the inbox "Focus terminal" affordance on deferred
   // native prompts (itr#437): setting it navigates to the Terminals view and
   // tells Terminals which session to auto-select. Cleared once Terminals

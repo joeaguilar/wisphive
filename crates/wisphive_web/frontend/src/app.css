@@ -1706,12 +1706,14 @@ kbd {
   min-width: 0;
   min-height: 0;
   display: grid;
-  grid-template-rows: auto 1fr;
+  /* row 1 = mobile sub-window header (display:none on desktop → collapses
+     to 0), row 2 = queue dock, row 3 = the terminal itself. */
+  grid-template-rows: auto auto 1fr;
   overflow: auto;
 }
 
 .terminals-terminal-slot {
-  grid-row: 2 / 3;
+  grid-row: 3 / 4;
   min-height: 0;
   min-width: 0;
   overflow: auto;
@@ -1720,7 +1722,32 @@ kbd {
 }
 
 .terminal-queue-dock {
+  grid-row: 2 / 3;
+}
+
+/* Sub-window chrome — desktop hides it (sidebar stays visible alongside the
+   terminal, so there is nothing to go "back" to). */
+.terminals-mobile-header {
+  display: none;
   grid-row: 1 / 2;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-sm);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-sidebar);
+}
+
+.terminals-mobile-back {
+  flex: 0 0 auto;
+  min-height: var(--touch-min, 44px);
+}
+
+.terminals-mobile-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .terminals-empty-state {
@@ -1728,20 +1755,40 @@ kbd {
   opacity: 0.5;
 }
 
-/* Narrow screens: stack list on top of the terminal so claude code and
-   other TUI apps get a usable viewport. */
+/* Narrow screens: two-action workflow (itr#487). The pane shows ONLY the
+   session list; opening a terminal (the `terminal-open` state class set by
+   Terminals.tsx on selection) swaps it for a full-viewport sub-window with a
+   back header. Both components stay mounted — visibility is pure CSS keyed
+   on breakpoint + state, so desktop keeps the side-by-side layout untouched.
+   Breakpoint must stay in lock-step with MOBILE_BREAKPOINT_PX in
+   hooks/useViewport.ts. */
 @media (max-width: 900px) {
   .terminals-layout {
     flex-direction: column;
   }
+  /* Action 1: the list owns the whole pane… */
   .terminals-sidebar {
-    flex: 0 0 auto;
-    max-height: 35vh;
-    min-height: 140px;
-  }
-  .terminals-main {
     flex: 1 1 auto;
-    min-height: 60vh;
+    max-height: none;
+    min-height: 0;
+  }
+  .terminals-layout:not(.terminal-open) .terminals-main {
+    display: none;
+  }
+  /* …Action 2: the opened terminal takes the whole viewport. Fixed overlay
+     (below the modal layer at z-index 100) so TUI apps get every row the
+     device has; the back button is the way out. */
+  .terminals-layout.terminal-open .terminals-sidebar {
+    display: none;
+  }
+  .terminals-layout.terminal-open .terminals-main {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    background: var(--bg);
+  }
+  .terminals-layout.terminal-open .terminals-mobile-header {
+    display: flex;
   }
 }
 

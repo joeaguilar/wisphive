@@ -154,6 +154,16 @@ export function Terminals(props: TerminalsProps) {
     else onAttach(t.id);
   };
 
+  // Mobile sub-window back action (itr#487): below the breakpoint selecting a
+  // terminal opens it full-screen (CSS keys on the `terminal-open` class);
+  // "back" closes the sub-window by clearing the selection, returning to the
+  // list. Detach so the daemon stops streaming to a pane nobody is viewing.
+  const handleBack = () => {
+    if (selectedId) onDetach(selectedId);
+    setSelectedId(null);
+    setReplayMode(false);
+  };
+
   // Honour an inbox deep-link focus (itr#437). Waits for the target session to
   // appear in `terminals` (term_list may not have arrived yet), then selects +
   // live-attaches it and clears the request upstream so it won't re-fire.
@@ -266,7 +276,7 @@ export function Terminals(props: TerminalsProps) {
   };
 
   return (
-    <div className="terminals-layout">
+    <div className={`terminals-layout${selected ? " terminal-open" : ""}`}>
       <div className="terminals-sidebar">
         <div className="terminals-sidebar-toolbar">
           <button onClick={handleCreate}>+ New terminal</button>
@@ -458,6 +468,23 @@ export function Terminals(props: TerminalsProps) {
       <div className="terminals-main">
         {selected ? (
           <>
+            {/* Visible only inside the mobile sub-window (CSS hides it on
+                desktop, where the sidebar stays alongside the terminal).
+                Status/command/replay markers live in TerminalView's own strip
+                right below — repeating them here would just double the chrome. */}
+            <div className="terminals-mobile-header">
+              <button
+                type="button"
+                className="terminals-mobile-back"
+                onClick={handleBack}
+                aria-label="Back to terminal list"
+              >
+                ‹ Terminals
+              </button>
+              <strong className="terminals-mobile-title">
+                {selected.label ?? selected.id.slice(0, 8)}
+              </strong>
+            </div>
             <TerminalQueueDock
               terminalPending={terminalPending}
               otherPendingCount={otherPendingCount}
