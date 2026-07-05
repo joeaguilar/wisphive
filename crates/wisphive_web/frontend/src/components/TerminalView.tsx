@@ -97,84 +97,22 @@ export function TerminalView({ session, replayMode, onInput, onResize, registerH
     });
     resizeObserver.observe(containerRef.current);
 
-    // Touch-to-scroll (itr#445). xterm's viewport scrolls via the wheel or the
-    // scrollbar, but a phone/tablet has neither — so a vertical touch-drag has
-    // to be translated into a scrollback scroll by hand. xterm 6 renders through
-    // a custom (Monaco-style) scrollable, NOT a native overflow:auto viewport —
-    // so writing `.xterm-viewport.scrollTop` is ignored. We drive the public
-    // `term.scrollLines()` API instead, converting the finger's pixel travel
-    // into whole-row deltas (px-per-row = viewport height / rows) and tracking
-    // how many rows we've already applied this gesture so the content follows
-    // the finger smoothly. Listeners are native + capture phase with
-    // { passive: false } because React's synthetic touch handlers are passive
-    // and cannot preventDefault; stopPropagation keeps xterm from starting a
-    // text selection mid-scroll. A tap (no movement past the threshold) is never
-    // intercepted, so tap-to-focus + the on-screen keyboard keep working.
-    // `touch-action: none` on the container (set inline below) stops an ancestor
-    // overflow:auto pane from claiming the gesture first.
-    const container = containerRef.current;
-    const viewport = container.querySelector<HTMLElement>(".xterm-viewport");
-    const SCROLL_LOCK_PX = 6; // movement before a drag commits to scrolling
-    let activeTouchId: number | null = null;
-    let startY = 0;
-    let appliedRows = 0; // rows already scrolled this gesture (signed)
-    let scrolling = false;
-
-    // Height of one terminal row in CSS px. The viewport is exactly rows tall,
-    // so its clientHeight / rows is the cell height; fall back to a font-size
-    // estimate if layout hasn't settled (clientHeight can be 0 pre-paint).
-    const rowHeight = () => {
-      const h = viewport?.clientHeight ?? 0;
-      const rows = term.rows || 1;
-      const px = h > 0 ? h / rows : 0;
-      return px > 0 ? px : 17; // ~fontSize(13) * lineHeight
-    };
-
-    const onTouchStart = (e: TouchEvent) => {
-      if (e.touches.length !== 1) return;
-      const t = e.touches[0];
-      activeTouchId = t.identifier;
-      startY = t.clientY;
-      appliedRows = 0;
-      scrolling = false;
-    };
-    const onTouchMove = (e: TouchEvent) => {
-      if (activeTouchId === null) return;
-      const t = Array.from(e.touches).find((x) => x.identifier === activeTouchId);
-      if (!t) return;
-      const dy = t.clientY - startY;
-      if (!scrolling && Math.abs(dy) < SCROLL_LOCK_PX) return;
-      scrolling = true;
-      // Drag down (dy>0) → reveal earlier scrollback → scroll up (negative
-      // scrollLines). Track applied rows so we only emit the incremental delta.
-      const targetRows = Math.round(-dy / rowHeight());
-      const delta = targetRows - appliedRows;
-      if (delta !== 0) {
-        term.scrollLines(delta);
-        appliedRows = targetRows;
-      }
-      e.preventDefault();
-      e.stopPropagation();
-    };
-    const onTouchEnd = (e: TouchEvent) => {
-      if (activeTouchId === null) return;
-      if (Array.from(e.touches).some((x) => x.identifier === activeTouchId)) return;
-      activeTouchId = null;
-      appliedRows = 0;
-      scrolling = false;
-    };
-    container.addEventListener("touchstart", onTouchStart, { capture: true, passive: true });
-    container.addEventListener("touchmove", onTouchMove, { capture: true, passive: false });
-    container.addEventListener("touchend", onTouchEnd, { capture: true, passive: true });
-    container.addEventListener("touchcancel", onTouchEnd, { capture: true, passive: true });
+    // Touch-to-scroll (itr#445) is handled by xterm 6 itself: its Monaco-derived
+    // scrollable registers a document-level touch Gesture (enabled whenever
+    // isTouchDevice() is true — real phones and DevTools touch emulation) that
+    // drags the viewport through scrollback. We deliberately do NOT hand-roll a
+    // touch handler: an earlier custom listener that called term.scrollLines()
+    // and stopPropagation() suppressed xterm's own Gesture and, being bound to
+    // the mount's lifecycle, broke after switching terminals (fresh worked, then
+    // re-attach didn't) while the instance-owned wheel handler kept working. The
+    // only thing xterm needs from us is to stop the `overflow:auto` ancestor
+    // panes (.terminals-main / .terminals-terminal-slot) from claiming the
+    // vertical pan first — that is what `touch-action: none` on the mount (set
+    // inline below) guarantees, letting xterm's Gesture win the gesture.
 
     return () => {
       cancelAnimationFrame(rafId);
       resizeObserver.disconnect();
-      container.removeEventListener("touchstart", onTouchStart, { capture: true });
-      container.removeEventListener("touchmove", onTouchMove, { capture: true });
-      container.removeEventListener("touchend", onTouchEnd, { capture: true });
-      container.removeEventListener("touchcancel", onTouchEnd, { capture: true });
       inputDisposable.dispose();
       unregister();
       term.dispose();
@@ -196,8 +134,8 @@ export function TerminalView({ session, replayMode, onInput, onResize, registerH
       </div>
       <div
         ref={containerRef}
-        // touchAction: none — the touch-to-scroll handler (itr#445) owns
-        // vertical drags, so the browser must not also pan an ancestor pane.
+        // touchAction: none — hand the vertical pan to xterm's own touch Gesture
+        // (itr#445) instead of letting the overflow:auto ancestor panes scroll.
         style={{ flex: 1, minHeight: 0, background: "var(--bg)", touchAction: "none" }}
       />
     </div>
