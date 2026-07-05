@@ -70,11 +70,11 @@ export function Agents({ agents, queue, timeline, selectedAgent, onSelectAgent, 
         {/* Agent header */}
         {agent && (
           <div className="agent-detail-header">
-            <div className="agent-detail-id">
+            <h2 className="agent-detail-id">
               <span className="status-indicator live" aria-hidden="true">●</span>
               <span>{agent.agent_id}</span>
               <span className="agent-card-type">{agent.agent_type}</span>
-            </div>
+            </h2>
             <div className="agent-detail-meta">
               <span>Project: {agent.project}</span>
               <span>Connected {timeAgo(agent.connected_at)}</span>

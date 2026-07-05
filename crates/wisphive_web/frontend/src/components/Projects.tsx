@@ -98,6 +98,7 @@ export function Projects({
         <input
           className="gate-path-input"
           type="text"
+          aria-label="Absolute path of the project to gate with Wisphive hooks"
           placeholder="/absolute/path/to/project"
           value={gatePath}
           onChange={(e) => setGatePath(e.target.value)}

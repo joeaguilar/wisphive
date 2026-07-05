@@ -31,6 +31,7 @@ export function History({ entries, onLoad, onSearch }: HistoryProps) {
         <input
           type="text"
           className="history-search"
+          aria-label="Search decision history"
           placeholder="Search history..."
           value={search}
           onChange={(e) => setSearch(e.target.value)}

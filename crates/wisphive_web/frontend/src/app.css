@@ -1608,6 +1608,19 @@ kbd {
   .btn-sm { min-height: 44px !important; } /* override the desktop-density cap */
 }
 
+/* Honour reduced-motion. The UI's motion is limited to short colour/opacity
+ * fades (state feedback, not decoration), but a user who asks for no motion
+ * gets none — the fades collapse to instant while state still changes. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
+
 /* ── Terminals view ────────────────────────────────────────────── */
 
 .terminals-layout {

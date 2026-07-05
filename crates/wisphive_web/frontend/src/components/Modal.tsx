@@ -110,6 +110,7 @@ export function TextModal({ title, placeholder, submitLabel, submitClass, onSubm
       <textarea
         ref={textRef}
         className="modal-textarea"
+        aria-label={title}
         placeholder={placeholder}
         rows={4}
         onKeyDown={(e) => {
