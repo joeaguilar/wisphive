@@ -118,8 +118,10 @@ Copy this block into the appropriate phase section:
   back down returns to the live tail. The page/outer pane does **not** scroll instead of the
   terminal. After scrolling, tap-to-focus and on-screen-keyboard input still work — no gesture
   gets stuck, no accidental text selection during the drag. Automated proof exists
-  (`TerminalView.test.tsx` drives the real `.xterm-viewport` scrollTop); this covers real-hardware
-  touch feel that jsdom can't.
+  (`TerminalView.test.tsx` asserts the drag drives xterm's public `term.scrollLines()`; a real
+  Chromium harness confirmed a touch-drag actually moves xterm 6's scrollback — xterm 6 uses a
+  custom scrollable, so the earlier `.xterm-viewport.scrollTop` approach was a no-op); this item
+  covers only real-hardware touch feel that automation can't.
 - **Evidence:** _phone/tablet screenshots (before/after scroll) + subjective note_
 - [ ] Verified — signed off: _______
 

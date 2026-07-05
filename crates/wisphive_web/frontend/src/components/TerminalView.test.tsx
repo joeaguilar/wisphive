@@ -1,10 +1,10 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render } from "@testing-library/react";
+import { Terminal } from "@xterm/xterm";
 import { TerminalView } from "./TerminalView";
 import type { TerminalSessionMeta } from "../types/protocol";
 
-// jsdom has no ResizeObserver; xterm's open() path also touches it via our
-// component. A no-op stub is enough — we assert on scroll, not on fit.
+// jsdom has no ResizeObserver; xterm's open() path touches it via our component.
 class ResizeObserverStub {
   observe() {}
   unobserve() {}
@@ -52,78 +52,84 @@ function touch(type: string, clientY: number, identifier = 1): Event {
   return e;
 }
 
-afterEach(cleanup);
+// Give the xterm viewport a real row height: 6 rows × 20px = 120px tall, so the
+// handler computes 20px per row.
+function primeViewport(container: HTMLElement) {
+  const viewport = container.querySelector<HTMLElement>(".xterm-viewport")!;
+  Object.defineProperty(viewport, "clientHeight", { value: 120, configurable: true });
+  return viewport;
+}
+
+function mountView() {
+  return render(
+    <TerminalView
+      session={session}
+      replayMode={false}
+      onInput={() => {}}
+      onResize={() => {}}
+      registerHandler={() => () => {}}
+    />,
+  );
+}
+
+let scrollLines: ReturnType<typeof vi.spyOn>;
+
+beforeEach(() => {
+  // xterm 6 renders through a custom scrollable (not native scrollTop), so the
+  // handler drives the public scrollLines() API — spy on it. mockImplementation
+  // also avoids the canvas path jsdom can't run.
+  scrollLines = vi.spyOn(Terminal.prototype, "scrollLines").mockImplementation(() => {});
+  // Silence xterm's noisy renderer warnings under jsdom (no real canvas).
+  vi.spyOn(console, "warn").mockImplementation(() => {});
+  vi.spyOn(console, "error").mockImplementation(() => {});
+});
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 describe("TerminalView touch-to-scroll (itr#445)", () => {
-  it("translates a vertical touch-drag into a scrollback scroll", () => {
-    let write!: (id: string, dir: "chunk" | "catchup" | "replay_chunk", bytes: Uint8Array) => void;
-    const registerHandler = (_id: string, handler: typeof write) => {
-      write = handler;
-      return () => {};
-    };
+  it("translates a vertical touch-drag into scrollLines(rows) up into scrollback", () => {
+    const { container } = mountView();
+    expect(container.querySelector(".xterm-viewport"), "xterm viewport should mount").not.toBeNull();
+    primeViewport(container);
 
-    const { container } = render(
-      <TerminalView
-        session={session}
-        replayMode={false}
-        onInput={() => {}}
-        onResize={() => {}}
-        registerHandler={registerHandler}
-      />,
-    );
-
-    // Fill the buffer well past the visible rows so there is scrollback to reach.
-    const lines = Array.from({ length: 200 }, (_, i) => `line ${i}\r\n`).join("");
-    write(session.id, "chunk", new TextEncoder().encode(lines));
-
-    const viewport = container.querySelector<HTMLElement>(".xterm-viewport");
-    expect(viewport, "xterm viewport should mount").not.toBeNull();
-
-    // xterm auto-scrolls to bottom on write; jsdom does no layout so give the
-    // viewport a real scroll range to move within, then park it at the bottom.
-    Object.defineProperty(viewport!, "scrollHeight", { value: 3000, configurable: true });
-    Object.defineProperty(viewport!, "clientHeight", { value: 100, configurable: true });
-    viewport!.scrollTop = 2900;
-
-    // Drag the finger DOWN 300px → reveal earlier scrollback (scrollTop drops).
     const mount = container.querySelector<HTMLElement>("div[style*='touch-action']")!;
     mount.dispatchEvent(touch("touchstart", 500));
-    const move = touch("touchmove", 800); // dy = +300
+    const move = touch("touchmove", 800); // dy = +300px, 20px/row → 15 rows
     mount.dispatchEvent(move);
 
-    expect(viewport!.scrollTop).toBe(2600); // 2900 - 300
-    expect(move.defaultPrevented).toBe(true); // page scroll suppressed
+    // Drag DOWN reveals earlier scrollback → scroll UP → negative scrollLines.
+    expect(scrollLines).toHaveBeenCalledWith(-15);
+    expect(move.defaultPrevented).toBe(true); // page/pane scroll suppressed
 
     mount.dispatchEvent(touch("touchend", 800));
   });
 
-  it("ignores a tap (sub-threshold movement) so tap-to-focus still works", () => {
-    const registerHandler = () => () => {};
-    const { container } = render(
-      <TerminalView
-        session={session}
-        replayMode={false}
-        onInput={() => {}}
-        onResize={() => {}}
-        registerHandler={registerHandler}
-      />,
-    );
-    const viewport = container.querySelector<HTMLElement>(".xterm-viewport")!;
-    Object.defineProperty(viewport, "scrollHeight", { value: 3000, configurable: true });
-    Object.defineProperty(viewport, "clientHeight", { value: 100, configurable: true });
-    viewport.scrollTop = 2900;
+  it("emits only the incremental row delta as the finger keeps moving", () => {
+    const { container } = mountView();
+    primeViewport(container);
 
     const mount = container.querySelector<HTMLElement>("div[style*='touch-action']")!;
     mount.dispatchEvent(touch("touchstart", 500));
-    const move = touch("touchmove", 503); // dy = +3, below the 6px lock
+    mount.dispatchEvent(touch("touchmove", 600)); // dy=100 → -5 rows
+    mount.dispatchEvent(touch("touchmove", 700)); // dy=200 → -10 rows, delta -5
+    mount.dispatchEvent(touch("touchend", 700));
+
+    expect(scrollLines.mock.calls).toEqual([[-5], [-5]]); // cumulative -10, no double-count
+  });
+
+  it("ignores a tap (sub-threshold movement) so tap-to-focus still works", () => {
+    const { container } = mountView();
+    primeViewport(container);
+
+    const mount = container.querySelector<HTMLElement>("div[style*='touch-action']")!;
+    mount.dispatchEvent(touch("touchstart", 500));
+    const move = touch("touchmove", 503); // dy = +3px, below the 6px lock
     mount.dispatchEvent(move);
 
-    expect(viewport.scrollTop).toBe(2900); // unchanged
+    expect(scrollLines).not.toHaveBeenCalled();
     expect(move.defaultPrevented).toBe(false); // gesture left for xterm/tap
     mount.dispatchEvent(touch("touchend", 503));
   });
 });
-
-// Silence xterm's noisy renderer warnings under jsdom (no real canvas).
-vi.spyOn(console, "warn").mockImplementation(() => {});
-vi.spyOn(console, "error").mockImplementation(() => {});
