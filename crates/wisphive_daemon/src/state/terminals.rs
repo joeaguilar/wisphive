@@ -3,15 +3,90 @@ use wisphive_protocol::{TerminalDirection, TerminalSessionMeta, TerminalStatus};
 
 use super::StateDb;
 
+type TerminalSessionRow = (
+    String,
+    Option<String>,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    String,
+    Option<String>,
+    Option<i64>,
+    String,
+    Option<String>,
+    i64,
+    Option<String>,
+    Option<String>,
+);
+
+fn hydrate_terminal_session(row: TerminalSessionRow) -> Option<TerminalSessionMeta> {
+    let (
+        id,
+        label,
+        command,
+        args_json,
+        cwd,
+        cols,
+        rows_,
+        started_at,
+        ended_at,
+        exit_code,
+        status,
+        group_name,
+        sort_order,
+        created_by,
+        replay_acl_json,
+    ) = row;
+
+    let Ok(id) = uuid::Uuid::parse_str(&id) else {
+        return None;
+    };
+    let args: Vec<String> = serde_json::from_str(&args_json).unwrap_or_default();
+    let Ok(started_at) = chrono::DateTime::parse_from_rfc3339(&started_at) else {
+        return None;
+    };
+    let ended_at = ended_at
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .map(|d| d.with_timezone(&chrono::Utc));
+    let Ok(status) = status.parse::<TerminalStatus>() else {
+        return None;
+    };
+    let replay_acl = replay_acl_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<Vec<String>>(json).ok())
+        .unwrap_or_default();
+
+    Some(TerminalSessionMeta {
+        id,
+        label,
+        command,
+        args,
+        cwd: std::path::PathBuf::from(cwd),
+        cols: cols as u16,
+        rows: rows_ as u16,
+        started_at: started_at.with_timezone(&chrono::Utc),
+        ended_at,
+        exit_code: exit_code.map(|c| c as i32),
+        status,
+        group_name,
+        sort_order,
+        created_by,
+        replay_acl,
+    })
+}
+
 impl StateDb {
     // ── Terminal session helpers ──────────────────────────────────
 
     /// Insert a new terminal session row.
     pub async fn create_terminal_session(&self, meta: &TerminalSessionMeta) -> Result<()> {
         let args_json = serde_json::to_string(&meta.args)?;
+        let replay_acl_json = serde_json::to_string(&meta.replay_acl)?;
         sqlx::query(
-            "INSERT INTO terminal_sessions (id, label, command, args, cwd, env_json, cols, rows, started_at, ended_at, exit_code, status, group_name, sort_order)
-             VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO terminal_sessions (id, label, command, args, cwd, env_json, cols, rows, started_at, ended_at, exit_code, status, group_name, sort_order, created_by, replay_acl)
+             VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(meta.id.to_string())
         .bind(&meta.label)
@@ -26,6 +101,8 @@ impl StateDb {
         .bind(meta.status.to_string())
         .bind(meta.group_name.as_deref())
         .bind(meta.sort_order)
+        .bind(meta.created_by.as_deref())
+        .bind(replay_acl_json)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -76,23 +153,8 @@ impl StateDb {
     /// with a newest-first default baked in at creation), tiebroken by
     /// `started_at` DESC. The client is responsible for sectioning by status.
     pub async fn list_terminal_sessions(&self) -> Result<Vec<TerminalSessionMeta>> {
-        type Row = (
-            String,
-            Option<String>,
-            String,
-            String,
-            String,
-            i64,
-            i64,
-            String,
-            Option<String>,
-            Option<i64>,
-            String,
-            Option<String>,
-            i64,
-        );
-        let rows: Vec<Row> = sqlx::query_as(
-            "SELECT id, label, command, args, cwd, cols, rows, started_at, ended_at, exit_code, status, group_name, sort_order
+        let rows: Vec<TerminalSessionRow> = sqlx::query_as(
+            "SELECT id, label, command, args, cwd, cols, rows, started_at, ended_at, exit_code, status, group_name, sort_order, created_by, replay_acl
              FROM terminal_sessions
              ORDER BY sort_order ASC, started_at DESC
              LIMIT 500",
@@ -101,50 +163,10 @@ impl StateDb {
         .await?;
 
         let mut out = Vec::with_capacity(rows.len());
-        for (
-            id,
-            label,
-            command,
-            args_json,
-            cwd,
-            cols,
-            rows_,
-            started_at,
-            ended_at,
-            exit_code,
-            status,
-            group_name,
-            sort_order,
-        ) in rows
-        {
-            let Ok(id) = uuid::Uuid::parse_str(&id) else {
-                continue;
-            };
-            let args: Vec<String> = serde_json::from_str(&args_json).unwrap_or_default();
-            let Ok(started_at) = chrono::DateTime::parse_from_rfc3339(&started_at) else {
-                continue;
-            };
-            let ended_at = ended_at
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-                .map(|d| d.with_timezone(&chrono::Utc));
-            let Ok(status) = status.parse::<TerminalStatus>() else {
-                continue;
-            };
-            out.push(TerminalSessionMeta {
-                id,
-                label,
-                command,
-                args,
-                cwd: std::path::PathBuf::from(cwd),
-                cols: cols as u16,
-                rows: rows_ as u16,
-                started_at: started_at.with_timezone(&chrono::Utc),
-                ended_at,
-                exit_code: exit_code.map(|c| c as i32),
-                status,
-                group_name,
-                sort_order,
-            });
+        for row in rows {
+            if let Some(meta) = hydrate_terminal_session(row) {
+                out.push(meta);
+            }
         }
         Ok(out)
     }
@@ -154,13 +176,46 @@ impl StateDb {
         &self,
         id: uuid::Uuid,
     ) -> Result<Option<TerminalSessionMeta>> {
-        // Tiny wrapper: filter list_terminal_sessions by id. For 500-row
-        // cap that is cheap; avoids a duplicate query/hydration path.
-        Ok(self
-            .list_terminal_sessions()
-            .await?
-            .into_iter()
-            .find(|m| m.id == id))
+        let row: Option<TerminalSessionRow> = sqlx::query_as(
+            "SELECT id, label, command, args, cwd, cols, rows, started_at, ended_at, exit_code, status, group_name, sort_order, created_by, replay_acl
+             FROM terminal_sessions
+             WHERE id = ?
+             LIMIT 1",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(hydrate_terminal_session))
+    }
+
+    /// Grant one resolver label explicit replay access to a session.
+    pub async fn grant_terminal_replay_access(
+        &self,
+        id: uuid::Uuid,
+        requester: &str,
+    ) -> Result<()> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT replay_acl FROM terminal_sessions WHERE id = ? LIMIT 1")
+                .bind(id.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some((acl_json,)) = row else {
+            return Ok(());
+        };
+        let mut acl = acl_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<Vec<String>>(json).ok())
+            .unwrap_or_default();
+        if !acl.iter().any(|entry| entry == requester) {
+            acl.push(requester.to_string());
+            let acl_json = serde_json::to_string(&acl)?;
+            sqlx::query("UPDATE terminal_sessions SET replay_acl = ? WHERE id = ?")
+                .bind(acl_json)
+                .bind(id.to_string())
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Insert a batch of terminal events in a single transaction.
@@ -272,6 +327,8 @@ mod tests {
             status: TerminalStatus::Running,
             group_name: None,
             sort_order: 0,
+            created_by: None,
+            replay_acl: Vec::new(),
         }
     }
 
@@ -289,6 +346,48 @@ mod tests {
         assert_eq!(list[0].command, "/bin/sh");
         assert_eq!(list[0].args, vec!["-c".to_string(), "echo hi".into()]);
         assert_eq!(list[0].status, TerminalStatus::Running);
+    }
+
+    /// itr#98: the creator identity written at create time must be readable
+    /// back for the replay authorship check.
+    #[tokio::test]
+    async fn created_by_round_trips() {
+        let db = test_db().await;
+        let id = uuid::Uuid::new_v4();
+        let mut meta = make_term_meta(id);
+        meta.created_by = Some("human:web:dev-1".into());
+        meta.replay_acl = vec!["human:web:dev-2".into()];
+        db.create_terminal_session(&meta).await.unwrap();
+        let got = db.get_terminal_session(id).await.unwrap().unwrap();
+        assert_eq!(got.created_by.as_deref(), Some("human:web:dev-1"));
+        assert_eq!(got.replay_acl, vec!["human:web:dev-2"]);
+        // Legacy-shaped row (no creator) reads back as None.
+        let legacy = uuid::Uuid::new_v4();
+        db.create_terminal_session(&make_term_meta(legacy))
+            .await
+            .unwrap();
+        let got = db.get_terminal_session(legacy).await.unwrap().unwrap();
+        assert_eq!(got.created_by, None);
+        assert!(got.replay_acl.is_empty());
+    }
+
+    #[tokio::test]
+    async fn grant_terminal_replay_access_adds_acl_entry_once() {
+        let db = test_db().await;
+        let id = uuid::Uuid::new_v4();
+        db.create_terminal_session(&make_term_meta(id))
+            .await
+            .unwrap();
+
+        db.grant_terminal_replay_access(id, "human:web:dev-2")
+            .await
+            .unwrap();
+        db.grant_terminal_replay_access(id, "human:web:dev-2")
+            .await
+            .unwrap();
+
+        let got = db.get_terminal_session(id).await.unwrap().unwrap();
+        assert_eq!(got.replay_acl, vec!["human:web:dev-2"]);
     }
 
     #[tokio::test]

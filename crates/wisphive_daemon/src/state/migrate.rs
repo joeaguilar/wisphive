@@ -144,6 +144,19 @@ impl StateDb {
         .execute(&self.pool)
         .await
         .ok();
+        // Replay authorization (itr#98): `created_by` is the implicit owner
+        // proof; `replay_acl` is an explicit per-session allowlist of resolver
+        // labels (`human:tui` / `human:web:<device-id>`). Legacy rows have no
+        // creator and an empty ACL, so replay fails closed unless access is
+        // granted later.
+        try_add_column(&self.pool, "terminal_sessions", "created_by", "TEXT").await?;
+        try_add_column(
+            &self.pool,
+            "terminal_sessions",
+            "replay_acl",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )
+        .await?;
 
         // Per-event stream: raw input/output/resize bytes for replay.
         sqlx::query(

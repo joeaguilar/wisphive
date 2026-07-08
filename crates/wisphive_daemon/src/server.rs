@@ -8,7 +8,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, broadcast};
 use tracing::{debug, error, info, warn};
 use wisphive_protocol::{
-    ClientMessage, ClientType, Decision, PROTOCOL_VERSION, RichDecision, ServerMessage, encode,
+    ClientMessage, ClientType, Decision, PROTOCOL_VERSION, RichDecision, ServerMessage,
+    TerminalSessionMeta, encode,
 };
 
 use crate::config::DaemonConfig;
@@ -29,6 +30,7 @@ const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 use crate::process_registry::ProcessRegistry;
 use crate::queue::DecisionQueue;
 use crate::registry::AgentRegistry;
+use crate::replay_gate::ReplayRateLimiter;
 use crate::state::StateDb;
 use crate::sudo_gate::ReauthRegistry;
 use crate::terminal::TerminalSessionManager;
@@ -42,6 +44,7 @@ struct ConnectionContext {
     state_db: Arc<StateDb>,
     terminal_manager: Arc<TerminalSessionManager>,
     reauth: ReauthRegistry,
+    replay_gate: ReplayRateLimiter,
     hook_timeout_secs: u64,
     notifications_enabled: bool,
     home_dir: PathBuf,
@@ -59,6 +62,7 @@ pub struct Server {
     state_db: Arc<StateDb>,
     terminal_manager: Arc<TerminalSessionManager>,
     reauth: ReauthRegistry,
+    replay_gate: ReplayRateLimiter,
 }
 
 impl Server {
@@ -103,6 +107,7 @@ impl Server {
             state_db,
             terminal_manager,
             reauth: ReauthRegistry::new(),
+            replay_gate: ReplayRateLimiter::new(),
         })
     }
 
@@ -308,6 +313,7 @@ impl Server {
                                 state_db: self.state_db.clone(),
                                 terminal_manager: self.terminal_manager.clone(),
                                 reauth: self.reauth.clone(),
+                                replay_gate: self.replay_gate.clone(),
                                 hook_timeout_secs: self.config.hook_timeout_secs,
                                 notifications_enabled: self.config.notifications_enabled,
                                 home_dir: self.config.home_dir.clone(),
@@ -782,6 +788,73 @@ fn resolver_label(device_id: &Option<wisphive_protocol::DeviceId>) -> String {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ReplayAccess {
+    session_known: bool,
+    author: Option<String>,
+    replay_acl: Vec<String>,
+    authored: bool,
+    explicit_access: bool,
+}
+
+impl ReplayAccess {
+    fn allowed(&self) -> bool {
+        self.session_known && (self.authored || self.explicit_access)
+    }
+
+    fn non_authored(&self) -> bool {
+        !self.authored
+    }
+
+    fn authorization(&self) -> &'static str {
+        if !self.session_known {
+            "no_session"
+        } else if self.authored {
+            "creator"
+        } else if self.explicit_access {
+            "acl"
+        } else {
+            "denied"
+        }
+    }
+}
+
+fn evaluate_replay_access(meta: Option<&TerminalSessionMeta>, requester: &str) -> ReplayAccess {
+    let session_known = meta.is_some();
+    let author = meta.and_then(|m| m.created_by.clone());
+    let replay_acl = meta.map(|m| m.replay_acl.clone()).unwrap_or_default();
+    let authored = author.as_deref() == Some(requester);
+    let explicit_access = replay_acl.iter().any(|entry| entry == requester);
+    ReplayAccess {
+        session_known,
+        author,
+        replay_acl,
+        authored,
+        explicit_access,
+    }
+}
+
+fn terminal_replay_request_detail(
+    id: uuid::Uuid,
+    requester: &str,
+    from_seq: Option<u64>,
+    access: &ReplayAccess,
+    outcome: &str,
+) -> String {
+    serde_json::json!({
+        "session_id": id,
+        "requester": requester,
+        "author": access.author.as_deref(),
+        "from_seq": from_seq,
+        "non_authored": access.non_authored(),
+        "authorized": access.allowed(),
+        "authorization": access.authorization(),
+        "replay_acl": &access.replay_acl,
+        "outcome": outcome,
+    })
+    .to_string()
+}
+
 /// Eagerly persist a resolved decision so subsequent history queries see it.
 ///
 /// The hook handler's `resolve_pending` is idempotent (no-op if already done),
@@ -1007,7 +1080,7 @@ async fn dispatch_command(
         | ClientMessage::TermSetGroup { .. }
         | ClientMessage::TermReorder { .. }
         | ClientMessage::TermReplay { .. } => {
-            handle_terminal_command(writer, ctx, msg, term_attachments, conn_tx).await?;
+            handle_terminal_command(writer, ctx, device_id, msg, term_attachments, conn_tx).await?;
         }
         _ => {
             warn!("unexpected message from TUI: {:?}", msg);
@@ -1703,9 +1776,14 @@ async fn handle_query_command(
 
 /// Dispatch terminal-session commands. These mutate the per-connection
 /// `term_attachments` map and spawn forwarders that send back over `conn_tx`.
+///
+/// `device_id` is the authenticated envelope identity (None = local TUI,
+/// stamped by the web bridge for browser clients). It attributes session
+/// creation (`created_by`) and the replay audit trail (itr#98).
 async fn handle_terminal_command(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     ctx: &ConnectionContext,
+    device_id: Option<wisphive_protocol::DeviceId>,
     msg: ClientMessage,
     term_attachments: &mut std::collections::HashMap<uuid::Uuid, tokio::task::JoinHandle<()>>,
     conn_tx: &tokio::sync::mpsc::Sender<ServerMessage>,
@@ -1722,7 +1800,16 @@ async fn handle_terminal_command(
         } => {
             match ctx
                 .terminal_manager
-                .create(label, command, args, cwd, cols, rows, env)
+                .create(
+                    label,
+                    command,
+                    args,
+                    cwd,
+                    cols,
+                    rows,
+                    env,
+                    Some(resolver_label(&device_id)),
+                )
                 .await
             {
                 Ok(meta) => {
@@ -1921,6 +2008,84 @@ async fn handle_terminal_command(
             from_seq,
             speed: _,
         } => {
+            // itr#98: replay streams a session's complete byte history —
+            // including anything typed into it (sudo passwords, pasted
+            // keys) — so every request is audited, rate-limited per
+            // requester, and authorized by creator identity or explicit
+            // per-session ACL before any bytes leave the daemon.
+            let requester = resolver_label(&device_id);
+            let dev_id: Option<String> = device_id.as_ref().map(|d| d.0.clone());
+
+            // SQLite is the source of truth for replay ACL updates. Fall back
+            // to live metadata only if the DB row is absent, which should not
+            // happen after normal create but keeps in-memory tests robust.
+            let mut meta = match ctx.state_db.get_terminal_session(id).await {
+                Ok(meta) => meta,
+                Err(e) => {
+                    warn!(%id, "failed to load terminal session for replay authz: {e}");
+                    None
+                }
+            };
+            if meta.is_none()
+                && let Some(session) = ctx.terminal_manager.get(id).await
+            {
+                meta = Some(session.meta.lock().await.clone());
+            }
+            let access = evaluate_replay_access(meta.as_ref(), &requester);
+            let rate_allowed = ctx.replay_gate.try_acquire(&requester).await;
+            let outcome = if !rate_allowed {
+                "rate_limited"
+            } else if access.allowed() {
+                "started"
+            } else {
+                "denied"
+            };
+
+            // Record the request BEFORE any return/stream so denied,
+            // rate-limited, aborted, and disconnected replays all have a
+            // timestamped audit row. `at` is stamped by append_web_audit.
+            let detail = terminal_replay_request_detail(id, &requester, from_seq, &access, outcome);
+            if let Err(e) = ctx
+                .state_db
+                .append_web_audit("terminal_replay", dev_id.as_deref(), None, Some(&detail))
+                .await
+            {
+                warn!("failed to audit terminal replay request: {e}");
+            }
+
+            if access.session_known && access.non_authored() {
+                info!(%id, %requester, author = ?access.author, authorization = access.authorization(), "non-authored terminal replay request");
+                if ctx.notifications_enabled {
+                    crate::notify::notify_terminal_replay(&requester, access.author.as_deref(), id);
+                }
+            }
+
+            if !rate_allowed {
+                warn!(%id, %requester, "terminal replay rate limit exceeded");
+                write_msg(
+                    writer,
+                    &ServerMessage::TermError {
+                        id: Some(id),
+                        message: "replay rate limit exceeded; try again shortly".into(),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+
+            if !access.allowed() {
+                warn!(%id, %requester, authorization = access.authorization(), "terminal replay denied");
+                write_msg(
+                    writer,
+                    &ServerMessage::TermError {
+                        id: Some(id),
+                        message: "terminal replay denied: requester is not the session creator or in the replay ACL".into(),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+
             // Pull events from SQLite and stream them as
             // replay chunks. Speed pacing is client-side.
             let state_db = ctx.state_db.clone();
@@ -1929,7 +2094,12 @@ async fn handle_terminal_command(
                 match state_db.replay_terminal_events(id, from_seq).await {
                     Ok(events) => {
                         let total = events.len() as u64;
+                        let mut events_streamed: u64 = 0;
+                        let mut bytes_streamed: u64 = 0;
+                        let mut completed = true;
                         for (seq, ts_us, direction, payload) in events {
+                            bytes_streamed += payload.len() as u64;
+                            events_streamed += 1;
                             let msg = ServerMessage::TermReplayChunk {
                                 id,
                                 seq,
@@ -1941,15 +2111,41 @@ async fn handle_terminal_command(
                                 ),
                             };
                             if tx.send(msg).await.is_err() {
-                                return;
+                                completed = false;
+                                break;
                             }
                         }
-                        let _ = tx
-                            .send(ServerMessage::TermReplayDone {
-                                id,
-                                total_events: total,
-                            })
-                            .await;
+                        if completed {
+                            let _ = tx
+                                .send(ServerMessage::TermReplayDone {
+                                    id,
+                                    total_events: total,
+                                })
+                                .await;
+                        }
+                        // Completion row: how much actually left the daemon.
+                        // `completed: false` = the client went away mid-
+                        // stream; the request row above already recorded
+                        // the attempt.
+                        let detail = serde_json::json!({
+                            "session_id": id,
+                            "requester": requester,
+                            "events": events_streamed,
+                            "bytes": bytes_streamed,
+                            "completed": completed,
+                        })
+                        .to_string();
+                        if let Err(e) = state_db
+                            .append_web_audit(
+                                "terminal_replay_done",
+                                dev_id.as_deref(),
+                                None,
+                                Some(&detail),
+                            )
+                            .await
+                        {
+                            warn!("failed to audit terminal replay completion: {e}");
+                        }
                     }
                     Err(e) => {
                         let _ = tx

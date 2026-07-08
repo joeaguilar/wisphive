@@ -8,6 +8,7 @@ pub mod process_registry;
 pub mod project_audit;
 pub mod queue;
 pub mod registry;
+pub mod replay_gate;
 pub mod server;
 pub mod shutdown;
 pub mod state;

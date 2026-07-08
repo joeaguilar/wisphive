@@ -282,6 +282,8 @@ mod tests {
             status: TerminalStatus::Running,
             group_name: None,
             sort_order: 0,
+            created_by: None,
+            replay_acl: Vec::new(),
         }
     }
 

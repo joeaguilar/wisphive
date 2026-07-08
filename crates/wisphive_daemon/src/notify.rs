@@ -48,6 +48,30 @@ pub fn notify_decision(req: &DecisionRequest) {
     });
 }
 
+/// Send a passive notification when a client requests replay for a terminal
+/// session it did not create (itr#98).
+///
+/// Replay streams the session's complete byte history — including anything
+/// typed into it (sudo passwords, pasted keys) — so a non-authored replay is
+/// surfaced to the operator the same way pending decisions are: a passive
+/// banner, never a blocker. `author = None` means the session predates the
+/// `created_by` column; those are treated as non-authored by the caller.
+pub fn notify_terminal_replay(requester: &str, author: Option<&str>, session_id: uuid::Uuid) {
+    let title = "Wisphive: terminal replay".to_string();
+    let body = format!(
+        "{requester} requested replay for terminal session {session_id}\nCreated by: {}",
+        author.unwrap_or("unknown (pre-audit session)")
+    );
+
+    tokio::spawn(async move {
+        if let Err(e) = send_passive_notification(&title, &body).await {
+            warn!("failed to send replay notification: {e}");
+        } else {
+            info!("sent passive notification: {title}");
+        }
+    });
+}
+
 /// Show a platform-specific passive notification.
 async fn send_passive_notification(title: &str, body: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]

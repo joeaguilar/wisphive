@@ -111,6 +111,10 @@ export interface TerminalSessionMeta {
   status: TerminalStatus;
   group_name?: string;
   sort_order: number;
+  /** Audit-trail identity of the creating client (itr#98); absent on legacy sessions. */
+  created_by?: string;
+  /** Resolver labels explicitly allowed to replay this session. */
+  replay_acl?: string[];
 }
 
 // Server → Client messages

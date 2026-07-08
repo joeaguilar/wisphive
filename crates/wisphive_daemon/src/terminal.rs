@@ -145,6 +145,7 @@ impl TerminalSessionManager {
         cols: u16,
         rows: u16,
         env: Option<HashMap<String, String>>,
+        created_by: Option<String>,
     ) -> Result<TerminalSessionMeta> {
         if cols == 0 || rows == 0 {
             return Err(anyhow!("terminal cols/rows must be nonzero"));
@@ -236,6 +237,8 @@ impl TerminalSessionManager {
             status: TerminalStatus::Running,
             group_name: None,
             sort_order,
+            created_by,
+            replay_acl: Vec::new(),
         };
         self.state_db.create_terminal_session(&meta).await?;
 

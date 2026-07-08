@@ -599,6 +599,17 @@ pub struct TerminalSessionMeta {
     /// user drags anything.
     #[serde(default)]
     pub sort_order: i64,
+    /// Audit-trail identity of the client that created this session
+    /// (`human:tui` or `human:web:<device-id>`, itr#98). `None` for sessions
+    /// created before the column existed; replay treats those as
+    /// non-authored (notify on replay) rather than silently trusted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+    /// Resolver labels explicitly allowed to replay this session. The creator
+    /// is authorized through `created_by` and does not need to be duplicated
+    /// here. Empty on legacy/default sessions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replay_acl: Vec<String>,
 }
 
 /// Content-aware rule for a specific tool.

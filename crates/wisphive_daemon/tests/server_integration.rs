@@ -16,6 +16,13 @@ fn temp_config() -> (tempfile::TempDir, DaemonConfig) {
     (tmp, config)
 }
 
+fn temp_config_without_notifications() -> (tempfile::TempDir, DaemonConfig) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("config.json"), r#"{"notifications":false}"#).unwrap();
+    let config = DaemonConfig::new(tmp.path().to_path_buf());
+    (tmp, config)
+}
+
 /// Helper: connect to the daemon socket and perform handshake as a hook client.
 async fn connect_as_hook(
     socket_path: &std::path::Path,
@@ -959,6 +966,244 @@ fn encode_web_approve_all(filter: Option<DecisionFilter>, device_id: &str) -> St
     })
     .with_device_id(DeviceId::from(device_id));
     encode(&cmd).unwrap()
+}
+
+fn encode_web_replay(id: uuid::Uuid, device_id: &str) -> String {
+    let cmd = ClientCommand::from(ClientMessage::TermReplay {
+        id,
+        from_seq: None,
+        speed: None,
+    })
+    .with_device_id(DeviceId::from(device_id));
+    encode(&cmd).unwrap()
+}
+
+fn terminal_meta(
+    id: uuid::Uuid,
+    created_by: Option<&str>,
+    replay_acl: Vec<&str>,
+) -> TerminalSessionMeta {
+    TerminalSessionMeta {
+        id,
+        label: Some("seeded".into()),
+        command: "/bin/sh".into(),
+        args: vec!["-c".into(), "echo seeded".into()],
+        cwd: PathBuf::from("/tmp"),
+        cols: 80,
+        rows: 24,
+        started_at: chrono::Utc::now(),
+        ended_at: None,
+        exit_code: None,
+        status: TerminalStatus::Running,
+        group_name: None,
+        sort_order: 0,
+        created_by: created_by.map(str::to_string),
+        replay_acl: replay_acl.into_iter().map(str::to_string).collect(),
+    }
+}
+
+async fn seed_terminal_history(
+    db_path: &std::path::Path,
+    created_by: Option<&str>,
+    replay_acl: Vec<&str>,
+    payloads: Vec<&[u8]>,
+) -> uuid::Uuid {
+    let db = wisphive_daemon::state::StateDb::open_client(&db_path.to_string_lossy())
+        .await
+        .unwrap();
+    let id = uuid::Uuid::new_v4();
+    db.create_terminal_session(&terminal_meta(id, created_by, replay_acl))
+        .await
+        .unwrap();
+    let rows: Vec<_> = payloads
+        .into_iter()
+        .enumerate()
+        .map(|(idx, payload)| {
+            (
+                id,
+                idx as u64,
+                idx as i64,
+                if idx % 2 == 0 {
+                    TerminalDirection::Input
+                } else {
+                    TerminalDirection::Output
+                },
+                payload.to_vec(),
+            )
+        })
+        .collect();
+    db.insert_terminal_events_batch(&rows).await.unwrap();
+    id
+}
+
+async fn recent_web_audit(db_path: &std::path::Path) -> Vec<wisphive_daemon::state::WebAuditRow> {
+    let db = wisphive_daemon::state::StateDb::open_client(&db_path.to_string_lossy())
+        .await
+        .unwrap();
+    db.list_web_audit(100).await.unwrap()
+}
+
+async fn wait_for_web_audit_event(
+    db_path: &std::path::Path,
+    event: &str,
+    session_id: uuid::Uuid,
+) -> wisphive_daemon::state::WebAuditRow {
+    for _ in 0..20 {
+        let rows = recent_web_audit(db_path).await;
+        if let Some(row) = rows.into_iter().find(|row| {
+            row.event == event
+                && row.detail.as_deref().is_some_and(|detail| {
+                    serde_json::from_str::<serde_json::Value>(detail)
+                        .ok()
+                        .and_then(|v| {
+                            v["session_id"]
+                                .as_str()
+                                .map(|s| s == session_id.to_string())
+                        })
+                        .unwrap_or(false)
+                })
+        }) {
+            return row;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("missing web_audit event {event} for terminal session {session_id}");
+}
+
+#[tokio::test]
+async fn term_replay_denies_unauthorized_web_device_and_audits_request() {
+    let (_tmp, config) = temp_config_without_notifications();
+    let socket_path = config.socket_path.clone();
+    let db_path = config.db_path.clone();
+    let shutdown_tx = start_server(config).await;
+
+    let session_id = seed_terminal_history(
+        &db_path,
+        Some("human:web:dev-owner"),
+        Vec::new(),
+        vec![&b"secret-input"[..], &b"secret-output"[..]],
+    )
+    .await;
+
+    let (mut tui_lines, mut tui_writer) = connect_as_tui(&socket_path).await;
+    tui_writer
+        .write_all(encode_web_replay(session_id, "dev-intruder").as_bytes())
+        .await
+        .unwrap();
+
+    let err = next_tui_msg(&mut tui_lines, |m| {
+        matches!(m, ServerMessage::TermError { .. })
+    })
+    .await;
+    match err {
+        ServerMessage::TermError {
+            id: Some(id),
+            message,
+        } => {
+            assert_eq!(id, session_id);
+            assert!(message.contains("replay denied"));
+        }
+        other => panic!("expected replay TermError, got: {:?}", other),
+    }
+
+    let row = wait_for_web_audit_event(&db_path, "terminal_replay", session_id).await;
+    assert_eq!(row.device_id.as_deref(), Some("dev-intruder"));
+    chrono::DateTime::parse_from_rfc3339(&row.at).expect("audit timestamp is RFC3339");
+    let detail: serde_json::Value = serde_json::from_str(row.detail.as_deref().unwrap()).unwrap();
+    assert_eq!(detail["session_id"], session_id.to_string());
+    assert_eq!(detail["requester"], "human:web:dev-intruder");
+    assert_eq!(detail["author"], "human:web:dev-owner");
+    assert_eq!(detail["authorized"], false);
+    assert_eq!(detail["authorization"], "denied");
+    assert_eq!(detail["outcome"], "denied");
+    assert_eq!(detail["non_authored"], true);
+
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn term_replay_allows_acl_grant_and_audits_bytes_streamed() {
+    use base64::Engine as _;
+
+    let (_tmp, config) = temp_config_without_notifications();
+    let socket_path = config.socket_path.clone();
+    let db_path = config.db_path.clone();
+    let shutdown_tx = start_server(config).await;
+
+    let session_id = seed_terminal_history(
+        &db_path,
+        Some("human:web:dev-owner"),
+        vec!["human:web:dev-reader"],
+        vec![&b"abc"[..], &b"wxyz"[..]],
+    )
+    .await;
+
+    let (mut tui_lines, mut tui_writer) = connect_as_tui(&socket_path).await;
+    tui_writer
+        .write_all(encode_web_replay(session_id, "dev-reader").as_bytes())
+        .await
+        .unwrap();
+
+    let mut events = 0u64;
+    let mut bytes = 0usize;
+    loop {
+        let line = tokio::time::timeout(Duration::from_secs(2), tui_lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        match decode::<ServerMessage>(&line).unwrap() {
+            ServerMessage::TermReplayChunk {
+                id,
+                data,
+                direction,
+                ..
+            } => {
+                assert_eq!(id, session_id);
+                assert!(matches!(
+                    direction,
+                    TerminalDirection::Input | TerminalDirection::Output
+                ));
+                events += 1;
+                bytes += base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .unwrap()
+                    .len();
+            }
+            ServerMessage::TermReplayDone { id, total_events } => {
+                assert_eq!(id, session_id);
+                assert_eq!(total_events, 2);
+                break;
+            }
+            other => panic!("expected replay chunk/done, got: {:?}", other),
+        }
+    }
+    assert_eq!(events, 2);
+    assert_eq!(bytes, 7);
+
+    let request_row = wait_for_web_audit_event(&db_path, "terminal_replay", session_id).await;
+    chrono::DateTime::parse_from_rfc3339(&request_row.at).expect("audit timestamp is RFC3339");
+    let request_detail: serde_json::Value =
+        serde_json::from_str(request_row.detail.as_deref().unwrap()).unwrap();
+    assert_eq!(request_detail["requester"], "human:web:dev-reader");
+    assert_eq!(request_detail["authorization"], "acl");
+    assert_eq!(request_detail["authorized"], true);
+    assert_eq!(request_detail["non_authored"], true);
+    assert_eq!(request_detail["outcome"], "started");
+    assert_eq!(
+        request_detail["replay_acl"],
+        serde_json::json!(["human:web:dev-reader"])
+    );
+
+    let done_row = wait_for_web_audit_event(&db_path, "terminal_replay_done", session_id).await;
+    let done_detail: serde_json::Value =
+        serde_json::from_str(done_row.detail.as_deref().unwrap()).unwrap();
+    assert_eq!(done_detail["requester"], "human:web:dev-reader");
+    assert_eq!(done_detail["events"], 2);
+    assert_eq!(done_detail["bytes"], 7);
+    assert_eq!(done_detail["completed"], true);
+
+    let _ = shutdown_tx.send(true);
 }
 
 #[tokio::test]
