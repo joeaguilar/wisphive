@@ -35,9 +35,37 @@ const SPAWN_PERSIST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PENDING_SPAWNS: usize = 8;
 const SPAWN_DECISION_AGENT_ID: &str = "wisphive-daemon:spawn";
 const SPAWN_DECISION_TOOL: &str = "SpawnAgent";
+const MAX_AGENT_ID_SUFFIX_BYTES: usize = 64;
 
 fn is_reserved_internal_agent_id(agent_id: &str) -> bool {
     agent_id.starts_with("wisphive-daemon:")
+}
+
+/// Defense-in-depth validation for identities received over the hook socket.
+///
+/// The hook validates before marker I/O; the daemon repeats the check before
+/// registry or database work so a hand-crafted socket client cannot seed an
+/// unsafe marker name. `cc-...` is exactly `^cc-[A-Za-z0-9_-]{1,64}$`; the
+/// other prefixes are equivalent ids emitted by supported agents and managed
+/// spawns.
+fn is_valid_hook_agent_id(agent_id: &str) -> bool {
+    if agent_id.contains('/')
+        || agent_id.contains('\\')
+        || agent_id.contains("..")
+        || agent_id.as_bytes().contains(&0)
+    {
+        return false;
+    }
+
+    let Some((prefix, suffix)) = agent_id.split_once('-') else {
+        return false;
+    };
+    matches!(prefix, "cc" | "codex" | "red" | "local" | "agent")
+        && !suffix.is_empty()
+        && suffix.len() <= MAX_AGENT_ID_SUFFIX_BYTES
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 fn hook_message_agent_id(msg: &ClientMessage) -> Option<&str> {
@@ -262,9 +290,20 @@ impl Server {
                     let reaped = reg.reap_inactive(agent_timeout);
                     drop(reg);
                     for agent_id in reaped {
-                        // Clean up session marker file
-                        let marker = self.config.home_dir.join("sessions").join(&agent_id);
-                        let _ = std::fs::remove_file(marker);
+                        // Validate again at the marker-filesystem sink. The
+                        // registry normally contains only validated hook ids,
+                        // but this prevents future ingress paths from turning
+                        // a stored identity into traversal.
+                        if is_valid_hook_agent_id(&agent_id) {
+                            let marker = self.config.home_dir.join("sessions").join(&agent_id);
+                            let _ = std::fs::remove_file(marker);
+                        } else {
+                            warn!(
+                                security_event = "invalid_agent_marker_rejected",
+                                %agent_id,
+                                "refusing to remove a marker for an invalid agent id"
+                            );
+                        }
                         let _ = self.tui_tx.send(ServerMessage::AgentDisconnected { agent_id });
                     }
                 }
@@ -505,21 +544,27 @@ async fn handle_hook(
 
     let msg: ClientMessage = wisphive_protocol::decode(&line)?;
 
-    // All identities arriving on the hook socket are untrusted. Apply the
-    // reserved namespace guard before any registry or database operation,
-    // including fuzzy ToolResult attachment.
+    // All identities arriving on the hook socket are untrusted. Validate before
+    // any registry or database operation, including fuzzy ToolResult
+    // attachment. The hook-provided project remains opaque metadata here and
+    // is never used by this handler as a filesystem write target.
     if let Some(agent_id) = hook_message_agent_id(&msg)
-        && is_reserved_internal_agent_id(agent_id)
+        && (is_reserved_internal_agent_id(agent_id) || !is_valid_hook_agent_id(agent_id))
     {
         let decision_id = match &msg {
             ClientMessage::DecisionRequest(req) => Some(req.id),
             _ => None,
         };
+        let reason = if is_reserved_internal_agent_id(agent_id) {
+            "agent ids beginning with 'wisphive-daemon:' are reserved"
+        } else {
+            "agent id must use a supported prefix and a 1-64 byte ASCII [A-Za-z0-9_-] suffix"
+        };
         warn!(
-            security_event = "reserved_agent_identity_rejected",
+            security_event = "invalid_agent_identity_rejected",
             ?decision_id,
             %agent_id,
-            "hook payload attempted to use a daemon-reserved identity"
+            "hook payload attempted to use an invalid identity"
         );
         if let Some(id) = decision_id {
             write_msg(
@@ -527,10 +572,7 @@ async fn handle_hook(
                 &ServerMessage::DecisionResponse {
                     id,
                     decision: Decision::Deny,
-                    message: Some(
-                        "Wisphive rejected this request: agent ids beginning with 'wisphive-daemon:' are reserved"
-                            .into(),
-                    ),
+                    message: Some(format!("Wisphive rejected this request: {reason}")),
                     updated_input: None,
                     additional_context: None,
                     selected_permission: None,
@@ -3036,10 +3078,10 @@ mod tests {
         CONN_CHANNEL_CAPACITY, MAX_LINE_BYTES, MAX_PENDING_SPAWNS, SpawnRunError,
         attach_tool_result_with_retry, enqueue_spawn_for_approval, ensure_spawn_mode_active,
         finalize_spawn_abandonment, finalize_spawn_decision, hook_message_agent_id,
-        is_reserved_internal_agent_id, partition_sudo_gated, peer_uid_allowed,
-        persist_auto_approve, read_capped_line, resolve_bulk_deny, run_after_spawn_approval,
-        set_socket_permissions, settle_spawn_expiry, spawn_approval_request,
-        sweep_stale_session_markers,
+        is_reserved_internal_agent_id, is_valid_hook_agent_id, partition_sudo_gated,
+        peer_uid_allowed, persist_auto_approve, read_capped_line, resolve_bulk_deny,
+        run_after_spawn_approval, set_socket_permissions, settle_spawn_expiry,
+        spawn_approval_request, sweep_stale_session_markers,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -3831,6 +3873,31 @@ mod tests {
         assert!(is_reserved_internal_agent_id("wisphive-daemon:spawn"));
         assert!(is_reserved_internal_agent_id("wisphive-daemon:future"));
         assert!(!is_reserved_internal_agent_id("claude-session"));
+
+        for valid in [
+            "cc-session_1",
+            "codex-session-2",
+            "red-worker",
+            "local-model",
+            "agent-0123456789abcdef",
+        ] {
+            assert!(is_valid_hook_agent_id(valid), "{valid} should be valid");
+        }
+        for invalid in [
+            "cc-../../tmp/evil",
+            "cc-path/child",
+            "cc-path\\child",
+            "cc-null\0byte",
+            "cc-",
+            "cc-dotted.name",
+            "cc-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_--",
+            "wisphive-daemon:spawn",
+        ] {
+            assert!(
+                !is_valid_hook_agent_id(invalid),
+                "{invalid:?} should be invalid"
+            );
+        }
 
         let mut result = tool_result("reserved-result");
         result.agent_id = "wisphive-daemon:spawn".into();

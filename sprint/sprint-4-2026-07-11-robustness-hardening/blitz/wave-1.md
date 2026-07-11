@@ -38,7 +38,7 @@
 ### Wave 3
 
 - **#296 — Move terminal-output side effects out of the reducer**
-  - Files: `crates/wisphive_web/frontend/src/hooks/useWisphive.ts`
+  - Files: `crates/wisphive_web/frontend/src/hooks/useWisphive.ts`, `crates/wisphive_web/frontend/src/hooks/useWisphive.test.ts`
 - **#411 — Use precise Wisphive hook matching in project audit**
   - Files: `crates/wisphive_daemon/src/project_audit.rs`, `crates/wisphive_cli/src/commands/hooks.rs`
 - **#86 — Validate agent IDs before filesystem access**
@@ -248,6 +248,8 @@ No wave contains a shared owned file. Co-located tests inherit the same ownershi
 - **Pre-Wave 2 test ownership:** added the existing `useWisphive.test.ts` surface to #295 and `tui/tests/ui_snapshots.rs` to #362. Neither path conflicts with another Wave 2 worker.
 - **Wave 2 / #295 transient gate red:** its first Rust gate overlapped #362's in-flight TUI snapshot edits and failed only on those two neighbor tests. No #295 rework was needed; after #362 converged, the required rerun passed.
 - **Wave 2 gate:** orchestrator reran both repository gates after all workers settled: `GATR exit=0 dur=23.5s errors=0 warnings=0 adapter=generic tag=blitz-wave2-final-rust` and `GATR exit=0 dur=6.2s errors=0 warnings=0 adapter=generic tag=blitz-wave2-final-frontend` (13 files, 118 tests).
+- **Wave 3 sandbox gate retry:** #296 and #86 each hit a sandbox-only `PermissionDenied` when the existing #294 fake-daemon regression bound a Unix socket. The exact test and full gates passed outside that restriction; no product-code repair was needed.
+- **Wave 3 gate:** orchestrator reran both repository gates after all workers settled: `GATR exit=0 dur=23.4s errors=0 warnings=0 adapter=generic tag=blitz-wave3-final-rust` and `GATR exit=0 dur=6.4s errors=0 warnings=0 adapter=generic tag=blitz-wave3-final-frontend` (13 files, 119 tests).
 
 ## Outcomes
 
@@ -261,6 +263,11 @@ No wave contains a shared owned file. Co-located tests inherit the same ownershi
   - **#294 closed:** agent CLI startup now deterministically drains Welcome/AgentsSnapshot/QueueSnapshot before reading list/start/stop responses; fake Unix-daemon regression proves AgentList is returned.
   - **#295 closed:** one successful sudo reauth drains the deduplicated batch of still-queued, tool-matching approvals exactly once; cancel abandons the whole batch; parsed-WebSocket Vitest covers two gates.
   - **#362 closed:** shared character-aware truncation replaces both panic-prone UTF-8 byte slices; real Ratatui queue and session renders cover emoji at the former split boundaries.
+  - **Commit:** `b69c4b1` — `fix(clients): harden agent replies and approval UI`.
+- **Wave 3 — 2026-07-11T23:00Z–2026-07-11T23:09Z — 3 workers.**
+  - **#296 closed:** validated terminal live/catch-up/replay frames dispatch imperative xterm callbacks before the React state updater; StrictMode runtime test proves exactly one callback per frame. Related follow-up seam remains itr#114.
+  - **#411 closed:** project audit now reuses the daemon's precise Wisphive hook-command matcher; regression fixtures prove paths that merely contain `wisphive` are not classified as installed.
+  - **#86 closed:** hook and daemon boundaries reject traversal-capable agent IDs and malformed terminal UUIDs before marker/database work; marker cleanup revalidates stored IDs and project strings remain opaque metadata.
   - **Commit:** pending immediately after this log update.
 
 ## Quarantine triage notes

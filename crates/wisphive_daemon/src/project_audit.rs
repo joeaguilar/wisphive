@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::hook_install::has_wisphive_hook;
+
 pub const CLAUDE_HOOK_EVENTS: &[&str] = &[
     "PreToolUse",
     "PostToolUse",
@@ -259,20 +261,6 @@ fn has_wisphive_hook_for_event(settings: &serde_json::Value, event: &str) -> boo
         .is_some_and(|entries| entries.iter().any(has_wisphive_hook))
 }
 
-fn has_wisphive_hook(rule: &serde_json::Value) -> bool {
-    if let Some(hooks_arr) = rule.get("hooks").and_then(|hooks| hooks.as_array()) {
-        return hooks_arr.iter().any(hook_command_mentions_wisphive);
-    }
-
-    hook_command_mentions_wisphive(rule)
-}
-
-fn hook_command_mentions_wisphive(hook: &serde_json::Value) -> bool {
-    hook.get("command")
-        .and_then(|command| command.as_str())
-        .is_some_and(|command| command.contains("wisphive"))
-}
-
 fn read_hook_mode(wisphive_home: &Path) -> HookMode {
     match std::fs::read_to_string(wisphive_home.join("mode")) {
         Ok(mode) => match mode.trim() {
@@ -429,6 +417,37 @@ mod tests {
         assert!(audit.hooks.codex.enabled);
         assert!(audit.hooks.all_installed);
         assert!(audit.hooks.all_enabled);
+    }
+
+    #[test]
+    fn foreign_hook_path_containing_wisphive_is_not_installed() {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+
+        fs::write(home.path().join("mode"), "active\n").unwrap();
+        write_json(
+            &project.path().join(".claude").join("settings.json"),
+            &hook_settings(
+                CLAUDE_HOOK_EVENTS,
+                "/Users/x/AI_Projects/wisphive/scripts/lint.sh",
+            ),
+        );
+        write_json(
+            &project.path().join(".codex").join("hooks.json"),
+            &hook_settings(
+                CODEX_HOOK_EVENTS,
+                "env WISPHIVE_AGENT_TYPE=codex /Users/x/wisphive-notifier",
+            ),
+        );
+
+        let audit = ProjectAudit::scan_with_home(project.path(), home.path());
+
+        assert!(audit.hooks.claude.installed_events.is_empty());
+        assert!(audit.hooks.codex.installed_events.is_empty());
+        assert!(!audit.hooks.claude.installed);
+        assert!(!audit.hooks.codex.installed);
+        assert!(!audit.hooks.all_installed);
+        assert!(!audit.hooks.all_enabled);
     }
 
     #[test]

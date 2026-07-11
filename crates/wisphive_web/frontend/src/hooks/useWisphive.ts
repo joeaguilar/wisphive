@@ -170,6 +170,37 @@ export function useWisphive() {
         });
       }
 
+      // Terminal output is an imperative xterm side effect, not a state
+      // transition. Keep it outside the functional updater: React may invoke
+      // updater functions more than once in StrictMode or concurrent renders.
+      // The message has already crossed parseServerMessage's trust boundary,
+      // so decoding and dispatching it here preserves the existing validation.
+      switch (msg.type) {
+        case "term_chunk": {
+          const handler = terminalHandlersRef.current.get(msg.id);
+          if (handler && msg.direction === "output") {
+            handler(msg.id, "chunk", decodeBase64(msg.data));
+          }
+          return;
+        }
+
+        case "term_catchup": {
+          const handler = terminalHandlersRef.current.get(msg.id);
+          if (handler) {
+            handler(msg.id, "catchup", decodeBase64(msg.screen));
+          }
+          return;
+        }
+
+        case "term_replay_chunk": {
+          const handler = terminalHandlersRef.current.get(msg.id);
+          if (handler && msg.direction === "output") {
+            handler(msg.id, "replay_chunk", decodeBase64(msg.data));
+          }
+          return;
+        }
+      }
+
       setState((prev) => {
         switch (msg.type) {
           case "welcome":
@@ -322,22 +353,6 @@ export function useWisphive() {
           case "term_list_response":
             return { ...prev, terminals: msg.sessions };
 
-          case "term_chunk": {
-            const handler = terminalHandlersRef.current.get(msg.id);
-            if (handler && msg.direction === "output") {
-              handler(msg.id, "chunk", decodeBase64(msg.data));
-            }
-            return prev;
-          }
-
-          case "term_catchup": {
-            const handler = terminalHandlersRef.current.get(msg.id);
-            if (handler) {
-              handler(msg.id, "catchup", decodeBase64(msg.screen));
-            }
-            return prev;
-          }
-
           case "term_ended":
             return {
               ...prev,
@@ -345,14 +360,6 @@ export function useWisphive() {
                 t.id === msg.id ? { ...t, status: msg.status, exit_code: msg.exit_code } : t,
               ),
             };
-
-          case "term_replay_chunk": {
-            const handler = terminalHandlersRef.current.get(msg.id);
-            if (handler && msg.direction === "output") {
-              handler(msg.id, "replay_chunk", decodeBase64(msg.data));
-            }
-            return prev;
-          }
 
           case "term_replay_done":
             return prev;

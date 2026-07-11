@@ -12,6 +12,7 @@ use wisphive_protocol::{
 
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_STDIN_BYTES: usize = 8 * 1024 * 1024;
+const MAX_AGENT_ID_SUFFIX_BYTES: usize = 64;
 
 /// Maximum bytes a single newline-delimited response line from the daemon may
 /// occupy before the hook rejects it (itr#83). Without a cap, a misbehaving or
@@ -108,6 +109,10 @@ impl FailMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HookFailureKind {
     Runtime,
+    /// A caller-controlled identity or correlation value failed validation.
+    /// Unlike ordinary runtime failures this is always denied: fail-open mode
+    /// must not turn malformed input into a filesystem path or daemon identity.
+    InvalidInput,
     InputTooLarge,
     /// The daemon socket could not be reached (refused / absent / connect-level
     /// IO error). This is a control-plane outage, not a per-call failure: a
@@ -143,6 +148,19 @@ impl HookFailure {
             ),
             event_type: HookEventType::PreToolUse,
             agent_type: detect_agent_type(&serde_json::Value::Null),
+        }
+    }
+
+    fn invalid_input(
+        message: impl Into<String>,
+        event_type: HookEventType,
+        agent_type: &AgentType,
+    ) -> Self {
+        Self {
+            kind: HookFailureKind::InvalidInput,
+            message: message.into(),
+            event_type,
+            agent_type: agent_type.clone(),
         }
     }
 
@@ -277,6 +295,83 @@ fn agent_id_prefix(agent_type: &AgentType) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InvalidAgentId;
+
+impl fmt::Display for InvalidAgentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "agent id must use a supported prefix and a 1-64 byte ASCII [A-Za-z0-9_-] suffix"
+        )
+    }
+}
+
+impl std::error::Error for InvalidAgentId {}
+
+/// Validate an agent id before it can become a session-marker path component.
+///
+/// `cc-...` follows the issue's exact `^cc-[A-Za-z0-9_-]{1,64}$` contract.
+/// The other prefixes are the equivalent forms emitted for the other supported
+/// agent types and daemon-managed children.
+fn validate_agent_id(agent_id: &str) -> Result<(), InvalidAgentId> {
+    if agent_id.contains('/')
+        || agent_id.contains('\\')
+        || agent_id.contains("..")
+        || agent_id.as_bytes().contains(&0)
+    {
+        return Err(InvalidAgentId);
+    }
+
+    let Some((prefix, suffix)) = agent_id.split_once('-') else {
+        return Err(InvalidAgentId);
+    };
+    if !matches!(prefix, "cc" | "codex" | "red" | "local" | "agent")
+        || suffix.is_empty()
+        || suffix.len() > MAX_AGENT_ID_SUFFIX_BYTES
+        || !suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(InvalidAgentId);
+    }
+
+    Ok(())
+}
+
+fn resolve_agent_id(
+    session_id: Option<&str>,
+    managed_agent_id: Option<&str>,
+    agent_type: &AgentType,
+    process_id: u32,
+) -> Result<String, InvalidAgentId> {
+    let agent_id = session_id
+        .map(|session_id| format!("{}-{session_id}", agent_id_prefix(agent_type)))
+        .or_else(|| managed_agent_id.map(str::to_owned))
+        .unwrap_or_else(|| format!("{}-{process_id}", agent_id_prefix(agent_type)));
+    validate_agent_id(&agent_id)?;
+    Ok(agent_id)
+}
+
+fn agent_id_from_hook_event(
+    hook_event: &serde_json::Value,
+    agent_type: &AgentType,
+) -> Result<String, InvalidAgentId> {
+    let managed_agent_id = std::env::var("WISPHIVE_AGENT_ID").ok();
+    resolve_agent_id(
+        hook_event
+            .get("session_id")
+            .and_then(|value| value.as_str()),
+        managed_agent_id.as_deref(),
+        agent_type,
+        process::id(),
+    )
+}
+
+fn parse_terminal_session_id(value: Option<&str>) -> Result<Option<uuid::Uuid>, uuid::Error> {
+    value.map(uuid::Uuid::parse_str).transpose()
+}
+
 fn agent_project_env(agent_type: &AgentType) -> Option<&'static str> {
     match agent_type {
         AgentType::Codex => Some("CODEX_PROJECT_DIR"),
@@ -325,7 +420,10 @@ fn response_for_failure(failure: &HookFailure, fail_mode: FailMode) -> HookRespo
     // guarantee is absolute (itr#344). For PostToolUse the deny is inert
     // anyway (the formatter exits 0 for telemetry), so nothing already-ran
     // gets blocked.
-    if failure.kind == HookFailureKind::InputTooLarge {
+    if matches!(
+        failure.kind,
+        HookFailureKind::InputTooLarge | HookFailureKind::InvalidInput
+    ) {
         return failure.deny_response();
     }
 
@@ -775,13 +873,40 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
         .unwrap_or_else(|| event_type.to_string());
 
     // Extract agent identity early (needed for registration before auto-approve check)
-    let agent_id = hook_event
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .map(|s| format!("{}-{}", agent_id_prefix(&agent_type), s))
-        .or_else(|| std::env::var("WISPHIVE_AGENT_ID").ok())
-        .unwrap_or_else(|| format!("{}-{}", agent_id_prefix(&agent_type), process::id()));
+    let agent_id = agent_id_from_hook_event(&hook_event, &agent_type).map_err(|error| {
+        HookFailure::invalid_input(
+            format!("Wisphive rejected malformed hook identity: {error}"),
+            event_type,
+            &agent_type,
+        )
+    })?;
 
+    // Correlation with wisphive-managed terminal sessions. Validate the
+    // environment value at the same early input boundary as agent_id, before
+    // registration can inspect or create a marker file.
+    let terminal_session_env = match std::env::var("WISPHIVE_TERMINAL_SESSION_ID") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(HookFailure::invalid_input(
+                "Wisphive rejected WISPHIVE_TERMINAL_SESSION_ID: value is not UTF-8",
+                event_type,
+                &agent_type,
+            ));
+        }
+    };
+    let terminal_session_id =
+        parse_terminal_session_id(terminal_session_env.as_deref()).map_err(|_| {
+            HookFailure::invalid_input(
+                "Wisphive rejected WISPHIVE_TERMINAL_SESSION_ID: value must be a UUID",
+                event_type,
+                &agent_type,
+            )
+        })?;
+
+    // This hook-provided path is untrusted display/audit metadata. Keep it
+    // opaque: neither the hook registration path nor the daemon hook handler
+    // uses it as a filesystem write target.
     let project = agent_project_env(&agent_type)
         .and_then(|key| std::env::var(key).ok())
         .map(PathBuf::from)
@@ -804,7 +929,7 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
         .map(|s| s.to_string());
 
     // Layer 3: Register agent with daemon (once per session, fire-and-forget)
-    register_agent_once(&agent_id, agent_type.clone(), &project, wisphive_dir);
+    let _ = register_agent_once(&agent_id, agent_type.clone(), &project, wisphive_dir);
 
     // Always-defer classification: questions, plan-mode, elicitations, and any
     // operator-designated harmful tools carry a human answer back only through
@@ -971,13 +1096,6 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
             obj.insert("plan_content".into(), serde_json::Value::String(plan));
         }
     }
-
-    // Correlation with wisphive-managed terminal sessions: the daemon
-    // exports WISPHIVE_TERMINAL_SESSION_ID into the PTY, which flows through
-    // the shell to any Claude/Codex process and on into this hook.
-    let terminal_session_id = std::env::var("WISPHIVE_TERMINAL_SESSION_ID")
-        .ok()
-        .and_then(|s| uuid::Uuid::parse_str(&s).ok());
 
     // Kept for the itr#397 audit record written after the daemon responds —
     // the originals move into the request below.
@@ -1271,12 +1389,7 @@ fn handle_post_tool_use(
         .cloned()
         .unwrap_or(serde_json::Value::Null);
 
-    let agent_id = hook_event
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .map(|s| format!("{}-{}", agent_id_prefix(&agent_type), s))
-        .or_else(|| std::env::var("WISPHIVE_AGENT_ID").ok())
-        .unwrap_or_else(|| format!("{}-{}", agent_id_prefix(&agent_type), std::process::id()));
+    let agent_id = agent_id_from_hook_event(hook_event, &agent_type)?;
 
     let tool_use_id = hook_event
         .get("tool_use_id")
@@ -1323,49 +1436,54 @@ fn register_agent_once(
     agent_type: AgentType,
     project: &std::path::Path,
     wisphive_dir: &std::path::Path,
-) {
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Defense in depth: validate before even checking marker existence. This
+    // keeps `sessions_dir.join(agent_id)` from interpreting caller-controlled
+    // separators or parent components.
+    validate_agent_id(agent_id)?;
+
     // Fast path: check marker file (single stat syscall)
     let sessions_dir = wisphive_dir.join("sessions");
     let marker = sessions_dir.join(agent_id);
     if marker.exists() {
-        return;
+        return Ok(());
     }
 
-    // Attempt registration — all errors are swallowed (fail-open)
-    let _ = (|| -> Result<(), Box<dyn std::error::Error>> {
-        let socket_path = wisphive_dir.join("wisphive.sock");
-        let stream = UnixStream::connect(&socket_path)?;
-        stream.set_write_timeout(Some(Duration::from_secs(1)))?;
-        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+    // The caller intentionally swallows transport errors to preserve
+    // registration's fail-open behavior. Returning them keeps validation and
+    // marker-write failures directly testable.
+    let socket_path = wisphive_dir.join("wisphive.sock");
+    let stream = UnixStream::connect(&socket_path)?;
+    stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
 
-        let mut reader = BufReader::new(stream.try_clone()?);
-        let mut writer = stream;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut writer = stream;
 
-        // Handshake
-        let hello = wisphive_protocol::encode(&ClientMessage::Hello {
-            client: ClientType::Hook,
-            version: PROTOCOL_VERSION,
-        })?;
-        writer.write_all(hello.as_bytes())?;
+    // Handshake
+    let hello = wisphive_protocol::encode(&ClientMessage::Hello {
+        client: ClientType::Hook,
+        version: PROTOCOL_VERSION,
+    })?;
+    writer.write_all(hello.as_bytes())?;
 
-        // Consume welcome (capped — itr#83)
-        let mut welcome_line = String::new();
-        read_line_capped(&mut reader, &mut welcome_line, MAX_LINE_BYTES)?;
+    // Consume welcome (capped — itr#83)
+    let mut welcome_line = String::new();
+    read_line_capped(&mut reader, &mut welcome_line, MAX_LINE_BYTES)?;
 
-        // Send AgentRegister (fire-and-forget)
-        let msg = wisphive_protocol::encode(&ClientMessage::AgentRegister {
-            agent_id: agent_id.to_string(),
-            agent_type: agent_type.clone(),
-            project: project.to_path_buf(),
-        })?;
-        writer.write_all(msg.as_bytes())?;
+    // `project` remains opaque metadata on this channel; the receiver must not
+    // treat it as authority for a filesystem write.
+    let msg = wisphive_protocol::encode(&ClientMessage::AgentRegister {
+        agent_id: agent_id.to_string(),
+        agent_type,
+        project: project.to_path_buf(),
+    })?;
+    writer.write_all(msg.as_bytes())?;
 
-        // Create marker file
-        let _ = std::fs::create_dir_all(&sessions_dir);
-        let _ = std::fs::write(&marker, "");
+    std::fs::create_dir_all(&sessions_dir)?;
+    std::fs::write(&marker, "")?;
 
-        Ok(())
-    })();
+    Ok(())
 }
 
 /// Check if an event type should be auto-approved based on config.
@@ -2234,6 +2352,91 @@ mod tests {
         assert_eq!(fail_mode_from_contents(None), FailMode::Closed);
         assert_eq!(fail_mode_from_contents(Some("invalid")), FailMode::Closed);
         assert_eq!(fail_mode_from_contents(Some("")), FailMode::Closed);
+    }
+
+    #[test]
+    fn hook_session_id_rejects_traversal_before_marker_io() {
+        let hook_event = serde_json::json!({"session_id": "../../tmp/evil"});
+        let session_id = hook_event
+            .get("session_id")
+            .and_then(|value| value.as_str());
+
+        let error = resolve_agent_id(session_id, None, &AgentType::ClaudeCode, 42)
+            .expect_err("traversal session id must be rejected");
+
+        assert_eq!(error, InvalidAgentId);
+    }
+
+    #[test]
+    fn register_agent_once_rejects_invalid_id_before_filesystem_access() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join("sessions");
+
+        let error = register_agent_once(
+            "cc-path/child",
+            AgentType::ClaudeCode,
+            Path::new("/opaque/project"),
+            home.path(),
+        )
+        .expect_err("slash-containing agent id must return an error");
+
+        assert!(error.downcast_ref::<InvalidAgentId>().is_some());
+        assert!(
+            !sessions.exists(),
+            "validation must run before marker directory inspection or creation"
+        );
+    }
+
+    #[test]
+    fn agent_id_validation_accepts_supported_safe_forms_only() {
+        for valid in [
+            "cc-session_1",
+            "codex-session-2",
+            "red-worker",
+            "local-model",
+            "agent-0123456789abcdef",
+        ] {
+            validate_agent_id(valid).unwrap_or_else(|_| panic!("{valid} should be valid"));
+        }
+        for invalid in [
+            "cc-../../tmp/evil",
+            "cc-path/child",
+            "cc-path\\child",
+            "cc-null\0byte",
+            "cc-",
+            "cc-dotted.name",
+            "cc-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_--",
+            "unknown-session",
+        ] {
+            assert!(
+                validate_agent_id(invalid).is_err(),
+                "{invalid:?} should be invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_session_id_must_be_a_uuid() {
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(
+            parse_terminal_session_id(Some(&id.to_string())).unwrap(),
+            Some(id)
+        );
+        assert!(parse_terminal_session_id(Some("../../terminal")).is_err());
+        assert_eq!(parse_terminal_session_id(None).unwrap(), None);
+    }
+
+    #[test]
+    fn invalid_identity_denies_even_in_fail_open_mode() {
+        let failure = HookFailure::invalid_input(
+            "malformed agent id",
+            HookEventType::PreToolUse,
+            &AgentType::ClaudeCode,
+        );
+
+        let response = response_for_failure(&failure, FailMode::Open);
+
+        assert_eq!(response.decision, Decision::Deny);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+import { StrictMode } from "react";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useWisphive } from "./useWisphive";
@@ -113,6 +114,57 @@ describe("useWisphive hook-gating (itr#460)", () => {
     act(() => latest().open());
     return view;
   }
+
+  async function mountOpenStrict() {
+    const view = renderHook(() => useWisphive(), { wrapper: StrictMode });
+    await waitFor(() => expect(MockWebSocket.instances.length).toBeGreaterThan(0));
+    act(() => latest().open());
+    return view;
+  }
+
+  it("dispatches every terminal output frame exactly once in StrictMode (itr#296)", async () => {
+    const { result } = await mountOpenStrict();
+    const handler = vi.fn();
+    const unregister = result.current.registerTerminalHandler(TERMINAL_ID, handler);
+
+    act(() => {
+      latest().emit({
+        type: "term_chunk",
+        id: TERMINAL_ID,
+        seq: 1,
+        ts_us: 100,
+        direction: "output",
+        data: btoa("live"),
+      });
+      latest().emit({
+        type: "term_catchup",
+        id: TERMINAL_ID,
+        cols: 80,
+        rows: 24,
+        next_seq: 2,
+        screen: btoa("catchup"),
+      });
+      latest().emit({
+        type: "term_replay_chunk",
+        id: TERMINAL_ID,
+        seq: 2,
+        ts_us: 200,
+        direction: "output",
+        data: btoa("replay"),
+      });
+    });
+
+    expect(handler).toHaveBeenCalledTimes(3);
+    expect(
+      handler.mock.calls.map(([id, direction, bytes]) => [id, direction, Array.from(bytes)]),
+    ).toEqual([
+      [TERMINAL_ID, "chunk", [108, 105, 118, 101]],
+      [TERMINAL_ID, "catchup", [99, 97, 116, 99, 104, 117, 112]],
+      [TERMINAL_ID, "replay_chunk", [114, 101, 112, 108, 97, 121]],
+    ]);
+
+    unregister();
+  });
 
   it("installHooks sends install_hooks for the given project", async () => {
     const { result } = await mountOpen();
