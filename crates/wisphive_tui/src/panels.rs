@@ -11,6 +11,31 @@ use wisphive_protocol::DecisionRequest;
 
 use crate::app::ProjectStatus;
 
+/// Truncate owned text to at most `max_chars`, preserving UTF-8 boundaries.
+///
+/// The three-dot suffix counts toward the limit so existing ASCII layout stays
+/// unchanged. Short strings retain their original allocation.
+pub(crate) fn truncate_with_ellipsis(mut text: String, max_chars: usize) -> String {
+    if text.chars().nth(max_chars).is_none() {
+        return text;
+    }
+
+    let ellipsis = match max_chars {
+        0 => "",
+        1 => ".",
+        2 => "..",
+        _ => "...",
+    };
+    let prefix_chars = max_chars.saturating_sub(ellipsis.len());
+    let truncate_at = text
+        .char_indices()
+        .nth(prefix_chars)
+        .map_or(text.len(), |(byte_index, _)| byte_index);
+    text.truncate(truncate_at);
+    text.push_str(ellipsis);
+    text
+}
+
 /// Format a decision request as a compact single-line string for the queue panel.
 pub fn format_queue_item(req: &DecisionRequest) -> String {
     let project_name = req
@@ -114,9 +139,5 @@ fn truncate_tool_input(req: &DecisionRequest) -> String {
         }
     };
 
-    if summary.len() > 50 {
-        format!("{}...", &summary[..47])
-    } else {
-        summary
-    }
+    truncate_with_ellipsis(summary, 50)
 }

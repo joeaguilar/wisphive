@@ -41,10 +41,10 @@ export interface WisphiveState {
    * hasn't registered yet is never falsely treated as gone. */
   endedAgentIds: string[];
   terminals: TerminalSessionMeta[];
-  /** Set when the daemon refuses a sudo-class approve with
-   * `web_reauth_required`. The App renders SudoModal while this is non-null;
-   * on successful reauth the hook's `retryPendingApprove` replays the stashed
-   * approve. Null when no sudo prompt is pending. */
+  /** The newest sudo-class request refused with `web_reauth_required`. The App
+   * renders one SudoModal while this is non-null; on successful reauth the
+   * hook's `retryPendingApprove` replays every gated request accumulated while
+   * that modal was open. Null when no sudo prompt is pending. */
   pendingReauth: PendingReauth | null;
   /** Currently-active resource alerts (audit archive size, low disk), one per
    * `kind`. The daemon raises these instead of deleting audit data (itr#340);
@@ -124,6 +124,11 @@ export function useWisphive() {
   const approveStashRef = useRef<Map<string, { toolName: string; opts: ApproveOpts | undefined }>>(
     new Map(),
   );
+  // Every WebReauthRequired received while the single modal is open. State
+  // exposes the newest event for display, while this map retains the full
+  // deduplicated batch so one successful reauth can replay all gated requests.
+  // Keying by request_id also makes duplicate server frames idempotent.
+  const pendingReauthsRef = useRef<Map<string, PendingReauth>>(new Map());
   // Pending install-hooks stash (itr#460). `install_hooks` is sudo-gated, so
   // the daemon may bounce it with `web_reauth_required` (request_id = the
   // project path, tool_name = "InstallHooks"). We stash the project the
@@ -157,6 +162,13 @@ export function useWisphive() {
   const handleMessage = useCallback((data: string) => {
     try {
       const msg = parseServerMessage(data);
+
+      if (msg.type === "web_reauth_required") {
+        pendingReauthsRef.current.set(msg.request_id, {
+          request_id: msg.request_id,
+          tool_name: msg.tool_name,
+        });
+      }
 
       setState((prev) => {
         switch (msg.type) {
@@ -350,13 +362,9 @@ export function useWisphive() {
             return prev;
 
           case "web_reauth_required":
-            // Daemon rejected a sudo-class approve from this device. Track
-            // the gated request_id so retryPendingApprove replays exactly
-            // that approve (not whatever the user clicked last). If a
-            // second gate arrives while the modal is already open, prefer
-            // the newer one — both stashes live in approveStashRef so no
-            // request is lost; the user just reauths once and we replay
-            // both (the older one via a secondary drain after success).
+            // Display the newest gate in the single modal. The complete
+            // deduplicated batch lives in pendingReauthsRef and is drained
+            // after one successful reauth.
             return {
               ...prev,
               pendingReauth: {
@@ -520,57 +528,61 @@ export function useWisphive() {
     [send],
   );
 
-  /** User cancels the sudo modal (Esc / Cancel). Drop the stashed approve
-   * for the gated request so a later reauth success doesn't replay one
-   * the user chose to abandon. */
+  /** User cancels the sudo modal (Esc / Cancel). Drop every request accumulated
+   * under that modal so a later reauth success cannot replay any approval the
+   * user chose to abandon. */
   const dismissReauth = useCallback(() => {
     setState((prev) => {
-      if (prev.pendingReauth) {
-        // Drop whichever stash the abandoned reauth was gating so a later
-        // success can't replay a call the user cancelled. Only one applies
-        // per request_id, but deleting both is harmless and keeps the branch
-        // simple.
-        approveStashRef.current.delete(prev.pendingReauth.request_id);
-        installStashRef.current.delete(prev.pendingReauth.request_id);
+      const gated = [...pendingReauthsRef.current.values()];
+      pendingReauthsRef.current.clear();
+      if (gated.length === 0 && prev.pendingReauth) {
+        gated.push(prev.pendingReauth);
+      }
+      for (const reauth of gated) {
+        // Only one stash kind applies per request_id, but deleting both is
+        // harmless and keeps mixed approve/install batches simple.
+        approveStashRef.current.delete(reauth.request_id);
+        installStashRef.current.delete(reauth.request_id);
       }
       return { ...prev, pendingReauth: null };
     });
   }, []);
 
-  /** Called by SudoModal on 200 from /api/auth/reauth. Replays the exact
-   * gated approve (keyed by request_id from the daemon) iff it's still in
-   * the queue — if the request was resolved out-of-band (e.g. another
-   * client approved it) there's nothing to replay and we just close the
-   * modal. Uses functional setState so the queue check is never stale. */
+  /** Called by SudoModal on 200 from /api/auth/reauth. Replays each accumulated
+   * gated approve (keyed by request_id from the daemon) iff it's still in the
+   * queue — requests resolved out-of-band are skipped. Uses functional setState
+   * so every queue check observes the current snapshot. */
   const retryPendingApprove = useCallback(() => {
     setState((prev) => {
-      const reauth = prev.pendingReauth;
-      if (!reauth) return { ...prev, pendingReauth: null };
-      // Branch on the gated tool. `install_hooks` (itr#460) is sudo-gated too;
-      // its reauth carries request_id = the project path and
-      // tool_name = "InstallHooks", so replay the install rather than an
-      // approve. Everything else replays the stashed approve unchanged.
-      if (reauth.tool_name === "InstallHooks") {
-        const project = reauth.request_id;
-        const wasStashed = installStashRef.current.delete(project);
-        if (wasStashed) {
-          send({ type: "install_hooks", project });
-        }
-        return { ...prev, pendingReauth: null };
+      const gated = [...pendingReauthsRef.current.values()];
+      pendingReauthsRef.current.clear();
+      if (gated.length === 0 && prev.pendingReauth) {
+        gated.push(prev.pendingReauth);
       }
-      const stashed = approveStashRef.current.get(reauth.request_id);
-      approveStashRef.current.delete(reauth.request_id);
-      // itr#275: only replay if the tool we stashed the approve for matches
-      // what this WebReauthRequired says it's gating. A mismatch (or no
-      // stash at all) means the event is stale/out-of-band relative to
-      // what we actually sent — replaying anyway would risk resurrecting a
-      // non-sudo (e.g. Read) approve under cover of an unrelated reauth.
-      if (
-        stashed &&
-        stashed.toolName === reauth.tool_name &&
-        prev.queue.some((r) => r.id === reauth.request_id)
-      ) {
-        send({ type: "approve", id: reauth.request_id, ...stashed.opts });
+
+      for (const reauth of gated) {
+        // `install_hooks` (itr#460) is sudo-gated too; its reauth carries
+        // request_id = the project path and tool_name = "InstallHooks".
+        if (reauth.tool_name === "InstallHooks") {
+          const project = reauth.request_id;
+          const wasStashed = installStashRef.current.delete(project);
+          if (wasStashed) {
+            send({ type: "install_hooks", project });
+          }
+          continue;
+        }
+
+        const stashed = approveStashRef.current.get(reauth.request_id);
+        approveStashRef.current.delete(reauth.request_id);
+        // itr#275: only replay if the stashed tool matches the gate. A
+        // mismatch (or no stash) is stale/out-of-band and must not approve.
+        if (
+          stashed &&
+          stashed.toolName === reauth.tool_name &&
+          prev.queue.some((r) => r.id === reauth.request_id)
+        ) {
+          send({ type: "approve", id: reauth.request_id, ...stashed.opts });
+        }
       }
       return { ...prev, pendingReauth: null };
     });

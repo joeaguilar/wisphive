@@ -16,7 +16,11 @@ fn connect_to_daemon() -> Result<(BufReader<UnixStream>, UnixStream)> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let socket_path = PathBuf::from(home).join(".wisphive").join("wisphive.sock");
 
-    let stream = UnixStream::connect(&socket_path)
+    connect_to_socket(&socket_path)
+}
+
+fn connect_to_socket(socket_path: &Path) -> Result<(BufReader<UnixStream>, UnixStream)> {
+    let stream = UnixStream::connect(socket_path)
         .context("could not connect to daemon — is it running? (wisphive daemon start)")?;
     stream.set_read_timeout(Some(SOCKET_TIMEOUT))?;
     stream.set_write_timeout(Some(SOCKET_TIMEOUT))?;
@@ -69,8 +73,13 @@ fn is_matching_spawn_queue_ack(sent: &SpawnAgentRequest, msg: &ServerMessage) ->
 
 /// Send a message and read one response.
 fn send_and_recv(msg: &ClientMessage) -> Result<ServerMessage> {
-    let (mut reader, mut writer) = connect_to_daemon()?;
+    send_and_recv_on(msg, connect_to_daemon()?)
+}
 
+fn send_and_recv_on(
+    msg: &ClientMessage,
+    (mut reader, mut writer): (BufReader<UnixStream>, UnixStream),
+) -> Result<ServerMessage> {
     let encoded = wisphive_protocol::encode(msg)?;
     writer.write_all(encoded.as_bytes())?;
 
@@ -322,6 +331,8 @@ fn print_agent(agent: &ManagedAgent) {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::net::UnixListener;
+
     use super::*;
 
     fn spawn(prompt: &str) -> SpawnAgentRequest {
@@ -371,5 +382,59 @@ mod tests {
             decision.tool_name = "Bash".into();
         }
         assert!(!is_matching_spawn_queue_ack(&sent, &ordinary));
+    }
+
+    #[test]
+    fn list_agents_skips_startup_snapshots_before_response() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("fake-daemon.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let fake_daemon = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+            let mut hello_line = String::new();
+            reader.read_line(&mut hello_line).unwrap();
+            let hello: ClientMessage = wisphive_protocol::decode(&hello_line).unwrap();
+            assert!(matches!(
+                hello,
+                ClientMessage::Hello {
+                    client: ClientType::Tui,
+                    version: PROTOCOL_VERSION
+                }
+            ));
+
+            for message in [
+                ServerMessage::Welcome {
+                    version: PROTOCOL_VERSION,
+                },
+                ServerMessage::AgentsSnapshot { agents: Vec::new() },
+                ServerMessage::QueueSnapshot { items: Vec::new() },
+            ] {
+                stream
+                    .write_all(wisphive_protocol::encode(&message).unwrap().as_bytes())
+                    .unwrap();
+            }
+
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let request: ClientMessage = wisphive_protocol::decode(&request_line).unwrap();
+            assert!(matches!(request, ClientMessage::ListAgents));
+
+            stream
+                .write_all(
+                    wisphive_protocol::encode(&ServerMessage::AgentList { agents: Vec::new() })
+                        .unwrap()
+                        .as_bytes(),
+                )
+                .unwrap();
+        });
+
+        let connection = connect_to_socket(&socket_path).unwrap();
+        let response = send_and_recv_on(&ClientMessage::ListAgents, connection).unwrap();
+
+        assert!(matches!(response, ServerMessage::AgentList { agents } if agents.is_empty()));
+        fake_daemon.join().unwrap();
     }
 }

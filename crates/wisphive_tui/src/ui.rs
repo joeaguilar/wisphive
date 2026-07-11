@@ -975,12 +975,7 @@ fn draw_session_timeline_view(frame: &mut Frame, app: &App) {
             let input_summary = if let Some(cmd) =
                 entry.tool_input.get("command").and_then(|v| v.as_str())
             {
-                let s = cmd.to_string();
-                if s.len() > 40 {
-                    format!("{}...", &s[..37])
-                } else {
-                    s
-                }
+                panels::truncate_with_ellipsis(cmd.to_string(), 40)
             } else if let Some(path) = entry.tool_input.get("file_path").and_then(|v| v.as_str()) {
                 path.to_string()
             } else {

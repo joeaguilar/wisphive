@@ -31,9 +31,9 @@
 - **#294 — Agent commands read the wrong post-handshake response**
   - Files: `crates/wisphive_cli/src/commands/agent.rs`, `crates/wisphive_daemon/src/server.rs`
 - **#295 — Multiple sudo-gated approvals strand older requests**
-  - Files: `crates/wisphive_web/frontend/src/hooks/useWisphive.ts`
+  - Files: `crates/wisphive_web/frontend/src/hooks/useWisphive.ts`, `crates/wisphive_web/frontend/src/hooks/useWisphive.test.ts`
 - **#362 — TUI byte-slice truncation panics on Unicode**
-  - Files: `crates/wisphive_tui/src/panels.rs`, `crates/wisphive_tui/src/ui.rs`
+  - Files: `crates/wisphive_tui/src/panels.rs`, `crates/wisphive_tui/src/ui.rs`, `crates/wisphive_tui/tests/ui_snapshots.rs`
 
 ### Wave 3
 
@@ -245,6 +245,9 @@ No wave contains a shared owned file. Co-located tests inherit the same ownershi
 - **Wave 1 / #105 prototype-safety intervention:** repair recheck found `{}` plus indexed assignment mishandled an own `__proto__` JSON key. The orchestrator switched recursive object reconstruction to own-property-safe `Object.fromEntries` and added WebSocket-path regression coverage proving the key remains inert data with no inherited `command` field.
 - **Wave 1 / #94 expanded retry:** the retry's scratch security review continued until PASS, repairing claim/expiry/bulk-deny races, exact edited-input validation, durable failure reconciliation, strict agent-specific argv and hook checks, server-owned provenance, active-mode checks, sudo reauth, restart fail-closed behavior, and CLI queued acknowledgments. Follow-ups #510 and #511 capture two pre-existing seams that require separate scope.
 - **Wave 1 gate:** orchestrator reran both repository gates after all repairs: `GATR exit=0 dur=23.5s errors=0 warnings=0 adapter=generic tag=blitz-wave1-final-rust` and `GATR exit=0 dur=6.5s errors=0 warnings=0 adapter=generic tag=blitz-wave1-final-frontend` (13 files, 117 tests).
+- **Pre-Wave 2 test ownership:** added the existing `useWisphive.test.ts` surface to #295 and `tui/tests/ui_snapshots.rs` to #362. Neither path conflicts with another Wave 2 worker.
+- **Wave 2 / #295 transient gate red:** its first Rust gate overlapped #362's in-flight TUI snapshot edits and failed only on those two neighbor tests. No #295 rework was needed; after #362 converged, the required rerun passed.
+- **Wave 2 gate:** orchestrator reran both repository gates after all workers settled: `GATR exit=0 dur=23.5s errors=0 warnings=0 adapter=generic tag=blitz-wave2-final-rust` and `GATR exit=0 dur=6.2s errors=0 warnings=0 adapter=generic tag=blitz-wave2-final-frontend` (13 files, 118 tests).
 
 ## Outcomes
 
@@ -253,6 +256,11 @@ No wave contains a shared owned file. Co-located tests inherit the same ownershi
   - **#105 closed:** every inbound daemon WebSocket variant is validated into a wrapped discriminated union; recursive JSON values are preserved safely (including inert `__proto__` keys), malformed frames log without poisoning later valid frames, and Rust enum/UUID/time/integer domains are checked. Independent cross-language review: PASS.
   - **#106 closed:** component/queue tool inputs use one explicit parser with no unsafe assertions; malformed AskUserQuestion payloads render a stable fallback. Runtime evidence: React/jsdom component and queue flows; 117 frontend tests green at final gate.
   - **Follow-ups filed:** #510 (Claude hook/daemon timeout invariant) and #511 (effective Codex multi-source hook inventory).
+  - **Commit:** `2102fb7` — `fix(control-plane): harden spawn and web trust boundaries`.
+- **Wave 2 — 2026-07-11T22:51Z–2026-07-11T22:59Z — 3 workers.**
+  - **#294 closed:** agent CLI startup now deterministically drains Welcome/AgentsSnapshot/QueueSnapshot before reading list/start/stop responses; fake Unix-daemon regression proves AgentList is returned.
+  - **#295 closed:** one successful sudo reauth drains the deduplicated batch of still-queued, tool-matching approvals exactly once; cancel abandons the whole batch; parsed-WebSocket Vitest covers two gates.
+  - **#362 closed:** shared character-aware truncation replaces both panic-prone UTF-8 byte slices; real Ratatui queue and session renders cover emoji at the former split boundaries.
   - **Commit:** pending immediately after this log update.
 
 ## Quarantine triage notes

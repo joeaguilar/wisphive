@@ -531,6 +531,58 @@ describe("useWisphive approve-stash tool-name cross-check (itr#275)", () => {
     expect(replays).toHaveLength(2);
   });
 
+  it("replays two back-to-back sudo gates exactly once after one reauth (itr#295)", async () => {
+    const { result } = await mountOpen();
+    const first = decisionRequest({ id: BASH_REQUEST_ID, tool_name: "Bash" });
+    const second = decisionRequest({ id: VALID_REQUEST_ID, tool_name: "Write" });
+    act(() => latest().emit({ type: "queue_snapshot", items: [first, second] }));
+
+    act(() => {
+      result.current.approve(BASH_REQUEST_ID, { message: "approve bash" });
+      result.current.approve(VALID_REQUEST_ID, { message: "approve write" });
+    });
+
+    // Exercise the real parsed WebSocket-message path: both daemon bounces
+    // arrive while the same modal is open, with the newer gate shown there.
+    act(() => {
+      latest().emit({
+        type: "web_reauth_required",
+        device_id: "dev-1",
+        request_id: BASH_REQUEST_ID,
+        tool_name: "Bash",
+        at: "2026-07-11T12:00:01Z",
+      });
+      latest().emit({
+        type: "web_reauth_required",
+        device_id: "dev-1",
+        request_id: VALID_REQUEST_ID,
+        tool_name: "Write",
+        at: "2026-07-11T12:00:02Z",
+      });
+    });
+    expect(result.current.pendingReauth).toEqual({
+      request_id: VALID_REQUEST_ID,
+      tool_name: "Write",
+    });
+
+    act(() => result.current.retryPendingApprove());
+    expect(result.current.pendingReauth).toBeNull();
+
+    const approves = latest().sentMessages().filter((m) => m.type === "approve");
+    expect(approves.filter((m) => m.id === BASH_REQUEST_ID)).toEqual([
+      { type: "approve", id: BASH_REQUEST_ID, message: "approve bash" },
+      { type: "approve", id: BASH_REQUEST_ID, message: "approve bash" },
+    ]);
+    expect(approves.filter((m) => m.id === VALID_REQUEST_ID)).toEqual([
+      { type: "approve", id: VALID_REQUEST_ID, message: "approve write" },
+      { type: "approve", id: VALID_REQUEST_ID, message: "approve write" },
+    ]);
+
+    // A duplicate success callback cannot drain the already-cleared batch.
+    act(() => result.current.retryPendingApprove());
+    expect(latest().sentMessages().filter((m) => m.type === "approve")).toHaveLength(4);
+  });
+
   it("does not replay a Read approve when the WebReauthRequired references a mismatched tool", async () => {
     const { result } = await mountOpen();
     const req = decisionRequest({ id: READ_REQUEST_ID, tool_name: "Read" });

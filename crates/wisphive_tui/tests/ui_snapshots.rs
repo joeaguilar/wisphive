@@ -43,6 +43,7 @@ use ratatui::layout::Position;
 
 use wisphive_tui::app::{App, ViewMode};
 use wisphive_tui::modal::Modal;
+use wisphive_tui::panels;
 use wisphive_tui::ui;
 
 // ── Rendering helpers ────────────────────────────────────────────────
@@ -122,7 +123,9 @@ mod fixtures {
 
     use chrono::{DateTime, Duration, Utc};
     use uuid::Uuid;
-    use wisphive_protocol::{AgentInfo, AgentType, DecisionRequest, HookEventType};
+    use wisphive_protocol::{
+        AgentInfo, AgentType, Decision, DecisionRequest, HistoryEntry, HookEventType,
+    };
     use wisphive_tui::app::App;
 
     /// A fixed-age timestamp: 2 hours ago. Relative ages render as a stable
@@ -157,6 +160,49 @@ mod fixtures {
                 "description": "Run all workspace tests",
             }),
         )
+    }
+
+    /// The second rocket begins at byte 46, so the old `&summary[..47]`
+    /// queue truncation panicked in the middle of its UTF-8 encoding.
+    pub fn unicode_bash_request() -> DecisionRequest {
+        let prefix = "git commit -m \"ship 🚀\" && ";
+        let padding = "x".repeat(46 - prefix.len());
+        request(
+            5,
+            "Bash",
+            serde_json::json!({
+                "command": format!("{prefix}{padding}🚀 deploy now"),
+            }),
+        )
+    }
+
+    /// The rocket begins at byte 36, so the old `&s[..37]` timeline
+    /// truncation panicked in the middle of its UTF-8 encoding.
+    pub fn unicode_session_timeline_app() -> App {
+        let mut app = App::new();
+        app.connected = true;
+        app.view_mode = wisphive_tui::app::ViewMode::SessionTimeline;
+        app.session_timeline_agent_id = Some("codex-unicode".into());
+        app.session_timeline = vec![HistoryEntry {
+            id: Uuid::from_u128(6),
+            agent_id: "codex-unicode".into(),
+            agent_type: AgentType::Codex,
+            project: PathBuf::from("/tmp/wisphive-demo"),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({
+                "command": format!("{}🚀 timeline tail", "x".repeat(36)),
+            }),
+            decision: Decision::Approve,
+            requested_at: fixture_time(),
+            resolved_at: fixture_time(),
+            tool_result: None,
+            tool_use_id: Some("toolu_unicode".into()),
+            hook_event_name: Some("PreToolUse".into()),
+            terminal_session_id: None,
+            decided_by: Some("human".into()),
+            config_hash: None,
+        }];
+        app
     }
 
     pub fn edit_request() -> DecisionRequest {
@@ -247,7 +293,7 @@ mod fixtures {
 
 use fixtures::{
     ask_user_question_request, bash_request, dashboard_app, detail_app, edit_request,
-    exit_plan_mode_request,
+    exit_plan_mode_request, unicode_bash_request, unicode_session_timeline_app,
 };
 
 // ── Snapshot tests: queue panel + detail views ───────────────────────
@@ -256,6 +302,39 @@ use fixtures::{
 fn dashboard_queue_with_pending_decisions() {
     let app = dashboard_app();
     assert_frame_snapshot("dashboard_queue_pending", render_app(&app, 100, 24));
+}
+
+#[test]
+fn dashboard_queue_truncates_unicode_without_panicking() {
+    let mut app = App::new();
+    app.connected = true;
+    app.queue = vec![unicode_bash_request()];
+    app.rebuild_projects();
+
+    let queue_item = panels::format_queue_item(&app.queue[0]);
+    assert!(queue_item.contains("git commit -m \"ship 🚀\""));
+    assert!(queue_item.contains("🚀 de..."));
+
+    let frame = render_app(&app, 140, 24);
+    assert!(
+        frame.contains("git commit -m \"ship") && frame.matches('🚀').count() == 2,
+        "the pending Unicode command should render through the real queue surface\n{frame}"
+    );
+    assert!(
+        frame.contains("..."),
+        "long command should be truncated\n{frame}"
+    );
+}
+
+#[test]
+fn session_timeline_truncates_unicode_without_panicking() {
+    let app = unicode_session_timeline_app();
+    let frame = render_app(&app, 120, 12);
+
+    assert!(
+        frame.contains(&format!("{}🚀 ...", "x".repeat(36))),
+        "timeline command should be character-truncated after the rocket\n{frame}"
+    );
 }
 
 #[test]
