@@ -46,12 +46,12 @@
 
 ### Wave 4
 
-- **#95 — Make mode-file reads fail secure and verify permissions**
-  - Files: `crates/wisphive_hook/src/main.rs`, `crates/wisphive_cli/src/commands/hooks.rs`, `crates/wisphive_daemon/src/config.rs`
 - **#99 — Cap concurrent Unix-socket connections**
   - Files: `crates/wisphive_daemon/src/server.rs`
 - **#111 — Memoize keyboard actions**
-  - Files: `crates/wisphive_web/frontend/src/hooks/useKeyboard.ts`, `crates/wisphive_web/frontend/src/App.tsx`
+  - Files: `crates/wisphive_web/frontend/src/hooks/useKeyboard.ts`, `crates/wisphive_web/frontend/src/hooks/useKeyboard.test.ts`, `crates/wisphive_web/frontend/src/App.tsx`
+- **#116 — Use stable React keys for questions and options**
+  - Files: `crates/wisphive_web/frontend/src/components/DetailView.tsx`, `crates/wisphive_web/frontend/src/components/DetailView.test.tsx`
 
 ### Wave 5
 
@@ -59,15 +59,15 @@
   - Files: `crates/wisphive_hook/src/main.rs`, `crates/wisphive_daemon/src/server.rs`
 - **#114 — Move title/notification side effects out of the reducer**
   - Files: `crates/wisphive_web/frontend/src/hooks/useWisphive.ts`
-- **#116 — Use stable React keys for questions and options**
-  - Files: `crates/wisphive_web/frontend/src/components/DetailView.tsx`
+- **#262 — Enforce mode 0600 on SQLite database sidecars**
+  - Files: `crates/wisphive_daemon/src/state/mod.rs`, `AGENTS.md`
 
 ### Wave 6
 
+- **#95 — Make mode-file reads fail secure and verify permissions**
+  - Files: `crates/wisphive_hook/src/main.rs`, `crates/wisphive_cli/src/commands/hooks.rs`, `crates/wisphive_daemon/src/config.rs`, `crates/wisphive_daemon/src/server.rs`, `AGENTS.md`
 - **#205 — Add Copy controls to History details**
   - Files: `crates/wisphive_web/frontend/src/components/DetailView.tsx`, `crates/wisphive_web/frontend/src/components/ToolContent.tsx`, `crates/wisphive_web/frontend/src/components/CopyButton.tsx`
-- **#262 — Enforce mode 0600 on SQLite database sidecars**
-  - Files: `crates/wisphive_daemon/src/state/mod.rs`, `AGENTS.md`
 - **#303 — Honor the terminal-close kill flag**
   - Files: `crates/wisphive_daemon/src/terminal.rs`, `crates/wisphive_protocol/src/wire.rs`, `crates/wisphive_cli/src/commands/term.rs`
 
@@ -197,11 +197,11 @@
 
 ## File conflicts
 
-- `crates/wisphive_daemon/src/server.rs`: #94 → #294 → #86 → #99 → #96 → #407 → #97 → #101 → #102 → #336 → #409 → #410.
+- `crates/wisphive_daemon/src/server.rs`: #94 → #294 → #86 → #99 → #96 → #95 → #407 → #97 → #101 → #102 → #336 → #409 → #410.
 - `crates/wisphive_web/frontend/src/hooks/useWisphive.ts`: #105 → #295 → #296 → #114 → #375 → #376 → #118.
 - `crates/wisphive_web/src/lib.rs`: #407 → #504 → #495 → #408 → #277 → #281.
 - `crates/wisphive_cli/src/main.rs`: #306 → #348 → #371 → #277 → #318.
-- `crates/wisphive_hook/src/main.rs`: #86 → #95 → #96 → #102.
+- `crates/wisphive_hook/src/main.rs`: #86 → #96 → #95 → #102.
 - `crates/wisphive_cli/src/commands/agent.rs`: #94 → #294 → #412 → #470.
 - `crates/wisphive_cli/src/commands/hooks.rs`: #411 → #95 → #307.
 - `crates/wisphive_daemon/src/config.rs`: #95 → #407 → #495.
@@ -218,6 +218,7 @@
 - `ToolContent.tsx`: #106 → #205.
 - `crates/wisphive_daemon/src/queue.rs`: #94 → #97.
 - `crates/wisphive_daemon/src/state/decisions.rs`: #94 → #91.
+- `AGENTS.md`: #262 → #95.
 
 No wave contains a shared owned file. Co-located tests inherit the same ownership chain as their source; a worker must request an ownership expansion before touching any additional test file.
 
@@ -250,6 +251,9 @@ No wave contains a shared owned file. Co-located tests inherit the same ownershi
 - **Wave 2 gate:** orchestrator reran both repository gates after all workers settled: `GATR exit=0 dur=23.5s errors=0 warnings=0 adapter=generic tag=blitz-wave2-final-rust` and `GATR exit=0 dur=6.2s errors=0 warnings=0 adapter=generic tag=blitz-wave2-final-frontend` (13 files, 118 tests).
 - **Wave 3 sandbox gate retry:** #296 and #86 each hit a sandbox-only `PermissionDenied` when the existing #294 fake-daemon regression bound a Unix socket. The exact test and full gates passed outside that restriction; no product-code repair was needed.
 - **Wave 3 gate:** orchestrator reran both repository gates after all workers settled: `GATR exit=0 dur=23.4s errors=0 warnings=0 adapter=generic tag=blitz-wave3-final-rust` and `GATR exit=0 dur=6.4s errors=0 warnings=0 adapter=generic tag=blitz-wave3-final-frontend` (13 files, 119 tests).
+- **Pre-Wave 4 re-pack:** #95's full body requires daemon-side mode enforcement in `server.rs`, which conflicts with #99. Expanded #95 to `server.rs` + `AGENTS.md` and moved it to Wave 6; moved #116 to Wave 4 and #262 to Wave 5. The three waves remain size 3 and conflict-free.
+- **Wave 4 / #111 lint repair:** its first frontend pass caught a React hooks rule violation from assigning the actions ref during render. The worker moved the ref refresh into `useLayoutEffect`; both required gates then passed.
+- **Wave 4 gate:** orchestrator reran both repository gates after all workers settled: `GATR exit=0 dur=23.5s errors=0 warnings=0 adapter=generic tag=blitz-wave4-final-rust` and `GATR exit=0 dur=5.8s errors=0 warnings=0 adapter=generic tag=blitz-wave4-final-frontend` (14 files, 122 tests).
 
 ## Outcomes
 
@@ -268,6 +272,11 @@ No wave contains a shared owned file. Co-located tests inherit the same ownershi
   - **#296 closed:** validated terminal live/catch-up/replay frames dispatch imperative xterm callbacks before the React state updater; StrictMode runtime test proves exactly one callback per frame. Related follow-up seam remains itr#114.
   - **#411 closed:** project audit now reuses the daemon's precise Wisphive hook-command matcher; regression fixtures prove paths that merely contain `wisphive` are not classified as installed.
   - **#86 closed:** hook and daemon boundaries reject traversal-capable agent IDs and malformed terminal UUIDs before marker/database work; marker cleanup revalidates stored IDs and project strings remain opaque metadata.
+  - **Commit:** `3851024` — `fix(runtime): validate hook identity and terminal dispatch`.
+- **Wave 4 — 2026-07-11T23:11Z–2026-07-11T23:16Z — 3 workers.**
+  - **#99 closed:** a daemon-wide 256-permit semaphore bounds live socket handlers; over-cap clients receive a protocol error without a handler/context allocation and capacity recovers when permits drop.
+  - **#111 closed:** one stable keyboard listener reads the latest actions through a layout-ref refresh; rerender tests prove no listener churn and no stale callback after action changes.
+  - **#116 closed:** question and option keys derive from canonical content with duplicate occurrence disambiguation; rerender/click tests prove DOM identity follows reordered content and current request callbacks.
   - **Commit:** pending immediately after this log update.
 
 ## Quarantine triage notes

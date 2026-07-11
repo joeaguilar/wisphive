@@ -173,8 +173,93 @@ function pending(toolInput: JsonValue): DecisionRequest {
   };
 }
 
+function questionRequest(id: string, reverse = false): DecisionRequest {
+  const storage = {
+    header: "Storage",
+    question: "Choose a database",
+    options: [
+      { label: "SQLite", description: "Embedded" },
+      { label: "PostgreSQL", description: "Server" },
+    ],
+  };
+  const runtime = {
+    header: "Runtime",
+    question: "Choose a JavaScript runtime",
+    options: [
+      { label: "Node", description: "Established" },
+      { label: "Deno", description: "Modern" },
+    ],
+  };
+
+  if (reverse) {
+    storage.options.reverse();
+    runtime.options.reverse();
+  }
+
+  return {
+    ...pending({ questions: reverse ? [runtime, storage] : [storage, runtime] }),
+    id,
+  };
+}
+
 describe("DetailView", () => {
   afterEach(cleanup);
+
+  it("keeps question and option identity with content when a request is reordered", () => {
+    const onApprove = vi.fn();
+    const props = { onApprove, onDeny: vi.fn() };
+    const { rerender } = render(
+      <DetailView request={questionRequest("request-before")} {...props} />,
+    );
+    const runtimeQuestion = screen.getByRole("heading", { name: "Runtime" }).parentElement;
+    const denoButton = screen.getByRole("button", { name: /Deno/ });
+
+    rerender(
+      <DetailView request={questionRequest("request-after", true)} {...props} />,
+    );
+
+    const headings = screen.getAllByRole("heading", { level: 3 });
+    expect(headings.map((heading) => heading.textContent)).toEqual(["Runtime", "Storage"]);
+    expect(screen.getByRole("heading", { name: "Runtime" }).parentElement).toBe(runtimeQuestion);
+
+    const optionButtons = screen.getAllByRole("button").filter((button) =>
+      button.classList.contains("option-btn"),
+    );
+    expect(optionButtons.map((button) => button.textContent)).toEqual([
+      "Deno — Modern",
+      "Node — Established",
+      "PostgreSQL — Server",
+      "SQLite — Embedded",
+    ]);
+    const reorderedDenoButton = screen.getByRole("button", { name: /Deno/ });
+    expect(reorderedDenoButton).toBe(denoButton);
+
+    fireEvent.click(reorderedDenoButton);
+    expect(onApprove).toHaveBeenCalledWith("request-after");
+  });
+
+  it("disambiguates exact duplicate question and option content", () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const duplicate = {
+      question: "Pick one",
+      options: [{ label: "Same" }, { label: "Same" }],
+    };
+
+    render(
+      <DetailView
+        request={pending({ questions: [duplicate, duplicate] })}
+        onApprove={vi.fn()}
+        onDeny={vi.fn()}
+      />,
+    );
+
+    expect(screen.getAllByText("Pick one")).toHaveLength(2);
+    expect(screen.getAllByRole("button", { name: "Same" })).toHaveLength(4);
+    expect(consoleError.mock.calls.flat().join(" ")).not.toContain(
+      "Encountered two children with the same key",
+    );
+    consoleError.mockRestore();
+  });
 
   it("falls back without throwing for malformed questions and options arrays", () => {
     const props = { onApprove: vi.fn(), onDeny: vi.fn() };

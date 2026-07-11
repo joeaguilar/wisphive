@@ -31,6 +31,43 @@ function formatJson(value: unknown): string {
   return typeof json === "string" ? json : String(value ?? "");
 }
 
+interface KeyedOption {
+  label: string;
+  description?: string | null;
+}
+
+interface KeyedQuestion {
+  header?: string | null;
+  question: string;
+  options: KeyedOption[];
+}
+
+function optionContent(option: KeyedOption): [string, string | null] {
+  return [option.label, option.description ?? null];
+}
+
+function questionContent(question: KeyedQuestion): [string | null, string, string[]] {
+  const options = question.options
+    .map((option) => JSON.stringify(optionContent(option)))
+    .sort();
+  return [question.header ?? null, question.question, options];
+}
+
+/**
+ * Keep component identity attached to content when the daemon reorders a
+ * request. The occurrence is only a disambiguator for exact duplicates; it
+ * never substitutes a bare array position for the content identity.
+ */
+function withContentKeys<T>(items: readonly T[], content: (item: T) => unknown) {
+  const occurrences = new Map<string, number>();
+  return items.map((item) => {
+    const identity = JSON.stringify(content(item));
+    const occurrence = occurrences.get(identity) ?? 0;
+    occurrences.set(identity, occurrence + 1);
+    return { item, key: JSON.stringify([identity, occurrence]) };
+  });
+}
+
 interface DeferredDetailProps {
   decision: AuditDecision;
   onFocusTerminal: (terminalSessionId: string) => void;
@@ -65,14 +102,14 @@ export function DeferredDetailView({ decision, onFocusTerminal }: DeferredDetail
       {/* Full, untruncated prompt. Read-only: NO approve/deny/answer control. */}
       {prompt.kind === "questions" && (
         <div className="deferred-prompt" aria-label="Deferred question">
-          {prompt.questions.map((q, i) => (
-            <div key={i} className="deferred-question">
+          {withContentKeys(prompt.questions, questionContent).map(({ item: q, key }) => (
+            <div key={key} className="deferred-question">
               {q.header && <h4 className="deferred-question-header">{q.header}</h4>}
               {q.question && <p className="deferred-question-text">{q.question}</p>}
               {q.options.length > 0 && (
                 <ul className="deferred-options">
-                  {q.options.map((opt, j) => (
-                    <li key={j} className="deferred-option">
+                  {withContentKeys(q.options, optionContent).map(({ item: opt, key: optionKey }) => (
+                    <li key={optionKey} className="deferred-option">
                       <strong>{opt.label}</strong>
                       {opt.description && <span> — {opt.description}</span>}
                     </li>
@@ -173,14 +210,14 @@ export function DetailView({ request, onApprove, onDeny }: DetailViewProps) {
       {/* AskUserQuestion */}
       {parsedInput.kind === "ask-user-question" && parsedInput.input && (
         <div className="detail-section">
-          {parsedInput.input.questions.map((q, i) => (
-            <div key={i}>
+          {withContentKeys(parsedInput.input.questions, questionContent).map(({ item: q, key }) => (
+            <div key={key}>
               <h3>{q.header || "Question"}</h3>
               <p className="question-text">{q.question}</p>
               {q.options.length > 0 && (
                 <div className="options-list">
-                  {q.options.map((opt, j) => (
-                    <button key={j} className="option-btn" onClick={() => onApprove(request.id)}>
+                  {withContentKeys(q.options, optionContent).map(({ item: opt, key: optionKey }) => (
+                    <button key={optionKey} className="option-btn" onClick={() => onApprove(request.id)}>
                       <strong>{opt.label}</strong>
                       {opt.description && <span> — {opt.description}</span>}
                     </button>

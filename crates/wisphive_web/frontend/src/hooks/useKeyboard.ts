@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
 
 interface KeyboardActions {
   onApprove?: () => void;
@@ -18,16 +18,23 @@ interface KeyboardActions {
 }
 
 export function useKeyboard(actions: KeyboardActions) {
+  const actionsRef = useRef(actions);
+  useLayoutEffect(() => {
+    actionsRef.current = actions;
+  });
+
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      const currentActions = actionsRef.current;
+
       // Don't intercept when typing in inputs
       const tag = (e.target as HTMLElement).tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
 
       // Don't intercept when modals are open
       if (document.querySelector(".modal-overlay")) {
-        if (e.key === "Escape" && actions.onBack) {
-          actions.onBack();
+        if (e.key === "Escape" && currentActions.onBack) {
+          currentActions.onBack();
         }
         return;
       }
@@ -37,61 +44,61 @@ export function useKeyboard(actions: KeyboardActions) {
         case "j":
         case "ArrowDown":
           e.preventDefault();
-          actions.onNext?.();
+          currentActions.onNext?.();
           break;
         case "k":
         case "ArrowUp":
           e.preventDefault();
-          actions.onPrev?.();
+          currentActions.onPrev?.();
           break;
         case "Enter":
-          actions.onSelect?.();
+          currentActions.onSelect?.();
           break;
         case "Escape":
-          actions.onBack?.();
+          currentActions.onBack?.();
           break;
 
         // Actions
         case "y":
-          actions.onApprove?.();
+          currentActions.onApprove?.();
           break;
         case "n":
-          actions.onDeny?.();
+          currentActions.onDeny?.();
           break;
 
         // View switching (only lowercase, not in inputs)
         case "1":
-          actions.onViewQueue?.();
+          currentActions.onViewQueue?.();
           break;
         case "2":
-          actions.onViewHistory?.();
+          currentActions.onViewHistory?.();
           break;
         case "3":
-          actions.onViewSessions?.();
+          currentActions.onViewSessions?.();
           break;
         case "4":
-          actions.onViewProjects?.();
+          currentActions.onViewProjects?.();
           break;
         case "5":
-          actions.onViewAgents?.();
+          currentActions.onViewAgents?.();
           break;
         case "6":
-          actions.onViewConfig?.();
+          currentActions.onViewConfig?.();
           break;
 
         // Spawn
         case "N":
-          actions.onSpawn?.();
+          currentActions.onSpawn?.();
           break;
 
         // Help
         case "?":
-          actions.onHelp?.();
+          currentActions.onHelp?.();
           break;
       }
     };
 
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [actions]);
+  }, []);
 }

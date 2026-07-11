@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, broadcast};
 use tracing::{debug, error, info, warn};
 use wisphive_protocol::{
     ClientMessage, ClientType, Decision, DecisionRequest, PROTOCOL_VERSION, RichDecision,
@@ -21,6 +21,12 @@ use crate::config::DaemonConfig;
 /// dropping. Large enough to absorb a healthy burst between select wake-ups,
 /// small enough to cap worst-case RAM.
 const CONN_CHANNEL_CAPACITY: usize = 1024;
+
+/// Maximum number of live daemon socket handlers. Every accepted client type
+/// shares this pool so a local connection flood cannot create unbounded tasks
+/// or retain an unbounded number of file descriptors (itr#99).
+const MAX_CONCURRENT_CONNECTIONS: usize = 256;
+const CONNECTION_LIMIT_ERROR: &str = "daemon connection capacity reached; retry later";
 
 /// Maximum bytes a single newline-delimited line may occupy on a daemon socket
 /// reader before the connection is rejected (itr#83). Without a cap a peer that
@@ -270,6 +276,10 @@ impl Server {
         let mut alert_state = crate::disk_alert::AlertState::default();
         self.check_disk_alerts(&mut alert_state);
 
+        // The owned permit moves into each handler task and is released on
+        // every exit path, including cancellation and protocol errors.
+        let connection_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+
         loop {
             tokio::select! {
                 // Periodically reap exited agent processes and inactive agents
@@ -364,6 +374,20 @@ impl Server {
                                     continue;
                                 }
                             }
+
+                            let Some(permit) =
+                                try_acquire_connection_permit(&connection_permits)
+                            else {
+                                warn!(
+                                    limit = MAX_CONCURRENT_CONNECTIONS,
+                                    "rejecting connection: daemon connection capacity reached"
+                                );
+                                if let Err(e) = reject_connection_at_capacity(stream).await {
+                                    debug!("failed to send connection-capacity error: {e}");
+                                }
+                                continue;
+                            };
+
                             let ctx = Arc::new(ConnectionContext {
                                 queue: self.queue.clone(),
                                 process_registry: self.process_registry.clone(),
@@ -379,6 +403,7 @@ impl Server {
                                 audit_snapshot_limit: self.config.audit_snapshot_limit,
                             });
                             tokio::spawn(async move {
+                                let _permit = permit;
                                 if let Err(e) = handle_connection(stream, &ctx).await {
                                     warn!("connection error: {e}");
                                 }
@@ -419,6 +444,25 @@ impl Server {
 /// [`tokio::io::Lines`]) so every read goes through [`read_capped_line`], which
 /// enforces [`MAX_LINE_BYTES`] (itr#83).
 type SocketReader = BufReader<tokio::net::unix::OwnedReadHalf>;
+
+/// Acquire a permit without queueing another task. The daemon never closes
+/// this semaphore, so either a permit is returned immediately or the cap has
+/// been reached.
+fn try_acquire_connection_permit(permits: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+    permits.clone().try_acquire_owned().ok()
+}
+
+/// Send a bounded, protocol-shaped overload response directly from the accept
+/// loop. This deliberately avoids constructing a [`ConnectionContext`] or
+/// spawning a handler for a client that cannot be admitted.
+async fn reject_connection_at_capacity(mut stream: UnixStream) -> Result<()> {
+    let encoded = encode(&ServerMessage::Error {
+        message: CONNECTION_LIMIT_ERROR.into(),
+    })?;
+    stream.write_all(encoded.as_bytes()).await?;
+    stream.shutdown().await?;
+    Ok(())
+}
 
 /// Read one newline-delimited line into `buf`, capping it at [`MAX_LINE_BYTES`]
 /// (itr#83).
@@ -3075,17 +3119,18 @@ fn peer_uid_allowed(peer_uid: u32, daemon_uid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONN_CHANNEL_CAPACITY, MAX_LINE_BYTES, MAX_PENDING_SPAWNS, SpawnRunError,
-        attach_tool_result_with_retry, enqueue_spawn_for_approval, ensure_spawn_mode_active,
-        finalize_spawn_abandonment, finalize_spawn_decision, hook_message_agent_id,
-        is_reserved_internal_agent_id, is_valid_hook_agent_id, partition_sudo_gated,
-        peer_uid_allowed, persist_auto_approve, read_capped_line, resolve_bulk_deny,
+        CONN_CHANNEL_CAPACITY, CONNECTION_LIMIT_ERROR, MAX_CONCURRENT_CONNECTIONS, MAX_LINE_BYTES,
+        MAX_PENDING_SPAWNS, SpawnRunError, attach_tool_result_with_retry,
+        enqueue_spawn_for_approval, ensure_spawn_mode_active, finalize_spawn_abandonment,
+        finalize_spawn_decision, hook_message_agent_id, is_reserved_internal_agent_id,
+        is_valid_hook_agent_id, partition_sudo_gated, peer_uid_allowed, persist_auto_approve,
+        read_capped_line, reject_connection_at_capacity, resolve_bulk_deny,
         run_after_spawn_approval, set_socket_permissions, settle_spawn_expiry,
-        spawn_approval_request, sweep_stale_session_markers,
+        spawn_approval_request, sweep_stale_session_markers, try_acquire_connection_permit,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use tokio::io::BufReader;
+    use tokio::io::{AsyncBufReadExt, BufReader};
 
     fn spawn_req(project: &std::path::Path) -> wisphive_protocol::SpawnAgentRequest {
         serde_json::from_value(serde_json::json!({
@@ -3952,6 +3997,47 @@ mod tests {
             rejected_full > 0,
             "excess sends past capacity must be rejected as Full (dropped), not queued"
         );
+    }
+
+    #[test]
+    fn connection_permit_pool_caps_handlers_and_recovers_capacity() {
+        let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+        let mut held = Vec::with_capacity(MAX_CONCURRENT_CONNECTIONS);
+
+        for _ in 0..MAX_CONCURRENT_CONNECTIONS {
+            held.push(
+                try_acquire_connection_permit(&permits)
+                    .expect("every permit through the configured cap should be available"),
+            );
+        }
+        assert!(
+            try_acquire_connection_permit(&permits).is_none(),
+            "a connection above the cap must not create a handler"
+        );
+
+        assert!(held.pop().is_some());
+        assert!(
+            try_acquire_connection_permit(&permits).is_some(),
+            "capacity must recover as soon as a handler releases its permit"
+        );
+    }
+
+    #[tokio::test]
+    async fn over_capacity_connection_receives_protocol_error() {
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+
+        reject_connection_at_capacity(server).await.unwrap();
+
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        assert!(reader.read_line(&mut line).await.unwrap() > 0);
+        let message: wisphive_protocol::ServerMessage = wisphive_protocol::decode(&line).unwrap();
+        match message {
+            wisphive_protocol::ServerMessage::Error { message } => {
+                assert_eq!(message, CONNECTION_LIMIT_ERROR);
+            }
+            other => panic!("expected capacity error, got {other:?}"),
+        }
     }
 
     // ---- itr#83: capped socket line length ----
