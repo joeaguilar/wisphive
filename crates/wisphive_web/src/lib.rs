@@ -22,7 +22,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use base64::Engine;
 use rust_embed::RustEmbed;
-use security::{AuthedDevice, ClientIp, SecurityConfig, security_middleware};
+use security::{AuthedDevice, ClientIp, ParsedOrigin, SecurityConfig, security_middleware};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{Level, info};
@@ -49,6 +49,15 @@ const VERIFY_DEADLINE: Duration = Duration::from_secs(5);
 const CONFIG_BODY_LIMIT: usize = 64 * 1024;
 const DEVICE_REVOKE_MIN_INTERVAL: Duration = Duration::from_secs(10);
 const DEV_CORS_ORIGINS: &[&str] = &["http://localhost:5173", "http://127.0.0.1:5173"];
+
+/// Format a stable `detail` reason code for `append_web_audit` as a JSON
+/// object (`{"reason": "..."}`). itr#258: `web_audit.detail` is documented
+/// as JSON; centralizing the reason-code shape here keeps future call sites
+/// from reintroducing a bare-string convention that ambiguates the column
+/// for downstream log consumers.
+fn audit_reason(reason: &str) -> String {
+    serde_json::json!({ "reason": reason }).to_string()
+}
 
 /// Shared server state.
 #[derive(Clone)]
@@ -749,6 +758,22 @@ async fn post_auth_reauth(
     (axum::http::StatusCode::OK, "ok").into_response()
 }
 
+/// Standard 429 response for [`crate::security::PeekThrottle`] rejections
+/// on the unauth discovery endpoints (`/api/auth/status`,
+/// `/api/auth/profile`). Mirrors the `Retry-After` shape used by the
+/// credential endpoints' `LoginThrottle` 429s, but the throttle itself is
+/// a fixed-window counter rather than exponential backoff, so we always
+/// hand back a flat hint (the window length) rather than a computed
+/// `retry_after`.
+fn peek_throttled_response() -> Response {
+    (
+        axum::http::StatusCode::TOO_MANY_REQUESTS,
+        [("retry-after", "60")],
+        "throttled",
+    )
+        .into_response()
+}
+
 /// GET /api/auth/status — unauthenticated setup-discovery surface.
 ///
 /// Returns `{ password_set, setup_required }`. The frontend hits this
@@ -760,9 +785,24 @@ async fn post_auth_reauth(
 /// the caller is about to decide which bootstrap flow to run, and lying
 /// here would force us to ship the decision via a cache-buster on the
 /// frontend build, which is worse.
-async fn get_auth_status(axum::extract::State(state): axum::extract::State<AppState>) -> Response {
-    let password_set = match state.security.state_db().get_web_password_hash().await {
-        Ok(opt) => opt.is_some(),
+///
+/// Unauth + no device token means anyone on an allowlisted origin can hit
+/// this as fast as they can connect; itr#317 adds a per-IP
+/// [`crate::security::PeekThrottle`] pass (separate budget from
+/// `LoginThrottle` — see that type's docs) so scripted hammering gets a
+/// `429` instead of unlimited free probes. itr#256 additionally caches the
+/// `password_set` fact itself (`SecurityConfig::password_set`) so a
+/// hammering client that clears the throttle window still doesn't cost a
+/// SQLite round-trip once a password has been observed set.
+async fn get_auth_status(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    client_ip: ClientIp,
+) -> Response {
+    if !state.security.peek_throttle().allow(client_ip.0).await {
+        return peek_throttled_response();
+    }
+    let password_set = match state.security.password_set().await {
+        Ok(set) => set,
         Err(e) => {
             tracing::warn!(error = %e, "auth_status: password-hash probe failed");
             return (
@@ -801,13 +841,33 @@ async fn get_auth_status(axum::extract::State(state): axum::extract::State<AppSt
 /// LocalLAN it returns `false` for RFC1918 IP-literal origins so the SPA
 /// can hide the "enroll passkey" button on the phone (WebAuthn forbids
 /// IP RP IDs; see `auth_profile::loopback_rp_id_from_origin`).
+///
+/// Same [`crate::security::PeekThrottle`] pass as `/api/auth/status`
+/// (itr#317) — unauth + no device token, so it needs its own budget too.
+///
+/// Takes `Option<Extension<ParsedOrigin>>` rather than re-parsing the
+/// `Origin` header itself: `security_middleware` already parsed it once
+/// (after the Origin allowlist check passed) via
+/// [`crate::security::SecurityConfig`]'s `check_origin`, and handing that
+/// parse result down avoids a second `Url::parse` of the same header that
+/// could theoretically disagree with the first on malformed input.
 async fn get_auth_profile(
     axum::extract::State(state): axum::extract::State<AppState>,
+    client_ip: ClientIp,
     uri: axum::http::Uri,
     headers: axum::http::HeaderMap,
+    parsed_origin: Option<axum::Extension<ParsedOrigin>>,
 ) -> Response {
+    if !state.security.peek_throttle().allow(client_ip.0).await {
+        return peek_throttled_response();
+    }
     let policy = &state.auth_policy;
-    let can_enroll = origin_can_enroll_passkey(policy, &headers, &uri);
+    let can_enroll = origin_can_enroll_passkey(
+        policy,
+        &headers,
+        &uri,
+        parsed_origin.map(|axum::Extension(p)| p),
+    );
     axum::Json(serde_json::json!({
         "profile": policy.profile_str(),
         "can_enroll_passkey_on_this_origin": can_enroll,
@@ -853,18 +913,33 @@ async fn get_auth_profile(
 /// the security middleware's Host allowlist 403s such requests before they
 /// reach the handler). `Origin` present but unparsable → `false` (don't
 /// quietly upgrade to host; the caller meant something we couldn't honour).
+///
+/// **`parsed_origin` (itr#317).** When the `Origin` header is present, this
+/// is the middleware's own `Url::parse` of it (see [`ParsedOrigin`]) rather
+/// than a second parse done here — `security_middleware` only reaches this
+/// handler at all once `check_origin`'s allowlist check has passed, and it
+/// attaches the parse result as a request extension right there. `None`
+/// with an `Origin` header present means that (allowlist-matching) header
+/// value failed to parse as a URL — treated the same as the historical
+/// "unparsable Origin" case: a deliberate `false`, not a silent fallback
+/// to the host-based path below.
 fn origin_can_enroll_passkey(
     policy: &AuthPolicy,
     headers: &axum::http::HeaderMap,
     uri: &axum::http::Uri,
+    parsed_origin: Option<ParsedOrigin>,
 ) -> bool {
-    if let Some(origin) = headers.get("origin").and_then(|h| h.to_str().ok()) {
-        // Origin was set explicitly. Honour it verbatim — including the
-        // "Origin present but unparsable" path which we treat as a deliberate
-        // negative answer rather than silently falling through to host.
-        return Url::parse(origin)
-            .ok()
-            .and_then(|u| policy.rp_id_for_origin(&u))
+    if headers
+        .get("origin")
+        .and_then(|h| h.to_str().ok())
+        .is_some()
+    {
+        // Origin header was present. Honour whatever the middleware parsed
+        // — including the "present but unparsable" case (`parsed_origin ==
+        // None`), which we treat as a deliberate negative answer rather
+        // than silently falling through to the host-based path below.
+        return parsed_origin
+            .and_then(|p| policy.rp_id_for_origin(&p.0))
             .is_some();
     }
 
@@ -906,7 +981,14 @@ struct SetPasswordRequest {
 /// `wisphive web set-password` accepts anything — that's fine because the
 /// CLI requires shell access (a stronger trust signal than "browser reaches
 /// the loopback UI").
-const MIN_PASSWORD_LEN: usize = 8;
+///
+/// 12 (itr#280): NIST SP 800-63B Rev.4 recommends 15 chars for memorized
+/// secrets without 2FA, but the web device token's trust level (sudo-class
+/// approval of AI-agent tool calls after reauth) is weighed against not
+/// frustrating local single-user installs, so 12 is the pragmatic
+/// compromise. Keep in sync with the duplicated constant in
+/// `Login.tsx::MIN_PASSWORD_LEN` (itr#132 tracks unifying the duplication).
+const MIN_PASSWORD_LEN: usize = 12;
 
 /// Hard ceiling on password length across every auth endpoint
 /// (login/reauth/set-password). Argon2's wall-time is insensitive to input
@@ -978,7 +1060,7 @@ async fn post_auth_set_password(
                 "web_password_set_denied",
                 None,
                 Some(&client_ip.0.to_string()),
-                Some("password_too_long"),
+                Some(&audit_reason("password_too_long")),
             )
             .await;
         return (axum::http::StatusCode::BAD_REQUEST, "password too long").into_response();
@@ -991,7 +1073,7 @@ async fn post_auth_set_password(
                 "web_password_set_denied",
                 None,
                 Some(&client_ip.0.to_string()),
-                Some("password_too_short"),
+                Some(&audit_reason("password_too_short")),
             )
             .await;
         return (
@@ -1039,7 +1121,13 @@ async fn post_auth_set_password(
     };
 
     match db.try_set_initial_web_password(&phc).await {
-        Ok(true) => {} // first-run, row inserted
+        Ok(true) => {
+            // itr#256: latch the process-local cache immediately so the
+            // very next request (from this client or any other) skips the
+            // SQLite round-trip `SecurityConfig::password_set` would
+            // otherwise still need on a cache miss.
+            security.mark_password_set();
+        }
         Ok(false) => {
             // Password already set — reset flow is CLI-only. Record as a
             // failure for throttle purposes so a script that keeps POSTing
@@ -1052,7 +1140,7 @@ async fn post_auth_set_password(
                     "web_password_set_denied",
                     None,
                     Some(&client_ip.0.to_string()),
-                    Some("already_set"),
+                    Some(&audit_reason("already_set")),
                 )
                 .await;
             return (
@@ -1069,7 +1157,7 @@ async fn post_auth_set_password(
                     "web_password_set_denied",
                     None,
                     Some(&client_ip.0.to_string()),
-                    Some("db_error"),
+                    Some(&audit_reason("db_error")),
                 )
                 .await;
             return (
@@ -1174,18 +1262,28 @@ async fn get_me(axum::Extension(device): axum::Extension<AuthedDevice>) -> Respo
 /// field is how it disambiguates). Any device that has a valid token can
 /// see the full list — there's no "admin" tier in the current model; a
 /// paired device is a paired device.
-async fn get_devices(axum::extract::State(state): axum::extract::State<AppState>) -> Response {
+///
+/// `last_ip` is only populated for the caller's own row (itr#259): a
+/// stolen/leaked token would otherwise hand an attacker the operator's
+/// full LAN topology (which IP is the NAS, the phone, the laptop) for
+/// free. The caller can still answer "where was I last seen from" — every
+/// other row reports `last_ip: null`.
+async fn get_devices(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::Extension(caller): axum::Extension<AuthedDevice>,
+) -> Response {
     match state.security.state_db().list_web_devices().await {
         Ok(devices) => {
             let json: Vec<serde_json::Value> = devices
                 .into_iter()
                 .map(|d| {
+                    let last_ip = if d.id == caller.id.0 { d.last_ip } else { None };
                     serde_json::json!({
                         "id": d.id,
                         "name": d.name,
                         "created_at": d.created_at,
                         "last_seen_at": d.last_seen_at,
-                        "last_ip": d.last_ip,
+                        "last_ip": last_ip,
                         "revoked_at": d.revoked_at,
                     })
                 })
@@ -1246,7 +1344,7 @@ async fn post_revoke_device(
                 "web_device_revoke_denied",
                 Some(&actor.id.0),
                 Some(&client_ip.0.to_string()),
-                Some("rate_limited"),
+                Some(&audit_reason("rate_limited")),
             )
             .await;
         return (
@@ -1270,7 +1368,7 @@ async fn post_revoke_device(
             "web_device_revoke",
             Some(&actor.id.0),
             Some(&client_ip.0.to_string()),
-            Some(&target_id),
+            Some(&serde_json::json!({ "target_device_id": target_id }).to_string()),
         )
         .await;
     (axum::http::StatusCode::OK, "ok").into_response()
@@ -1304,7 +1402,7 @@ async fn verify_revoke_password(
                     "web_device_revoke_denied",
                     Some(actor_device_id),
                     Some(&client_ip.0.to_string()),
-                    Some("auth_throttled"),
+                    Some(&audit_reason("auth_throttled")),
                 )
                 .await;
             tracing::warn!(retry_after_secs = retry, "device revoke reauth throttled");
@@ -1319,7 +1417,7 @@ async fn verify_revoke_password(
                 "web_device_revoke_denied",
                 Some(actor_device_id),
                 Some(&client_ip.0.to_string()),
-                Some("password_too_long"),
+                Some(&audit_reason("password_too_long")),
             )
             .await;
         return false;
@@ -1334,7 +1432,7 @@ async fn verify_revoke_password(
                     "web_device_revoke_denied",
                     Some(actor_device_id),
                     Some(&client_ip.0.to_string()),
-                    Some("password_missing"),
+                    Some(&audit_reason("password_missing")),
                 )
                 .await;
             return false;
@@ -1347,7 +1445,7 @@ async fn verify_revoke_password(
                     "web_device_revoke_denied",
                     Some(actor_device_id),
                     Some(&client_ip.0.to_string()),
-                    Some("db_error"),
+                    Some(&audit_reason("db_error")),
                 )
                 .await;
             return false;
@@ -1383,7 +1481,7 @@ async fn verify_revoke_password(
                 "web_device_revoke_denied",
                 Some(actor_device_id),
                 Some(&client_ip.0.to_string()),
-                Some("bad_password"),
+                Some(&audit_reason("bad_password")),
             )
             .await;
         false
@@ -1519,7 +1617,7 @@ async fn post_passkey_register_start(
                 "passkey_register_denied",
                 Some(&device.id.0),
                 Some(&client_ip.0.to_string()),
-                Some("sudo_required"),
+                Some(&audit_reason("sudo_required")),
             )
             .await;
         return (
@@ -1672,7 +1770,7 @@ async fn post_passkey_register_finish(
                     "passkey_register_failure",
                     Some(&device.id.0),
                     Some(&client_ip.0.to_string()),
-                    Some("wrong_session_variant"),
+                    Some(&audit_reason("wrong_session_variant")),
                 )
                 .await;
             return (
@@ -1687,7 +1785,7 @@ async fn post_passkey_register_finish(
                     "passkey_register_failure",
                     Some(&device.id.0),
                     Some(&client_ip.0.to_string()),
-                    Some("unknown_session"),
+                    Some(&audit_reason("unknown_session")),
                 )
                 .await;
             return (
@@ -1709,7 +1807,7 @@ async fn post_passkey_register_finish(
                 "passkey_register_failure",
                 Some(&device.id.0),
                 Some(&client_ip.0.to_string()),
-                Some("device_id_mismatch"),
+                Some(&audit_reason("device_id_mismatch")),
             )
             .await;
         return (
@@ -1724,7 +1822,7 @@ async fn post_passkey_register_finish(
                 "passkey_register_failure",
                 Some(&device.id.0),
                 Some(&client_ip.0.to_string()),
-                Some("rp_id_drift"),
+                Some(&audit_reason("rp_id_drift")),
             )
             .await;
         return (
@@ -1755,7 +1853,7 @@ async fn post_passkey_register_finish(
                     "passkey_register_failure",
                     Some(&device.id.0),
                     Some(&client_ip.0.to_string()),
-                    Some("webauthn_finish_error"),
+                    Some(&audit_reason("webauthn_finish_error")),
                 )
                 .await;
             return (
@@ -1807,7 +1905,7 @@ async fn post_passkey_register_finish(
                 "passkey_register_failure",
                 Some(&device.id.0),
                 Some(&client_ip.0.to_string()),
-                Some("db_insert_error"),
+                Some(&audit_reason("db_insert_error")),
             )
             .await;
         return (
@@ -1822,7 +1920,7 @@ async fn post_passkey_register_finish(
             "passkey_register",
             Some(&device.id.0),
             Some(&client_ip.0.to_string()),
-            Some(&cred_id_b64),
+            Some(&serde_json::json!({ "credential_id": cred_id_b64 }).to_string()),
         )
         .await;
 
@@ -2025,7 +2123,7 @@ async fn post_passkey_login_finish(
                     "passkey_login_failure",
                     None,
                     Some(&client_ip.0.to_string()),
-                    Some("unknown_credential"),
+                    Some(&audit_reason("unknown_credential")),
                 )
                 .await;
             guard.record_failure().await;
@@ -2072,7 +2170,7 @@ async fn post_passkey_login_finish(
                     "passkey_login_failure",
                     Some(&stored.device_id),
                     Some(&client_ip.0.to_string()),
-                    Some("webauthn_finish_error"),
+                    Some(&audit_reason("webauthn_finish_error")),
                 )
                 .await;
             guard.record_failure().await;
@@ -2094,7 +2192,7 @@ async fn post_passkey_login_finish(
                 "passkey_login_failure",
                 Some(&stored.device_id),
                 Some(&client_ip.0.to_string()),
-                Some("counter_regression"),
+                Some(&audit_reason("counter_regression")),
             )
             .await;
         guard.record_failure().await;
@@ -2143,7 +2241,7 @@ async fn post_passkey_login_finish(
             "passkey_login_success",
             Some(&new_device_id),
             Some(&client_ip.0.to_string()),
-            Some(&cred_id_b64),
+            Some(&serde_json::json!({ "credential_id": cred_id_b64 }).to_string()),
         )
         .await;
 

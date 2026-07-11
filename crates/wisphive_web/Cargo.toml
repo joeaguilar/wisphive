@@ -49,10 +49,15 @@ url = "2"
 # itr#311 adds the column. We pin to the workspace's existing sqlx
 # (already a dep of wisphive_daemon) to keep one version in the tree.
 sqlx.workspace = true
+# itr#228: tls.rs uses this to pull the SubjectPublicKeyInfo out of an
+# on-disk cert so `try_load_existing` can verify it actually matches the
+# loaded private key before reusing the pair. Was previously a dev-only dep
+# (test-only validity-window parsing); promoted to a real dependency now
+# that production code needs it too.
+x509-parser = "0.16"
 
 [dev-dependencies]
 tempfile.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tokio = { workspace = true, features = ["test-util"] }
-x509-parser = "0.16"

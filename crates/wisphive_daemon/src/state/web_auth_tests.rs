@@ -161,3 +161,87 @@ async fn web_audit_append_and_list_newest_first() {
     assert_eq!(rows[1].event, "login_failure");
     assert_eq!(rows[1].detail.as_deref(), Some("{\"reason\":\"bad_pw\"}"));
 }
+
+/// itr#258: every `append_web_audit` call in `wisphive_web` now formats a
+/// non-`None` `detail` as JSON (`serde_json::json!({...}).to_string()`)
+/// instead of a bare string, so future log consumers can parse the column
+/// uniformly rather than guessing at a per-event convention. This exercises
+/// one representative `detail` payload per event *kind* wisphive_web emits
+/// — reason-code details (`web_password_set_denied`,
+/// `web_device_revoke_denied`, `passkey_register_denied`,
+/// `passkey_register_failure`, `passkey_login_failure`) and
+/// value-carrying details (`web_device_revoke`'s target device id,
+/// `passkey_register`/`passkey_login_success`'s credential id) — round-trips
+/// through `append_web_audit` -> `list_web_audit` and confirms the stored
+/// `detail` column parses as `serde_json::Value`.
+#[tokio::test]
+async fn web_audit_detail_is_json_for_every_event_kind() {
+    let db = test_db().await;
+
+    // Reason-code details: `{"reason": "<code>"}`.
+    for (event, reason) in [
+        ("web_password_set_denied", "password_too_long"),
+        ("web_device_revoke_denied", "bad_password"),
+        ("passkey_register_denied", "sudo_required"),
+        ("passkey_register_failure", "webauthn_finish_error"),
+        ("passkey_login_failure", "counter_regression"),
+    ] {
+        db.append_web_audit(
+            event,
+            Some("dev-1"),
+            Some("1.2.3.4"),
+            Some(&serde_json::json!({ "reason": reason }).to_string()),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Value-carrying details: a keyed JSON object, not a bare id string.
+    db.append_web_audit(
+        "web_device_revoke",
+        Some("dev-1"),
+        Some("1.2.3.4"),
+        Some(&serde_json::json!({ "target_device_id": "dev-2" }).to_string()),
+    )
+    .await
+    .unwrap();
+    db.append_web_audit(
+        "passkey_register",
+        Some("dev-1"),
+        Some("1.2.3.4"),
+        Some(&serde_json::json!({ "credential_id": "cred-abc" }).to_string()),
+    )
+    .await
+    .unwrap();
+    db.append_web_audit(
+        "passkey_login_success",
+        Some("dev-1"),
+        Some("1.2.3.4"),
+        Some(&serde_json::json!({ "credential_id": "cred-abc" }).to_string()),
+    )
+    .await
+    .unwrap();
+
+    // `None`-detail events (e.g. `web_login_success`, `web_logout`) carry no
+    // detail at all — nothing to parse, so they're outside this test's scope.
+
+    let rows = db.list_web_audit(10).await.unwrap();
+    assert_eq!(rows.len(), 8, "expected one row per append above");
+    for row in &rows {
+        let detail = row
+            .detail
+            .as_deref()
+            .unwrap_or_else(|| panic!("event {:?} expected a detail column", row.event));
+        let parsed: serde_json::Value = serde_json::from_str(detail).unwrap_or_else(|e| {
+            panic!(
+                "event {:?} detail {detail:?} did not parse as JSON: {e}",
+                row.event
+            )
+        });
+        assert!(
+            parsed.is_object(),
+            "event {:?} detail {detail:?} parsed but is not a JSON object",
+            row.event
+        );
+    }
+}

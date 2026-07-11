@@ -13,7 +13,12 @@
 //!    persisted in `web_devices`; the raw token is shown to the client
 //!    exactly once. Every `/api/*` (except `/api/auth/login`) and `/ws`
 //!    request MUST carry a matching, non-revoked token via
-//!    `Authorization: Bearer <raw>` or `?token=<raw>`.
+//!    `Authorization: Bearer <raw>`. `/ws` alone also accepts `?token=<raw>`
+//!    (itr#494) because browsers cannot set custom headers on a WebSocket
+//!    upgrade handshake; every ordinary `/api/*` HTTP request has no such
+//!    constraint and rejects a query-string token even when it's otherwise
+//!    valid, so a bearer can't leak via browser history, proxy/access logs,
+//!    `Referer` propagation, screenshots, or copied links.
 //!
 //! Together these defeat the CVSS ~9.0 vector where a malicious web page
 //! opens `ws://127.0.0.1:3100/ws` and drives the daemon with full Tui
@@ -26,6 +31,7 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::body::Body;
 use axum::extract::{FromRequestParts, Request, State};
@@ -33,10 +39,11 @@ use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use wisphive_daemon::state::{StateDb, WebDeviceRow};
+use url::Url;
+use wisphive_daemon::state::{StateDb, WebAuthResult, WebDeviceRow};
 use wisphive_protocol::DeviceId;
 
-use crate::auth::{LoginThrottle, sha256_hex};
+use crate::auth::{LoginThrottle, PeekThrottle, sha256_hex};
 use crate::auth_profile::AuthPolicy;
 
 /// Authenticated web device context attached to a request by the security
@@ -50,6 +57,33 @@ pub struct AuthedDevice {
     /// `'static` and can outlive the DB row.
     #[allow(dead_code)]
     pub name: String,
+}
+
+/// The request's `Origin` header, parsed once by [`SecurityConfig::check_origin`]
+/// in [`security_middleware`] and attached as a request extension for
+/// downstream handlers (itr#317).
+///
+/// Before this existed, `check_origin` enforced the allowlist via a raw
+/// string compare, and `get_auth_profile` in `lib.rs` separately re-parsed
+/// the same `Origin` header with `Url::parse` to compute
+/// `rp_id_for_origin`. Two independent parsers reading the same header
+/// invite disagreement on malformed input; parsing once here and passing
+/// the result through `Extension<ParsedOrigin>` removes that class of bug
+/// and the duplicate work. Only inserted when the `Origin` header is
+/// present *and* parses as a URL — absent for same-origin navigations
+/// (which don't send `Origin` at all) and for the (practically
+/// unreachable, since every allowlist entry is itself a well-formed URL)
+/// case of a header that matched the allowlist string but failed to parse.
+#[derive(Clone, Debug)]
+pub struct ParsedOrigin(pub Url);
+
+/// Outcome of [`SecurityConfig::check_origin`]: either the request is
+/// rejected outright (403), or it's allowed and carries whatever `Origin`
+/// was successfully parsed (if any) for the caller to attach as a request
+/// extension.
+enum OriginCheck {
+    Rejected,
+    Allowed(Option<ParsedOrigin>),
 }
 
 /// Remote IP for the current request. Populated by [`security_middleware`]
@@ -93,6 +127,10 @@ struct SecurityConfigInner {
     allowed_hosts: Vec<String>,
     state_db: StateDb,
     throttle: LoginThrottle,
+    /// Per-IP rate limit for the unauth read-only discovery endpoints
+    /// (`/api/auth/status`, `/api/auth/profile`) — deliberately a separate
+    /// budget from `throttle` above; see [`PeekThrottle`]'s docs (itr#317).
+    peek_throttle: PeekThrottle,
     /// Active auth posture (itr#310). Cloned into the config so handlers
     /// (and the future WebAuthn machinery from #311) can branch on it
     /// without re-reading the profile from disk.
@@ -104,6 +142,40 @@ struct SecurityConfigInner {
     /// must be constructed from the configured port, not the
     /// (potentially `127.0.0.1`-typed) request URL.
     bind_port: u16,
+    /// itr#256: process-local cache of "has a web password ever been
+    /// observed set". `/api/auth/status` (an unauthenticated, unthrottled
+    /// -by-token discovery endpoint) and the setup-required gate in
+    /// [`security_middleware`] both used to run a SQLite `SELECT` on
+    /// *every* request — a small-scale DoS surface and a free "is this
+    /// instance set up yet" oracle for anyone who can reach the port.
+    ///
+    /// This is a cache-aside "sticky true" flag, not a full cache: it only
+    /// ever transitions `false -> true`, never back. [`SecurityConfig::
+    /// password_set`] checks the flag first and returns immediately on a
+    /// hit; on a miss it falls back to the one SQLite round-trip and
+    /// latches the flag if that lookup finds a password. `/api/auth/setup`
+    /// (`post_auth_set_password` in `lib.rs`) also latches it directly and
+    /// eagerly on a successful bootstrap, so the very next request — even
+    /// from a different client — is a cache hit with no extra query.
+    ///
+    /// **Why not invalidate it on `wisphive web reset-password`.** That
+    /// command is a separate CLI process (`open_db()` in
+    /// `wisphive_cli::commands::web`) that writes straight to
+    /// `wisphive.db` — it never touches a running web server's in-memory
+    /// state, so there is no in-process call site to flip this flag back
+    /// to `false`. A `false` cached in this struct while the CLI is
+    /// concurrently deleting the password row would also be wrong to
+    /// invalidate: the flag only ever *skips* a truthful equality check by
+    /// remembering a fact that used to be true, and once a password has
+    /// existed the operator is expected to restart the web server as part
+    /// of a reset (the reset also revokes every device token, which forces
+    /// re-auth regardless). Until restart, a stale `true` here means
+    /// `/api/auth/status` under-reports `setup_required` for a machine
+    /// that's mid-reset by an operator who already has shell access to the
+    /// host — a narrow, self-inflicted, and non-security-relevant window,
+    /// not a bypass of any auth check (device-token lookups always hit the
+    /// DB fresh; see [`SecurityConfig::lookup_device_token`]).
+    password_set_cache: AtomicBool,
 }
 
 impl SecurityConfig {
@@ -177,8 +249,10 @@ impl SecurityConfig {
                 allowed_hosts,
                 state_db,
                 throttle: LoginThrottle::new(),
+                peek_throttle: PeekThrottle::new(),
                 auth_policy,
                 bind_port: port,
+                password_set_cache: AtomicBool::new(false),
             }),
         })
     }
@@ -216,11 +290,13 @@ impl SecurityConfig {
                 allowed_hosts,
                 state_db,
                 throttle: LoginThrottle::new(),
+                peek_throttle: PeekThrottle::new(),
                 auth_policy,
                 // 3100 is the production default; tests don't actually
                 // bind it so the value only feeds the rp_origin
                 // derivation in itr#311's passkey handlers.
                 bind_port: 3100,
+                password_set_cache: AtomicBool::new(false),
             }),
         }
     }
@@ -246,6 +322,44 @@ impl SecurityConfig {
 
     pub fn throttle(&self) -> &LoginThrottle {
         &self.inner.throttle
+    }
+
+    /// The [`PeekThrottle`] for unauth read-only discovery endpoints —
+    /// separate budget from [`Self::throttle`] (itr#317).
+    pub fn peek_throttle(&self) -> &PeekThrottle {
+        &self.inner.peek_throttle
+    }
+
+    /// Whether a web password has ever been observed set (itr#256).
+    ///
+    /// Checks the [`SecurityConfigInner::password_set_cache`] flag first —
+    /// a hit returns immediately with no SQLite access. On a miss (fresh
+    /// process, or a process that hasn't yet seen a password) it falls
+    /// back to `get_web_password_hash` and latches the flag if that lookup
+    /// finds one, so every call after the first true observation is a
+    /// cache hit for the lifetime of the process. Used by both
+    /// `get_auth_status` (`lib.rs`) and the setup-required gate in
+    /// [`security_middleware`] so the two call sites share one cache
+    /// instead of each probing SQLite independently.
+    pub async fn password_set(&self) -> WebAuthResult<bool> {
+        if self.inner.password_set_cache.load(Ordering::Relaxed) {
+            return Ok(true);
+        }
+        let is_set = self.inner.state_db.get_web_password_hash().await?.is_some();
+        if is_set {
+            self.inner.password_set_cache.store(true, Ordering::Relaxed);
+        }
+        Ok(is_set)
+    }
+
+    /// Latch the [`SecurityConfigInner::password_set_cache`] flag directly,
+    /// without a DB round-trip. Called by `post_auth_set_password` in
+    /// `lib.rs` right after a successful bootstrap write, so the very next
+    /// request — even from a different client — is a cache hit instead of
+    /// paying for the SQLite lookup [`Self::password_set`] would otherwise
+    /// need to discover the same fact.
+    pub fn mark_password_set(&self) {
+        self.inner.password_set_cache.store(true, Ordering::Relaxed);
     }
 
     /// Resolve the effective host for this request and compare against
@@ -282,14 +396,25 @@ impl SecurityConfig {
         self.inner.allowed_hosts.iter().any(|h| h == candidate)
     }
 
-    fn check_origin(&self, headers: &HeaderMap) -> bool {
+    /// Enforce the Origin allowlist and, on a pass, parse the header once
+    /// so callers don't have to re-parse it downstream (itr#317; see
+    /// [`ParsedOrigin`]).
+    fn check_origin(&self, headers: &HeaderMap) -> OriginCheck {
         // Same-origin navigations from a browser do not send an Origin header
         // on top-level GETs — only cross-origin and fetch/WS requests do.
         // So "no Origin" is allowed; only a *mismatched* Origin is rejected.
         let Some(origin) = headers.get("origin").and_then(|h| h.to_str().ok()) else {
-            return true;
+            return OriginCheck::Allowed(None);
         };
-        self.inner.allowed_origins.iter().any(|o| o == origin)
+        if !self.inner.allowed_origins.iter().any(|o| o == origin) {
+            return OriginCheck::Rejected;
+        }
+        // Parsed exactly once here. Every allowlist entry is itself a
+        // well-formed URL (constructed via `format!("http(s)://host:port")`
+        // in `build`), so in practice this always succeeds for a matching
+        // Origin — but stay defensive and simply omit the extension rather
+        // than reject the (already allowlisted) request if it doesn't.
+        OriginCheck::Allowed(Url::parse(origin).ok().map(ParsedOrigin))
     }
 
     /// Look up the presented token against `web_devices`. Returns the device
@@ -343,13 +468,19 @@ pub async fn security_middleware(
         return (StatusCode::FORBIDDEN, "host not allowed").into_response();
     }
 
-    if !security.check_origin(&headers) {
-        tracing::warn!(
-            ?path,
-            origin = ?headers.get("origin"),
-            "rejecting request: origin not in allowlist"
-        );
-        return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+    match security.check_origin(&headers) {
+        OriginCheck::Rejected => {
+            tracing::warn!(
+                ?path,
+                origin = ?headers.get("origin"),
+                "rejecting request: origin not in allowlist"
+            );
+            return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+        }
+        OriginCheck::Allowed(Some(parsed)) => {
+            req.extensions_mut().insert(parsed);
+        }
+        OriginCheck::Allowed(None) => {}
     }
 
     // Propagate ConnectInfo into a typed ClientIp extension so handlers can
@@ -371,16 +502,16 @@ pub async fn security_middleware(
     // this gate with password_set=false means the client got confused, so
     // a hard error is correct.
     //
-    // Doing a DB lookup on every gated request is cheap (SQLite, same pool
-    // the rest of the handler uses, ~microseconds). If it ever shows up on
-    // a profile, replace with an AtomicBool cached in `SecurityConfig` that
-    // itr#215's `/api/auth/setup` handler flips to `password_set = true`
-    // on successful bootstrap.
+    // `password_set` (itr#256) is a cache-aside AtomicBool: once a password
+    // has been observed set, every subsequent gated request on every path
+    // hits the cache instead of a SQLite round-trip. See
+    // `SecurityConfigInner::password_set_cache`'s docs for why the cache
+    // never needs to go back to `false` in-process.
     let is_gated_api_path = path == "/ws" || path.starts_with("/api/");
     if is_gated_api_path && !path_bypasses_setup_gate(path) {
-        match security.state_db().get_web_password_hash().await {
-            Ok(Some(_)) => {}
-            Ok(None) => {
+        match security.password_set().await {
+            Ok(true) => {}
+            Ok(false) => {
                 tracing::warn!(?path, "rejecting request: setup-required (no web password)");
                 return setup_required_response();
             }
@@ -392,7 +523,7 @@ pub async fn security_middleware(
     }
 
     if path_requires_device_token(path) {
-        let token = match extract_presented_token(&headers, uri.query()) {
+        let token = match extract_presented_token(&headers, uri.query(), path) {
             Some(t) => t,
             None => {
                 tracing::warn!(?path, "rejecting request: missing device token");
@@ -501,10 +632,19 @@ fn path_bypasses_setup_gate(path: &str) -> bool {
     path == "/api/auth/status" || path == "/api/auth/profile" || path == "/api/auth/set-password"
 }
 
-/// Read a presented token from `Authorization: Bearer <raw>` or `?token=<raw>`.
-/// Browsers can't set Authorization on WebSocket upgrades, so the query
-/// form is the primary path for `/ws`.
-fn extract_presented_token(headers: &HeaderMap, query: Option<&str>) -> Option<String> {
+/// Read a presented token from `Authorization: Bearer <raw>` or, for `/ws`
+/// only, `?token=<raw>`.
+///
+/// Browsers can't set `Authorization` on a WebSocket upgrade request, so the
+/// query-string form exists solely as the `/ws` handshake's escape hatch
+/// (itr#494). Every other route — all of `/api/*` — MUST present the token
+/// via the `Authorization` header; a valid token riding in the query string
+/// of an ordinary HTTP request would otherwise leak through browser
+/// history, reverse-proxy/access logs, `Referer` propagation, screenshots,
+/// and copy-pasted links. `path_query_token_allowed` is the single source
+/// of truth for which paths get the query-string fallback — keep it in
+/// sync with any new query-token-eligible route.
+fn extract_presented_token(headers: &HeaderMap, query: Option<&str>, path: &str) -> Option<String> {
     if let Some(auth) = headers.get("authorization").and_then(|h| h.to_str().ok())
         && let Some(token) = auth
             .strip_prefix("Bearer ")
@@ -512,12 +652,22 @@ fn extract_presented_token(headers: &HeaderMap, query: Option<&str>) -> Option<S
     {
         return Some(token.to_string());
     }
-    if let Some(q) = query
+    if path_query_token_allowed(path)
+        && let Some(q) = query
         && let Some(token) = extract_query_param(q, "token")
     {
         return Some(token.to_string());
     }
     None
+}
+
+/// Paths allowed to authenticate via `?token=` in addition to the
+/// `Authorization` header. Deliberately narrow: only `/ws`, because
+/// browsers cannot set custom headers on a WebSocket upgrade handshake.
+/// Every ordinary `/api/*` HTTP request has no such constraint and must
+/// present its bearer token via the `Authorization` header (itr#494).
+fn path_query_token_allowed(path: &str) -> bool {
+    path == "/ws"
 }
 
 /// Extract `key=value` from a URL query string without pulling in a full URL
@@ -680,6 +830,8 @@ fn host_port(host: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
 
     #[test]
     fn path_requires_device_token_rules() {
@@ -753,18 +905,39 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer header-token".parse().unwrap());
         assert_eq!(
-            extract_presented_token(&headers, Some("token=query-token")).as_deref(),
+            extract_presented_token(&headers, Some("token=query-token"), "/ws").as_deref(),
             Some("header-token")
         );
     }
 
     #[test]
-    fn extract_presented_token_falls_back_to_query() {
+    fn extract_presented_token_falls_back_to_query_on_ws() {
         let headers = HeaderMap::new();
         assert_eq!(
-            extract_presented_token(&headers, Some("token=query-token")).as_deref(),
+            extract_presented_token(&headers, Some("token=query-token"), "/ws").as_deref(),
             Some("query-token")
         );
+    }
+
+    /// itr#494: the query-string fallback is scoped to `/ws` only. An
+    /// ordinary `/api/*` request presenting a token via `?token=` (and no
+    /// `Authorization` header) must NOT authenticate, even though the same
+    /// query string would work against `/ws`.
+    #[test]
+    fn extract_presented_token_rejects_query_on_api_paths() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            extract_presented_token(&headers, Some("token=query-token"), "/api/config"),
+            None
+        );
+    }
+
+    #[test]
+    fn path_query_token_allowed_scoped_to_ws() {
+        assert!(path_query_token_allowed("/ws"));
+        assert!(!path_query_token_allowed("/api/config"));
+        assert!(!path_query_token_allowed("/api/devices"));
+        assert!(!path_query_token_allowed("/"));
     }
 
     /// HTTP/2 drops the `Host:` header on the wire — the authority lives on
@@ -838,7 +1011,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "bearer lc-token".parse().unwrap());
         assert_eq!(
-            extract_presented_token(&headers, None).as_deref(),
+            extract_presented_token(&headers, None, "/api/config").as_deref(),
             Some("lc-token")
         );
     }
@@ -889,5 +1062,181 @@ mod tests {
         assert_eq!(strip_port("[::1]:3100"), "[::1]");
         assert_eq!(strip_port("[::1]"), "[::1]");
         assert_eq!(strip_port("localhost"), "localhost");
+    }
+
+    // ── password_set cache (itr#256) ────────────────────────────────────
+
+    #[tokio::test]
+    async fn password_set_reflects_db_before_any_write() {
+        let (_tmp, security) =
+            test_security_config(vec!["https://localhost:3100".to_string()]).await;
+        assert!(!security.password_set().await.unwrap());
+    }
+
+    /// The load-bearing proof: after the cache has observed `true` once, it
+    /// must keep reporting `true` even when the underlying DB row is wiped
+    /// out from under it — that can only happen if `password_set()` is
+    /// actually served from the `AtomicBool`, not by re-querying SQLite on
+    /// every call.
+    #[tokio::test]
+    async fn password_set_caches_true_without_further_db_reads() {
+        let (_tmp, security) =
+            test_security_config(vec!["https://localhost:3100".to_string()]).await;
+        security
+            .state_db()
+            .try_set_initial_web_password("fake-hash")
+            .await
+            .unwrap();
+
+        // First call discovers the password via the one-time DB fallback
+        // and latches the cache.
+        assert!(security.password_set().await.unwrap());
+
+        // Wipe the password row directly (mirrors what `wisphive web
+        // reset-password` does out-of-process). If `password_set()` were
+        // still hitting SQLite, this call would now observe `false`.
+        security.state_db().reset_web_password().await.unwrap();
+        assert!(
+            security.password_set().await.unwrap(),
+            "cached true must survive a DB-level password wipe — proves no SQLite \
+             round-trip happens once the cache has latched"
+        );
+    }
+
+    /// Mirrors what `post_auth_set_password` in `lib.rs` does immediately
+    /// after a successful bootstrap write: latch the cache directly with
+    /// no DB read at all, so the very next request is a hit.
+    #[tokio::test]
+    async fn mark_password_set_latches_cache_without_db_write() {
+        let (_tmp, security) =
+            test_security_config(vec!["https://localhost:3100".to_string()]).await;
+        // No password persisted anywhere in the DB.
+        security.mark_password_set();
+        assert!(security.password_set().await.unwrap());
+    }
+
+    // ── ParsedOrigin (itr#317) ──────────────────────────────────────────
+
+    async fn test_security_config(
+        allowed_origins: Vec<String>,
+    ) -> (tempfile::TempDir, SecurityConfig) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("wisphive.db");
+        let db = StateDb::open(db_path.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        let security =
+            SecurityConfig::for_test(allowed_origins, vec!["localhost:3100".to_string()], db);
+        (tmp, security)
+    }
+
+    #[tokio::test]
+    async fn check_origin_parses_allowlisted_origin() {
+        let (_tmp, security) =
+            test_security_config(vec!["https://localhost:3100".to_string()]).await;
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "https://localhost:3100".parse().unwrap());
+        match security.check_origin(&headers) {
+            OriginCheck::Allowed(Some(ParsedOrigin(url))) => {
+                assert_eq!(url.as_str(), "https://localhost:3100/");
+            }
+            OriginCheck::Allowed(None) => panic!("expected a parsed origin, got None"),
+            OriginCheck::Rejected => panic!("allowlisted origin must not be rejected"),
+        }
+    }
+
+    #[tokio::test]
+    async fn check_origin_allows_none_when_origin_absent() {
+        let (_tmp, security) =
+            test_security_config(vec!["https://localhost:3100".to_string()]).await;
+        let headers = HeaderMap::new();
+        assert!(matches!(
+            security.check_origin(&headers),
+            OriginCheck::Allowed(None)
+        ));
+    }
+
+    #[tokio::test]
+    async fn check_origin_rejects_unlisted_origin() {
+        let (_tmp, security) =
+            test_security_config(vec!["https://localhost:3100".to_string()]).await;
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "https://evil.example".parse().unwrap());
+        assert!(matches!(
+            security.check_origin(&headers),
+            OriginCheck::Rejected
+        ));
+    }
+
+    /// End-to-end through the real middleware (not just `check_origin`
+    /// directly): a request with an allowlisted `Origin` header should
+    /// have `ParsedOrigin` attached to its extensions and readable by a
+    /// downstream handler.
+    #[tokio::test]
+    async fn security_middleware_populates_parsed_origin_when_present() {
+        let (_tmp, security) =
+            test_security_config(vec!["https://localhost:3100".to_string()]).await;
+
+        async fn probe(parsed: Option<axum::Extension<ParsedOrigin>>) -> String {
+            match parsed {
+                Some(axum::Extension(ParsedOrigin(url))) => url.to_string(),
+                None => "absent".to_string(),
+            }
+        }
+
+        let app = axum::Router::new()
+            .route("/probe", axum::routing::get(probe))
+            .layer(axum::middleware::from_fn_with_state(
+                security,
+                security_middleware,
+            ));
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/probe")
+            .header("host", "localhost:3100")
+            .header("origin", "https://localhost:3100")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = app.oneshot(request).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"https://localhost:3100/");
+    }
+
+    /// Companion: no `Origin` header (the common same-origin-GET case) must
+    /// leave `ParsedOrigin` absent rather than the handler observing a
+    /// stale/empty value.
+    #[tokio::test]
+    async fn security_middleware_leaves_parsed_origin_absent_when_origin_missing() {
+        let (_tmp, security) =
+            test_security_config(vec!["https://localhost:3100".to_string()]).await;
+
+        async fn probe(parsed: Option<axum::Extension<ParsedOrigin>>) -> String {
+            match parsed {
+                Some(axum::Extension(ParsedOrigin(url))) => url.to_string(),
+                None => "absent".to_string(),
+            }
+        }
+
+        let app = axum::Router::new()
+            .route("/probe", axum::routing::get(probe))
+            .layer(axum::middleware::from_fn_with_state(
+                security,
+                security_middleware,
+            ));
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/probe")
+            .header("host", "localhost:3100")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = app.oneshot(request).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"absent");
     }
 }

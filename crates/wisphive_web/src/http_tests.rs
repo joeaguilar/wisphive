@@ -159,15 +159,37 @@ async fn api_config_accepts_valid_device_token_via_header() {
     assert_eq!(status, StatusCode::OK);
 }
 
+/// itr#494: query-string bearer tokens are scoped to `/ws` only. A
+/// perfectly valid device token riding in `?token=` on an ordinary HTTP API
+/// request must be rejected — even though the *same* token presented via
+/// `Authorization: Bearer` on the same route succeeds (see
+/// `api_config_accepts_valid_device_token_via_header` above). Query-string
+/// auth exists solely for the `/ws` handshake, where browsers cannot set
+/// custom headers; letting it work on `/api/*` too would let a bearer leak
+/// via browser history, reverse-proxy/access logs, `Referer` propagation,
+/// screenshots, and copied links.
 #[tokio::test]
-async fn api_config_accepts_valid_device_token_via_query() {
+async fn api_config_rejects_valid_device_token_via_query() {
     let (_tmp, state) = test_state().await;
     let (token, _id) = seed_device(state.security.state_db(), "laptop").await;
     let r = req("GET", &format!("/api/config?token={token}"))
         .body(Body::empty())
         .unwrap();
     let (status, _) = run_with(state, r).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// Companion negative case at a different `/api/*` route, confirming the
+/// rejection isn't specific to `/api/config`'s handler.
+#[tokio::test]
+async fn api_tool_tiers_rejects_valid_device_token_via_query() {
+    let (_tmp, state) = test_state().await;
+    let (token, _id) = seed_device(state.security.state_db(), "laptop").await;
+    let r = req("GET", &format!("/api/tool-tiers?token={token}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = run_with(state, r).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -1568,6 +1590,59 @@ async fn devices_lists_both_active_and_revoked() {
     );
 }
 
+/// itr#259: `last_ip` must only be populated for the caller's own row.
+/// A leaked/stolen token should not hand an attacker the operator's LAN
+/// topology (which IP is the NAS vs. the phone vs. the laptop) by reading
+/// every other device's `last_ip`.
+#[tokio::test]
+async fn devices_hides_last_ip_for_other_devices() {
+    let (_tmp, state) = test_state().await;
+    let (caller_token, caller_id) = seed_device(state.security.state_db(), "laptop").await;
+    let (other_token, other_id) = seed_device(state.security.state_db(), "nas").await;
+
+    // Give the "other" device a real last_ip by having it make an
+    // authenticated request from a distinct address — this is the LAN
+    // topology fact that must not leak to the caller.
+    let other_req = req("GET", "/api/me")
+        .header("authorization", format!("Bearer {other_token}"))
+        .extension(ClientIp(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42))))
+        .body(Body::empty())
+        .unwrap();
+    let (other_status, _) = run_with(state.clone(), other_req).await;
+    assert_eq!(other_status, StatusCode::OK);
+
+    // Caller lists devices — the security middleware's own touch of the
+    // caller's row (127.0.0.1, per the `req()` helper default) means the
+    // caller's own last_ip should come back populated.
+    let r = req("GET", "/api/devices")
+        .header("authorization", format!("Bearer {caller_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = run_with(state, r).await;
+    assert_eq!(status, StatusCode::OK);
+    let parsed: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+
+    let caller_row = parsed
+        .iter()
+        .find(|d| d["id"].as_str() == Some(caller_id.as_str()))
+        .unwrap();
+    assert_eq!(
+        caller_row["last_ip"].as_str(),
+        Some("127.0.0.1"),
+        "caller's own row must still report last_ip"
+    );
+
+    let other_row = parsed
+        .iter()
+        .find(|d| d["id"].as_str() == Some(other_id.as_str()))
+        .unwrap();
+    assert!(
+        other_row["last_ip"].is_null(),
+        "other devices' last_ip must be hidden from the caller, got {:?}",
+        other_row["last_ip"]
+    );
+}
+
 #[tokio::test]
 async fn devices_revoke_other_device() {
     let (_tmp, state) = test_state().await;
@@ -2197,10 +2272,20 @@ async fn passkey_login_finish_with_unknown_credential_returns_401_and_audits() {
     let (status, _) = run_with(state, r).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-    // Audit row recorded with discriminant `unknown_credential`.
+    // Audit row recorded with discriminant `unknown_credential`. itr#258:
+    // `web_audit.detail` is a JSON object (`{"reason": "..."}`, formatted by
+    // `audit_reason` in lib.rs) rather than a bare string, so the reason
+    // code must be parsed out before comparing.
     let audit = db_for_assertion.list_web_audit(100).await.unwrap();
     let found = audit.iter().any(|row| {
-        row.event == "passkey_login_failure" && row.detail.as_deref() == Some("unknown_credential")
+        row.event == "passkey_login_failure"
+            && row
+                .detail
+                .as_deref()
+                .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+                .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_string))
+                .as_deref()
+                == Some("unknown_credential")
     });
     assert!(
         found,

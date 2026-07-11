@@ -21,8 +21,10 @@ interface Props {
 /** Minimum password length for onboarding. Must match the backend
  * constant in `crates/wisphive_web/src/lib.rs::MIN_PASSWORD_LEN` — if
  * they drift the UI validation fails differently than the server and the
- * error gets blamed on the network. */
-const MIN_PASSWORD_LEN = 8;
+ * error gets blamed on the network. 12 (itr#280, NIST SP 800-63B Rev.4);
+ * the duplication is intentional per that ticket's non-goals — itr#132
+ * tracks a codegen path to unify it if it drifts again. */
+const MIN_PASSWORD_LEN = 12;
 
 /** Render a `PasskeyError` as the inline user-visible string. Kept as a
  * pure function (not a sub-component) so the same mapping is used in

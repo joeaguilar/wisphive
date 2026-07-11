@@ -99,12 +99,31 @@ export function useWisphive() {
   const wsEverOpenedRef = useRef<boolean>(false);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const terminalHandlersRef = useRef<Map<string, TerminalOutputHandler>>(new Map());
+  // Mirrors state.queue for synchronous reads inside plain (non-setState)
+  // callbacks — approve() needs the tool_name of the request it's approving
+  // at call time, and useState's setter doesn't hand back the current value
+  // outside a functional updater. Kept in sync by the effect below.
+  const queueRef = useRef<DecisionRequest[]>([]);
   // Per-request approve stash. Keyed by request_id so a successful reauth
   // replays the exact approve the daemon gated — not whatever the user
   // clicked last. The daemon carries `request_id` in every
   // WebReauthRequired (wire.rs) so we can correlate unambiguously even
   // when two sudo-class approves are in flight back-to-back.
-  const approveStashRef = useRef<Map<string, ApproveOpts | undefined>>(new Map());
+  //
+  // Each entry also carries the tool_name we believed we were approving
+  // (itr#275). Today the daemon only ever emits WebReauthRequired
+  // synchronously from a sudo-class gated arm on the same connection, so
+  // this can't currently be exploited — but the invariant is fragile: any
+  // future code path that emits WebReauthRequired out-of-band (an
+  // admin-triggered reauth, session-expiry, a background freshness check)
+  // could reference a stale or reused request_id. Without cross-checking
+  // the tool, a non-sudo approve (e.g. Read) sitting in the stash could get
+  // replayed under cover of an unrelated reauth. retryPendingApprove
+  // refuses to replay unless the incoming WebReauthRequired.tool_name
+  // matches what we actually stashed for that request_id.
+  const approveStashRef = useRef<Map<string, { toolName: string; opts: ApproveOpts | undefined }>>(
+    new Map(),
+  );
   // Pending install-hooks stash (itr#460). `install_hooks` is sudo-gated, so
   // the daemon may bounce it with `web_reauth_required` (request_id = the
   // project path, tool_name = "InstallHooks"). We stash the project the
@@ -128,6 +147,12 @@ export function useWisphive() {
     pendingReauth: null,
     diskAlerts: [],
   });
+
+  // Keep queueRef in sync so approve() can read the current queue
+  // synchronously (see queueRef declaration above, itr#275).
+  useEffect(() => {
+    queueRef.current = state.queue;
+  }, [state.queue]);
 
   const handleMessage = useCallback((data: string) => {
     try {
@@ -485,8 +510,12 @@ export function useWisphive() {
     (id: string, opts?: ApproveOpts) => {
       // Stash keyed by id so a subsequent web_reauth_required can correlate
       // back to the exact approve by request_id (see wire.rs). Clobbering is
-      // impossible — each approve gets its own map entry.
-      approveStashRef.current.set(id, opts);
+      // impossible — each approve gets its own map entry. Capture the
+      // tool_name of the request we're approving right now (itr#275) so
+      // retryPendingApprove can refuse to replay if a later reauth event
+      // claims to be gating a different tool.
+      const toolName = queueRef.current.find((r) => r.id === id)?.tool_name ?? "";
+      approveStashRef.current.set(id, { toolName, opts });
       send({ type: "approve", id, ...opts });
     },
     [send],
@@ -530,10 +559,19 @@ export function useWisphive() {
         }
         return { ...prev, pendingReauth: null };
       }
-      const opts = approveStashRef.current.get(reauth.request_id);
+      const stashed = approveStashRef.current.get(reauth.request_id);
       approveStashRef.current.delete(reauth.request_id);
-      if (prev.queue.some((r) => r.id === reauth.request_id)) {
-        send({ type: "approve", id: reauth.request_id, ...opts });
+      // itr#275: only replay if the tool we stashed the approve for matches
+      // what this WebReauthRequired says it's gating. A mismatch (or no
+      // stash at all) means the event is stale/out-of-band relative to
+      // what we actually sent — replaying anyway would risk resurrecting a
+      // non-sudo (e.g. Read) approve under cover of an unrelated reauth.
+      if (
+        stashed &&
+        stashed.toolName === reauth.tool_name &&
+        prev.queue.some((r) => r.id === reauth.request_id)
+      ) {
+        send({ type: "approve", id: reauth.request_id, ...stashed.opts });
       }
       return { ...prev, pendingReauth: null };
     });

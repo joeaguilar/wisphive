@@ -275,3 +275,134 @@ describe("useWisphive hook-gating (itr#460)", () => {
     expect(installs.length).toBe(1);
   });
 });
+
+describe("useWisphive approve-stash tool-name cross-check (itr#275)", () => {
+  beforeEach(() => {
+    MockWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", MockWebSocket as unknown as typeof WebSocket);
+    localStorage.setItem("wisphive-web-token", "test-token");
+  });
+
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+    vi.unstubAllGlobals();
+  });
+
+  async function mountOpen() {
+    const view = renderHook(() => useWisphive());
+    await waitFor(() => expect(MockWebSocket.instances.length).toBeGreaterThan(0));
+    act(() => latest().open());
+    return view;
+  }
+
+  function decisionRequest(overrides: Partial<Record<string, unknown>> = {}) {
+    return {
+      id: "req-1",
+      agent_id: "cc-1",
+      agent_type: "claude_code",
+      project: "/proj",
+      tool_name: "Read",
+      tool_input: { file_path: "/proj/README.md" },
+      timestamp: "2026-07-11T12:00:00Z",
+      hook_event_name: "PreToolUse",
+      ...overrides,
+    };
+  }
+
+  it("replays a matching sudo-class approve after reauth (regression guard alongside the InstallHooks path)", async () => {
+    const { result } = await mountOpen();
+    const req = decisionRequest({ id: "req-bash-1", tool_name: "Bash" });
+    act(() => latest().emit({ type: "queue_snapshot", items: [req] }));
+
+    act(() => result.current.approve("req-bash-1"));
+    expect(latest().sentMessages().filter((m) => m.type === "approve")).toHaveLength(1);
+
+    // Daemon bounces this Bash approve — sudo-class, so a genuine gate.
+    act(() =>
+      latest().emit({
+        type: "web_reauth_required",
+        device_id: "dev-1",
+        request_id: "req-bash-1",
+        tool_name: "Bash",
+        at: "2026-07-11T12:00:01Z",
+      }),
+    );
+    expect(result.current.pendingReauth).toEqual({
+      request_id: "req-bash-1",
+      tool_name: "Bash",
+    });
+
+    // Reauth succeeds and the gated tool matches what we stashed, so the
+    // approve replays.
+    act(() => result.current.retryPendingApprove());
+    expect(result.current.pendingReauth).toBeNull();
+    const replays = latest()
+      .sentMessages()
+      .filter((m) => m.type === "approve" && m.id === "req-bash-1");
+    expect(replays).toHaveLength(2);
+  });
+
+  it("does not replay a Read approve when the WebReauthRequired references a mismatched tool", async () => {
+    const { result } = await mountOpen();
+    const req = decisionRequest({ id: "req-read-1", tool_name: "Read" });
+    act(() => latest().emit({ type: "queue_snapshot", items: [req] }));
+
+    // Submit the Read approve — useWisphive stashes {toolName: "Read", opts}
+    // keyed by request_id, same bookkeeping as any other approve.
+    act(() => result.current.approve("req-read-1"));
+    expect(latest().sentMessages().filter((m) => m.type === "approve")).toHaveLength(1);
+
+    // Synthesize a stale/out-of-band WebReauthRequired: it reuses this
+    // request_id but names a different (sudo-class) tool. The daemon only
+    // ever emits this event synchronously from a sudo-class gated arm today
+    // — a genuine message could never claim to be gating "Read" — but
+    // itr#255/itr#275 flagged that any future reauth-triggering path
+    // (admin-triggered reauth, session expiry, a background freshness
+    // check) risks a stale/reused request_id bleeding into the stash. This
+    // simulates exactly that.
+    act(() =>
+      latest().emit({
+        type: "web_reauth_required",
+        device_id: "dev-1",
+        request_id: "req-read-1",
+        tool_name: "Bash",
+        at: "2026-07-11T12:00:01Z",
+      }),
+    );
+    expect(result.current.pendingReauth).toEqual({
+      request_id: "req-read-1",
+      tool_name: "Bash",
+    });
+
+    // Reauth "succeeds" — but the stashed tool_name ("Read") doesn't match
+    // what this WebReauthRequired claims to be gating ("Bash"), so
+    // retryPendingApprove must refuse to replay the Read approve.
+    act(() => result.current.retryPendingApprove());
+    expect(result.current.pendingReauth).toBeNull();
+    const approves = latest().sentMessages().filter((m) => m.type === "approve");
+    expect(approves).toHaveLength(1); // only the original submit; no replay
+  });
+
+  it("does not replay when no approve was ever stashed for the reauth's request_id", async () => {
+    const { result } = await mountOpen();
+    // No queue_snapshot, no approve() call — the stash is empty for this id.
+    act(() =>
+      latest().emit({
+        type: "web_reauth_required",
+        device_id: "dev-1",
+        request_id: "req-unknown",
+        tool_name: "Bash",
+        at: "2026-07-11T12:00:01Z",
+      }),
+    );
+    expect(result.current.pendingReauth).toEqual({
+      request_id: "req-unknown",
+      tool_name: "Bash",
+    });
+
+    act(() => result.current.retryPendingApprove());
+    expect(result.current.pendingReauth).toBeNull();
+    expect(latest().sentMessages().filter((m) => m.type === "approve")).toHaveLength(0);
+  });
+});
