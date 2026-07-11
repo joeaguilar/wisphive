@@ -56,6 +56,8 @@ const CERT_VALIDITY_DAYS: i64 = 397;
 /// 24h pad costs nothing (cert is still 396+d valid) and keeps clock-skewed
 /// phones from rejecting the cert with NotYetValid.
 const CERT_NOT_BEFORE_BACKDATE_HOURS: i64 = 24;
+/// The NotBefore backdate expressed in seconds, for the DER age check.
+const CERT_NOT_BEFORE_BACKDATE_SECS: i64 = CERT_NOT_BEFORE_BACKDATE_HOURS * 60 * 60;
 
 /// Result of `ensure_cert`: PEM bytes the TLS server needs plus a stable
 /// fingerprint suitable for showing in the startup banner.
@@ -91,6 +93,14 @@ pub fn ensure_cert(home_dir: &Path, bind_host: IpAddr) -> Result<EnsureCertResul
     // would drop the guard *immediately*, releasing the lock before we do
     // any work. `FileLock` is `#[must_use]` to make that mistake noisy.
     let _cert_lock = FileLock::acquire_exclusive(&home_dir.join(LOCK_FILENAME))?;
+
+    // itr#501: with the lock held (so we can't race a live `write_secret`),
+    // sweep any orphaned `<base>.<rand>.tmp` writer artifacts a prior crash
+    // left behind between the tmp fsync and the rename. itr#235 randomized the
+    // suffix per call, so no later `write_secret` ever revisits that exact
+    // filename to clean it up — without this sweep, a SIGKILL / power loss /
+    // ENOSPC-abort permanently leaks a 0600 tmp copy of key/cert material.
+    sweep_orphan_secret_tmps(home_dir);
 
     let cert_path = home_dir.join(CERT_FILENAME);
     let key_path = home_dir.join(KEY_FILENAME);
@@ -333,7 +343,17 @@ fn try_load_existing(
     // lying sidecar can't override the real cert age.
     let not_before = der_not_before_unix(&der)
         .with_context(|| format!("reading NotBefore from cert {} DER", cert_path.display()))?;
-    if (now as i64).saturating_sub(not_before) > MAX_CERT_AGE_SECS as i64 {
+    // itr#500: `generate_and_persist_inner` backdates the DER NotBefore by
+    // CERT_NOT_BEFORE_BACKDATE_HOURS while stamping the sidecar's
+    // `created_at` at plain `now`. Comparing `now - not_before` against a
+    // bare MAX_CERT_AGE_SECS would therefore trip a full backdate window
+    // (24h) early — regenerating at day 89 instead of day 90 and churning
+    // the TOFU cert pin. Add the backdate to the threshold so the effective
+    // cert lifetime stays the intended 90 days of *real* age and this check
+    // agrees with the sidecar age check above.
+    if (now as i64).saturating_sub(not_before)
+        > MAX_CERT_AGE_SECS as i64 + CERT_NOT_BEFORE_BACKDATE_SECS
+    {
         warn!(
             cert_path = %cert_path.display(),
             not_before,
@@ -435,6 +455,81 @@ fn generate_and_persist_inner(
         key_pem,
         fingerprint_sha256: fingerprint,
     })
+}
+
+/// Base filenames whose randomized `<base>.<rand>.tmp` writer artifacts
+/// `write_secret` / `tmp_path_for` create. Kept as the single source of truth
+/// for the itr#501 orphan sweep so it can never drift from what we actually
+/// write.
+const SECRET_TMP_BASES: &[&str] = &[CERT_FILENAME, KEY_FILENAME, META_FILENAME];
+
+/// itr#501: sweep orphaned `<base>.<rand>.tmp` writer artifacts out of the
+/// state dir. `write_secret` renames a freshly-written, fsync'd tmp over its
+/// final path; a crash (SIGKILL, power loss, ENOSPC-abort) after the fsync but
+/// before the rename leaks the tmp — a 0600 copy of key/cert material. Because
+/// itr#235 randomized the suffix per call, no later `write_secret` revisits
+/// that exact filename, so the old deterministic-`.tmp` self-healing cleanup
+/// is gone; this sweep is its replacement.
+///
+/// Called from `ensure_cert` under the held flock, so it can't race a live
+/// writer renaming through one of these names. Only entries that match the
+/// exact `<base>.<something>.tmp` writer scheme are removed — the live
+/// `web.cert.pem` / `web.key.pem` / `web.cert.meta.json` files and the
+/// `web.cert.lock` sidecar don't end in `.tmp` and are never touched.
+///
+/// Best-effort: a failed `read_dir` or individual `remove_file` is logged and
+/// skipped, never propagated — a sweep hiccup must not block cert generation.
+fn sweep_orphan_secret_tmps(home_dir: &Path) {
+    let entries = match fs::read_dir(home_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(
+                dir = %home_dir.display(),
+                error = %e,
+                "couldn't read state dir to sweep orphaned TLS tmp files; skipping"
+            );
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, "skipping unreadable dir entry during TLS tmp sweep");
+                continue;
+            }
+        };
+        let file_name = entry.file_name();
+        // A non-UTF-8 name can't be one of ours (our bases + a hex suffix are
+        // all ASCII), so skip without trying to lossily match it.
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !name.ends_with(".tmp") {
+            continue;
+        }
+        let is_orphan_tmp = SECRET_TMP_BASES
+            .iter()
+            .any(|base| name.starts_with(&format!("{base}.")));
+        if !is_orphan_tmp {
+            continue;
+        }
+        let path = entry.path();
+        match fs::remove_file(&path) {
+            Ok(()) => warn!(
+                path = %path.display(),
+                "removed orphaned TLS tmp file left by an interrupted secret write"
+            ),
+            // NotFound just means it vanished between read_dir and remove
+            // (another sweep, or the OS reclaimed it) — nothing to report.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!(
+                path = %path.display(),
+                error = %e,
+                "couldn't remove orphaned TLS tmp file during sweep; leaving it"
+            ),
+        }
+    }
 }
 
 /// Write `bytes` to `path` atomically with `0600` perms.
@@ -1089,6 +1184,7 @@ mod tests {
         let path = dir.path().join("shared.lock");
         let file = fs::OpenOptions::new()
             .create(true)
+            .truncate(true)
             .read(true)
             .write(true)
             .open(&path)
@@ -1353,6 +1449,79 @@ mod tests {
         );
     }
 
+    /// itr#501: a crash between the tmp fsync and the rename in `write_secret`
+    /// leaks a randomized `<base>.<rand>.tmp` copy of key/cert material, and
+    /// itr#235's per-call random suffix means no later write ever cleans it
+    /// up. `ensure_cert` must sweep those orphans under its flock — even on a
+    /// no-op run that reuses the existing cert — while leaving the live
+    /// cert/key/meta bytes untouched.
+    #[test]
+    fn sweep_removes_orphan_tmp_keeps_live_files() {
+        let _guard = test_lock();
+        let dir = TempDir::new().unwrap();
+        let bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+        // Mint a real cert so the live files exist to protect.
+        let first = ensure_cert(dir.path(), bind).unwrap();
+        let cert_before = fs::read(dir.path().join(CERT_FILENAME)).unwrap();
+        let key_before = fs::read(dir.path().join(KEY_FILENAME)).unwrap();
+        let meta_before = fs::read(dir.path().join(META_FILENAME)).unwrap();
+
+        // Plant an orphaned 0600 tmp for each secret base, matching the exact
+        // `<base>.<hex>.tmp` scheme `tmp_path_for` produces, as if a crash
+        // interrupted a write right before the rename.
+        let orphans: Vec<PathBuf> = [
+            format!("{KEY_FILENAME}.deadbeefdeadbeef.tmp"),
+            format!("{CERT_FILENAME}.0011223344556677.tmp"),
+            format!("{META_FILENAME}.8899aabbccddeeff.tmp"),
+        ]
+        .iter()
+        .map(|n| {
+            let p = dir.path().join(n);
+            let mut f = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&p)
+                .unwrap();
+            f.write_all(b"leaked key material").unwrap();
+            p
+        })
+        .collect();
+        for p in &orphans {
+            assert!(p.exists(), "orphan {} should exist pre-sweep", p.display());
+        }
+
+        // Plant a decoy that must NOT be swept: same base but not a `.tmp`.
+        let decoy = dir.path().join(format!("{KEY_FILENAME}.bak"));
+        fs::write(&decoy, b"keep me").unwrap();
+
+        // The cert is still valid, so this call reuses it (no regen) — but it
+        // must still run the sweep.
+        let second = ensure_cert(dir.path(), bind).unwrap();
+        assert_eq!(
+            first.fingerprint_sha256, second.fingerprint_sha256,
+            "cert should have been reused, not regenerated",
+        );
+
+        for p in &orphans {
+            assert!(!p.exists(), "orphan {} should be swept", p.display());
+        }
+        assert!(decoy.exists(), "non-.tmp sibling must not be swept");
+
+        // Live secrets are byte-for-byte untouched.
+        assert_eq!(
+            fs::read(dir.path().join(CERT_FILENAME)).unwrap(),
+            cert_before
+        );
+        assert_eq!(fs::read(dir.path().join(KEY_FILENAME)).unwrap(), key_before);
+        assert_eq!(
+            fs::read(dir.path().join(META_FILENAME)).unwrap(),
+            meta_before
+        );
+    }
+
     /// itr#228: if `web.key.pem` gets swapped for an unrelated (but
     /// well-formed) key — partial write, manual edit, wrong file copied in —
     /// `ensure_cert` must not hand back the mismatched pair. It should
@@ -1487,8 +1656,12 @@ mod tests {
         params
             .distinguished_name
             .push(DnType::CommonName, COMMON_NAME);
-        let old_not_before =
-            OffsetDateTime::now_utc() - TimeDuration::seconds(MAX_CERT_AGE_SECS as i64 + 3600);
+        // Past the effective threshold, which since itr#500 is
+        // MAX_CERT_AGE_SECS + the 24h NotBefore backdate.
+        let old_not_before = OffsetDateTime::now_utc()
+            - TimeDuration::seconds(
+                MAX_CERT_AGE_SECS as i64 + CERT_NOT_BEFORE_BACKDATE_SECS + 3600,
+            );
         params.not_before = old_not_before;
         params.not_after = old_not_before + TimeDuration::days(CERT_VALIDITY_DAYS);
         let cert = params.self_signed(&key_pair).unwrap();
@@ -1526,6 +1699,89 @@ mod tests {
             GENERATE_INVOCATIONS.load(Ordering::SeqCst),
             1,
             "expected exactly one regeneration triggered by the DER NotBefore check",
+        );
+    }
+
+    /// itr#500 boundary: the DER NotBefore age check must account for the 24h
+    /// backdate that `generate_and_persist_inner` applies, so the effective
+    /// cert lifetime is the intended 90 days of *real* age rather than 89.
+    /// A cert minted the production way (NotBefore = created_at − 24h) that is
+    /// just under 90 real days old must be REUSED; one just over must be
+    /// REGENERATED. The sidecar's `created_at` is kept fresh so the sidecar
+    /// age check can't fire and the DER check is the sole decider. Before the
+    /// fix (threshold = bare MAX_CERT_AGE_SECS) the day-89-and-change case
+    /// regenerated prematurely, so this test fails on the buggy code.
+    #[test]
+    fn der_not_before_age_check_accounts_for_backdate() {
+        let _guard = test_lock();
+        let bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let desired_sans = compute_sans(bind);
+
+        // Mint a cert whose DER NotBefore sits `real_age_secs` in the past
+        // *plus* the production 24h backdate (mirroring
+        // generate_and_persist_inner), drop it next to a fresh sidecar, run
+        // ensure_cert, and report whether it regenerated. Returns true iff a
+        // regeneration happened.
+        let ran_regen = |real_age_secs: i64| -> bool {
+            let dir = TempDir::new().unwrap();
+            let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+            let mut params = CertificateParams::new(desired_sans.clone()).unwrap();
+            params
+                .distinguished_name
+                .push(DnType::CommonName, COMMON_NAME);
+            let not_before = OffsetDateTime::now_utc()
+                - TimeDuration::seconds(real_age_secs)
+                - TimeDuration::hours(CERT_NOT_BEFORE_BACKDATE_HOURS);
+            params.not_before = not_before;
+            params.not_after = not_before + TimeDuration::days(CERT_VALIDITY_DAYS);
+            let cert = params.self_signed(&key_pair).unwrap();
+            let cert_pem = cert.pem().into_bytes();
+            let key_pem = key_pair.serialize_pem().into_bytes();
+
+            write_secret(&dir.path().join(KEY_FILENAME), &key_pem).unwrap();
+            write_secret(&dir.path().join(CERT_FILENAME), &cert_pem).unwrap();
+
+            // Fresh sidecar: created_at = now, so the sidecar age check never
+            // fires and the DER NotBefore check alone decides reuse vs regen.
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let meta = CertMeta {
+                created_at: now,
+                sans: desired_sans.clone(),
+            };
+            write_secret(
+                &dir.path().join(META_FILENAME),
+                &serde_json::to_vec_pretty(&meta).unwrap(),
+            )
+            .unwrap();
+
+            let old_fp = fingerprint_from_der(&cert_der_from_pem(&cert_pem).unwrap());
+            GENERATE_INVOCATIONS.store(0, Ordering::SeqCst);
+            let result = ensure_cert(dir.path(), bind).unwrap();
+            let regenerated = result.fingerprint_sha256 != old_fp;
+            assert_eq!(
+                regenerated,
+                GENERATE_INVOCATIONS.load(Ordering::SeqCst) == 1,
+                "fingerprint change and GENERATE_INVOCATIONS must agree on whether a regen happened",
+            );
+            regenerated
+        };
+
+        // ~1h shy of 90 real days old. With the 24h backdate the DER
+        // NotBefore is 90d+23h in the past — which the buggy bare-MAX check
+        // (`> 90d`) would have regenerated a full day early. The fix keeps it.
+        assert!(
+            !ran_regen(MAX_CERT_AGE_SECS as i64 - 3600),
+            "a cert under 90 days of REAL age must be reused, not regenerated — \
+             the DER check must add the 24h NotBefore backdate to its threshold",
+        );
+
+        // ~1h past 90 real days old: genuinely over policy, must regenerate.
+        assert!(
+            ran_regen(MAX_CERT_AGE_SECS as i64 + 3600),
+            "a cert over 90 days of REAL age must be regenerated",
         );
     }
 

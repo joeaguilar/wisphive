@@ -67,44 +67,125 @@ pub fn hash_password(password: &str) -> anyhow::Result<String> {
     Ok(phc)
 }
 
-/// Minimum acceptable Argon2 cost parameters for `verify_password`. Mirrors
-/// the params `argon2_instance` hashes with, so a stored hash can never be
-/// *weaker* than what this build would produce today.
+/// Minimum acceptable Argon2 cost parameters, mirroring the params
+/// `argon2_instance` hashes with. These are the *rehash trigger* for
+/// `verify_password_with_migration`, **not** a hard reject wall.
+///
+/// # Raising a floor is not free
+///
+/// Historically these gated `verify_password`: any stored hash below the
+/// floor made the correct password verify `false` *forever*, with no
+/// rehash-on-verify migration path (a one-way ratchet — itr#502). That made
+/// bumping a floor a foot-gun: every account whose stored hash predated the
+/// bump (an imported DB, an older build, or simply a hash minted before the
+/// bump) would be **silently locked out**, indistinguishable from a wrong
+/// password.
+///
+/// The read path no longer rejects on the cost floor: a correct password
+/// verifies against the hash's *own embedded* parameters and the outcome
+/// flags that a rehash is warranted (`OkRehashNeeded`, see
+/// `verify_password_with_migration`), so raising a floor no longer *locks
+/// out* below-floor accounts. The *write* path (`argon2_instance`) still
+/// mints at these floors, so newly stored hashes are never below them.
+///
+/// **The transparent rehash-on-login migration is not yet wired** (itr#502
+/// closed only the lockout ratchet; the rehash sink is a tracked follow-up).
+/// No production caller consumes `OkRehashNeeded` today — every login path
+/// uses the `verify_password` bool wrapper and discards the signal — so a
+/// below-floor hash keeps verifying at its weak parameters indefinitely; it
+/// is accepted, not upgraded. Until a caller branches on `OkRehashNeeded` and
+/// re-persists a floor-compliant hash, raising a floor still requires a forced
+/// password reset for every below-floor account to actually migrate it. Do
+/// not reintroduce a bare below-floor `return false`.
 const MIN_M_COST: u32 = 19_456;
 const MIN_T_COST: u32 = 2;
 const MIN_P_COST: u32 = 1;
 
-/// Verify a password against a stored PHC string. Returns `false` on any
-/// parse, algorithm, parameter, or mismatch error — never panics.
+/// Outcome of verifying a candidate password against a stored PHC hash.
 ///
-/// Before delegating to `Argon2::verify_password`, the PHC string's
-/// algorithm and cost parameters are checked against `MIN_*_COST` /
-/// `Argon2id` (itr#232). `Argon2::default().verify_password` blindly
-/// verifies whatever algorithm/params the PHC string claims, so a tampered
-/// DB row advertising `argon2i` or a weakened `m_cost` would otherwise
-/// verify a correct password fine — silently downgrading that account to a
-/// scheme that's cheaper to brute-force offline. Rejecting on the parsed
-/// metadata up front, before running any Argon2 computation over the
-/// candidate password, keeps the failure mode a plain boolean rather than
-/// something that leaks *why* verification failed.
+/// Distinguishes a plain mismatch from a *correct* password whose stored hash
+/// was minted below the current `MIN_*_COST` floor and so warrants a
+/// transparent rehash on this successful login (itr#502). Callers that hold a
+/// write sink for the stored hash should branch on `OkRehashNeeded` and
+/// re-persist `hash_password(password)` while the cleartext is still in hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordVerification {
+    /// Password matched and the stored hash already meets the current floor.
+    Ok,
+    /// Password matched, but the stored hash's embedded cost parameters are
+    /// below the current floor. Treat as a **successful** login, then re-hash
+    /// the still-in-hand cleartext with `hash_password` and persist it so the
+    /// account is migrated off the weak parameters.
+    OkRehashNeeded,
+    /// Password did not match, the PHC string was unparseable, or it used a
+    /// disallowed algorithm. Indistinguishable to the caller by design.
+    Failed,
+}
+
+/// Verify a password against a stored PHC string. Returns `false` on any
+/// parse, algorithm, or mismatch error — never panics. A correct password
+/// against a below-floor Argon2id hash returns `true` (the read-path ratchet
+/// of itr#502 is closed); use `verify_password_with_migration` when the
+/// caller can rehash to migrate that hash forward.
 pub fn verify_password(password: &str, phc: &str) -> bool {
+    !matches!(
+        verify_password_with_migration(password, phc),
+        PasswordVerification::Failed
+    )
+}
+
+/// Verify a password against a stored PHC string, surfacing whether a correct
+/// password's stored hash is below the current cost floor and should be
+/// rehashed.
+///
+/// The PHC string's algorithm is still checked against `Argon2id` up front:
+/// an algorithm downgrade (e.g. a row advertising `argon2i`) is a distinct
+/// concern from the cost-floor ratchet, is never produced by any in-tree
+/// write path, and stays a hard `Failed`. The cost *parameters*, however, are
+/// **not** a reject wall (itr#502): the candidate is verified against the
+/// hash's own embedded parameters — `Argon2::default().verify_password`
+/// reconstructs algorithm/params from the PHC string, so this compares
+/// correctly even for a below-floor hash — and only after a *successful*
+/// compare do we consult the floor. A correct password against a below-floor
+/// hash returns `OkRehashNeeded` (never a permanent lockout); a wrong
+/// password returns `Failed` regardless of the stored params, so no floor
+/// state leaks through the boolean or triggers the rehash warning.
+pub fn verify_password_with_migration(password: &str, phc: &str) -> PasswordVerification {
     let Ok(parsed) = PasswordHash::new(phc) else {
-        return false;
+        return PasswordVerification::Failed;
     };
     if parsed.algorithm != Algorithm::Argon2id.ident() {
-        return false;
+        return PasswordVerification::Failed;
     }
     let Ok(params) = Params::try_from(&parsed) else {
-        return false;
+        return PasswordVerification::Failed;
     };
+    // Verify against the hash's OWN embedded parameters first. `verify_password`
+    // does the constant-time compare internally.
+    if Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_err()
+    {
+        return PasswordVerification::Failed;
+    }
+    // Correct password. If the stored hash predates the current floor, the
+    // login succeeds but the caller should rehash to migrate it forward. The
+    // warning fires only on a successful compare, so wrong-password guessing
+    // can't spam it or use it as a floor oracle.
     if params.m_cost() < MIN_M_COST || params.t_cost() < MIN_T_COST || params.p_cost() < MIN_P_COST
     {
-        return false;
+        warn!(
+            m_cost = params.m_cost(),
+            t_cost = params.t_cost(),
+            p_cost = params.p_cost(),
+            min_m_cost = MIN_M_COST,
+            min_t_cost = MIN_T_COST,
+            min_p_cost = MIN_P_COST,
+            "web password verified against an Argon2id hash below the current cost floor; rehash on next successful login or force a password reset"
+        );
+        return PasswordVerification::OkRehashNeeded;
     }
-    // `verify_password` does the constant-time compare internally.
-    Argon2::default()
-        .verify_password(password.as_bytes(), &parsed)
-        .is_ok()
+    PasswordVerification::Ok
 }
 
 /// True when no web admin password has been stored — i.e. this is a fresh
@@ -511,12 +592,38 @@ impl AttemptGuard {
         apply_failure(&mut state, self.ip_key, self.backoff_cap);
     }
 
-    /// Record that the verify succeeded. Drops the per-IP entry entirely
-    /// — a successful login wipes the lockout history.
+    /// Record that the verify succeeded. Releases **only this guard's own**
+    /// in-flight reservation and wipes the per-IP lockout history (a
+    /// successful login clears the IP's failure counter and lockout window).
+    ///
+    /// itr#498: previously this unconditionally did `state.map.remove(&ip_key)`,
+    /// which erased the whole per-IP entry — including the `in_flight` counts
+    /// of *sibling* guards still verifying from the same IP. Harmless under
+    /// the old hardcoded cap of 1 (siblings could never coexist), but once the
+    /// cap is configurable > 1 (itr#243, the NAT/office scenario) one sibling's
+    /// success wiped the shared counter while other siblings were still
+    /// outstanding, letting fresh attempts stack on top of them so the true
+    /// concurrent count could exceed the configured cap. Now we decrement in
+    /// place like [`Self::release_slot`] and only remove the map entry once it
+    /// is genuinely empty — no siblings still in flight — mirroring how the
+    /// eviction sweep garbage-collects idle entries.
     pub async fn record_success(mut self) {
         self.consumed = true;
+        let now = Instant::now();
         let mut state = self.inner.write().await;
-        state.map.remove(&self.ip_key);
+        if let Some(entry) = state.map.get_mut(&self.ip_key) {
+            // Release only our own reservation; siblings keep theirs.
+            entry.in_flight = entry.in_flight.saturating_sub(1);
+            // A successful login clears this IP's lockout history.
+            entry.failures = 0;
+            entry.locked_until = now;
+            entry.last_seen = now;
+            // GC the entry only when it carries no live state: no in-flight
+            // siblings (and failures/lockout were just cleared above).
+            if entry.in_flight == 0 {
+                state.map.remove(&self.ip_key);
+            }
+        }
     }
 
     /// Release the in-flight slot without counting the attempt as either
@@ -589,12 +696,41 @@ impl Drop for AttemptGuard {
 /// lets `failures` accumulate (so the schedule reflects the full attempt
 /// count once the lockout does lapse), but a probe that lands *inside* an
 /// active lockout can no longer extend it.
+///
+/// itr#499: under a raised in-flight cap (itr#243, `max_in_flight > 1`)
+/// several distinct guards can be admitted *before* the lockout exists and
+/// then fail near-simultaneously. The first fail sets
+/// `locked_until = now + backoff_for(1)`; the siblings land inside that
+/// fresh window, so the `now >= locked_until` recompute above is suppressed
+/// and the lockout stays pinned at the 1-failure rung even though the burst
+/// was larger. To fix that without reintroducing the itr#233 bug we advance
+/// the deadline *monotonically* — `max(locked_until, now + backoff_for(...))`,
+/// which never shortens an existing lockout — but **only while another guard
+/// from the same burst is still in flight** (`in_flight > 0` before we
+/// release this one). That gate is what keeps this honest: `try_begin_attempt`
+/// refuses to admit a new guard while an IP is locked out, so the only
+/// failures that can reach here mid-lockout are the tail of the original
+/// concurrent burst. Once that burst fully drains (`in_flight == 0`) no
+/// further guard can be admitted until the lockout lapses, so a lone probe
+/// re-hitting an already-locked entry (the itr#233 case, and what
+/// `record_failure_does_not_extend_active_lockout` drives directly with
+/// `in_flight == 0`) can never push the deadline out.
 fn apply_failure(state: &mut ThrottleInner, ip_key: IpAddr, backoff_cap: Duration) {
     let now = Instant::now();
     if let Some(entry) = state.map.get_mut(&ip_key) {
         entry.failures = entry.failures.saturating_add(1);
         if now >= entry.locked_until {
+            // Previous lockout (if any) has lapsed — open a fresh window
+            // from `now` reflecting the accumulated failure count.
             entry.locked_until = now + backoff_for(entry.failures, backoff_cap);
+        } else if entry.in_flight > 0 {
+            // Still inside an active lockout, but this is a genuine sibling
+            // failure from a concurrent burst (another guard is outstanding).
+            // Advance the deadline to reflect the higher rung, never shortening
+            // it (monotonic — preserves itr#233).
+            entry.locked_until = entry
+                .locked_until
+                .max(now + backoff_for(entry.failures, backoff_cap));
         }
         entry.in_flight = entry.in_flight.saturating_sub(1);
         entry.last_seen = now;
@@ -901,34 +1037,56 @@ mod tests {
         );
     }
 
-    /// itr#232 acceptance: a PHC string with `m_cost` below the enforced
-    /// minimum (19456) must be rejected, even against the correct
-    /// password — otherwise a tampered DB row can downgrade the memory
-    /// cost to something cheap to brute-force offline.
+    /// itr#502: a PHC string with `m_cost` below the enforced minimum must
+    /// NOT permanently lock out the correct password (the one-way ratchet
+    /// #502 closes). The correct password verifies against the hash's
+    /// embedded params and the outcome flags that a rehash is warranted; a
+    /// wrong password against the same below-floor hash still fails, so no
+    /// floor state leaks through the boolean.
     #[test]
-    fn rejects_low_m_cost() {
+    fn below_floor_m_cost_verifies_and_flags_rehash() {
         let password = "correct horse battery staple";
         let weak_m_cost = MIN_M_COST - 1;
         let params = Params::new(weak_m_cost, MIN_T_COST, MIN_P_COST, None).unwrap();
         let phc = hash_with_params(password, Algorithm::Argon2id, params);
+
+        // Correct password: closes the lockout ratchet — returns true.
         assert!(
-            !verify_password(password, &phc),
-            "PHC string with m_cost < {MIN_M_COST} must be rejected regardless of password correctness"
+            verify_password(password, &phc),
+            "correct password against a below-floor m_cost hash must still verify (itr#502)"
+        );
+        assert_eq!(
+            verify_password_with_migration(password, &phc),
+            PasswordVerification::OkRehashNeeded,
+            "a correct password against a below-floor hash must flag a rehash, not lock out"
+        );
+
+        // Wrong password against the same below-floor hash still fails.
+        assert!(!verify_password("wrong password", &phc));
+        assert_eq!(
+            verify_password_with_migration("wrong password", &phc),
+            PasswordVerification::Failed
         );
     }
 
-    /// Sibling checks for `t_cost` / `p_cost` below minimum, since the
-    /// itr#232 fix validates all three cost parameters, not just m_cost.
+    /// Sibling check for `t_cost` below minimum — same itr#502 migration
+    /// semantics as m_cost. Also pins that p_cost's floor tracks the crate's
+    /// own `Params::MIN_P_COST`, so there's no silent gap below it.
     #[test]
-    fn rejects_low_t_cost_and_p_cost() {
+    fn below_floor_t_cost_verifies_and_flags_rehash() {
         let password = "correct horse battery staple";
 
         let low_t = Params::new(MIN_M_COST, MIN_T_COST - 1, MIN_P_COST, None).unwrap();
         let phc_t = hash_with_params(password, Algorithm::Argon2id, low_t);
         assert!(
-            !verify_password(password, &phc_t),
-            "low t_cost must be rejected"
+            verify_password(password, &phc_t),
+            "correct password against a below-floor t_cost hash must still verify (itr#502)"
         );
+        assert_eq!(
+            verify_password_with_migration(password, &phc_t),
+            PasswordVerification::OkRehashNeeded
+        );
+        assert!(!verify_password("wrong password", &phc_t));
 
         // p_cost's floor is already `Params::MIN_P_COST` (1) at the crate
         // level, so there's no way to construct a PHC string below our
@@ -937,14 +1095,19 @@ mod tests {
         assert_eq!(MIN_P_COST, argon2::Params::MIN_P_COST);
     }
 
-    /// A hash produced at exactly the minimum thresholds must still verify
-    /// — the fix must not be off-by-one and reject legitimate hashes.
+    /// A hash produced at exactly the minimum thresholds must verify cleanly
+    /// as `Ok` (no spurious rehash flag) — the floor check must not be
+    /// off-by-one against a legitimate at-floor hash.
     #[test]
     fn accepts_hash_at_exact_minimum_params() {
         let password = "correct horse battery staple";
         let params = Params::new(MIN_M_COST, MIN_T_COST, MIN_P_COST, None).unwrap();
         let phc = hash_with_params(password, Algorithm::Argon2id, params);
         assert!(verify_password(password, &phc));
+        assert_eq!(
+            verify_password_with_migration(password, &phc),
+            PasswordVerification::Ok
+        );
     }
 
     #[test]
@@ -1227,6 +1390,73 @@ mod tests {
         g3.record_success().await;
     }
 
+    /// itr#498 regression: with `max_in_flight > 1`, one sibling's
+    /// `record_success` must release ONLY its own reservation, not wipe the
+    /// whole per-IP entry (which would erase the in-flight counts of siblings
+    /// still verifying). Under the old `state.map.remove(&ip_key)` the shared
+    /// counter was zeroed while g2/g3 were still outstanding, so fresh attempts
+    /// stacked on top and admitted concurrency blew past the configured cap.
+    #[tokio::test]
+    async fn record_success_releases_only_own_slot_respecting_cap() {
+        let throttle = LoginThrottle::with_max_in_flight(3);
+        let ip: IpAddr = Ipv4Addr::new(203, 0, 113, 9).into();
+        let key = normalize_ip(ip);
+
+        // Fill the cap: three concurrent verifies outstanding.
+        let g1 = throttle.try_begin_attempt(ip).await.expect("g1 admitted");
+        let g2 = throttle.try_begin_attempt(ip).await.expect("g2 admitted");
+        let g3 = throttle.try_begin_attempt(ip).await.expect("g3 admitted");
+
+        // At the cap — a 4th concurrent attempt must be refused.
+        assert!(
+            throttle.try_begin_attempt(ip).await.is_err(),
+            "cap=3 already full (g1,g2,g3) — 4th concurrent attempt must be rejected"
+        );
+
+        // One sibling succeeds while g2 and g3 are STILL in flight. The old
+        // `map.remove` wiped g2/g3's shared in_flight counter here.
+        g1.record_success().await;
+
+        // Exactly one slot should now be free — the true outstanding count is
+        // 2 (g2, g3), so g4 is admitted and the counter reads 3.
+        let g4 = throttle
+            .try_begin_attempt(ip)
+            .await
+            .expect("one slot freed by g1's success — g4 must be admitted");
+
+        {
+            let state = throttle.inner.read().await;
+            let entry = state
+                .map
+                .get(&key)
+                .expect("entry present with siblings in flight");
+            assert_eq!(
+                entry.in_flight, 3,
+                "in_flight must equal the true outstanding guards (g2,g3,g4), never exceeding the cap"
+            );
+        }
+
+        // Back at the cap (g2,g3,g4) — a 5th concurrent attempt must be
+        // rejected. Under the buggy code the entry was gone, so this would
+        // wrongly succeed and admitted concurrency would exceed the cap of 3.
+        assert!(
+            throttle.try_begin_attempt(ip).await.is_err(),
+            "cap=3 full again (g2,g3,g4) — 5th concurrent attempt must be rejected"
+        );
+
+        // Mixed outcome: g2 fails while g3/g4 are still in flight, then both
+        // succeed. The entry must GC to empty once no guard is outstanding.
+        g2.record_failure().await;
+        g3.record_success().await;
+        g4.record_success().await;
+
+        let state = throttle.inner.read().await;
+        assert!(
+            !state.map.contains_key(&key),
+            "entry must be GC'd once no guard is outstanding and the lockout is clear"
+        );
+    }
+
     /// itr#231 follow-up: once the first attempt finishes (fail or
     /// success), the next caller should be able to begin (subject to the
     /// backoff for record_failure, or freely after record_success).
@@ -1419,6 +1649,58 @@ mod tests {
         assert!(
             entry.locked_until <= locked_until_before + Duration::from_secs(30),
             "lockout must never exceed schedule(failures) capped at 30s"
+        );
+    }
+
+    /// itr#499 acceptance: under a raised in-flight cap (itr#243), several
+    /// guards can be admitted before any lockout exists and then fail
+    /// near-simultaneously. The first failure opens a window at
+    /// `backoff_for(1)`; the siblings land *inside* that fresh window. The
+    /// lockout must still advance to reflect the full burst size —
+    /// `backoff_for(3)` for three concurrent failures — not stay pinned at
+    /// the 1-failure rung. This complements
+    /// `record_failure_does_not_extend_active_lockout`: a lone probe with no
+    /// sibling in flight (`in_flight == 0`) still can't extend the lockout,
+    /// but a genuine concurrent burst does.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_burst_advances_lockout_to_full_rung() {
+        let throttle = LoginThrottle::with_max_in_flight(3);
+        let ip: IpAddr = Ipv4Addr::new(198, 51, 100, 7).into();
+        let key = normalize_ip(ip);
+
+        // Fill the cap: three concurrent verifies admitted before any lockout
+        // exists, so none is rejected by `locked_until`.
+        let g1 = throttle.try_begin_attempt(ip).await.expect("g1 admitted");
+        let g2 = throttle.try_begin_attempt(ip).await.expect("g2 admitted");
+        let g3 = throttle.try_begin_attempt(ip).await.expect("g3 admitted");
+
+        // All three fail near-simultaneously (the paused clock keeps `now`
+        // fixed, so g2 and g3 land inside g1's fresh lockout window).
+        g1.record_failure().await;
+        g2.record_failure().await;
+        g3.record_failure().await;
+
+        let state = throttle.inner.read().await;
+        let entry = state.map.get(&key).expect("entry should exist");
+        assert_eq!(
+            entry.failures, 3,
+            "all three concurrent failures should have accumulated"
+        );
+        assert_eq!(
+            entry.in_flight, 0,
+            "all three guards should have been released"
+        );
+
+        let remaining = entry.locked_until - Instant::now();
+        assert_eq!(
+            remaining,
+            backoff_for(3, DEFAULT_BACKOFF_CAP),
+            "lockout must reflect the full 3-failure burst, not the 1-failure rung"
+        );
+        assert_ne!(
+            remaining,
+            backoff_for(1, DEFAULT_BACKOFF_CAP),
+            "lockout must not stay pinned at backoff_for(1) under a raised in-flight cap"
         );
     }
 

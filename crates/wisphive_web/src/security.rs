@@ -31,7 +31,8 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{FromRequestParts, Request, State};
@@ -142,41 +143,59 @@ struct SecurityConfigInner {
     /// must be constructed from the configured port, not the
     /// (potentially `127.0.0.1`-typed) request URL.
     bind_port: u16,
-    /// itr#256: process-local cache of "has a web password ever been
-    /// observed set". `/api/auth/status` (an unauthenticated, unthrottled
-    /// -by-token discovery endpoint) and the setup-required gate in
-    /// [`security_middleware`] both used to run a SQLite `SELECT` on
+    /// itr#256/#497: process-local, **bounded-TTL** cache of "is a web
+    /// password currently set". `/api/auth/status` (an unauthenticated,
+    /// unthrottled-by-token discovery endpoint) and the setup-required gate
+    /// in [`security_middleware`] both used to run a SQLite `SELECT` on
     /// *every* request — a small-scale DoS surface and a free "is this
     /// instance set up yet" oracle for anyone who can reach the port.
     ///
-    /// This is a cache-aside "sticky true" flag, not a full cache: it only
-    /// ever transitions `false -> true`, never back. [`SecurityConfig::
-    /// password_set`] checks the flag first and returns immediately on a
-    /// hit; on a miss it falls back to the one SQLite round-trip and
-    /// latches the flag if that lookup finds a password. `/api/auth/setup`
-    /// (`post_auth_set_password` in `lib.rs`) also latches it directly and
-    /// eagerly on a successful bootstrap, so the very next request — even
-    /// from a different client — is a cache hit with no extra query.
+    /// [`SecurityConfig::password_set`] serves from this flag without a DB
+    /// round-trip **until [`SecurityConfigInner::password_set_valid_until_ms`]
+    /// elapses** (one [`PASSWORD_SET_CACHE_TTL`] past the last DB
+    /// confirmation). Once the deadline passes, the next call re-reads
+    /// `get_web_password_hash` and either extends the deadline (still set)
+    /// or flips the flag back to `false` (cleared out-of-process).
+    /// `post_auth_set_password` in `lib.rs` also latches the flag directly
+    /// and eagerly on a successful bootstrap via
+    /// [`SecurityConfig::mark_password_set`], so the very next request —
+    /// even from a different client — is a cache hit.
     ///
-    /// **Why not invalidate it on `wisphive web reset-password`.** That
-    /// command is a separate CLI process (`open_db()` in
-    /// `wisphive_cli::commands::web`) that writes straight to
-    /// `wisphive.db` — it never touches a running web server's in-memory
-    /// state, so there is no in-process call site to flip this flag back
-    /// to `false`. A `false` cached in this struct while the CLI is
-    /// concurrently deleting the password row would also be wrong to
-    /// invalidate: the flag only ever *skips* a truthful equality check by
-    /// remembering a fact that used to be true, and once a password has
-    /// existed the operator is expected to restart the web server as part
-    /// of a reset (the reset also revokes every device token, which forces
-    /// re-auth regardless). Until restart, a stale `true` here means
-    /// `/api/auth/status` under-reports `setup_required` for a machine
-    /// that's mid-reset by an operator who already has shell access to the
-    /// host — a narrow, self-inflicted, and non-security-relevant window,
-    /// not a bypass of any auth check (device-token lookups always hit the
-    /// DB fresh; see [`SecurityConfig::lookup_device_token`]).
+    /// **Why bounded-TTL rather than sticky-true (itr#497).** Earlier this
+    /// was a "sticky true" flag that only ever transitioned `false -> true`.
+    /// But `wisphive web reset-password` is a *separate* CLI process
+    /// (`open_db()` in `wisphive_cli::commands::web`) that deletes the
+    /// password row straight in `wisphive.db` with no signal to a running
+    /// server. A sticky-true cache left `/api/auth/status` reporting
+    /// `setup_required: false` forever after such a reset, so the SPA kept
+    /// rendering Login (which then 401s, the hash being gone) and the
+    /// unauthenticated setup endpoint stayed live but hidden — recoverable
+    /// only by a full restart. The bounded TTL self-heals within a few
+    /// seconds regardless of which process cleared the hash, cross-process,
+    /// with no in-memory signal required. Device-token lookups always hit
+    /// the DB fresh regardless (see
+    /// [`SecurityConfig::lookup_device_token`]); this cache only fronts the
+    /// setup-required discovery surface.
     password_set_cache: AtomicBool,
+    /// Companion deadline for `password_set_cache`:
+    /// [`SecurityConfigInner::base`]-relative milliseconds after which a
+    /// cached `true` is stale and must be re-confirmed against the DB. Set
+    /// to `now_ms + `[`PASSWORD_SET_CACHE_TTL`] on each DB confirmation.
+    /// Only meaningful when `password_set_cache` is `true`; a stored `0`
+    /// means "always stale" (used to force a re-check).
+    password_set_valid_until_ms: AtomicU64,
+    /// Monotonic base captured at construction. All cache timestamps are
+    /// stored as milliseconds elapsed since this instant so they fit in an
+    /// [`AtomicU64`] (an [`Instant`] can't live in an atomic directly).
+    base: Instant,
 }
+
+/// How long [`SecurityConfig::password_set`] trusts a cached `true` before
+/// re-confirming it against the DB. Short enough that a live
+/// `wisphive web reset-password` self-heals within seconds (itr#497), long
+/// enough that the steady-state authenticated case almost never pays the
+/// SQLite round-trip.
+const PASSWORD_SET_CACHE_TTL: Duration = Duration::from_secs(5);
 
 impl SecurityConfig {
     /// Build a security config.
@@ -253,6 +272,8 @@ impl SecurityConfig {
                 auth_policy,
                 bind_port: port,
                 password_set_cache: AtomicBool::new(false),
+                password_set_valid_until_ms: AtomicU64::new(0),
+                base: Instant::now(),
             }),
         })
     }
@@ -297,6 +318,8 @@ impl SecurityConfig {
                 // derivation in itr#311's passkey handlers.
                 bind_port: 3100,
                 password_set_cache: AtomicBool::new(false),
+                password_set_valid_until_ms: AtomicU64::new(0),
+                base: Instant::now(),
             }),
         }
     }
@@ -330,23 +353,60 @@ impl SecurityConfig {
         &self.inner.peek_throttle
     }
 
-    /// Whether a web password has ever been observed set (itr#256).
+    /// Whether a web password is currently set (itr#256/#497).
     ///
-    /// Checks the [`SecurityConfigInner::password_set_cache`] flag first —
-    /// a hit returns immediately with no SQLite access. On a miss (fresh
-    /// process, or a process that hasn't yet seen a password) it falls
-    /// back to `get_web_password_hash` and latches the flag if that lookup
-    /// finds one, so every call after the first true observation is a
-    /// cache hit for the lifetime of the process. Used by both
+    /// A bounded-TTL cache-aside over `get_web_password_hash`. When the
+    /// [`SecurityConfigInner::password_set_cache`] flag is `true` **and** it
+    /// was confirmed against the DB within [`PASSWORD_SET_CACHE_TTL`], this
+    /// returns `true` immediately with no SQLite access — the steady-state
+    /// authenticated case. Once that confirmation goes stale, the call
+    /// re-reads the DB and either refreshes the confirmation timestamp
+    /// (still set) or flips the flag back to `false` (the password was
+    /// cleared out-of-process, e.g. by `wisphive web reset-password`), so a
+    /// live reset self-heals within the TTL without a server restart.
+    ///
+    /// When the flag is `false` (fresh process, or genuinely unset) it
+    /// falls back to the one SQLite round-trip on every call — the
+    /// pre-setup window, where hitting the DB each time is expected — and
+    /// latches the flag the moment a password appears. Used by both
     /// `get_auth_status` (`lib.rs`) and the setup-required gate in
     /// [`security_middleware`] so the two call sites share one cache
     /// instead of each probing SQLite independently.
     pub async fn password_set(&self) -> WebAuthResult<bool> {
         if self.inner.password_set_cache.load(Ordering::Relaxed) {
-            return Ok(true);
+            let now_ms = self.now_ms();
+            let valid_until = self
+                .inner
+                .password_set_valid_until_ms
+                .load(Ordering::Relaxed);
+            if now_ms < valid_until {
+                // Fresh cached true — the common authenticated case, served
+                // with no DB round-trip.
+                return Ok(true);
+            }
+            // Deadline passed: re-confirm against the DB. A concurrent
+            // `reset-password` may have cleared the row out-of-process.
+            let is_set = self.inner.state_db.get_web_password_hash().await?.is_some();
+            if is_set {
+                self.inner.password_set_valid_until_ms.store(
+                    now_ms.saturating_add(Self::cache_ttl_ms()),
+                    Ordering::Relaxed,
+                );
+            } else {
+                self.inner
+                    .password_set_cache
+                    .store(false, Ordering::Relaxed);
+            }
+            return Ok(is_set);
         }
         let is_set = self.inner.state_db.get_web_password_hash().await?.is_some();
         if is_set {
+            // Store the deadline before the flag so a reader that observes
+            // `true` also sees a fresh `valid_until`.
+            self.inner.password_set_valid_until_ms.store(
+                self.now_ms().saturating_add(Self::cache_ttl_ms()),
+                Ordering::Relaxed,
+            );
             self.inner.password_set_cache.store(true, Ordering::Relaxed);
         }
         Ok(is_set)
@@ -357,9 +417,39 @@ impl SecurityConfig {
     /// `lib.rs` right after a successful bootstrap write, so the very next
     /// request — even from a different client — is a cache hit instead of
     /// paying for the SQLite lookup [`Self::password_set`] would otherwise
-    /// need to discover the same fact.
+    /// need to discover the same fact. Stamps the confirmation timestamp so
+    /// the bounded-TTL window (itr#497) starts fresh from this write.
     pub fn mark_password_set(&self) {
+        // Deadline before flag: a reader seeing `true` must also see a
+        // fresh `valid_until`, else it would needlessly re-hit the DB.
+        self.inner.password_set_valid_until_ms.store(
+            self.now_ms().saturating_add(Self::cache_ttl_ms()),
+            Ordering::Relaxed,
+        );
         self.inner.password_set_cache.store(true, Ordering::Relaxed);
+    }
+
+    /// [`PASSWORD_SET_CACHE_TTL`] in milliseconds.
+    fn cache_ttl_ms() -> u64 {
+        PASSWORD_SET_CACHE_TTL.as_millis() as u64
+    }
+
+    /// Milliseconds elapsed since [`SecurityConfigInner::base`] — the clock
+    /// backing the bounded-TTL `password_set` cache. Monotonic and cheap.
+    fn now_ms(&self) -> u64 {
+        self.inner.base.elapsed().as_millis() as u64
+    }
+
+    /// Force the `password_set` cache's deadline into the past so the next
+    /// [`Self::password_set`] call treats a cached `true` as stale and
+    /// re-reads the DB — lets tests exercise the bounded-TTL re-check
+    /// (itr#497) without sleeping [`PASSWORD_SET_CACHE_TTL`]. Storing `0` is
+    /// unconditionally stale because `now_ms >= 0` always holds.
+    #[cfg(test)]
+    fn expire_password_set_cache_for_test(&self) {
+        self.inner
+            .password_set_valid_until_ms
+            .store(0, Ordering::Relaxed);
     }
 
     /// Resolve the effective host for this request and compare against
@@ -502,11 +592,12 @@ pub async fn security_middleware(
     // this gate with password_set=false means the client got confused, so
     // a hard error is correct.
     //
-    // `password_set` (itr#256) is a cache-aside AtomicBool: once a password
-    // has been observed set, every subsequent gated request on every path
-    // hits the cache instead of a SQLite round-trip. See
-    // `SecurityConfigInner::password_set_cache`'s docs for why the cache
-    // never needs to go back to `false` in-process.
+    // `password_set` (itr#256/#497) is a bounded-TTL cache-aside: a password
+    // observed set is served from memory for up to `PASSWORD_SET_CACHE_TTL`
+    // before the DB is re-read, so a live `wisphive web reset-password` (a
+    // separate process) self-heals this gate back to setup-required within
+    // the TTL without a server restart. See
+    // `SecurityConfigInner::password_set_cache`'s docs.
     let is_gated_api_path = path == "/ws" || path.starts_with("/api/");
     if is_gated_api_path && !path_bypasses_setup_gate(path) {
         match security.password_set().await {
@@ -1073,11 +1164,14 @@ mod tests {
         assert!(!security.password_set().await.unwrap());
     }
 
-    /// The load-bearing proof: after the cache has observed `true` once, it
-    /// must keep reporting `true` even when the underlying DB row is wiped
-    /// out from under it — that can only happen if `password_set()` is
-    /// actually served from the `AtomicBool`, not by re-querying SQLite on
-    /// every call.
+    /// The load-bearing proof of the fast path: *within* the TTL, after the
+    /// cache has observed `true` once, it must keep reporting `true` even
+    /// when the underlying DB row is wiped out from under it — that can only
+    /// happen if `password_set()` is served from the cached flag, not by
+    /// re-querying SQLite on every call. (The test completes in
+    /// milliseconds, far inside [`PASSWORD_SET_CACHE_TTL`], so the deadline
+    /// has not yet elapsed — the stale-path re-check is covered separately
+    /// by `password_set_reverts_to_false_after_ttl_when_db_reset`.)
     #[tokio::test]
     async fn password_set_caches_true_without_further_db_reads() {
         let (_tmp, security) =
@@ -1098,9 +1192,82 @@ mod tests {
         security.state_db().reset_web_password().await.unwrap();
         assert!(
             security.password_set().await.unwrap(),
-            "cached true must survive a DB-level password wipe — proves no SQLite \
-             round-trip happens once the cache has latched"
+            "cached true must survive a DB-level password wipe within the TTL — \
+             proves no SQLite round-trip happens on the fresh-cache fast path"
         );
+    }
+
+    /// itr#497: the bounded-TTL invalidation. `wisphive web reset-password`
+    /// runs in a *separate* CLI process and deletes the password row
+    /// straight in `wisphive.db` with no signal to a running server. Once
+    /// the cached `true`'s deadline elapses, `password_set()` must re-read
+    /// the DB, observe the wipe, and flip back to `false` — so a live reset
+    /// self-heals `/api/auth/status` (which reads this) into setup-required
+    /// mode without a server restart.
+    #[tokio::test]
+    async fn password_set_reverts_to_false_after_ttl_when_db_reset() {
+        let (_tmp, security) =
+            test_security_config(vec!["https://localhost:3100".to_string()]).await;
+        security
+            .state_db()
+            .try_set_initial_web_password("fake-hash")
+            .await
+            .unwrap();
+
+        // Latch the cache to true (mirrors a running server that has served
+        // an authenticated session).
+        assert!(security.password_set().await.unwrap());
+
+        // Out-of-process reset: the password row is deleted with no
+        // in-memory signal to this server.
+        security.state_db().reset_web_password().await.unwrap();
+
+        // Still true while the cache deadline hasn't elapsed.
+        assert!(
+            security.password_set().await.unwrap(),
+            "cache must stay true until its TTL deadline passes"
+        );
+
+        // Simulate the TTL deadline passing (no real sleep).
+        security.expire_password_set_cache_for_test();
+
+        // Now the stale-path re-check runs, sees no password, and flips.
+        assert!(
+            !security.password_set().await.unwrap(),
+            "after the TTL elapses the cache must re-read the DB and revert to \
+             false so /api/auth/status reports setup-required again"
+        );
+
+        // And it stays false on the next call — the flag itself is now
+        // false, so we're back on the pre-setup DB-every-call path.
+        assert!(!security.password_set().await.unwrap());
+    }
+
+    /// A reset followed by a fresh bootstrap must re-latch: after the cache
+    /// reverts to false and a new password is written, `password_set()`
+    /// observes it and caches true again (the full self-heal cycle).
+    #[tokio::test]
+    async fn password_set_relatches_after_reset_then_new_password() {
+        let (_tmp, security) =
+            test_security_config(vec!["https://localhost:3100".to_string()]).await;
+        security
+            .state_db()
+            .try_set_initial_web_password("hash-one")
+            .await
+            .unwrap();
+        assert!(security.password_set().await.unwrap());
+
+        security.state_db().reset_web_password().await.unwrap();
+        security.expire_password_set_cache_for_test();
+        assert!(!security.password_set().await.unwrap());
+
+        // A new bootstrap writes a fresh password; the cache re-latches.
+        security
+            .state_db()
+            .try_set_initial_web_password("hash-two")
+            .await
+            .unwrap();
+        assert!(security.password_set().await.unwrap());
     }
 
     /// Mirrors what `post_auth_set_password` in `lib.rs` does immediately
