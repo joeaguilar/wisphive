@@ -55,12 +55,10 @@
 
 ### Wave 5
 
-- **#96 — Protect config and auto-approve files with mode 0600**
-  - Files: `crates/wisphive_hook/src/main.rs`, `crates/wisphive_daemon/src/server.rs`
 - **#114 — Move title/notification side effects out of the reducer**
-  - Files: `crates/wisphive_web/frontend/src/hooks/useWisphive.ts`
-- **#262 — Enforce mode 0600 on SQLite database sidecars**
-  - Files: `crates/wisphive_daemon/src/state/mod.rs`, `AGENTS.md`
+  - Files: `crates/wisphive_web/frontend/src/hooks/useWisphive.ts`, `crates/wisphive_web/frontend/src/hooks/useWisphive.test.ts`
+- **#503 — Improve fail-closed TLS corruption remediation**
+  - Files: `crates/wisphive_web/src/tls.rs`
 
 ### Wave 6
 
@@ -77,8 +75,8 @@
   - Files: `crates/wisphive_cli/src/main.rs`
 - **#307 — Handle non-object Claude hook settings without panic**
   - Files: `crates/wisphive_cli/src/commands/hooks.rs`
-- **#365 — Remove ended terminal sessions from the live map**
-  - Files: `crates/wisphive_daemon/src/terminal.rs`
+- **#262 — Enforce mode 0600 on SQLite database sidecars**
+  - Files: `crates/wisphive_daemon/src/state/mod.rs`, `AGENTS.md`
 
 ### Wave 8
 
@@ -192,16 +190,16 @@
 
 - **#472 — Align daemon SpawnAgent behavior with kill-switch preflight**
   - Files: `crates/wisphive_daemon/src/process_registry.rs`
-- **#503 — Improve fail-closed TLS corruption remediation**
-  - Files: `crates/wisphive_web/src/tls.rs`
+- **#365 — Remove ended terminal sessions from the live map**
+  - Files: `crates/wisphive_daemon/src/terminal.rs`
 
 ## File conflicts
 
-- `crates/wisphive_daemon/src/server.rs`: #94 → #294 → #86 → #99 → #96 → #95 → #407 → #97 → #101 → #102 → #336 → #409 → #410.
+- `crates/wisphive_daemon/src/server.rs`: #94 → #294 → #86 → #99 → #95 → #407 → #97 → #101 → #102 → #336 → #409 → #410.
 - `crates/wisphive_web/frontend/src/hooks/useWisphive.ts`: #105 → #295 → #296 → #114 → #375 → #376 → #118.
 - `crates/wisphive_web/src/lib.rs`: #407 → #504 → #495 → #408 → #277 → #281.
 - `crates/wisphive_cli/src/main.rs`: #306 → #348 → #371 → #277 → #318.
-- `crates/wisphive_hook/src/main.rs`: #86 → #96 → #95 → #102.
+- `crates/wisphive_hook/src/main.rs`: #86 → #95 → #102.
 - `crates/wisphive_cli/src/commands/agent.rs`: #94 → #294 → #412 → #470.
 - `crates/wisphive_cli/src/commands/hooks.rs`: #411 → #95 → #307.
 - `crates/wisphive_daemon/src/config.rs`: #95 → #407 → #495.
@@ -218,7 +216,7 @@
 - `ToolContent.tsx`: #106 → #205.
 - `crates/wisphive_daemon/src/queue.rs`: #94 → #97.
 - `crates/wisphive_daemon/src/state/decisions.rs`: #94 → #91.
-- `AGENTS.md`: #262 → #95.
+- `AGENTS.md`: #95 → #262.
 
 No wave contains a shared owned file. Co-located tests inherit the same ownership chain as their source; a worker must request an ownership expansion before touching any additional test file.
 
@@ -252,6 +250,10 @@ No wave contains a shared owned file. Co-located tests inherit the same ownershi
 - **Wave 3 sandbox gate retry:** #296 and #86 each hit a sandbox-only `PermissionDenied` when the existing #294 fake-daemon regression bound a Unix socket. The exact test and full gates passed outside that restriction; no product-code repair was needed.
 - **Wave 3 gate:** orchestrator reran both repository gates after all workers settled: `GATR exit=0 dur=23.4s errors=0 warnings=0 adapter=generic tag=blitz-wave3-final-rust` and `GATR exit=0 dur=6.4s errors=0 warnings=0 adapter=generic tag=blitz-wave3-final-frontend` (13 files, 119 tests).
 - **Pre-Wave 4 re-pack:** #95's full body requires daemon-side mode enforcement in `server.rs`, which conflicts with #99. Expanded #95 to `server.rs` + `AGENTS.md` and moved it to Wave 6; moved #116 to Wave 4 and #262 to Wave 5. The three waves remain size 3 and conflict-free.
+- **Pre-Wave 5 re-pack:** #96 changes documented runtime-file permission semantics and therefore also owns `AGENTS.md`, conflicting with #262. Moved #503 to Wave 5, #262 to Wave 7, and #365 to Wave 20. Wave count/capacity remain unchanged and all affected waves stay conflict-free.
+- **Wave 5 / #96 hard quarantine:** exact same-UID provenance cannot be authenticated by owner/mode checks or a file-backed key readable by that UID. The worker made no edits. PO directed that #96 remain open for Fable review and be removed from this blitz; tracker tags `needs-fable-review` and `blitz-skipped` plus note #181 preserve the full required design expansion. Outcome: `failed-skipped`.
+- **Wave 5 sandbox gate retry:** #114's first Rust run hit the existing fake-daemon Unix-socket sandbox restriction; its authorized rerun and the orchestrator gate passed without a product-code intervention.
+- **Wave 5 gate:** orchestrator reran both repository gates after workers settled: `GATR exit=0 dur=24.6s errors=0 warnings=0 adapter=generic tag=blitz-wave5-final-rust` and `GATR exit=0 dur=5.8s errors=0 warnings=0 adapter=generic tag=blitz-wave5-final-frontend` (14 files, 124 tests).
 - **Wave 4 / #111 lint repair:** its first frontend pass caught a React hooks rule violation from assigning the actions ref during render. The worker moved the ref refresh into `useLayoutEffect`; both required gates then passed.
 - **Wave 4 gate:** orchestrator reran both repository gates after all workers settled: `GATR exit=0 dur=23.5s errors=0 warnings=0 adapter=generic tag=blitz-wave4-final-rust` and `GATR exit=0 dur=5.8s errors=0 warnings=0 adapter=generic tag=blitz-wave4-final-frontend` (14 files, 122 tests).
 
@@ -277,8 +279,13 @@ No wave contains a shared owned file. Co-located tests inherit the same ownershi
   - **#99 closed:** a daemon-wide 256-permit semaphore bounds live socket handlers; over-cap clients receive a protocol error without a handler/context allocation and capacity recovers when permits drop.
   - **#111 closed:** one stable keyboard listener reads the latest actions through a layout-ref refresh; rerender tests prove no listener churn and no stale callback after action changes.
   - **#116 closed:** question and option keys derive from canonical content with duplicate occurrence disambiguation; rerender/click tests prove DOM identity follows reordered content and current request callbacks.
+  - **Commit:** `d269d50` — `fix(runtime): cap connections and stabilize UI identity`.
+- **Wave 5 — 2026-07-11T23:19Z–2026-07-11T23:25Z — 3 workers.**
+  - **#114 closed:** title updates run in an effect, one validated decision frame creates one notification outside state updaters, permission prompting waits for a real click, and redundant socket error closing is removed. StrictMode/gesture tests pass.
+  - **#503 closed:** readable-but-unparseable TLS cert/key material remains fail-closed with actionable path-specific remediation; tests prove no regeneration and no file mutation.
+  - **#96 failed-skipped:** no edits; remains open with Fable-review tags and the PO-approved design diagnostic.
   - **Commit:** pending immediately after this log update.
 
 ## Quarantine triage notes
 
-- None yet.
+- **#96:** PO decision on 2026-07-11: mark for Fable review and remove from the blitz plan. No partial hardening should land under this story because it would not meet the stated same-UID provenance acceptance.

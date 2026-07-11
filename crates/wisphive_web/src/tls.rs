@@ -80,6 +80,12 @@ struct CertMeta {
 /// Make sure a usable TLS cert exists at the conventional location, minting a
 /// fresh one when files are missing, expired (>90d), or the SAN set has
 /// drifted from what we'd generate today (e.g. user changed bind host).
+///
+/// Those policy-driven cases are safe to self-heal. Readable but unparseable
+/// certificate or key files are different: they can indicate corruption or
+/// tampering, and replacing them would silently rotate the fingerprint paired
+/// devices trust. Such parse failures remain hard errors until the operator
+/// intentionally deletes both files to request regeneration.
 pub fn ensure_cert(home_dir: &Path, bind_host: IpAddr) -> Result<EnsureCertResult> {
     fs::create_dir_all(home_dir)
         .with_context(|| format!("creating home dir {}", home_dir.display()))?;
@@ -298,14 +304,21 @@ fn try_load_existing(
         }
     };
 
-    // Parse failure here is "the file exists, we read it, but it isn't a
-    // PEM cert" — same data-integrity signal as a corrupt meta sidecar.
-    // Propagate consistently rather than silently regen.
+    // A parse failure means "the file exists and was readable, but its
+    // contents aren't usable cryptographic material". Unlike missing,
+    // expired, or SAN-drifted files above, this can signal disk corruption
+    // or tampering. Never hide that signal by regenerating: doing so would
+    // also rotate the fingerprint paired devices trust.
     let der = cert_der_from_pem(&cert_pem).with_context(|| {
-        format!(
-            "cert PEM at {} has no CERTIFICATE block",
-            cert_path.display()
-        )
+        tls_material_corruption_context("certificate", cert_path, cert_path, key_path)
+    })?;
+
+    // Parse the certificate's cryptographic structure before the key. A PEM
+    // envelope can be syntactically valid while containing arbitrary DER;
+    // surfacing that as a cert-specific hard error makes remediation point
+    // at the actual offending file instead of a later pair-comparison step.
+    let not_before = der_not_before_unix(&der).with_context(|| {
+        tls_material_corruption_context("certificate", cert_path, cert_path, key_path)
     })?;
 
     // itr#228: cert.pem and key.pem can each parse fine on their own while
@@ -318,11 +331,9 @@ fn try_load_existing(
     // age and fall through to regeneration rather than handing back a pair
     // that can't work together.
     if !key_matches_cert_spki(&key_pem, &der).with_context(|| {
-        format!(
-            "comparing key {} against cert {} public key",
-            key_path.display(),
-            cert_path.display()
-        )
+        // The cert was parsed successfully just above, so a parse error from
+        // the comparison helper now identifies the private key as corrupt.
+        tls_material_corruption_context("private key", key_path, cert_path, key_path)
     })? {
         warn!(
             cert_path = %cert_path.display(),
@@ -341,8 +352,6 @@ fn try_load_existing(
     // — the field a TLS client actually verifies and that can't be edited
     // without re-signing the cert — and regen on that basis too, so a
     // lying sidecar can't override the real cert age.
-    let not_before = der_not_before_unix(&der)
-        .with_context(|| format!("reading NotBefore from cert {} DER", cert_path.display()))?;
     // itr#500: `generate_and_persist_inner` backdates the DER NotBefore by
     // CERT_NOT_BEFORE_BACKDATE_HOURS while stamping the sidecar's
     // `created_at` at plain `now`. Comparing `now - not_before` against a
@@ -370,6 +379,25 @@ fn try_load_existing(
         key_pem,
         fingerprint_sha256: fingerprint,
     }))
+}
+
+/// Build the operator-facing context for readable TLS material that cannot be
+/// parsed. Automatic replacement is deliberately forbidden here: it would
+/// erase a corruption/tampering signal and rotate the fingerprint paired
+/// devices trust. Naming both concrete paths makes the destructive recovery
+/// step explicit without ever echoing secret contents.
+fn tls_material_corruption_context(
+    kind: &str,
+    offending_path: &Path,
+    cert_path: &Path,
+    key_path: &Path,
+) -> String {
+    format!(
+        "TLS {kind} {} is corrupt or unparseable; refusing automatic regeneration because it would rotate the fingerprint trusted by paired devices. After investigating, intentionally delete {} and {} to regenerate",
+        offending_path.display(),
+        cert_path.display(),
+        key_path.display(),
+    )
 }
 
 fn generate_and_persist(
@@ -1520,6 +1548,92 @@ mod tests {
             fs::read(dir.path().join(META_FILENAME)).unwrap(),
             meta_before
         );
+    }
+
+    /// itr#503: a syntactically valid CERTIFICATE PEM envelope can still
+    /// contain DER that is not an X.509 certificate. That is a corruption or
+    /// tampering signal, not a safe self-healing case: automatic regeneration
+    /// would rotate the fingerprint paired devices trust and hide the cause.
+    #[test]
+    fn unparseable_certificate_is_hard_error_without_regeneration() {
+        let _guard = test_lock();
+        let dir = TempDir::new().unwrap();
+        let bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let _ = ensure_cert(dir.path(), bind).unwrap();
+
+        let cert_path = dir.path().join(CERT_FILENAME);
+        let key_path = dir.path().join(KEY_FILENAME);
+        let original_key = fs::read(&key_path).unwrap();
+        let corrupt_cert = b"-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n";
+        write_secret(&cert_path, corrupt_cert).unwrap();
+
+        GENERATE_INVOCATIONS.store(0, Ordering::SeqCst);
+        let err = match ensure_cert(dir.path(), bind) {
+            Ok(_) => panic!("unparseable certificate must fail closed"),
+            Err(err) => err,
+        };
+        let message = format!("{err:#}");
+
+        assert!(
+            message.starts_with(&format!("TLS certificate {}", cert_path.display())),
+            "error must identify the offending certificate: {message}",
+        );
+        assert!(
+            message.contains("intentionally delete"),
+            "error must require intentional recovery: {message}",
+        );
+        assert!(message.contains(&cert_path.display().to_string()));
+        assert!(message.contains(&key_path.display().to_string()));
+        assert_eq!(
+            GENERATE_INVOCATIONS.load(Ordering::SeqCst),
+            0,
+            "corrupt certificate must not trigger regeneration",
+        );
+        assert_eq!(fs::read(&cert_path).unwrap(), corrupt_cert);
+        assert_eq!(fs::read(&key_path).unwrap(), original_key);
+    }
+
+    /// itr#503: a valid PRIVATE KEY PEM envelope with malformed PKCS#8 bytes
+    /// receives the same fail-closed treatment as a corrupt certificate. The
+    /// loader must leave both files untouched until the operator investigates
+    /// and explicitly deletes the pair to request a new fingerprint.
+    #[test]
+    fn unparseable_private_key_is_hard_error_without_regeneration() {
+        let _guard = test_lock();
+        let dir = TempDir::new().unwrap();
+        let bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let _ = ensure_cert(dir.path(), bind).unwrap();
+
+        let cert_path = dir.path().join(CERT_FILENAME);
+        let key_path = dir.path().join(KEY_FILENAME);
+        let original_cert = fs::read(&cert_path).unwrap();
+        let corrupt_key = b"-----BEGIN PRIVATE KEY-----\nAQID\n-----END PRIVATE KEY-----\n";
+        write_secret(&key_path, corrupt_key).unwrap();
+
+        GENERATE_INVOCATIONS.store(0, Ordering::SeqCst);
+        let err = match ensure_cert(dir.path(), bind) {
+            Ok(_) => panic!("unparseable private key must fail closed"),
+            Err(err) => err,
+        };
+        let message = format!("{err:#}");
+
+        assert!(
+            message.starts_with(&format!("TLS private key {}", key_path.display())),
+            "error must identify the offending private key: {message}",
+        );
+        assert!(
+            message.contains("intentionally delete"),
+            "error must require intentional recovery: {message}",
+        );
+        assert!(message.contains(&cert_path.display().to_string()));
+        assert!(message.contains(&key_path.display().to_string()));
+        assert_eq!(
+            GENERATE_INVOCATIONS.load(Ordering::SeqCst),
+            0,
+            "corrupt private key must not trigger regeneration",
+        );
+        assert_eq!(fs::read(&cert_path).unwrap(), original_cert);
+        assert_eq!(fs::read(&key_path).unwrap(), corrupt_key);
     }
 
     /// itr#228: if `web.key.pem` gets swapped for an unrelated (but

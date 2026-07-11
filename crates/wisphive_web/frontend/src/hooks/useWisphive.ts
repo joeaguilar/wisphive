@@ -153,6 +153,31 @@ export function useWisphive() {
     diskAlerts: [],
   });
 
+  // Keep document side effects out of state updaters. React may invoke a
+  // functional updater more than once in StrictMode or concurrent renders;
+  // this title assignment is idempotent and follows the committed queue.
+  useEffect(() => {
+    document.title = state.queue.length > 0 ? `(${state.queue.length}) Wisphive` : "Wisphive";
+  }, [state.queue.length]);
+
+  // Browsers require Notification permission prompts to originate from a
+  // user gesture. Defer the one-time prompt until the first click rather than
+  // asking when the WebSocket opens in the background.
+  useEffect(() => {
+    if (!("Notification" in window) || window.Notification.permission !== "default") {
+      return;
+    }
+
+    const requestNotificationPermission = () => {
+      if (window.Notification.permission === "default") {
+        void window.Notification.requestPermission();
+      }
+    };
+
+    window.addEventListener("click", requestNotificationPermission, { once: true });
+    return () => window.removeEventListener("click", requestNotificationPermission);
+  }, []);
+
   // Keep queueRef in sync so approve() can read the current queue
   // synchronously (see queueRef declaration above, itr#275).
   useEffect(() => {
@@ -201,6 +226,28 @@ export function useWisphive() {
         }
       }
 
+      // Notification delivery belongs to the validated message boundary, not
+      // a functional state updater. One server frame therefore constructs one
+      // notification even when React probes updater purity in StrictMode.
+      if (
+        msg.type === "new_decision" &&
+        document.hidden &&
+        "Notification" in window &&
+        window.Notification.permission === "granted"
+      ) {
+        const req = msg.request;
+        new window.Notification(`Wisphive: ${req.tool_name}`, {
+          body: `${req.agent_id.slice(0, 20)} needs a decision`,
+          tag: "wisphive-decision",
+        });
+      }
+
+      // Likewise, clear imperative retry bookkeeping before computing the
+      // next immutable state snapshot.
+      if (msg.type === "decision_resolved") {
+        approveStashRef.current.delete(msg.id);
+      }
+
       setState((prev) => {
         switch (msg.type) {
           case "welcome":
@@ -212,24 +259,13 @@ export function useWisphive() {
           case "new_decision": {
             const req = msg.request;
             const newQueue = [...prev.queue, req];
-            document.title = newQueue.length > 0 ? `(${newQueue.length}) Wisphive` : "Wisphive";
-            if (document.hidden && Notification.permission === "granted") {
-              new Notification(`Wisphive: ${req.tool_name}`, {
-                body: `${req.agent_id.slice(0, 20)} needs a decision`,
-                tag: "wisphive-decision",
-              });
-            }
             return { ...prev, queue: newQueue };
           }
 
           case "decision_resolved": {
-            // Drop any stashed approve for the resolved request — the
-            // daemon finalised it (our approve or another client's), so
-            // there's nothing left to retry even if a stale
-            // web_reauth_required somehow arrived later.
-            approveStashRef.current.delete(msg.id);
+            // The event boundary above already cleared any matching approve
+            // stash; this transition only computes the next queue value.
             const filtered = prev.queue.filter((r) => r.id !== msg.id);
-            document.title = filtered.length > 0 ? `(${filtered.length}) Wisphive` : "Wisphive";
             return { ...prev, queue: filtered };
           }
 
@@ -431,9 +467,6 @@ export function useWisphive() {
 
     ws.onopen = () => {
       wsEverOpenedRef.current = true;
-      if ("Notification" in window && Notification.permission === "default") {
-        Notification.requestPermission();
-      }
     };
 
     ws.onmessage = (event) => {
@@ -472,9 +505,6 @@ export function useWisphive() {
       reconnectTimer.current = setTimeout(connect, 2000);
     };
 
-    ws.onerror = () => {
-      ws.close();
-    };
   }, [handleMessage]);
 
   useEffect(() => {

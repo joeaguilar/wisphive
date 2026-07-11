@@ -166,6 +166,67 @@ describe("useWisphive hook-gating (itr#460)", () => {
     unregister();
   });
 
+  it("creates exactly one desktop notification for one StrictMode decision (itr#114)", async () => {
+    const notifications = vi.fn();
+    const requestPermission = vi.fn(async () => "granted" as NotificationPermission);
+    class GrantedNotification {
+      static permission: NotificationPermission = "granted";
+      static requestPermission = requestPermission;
+
+      constructor(title: string, options?: NotificationOptions) {
+        notifications(title, options);
+      }
+    }
+    vi.stubGlobal("Notification", GrantedNotification);
+    const hidden = vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+
+    const { result } = await mountOpenStrict();
+    act(() =>
+      latest().emit({
+        type: "new_decision",
+        ...decisionRequest({ id: VALID_REQUEST_ID, tool_name: "Bash" }),
+      }),
+    );
+
+    expect(result.current.queue).toHaveLength(1);
+    expect(notifications).toHaveBeenCalledTimes(1);
+    expect(notifications).toHaveBeenCalledWith("Wisphive: Bash", {
+      body: "cc-1 needs a decision",
+      tag: "wisphive-decision",
+    });
+    expect(requestPermission).not.toHaveBeenCalled();
+    expect(document.title).toBe("(1) Wisphive");
+
+    act(() =>
+      latest().emit({
+        type: "decision_resolved",
+        id: VALID_REQUEST_ID,
+        decision: "approve",
+      }),
+    );
+    expect(document.title).toBe("Wisphive");
+
+    hidden.mockRestore();
+  });
+
+  it("requests notification permission only after a user click (itr#114)", async () => {
+    const requestPermission = vi.fn(async () => "denied" as NotificationPermission);
+    class DefaultNotification {
+      static permission: NotificationPermission = "default";
+      static requestPermission = requestPermission;
+    }
+    vi.stubGlobal("Notification", DefaultNotification);
+
+    await mountOpenStrict();
+    expect(requestPermission).not.toHaveBeenCalled();
+
+    act(() => window.dispatchEvent(new MouseEvent("click")));
+    expect(requestPermission).toHaveBeenCalledTimes(1);
+
+    act(() => window.dispatchEvent(new MouseEvent("click")));
+    expect(requestPermission).toHaveBeenCalledTimes(1);
+  });
+
   it("installHooks sends install_hooks for the given project", async () => {
     const { result } = await mountOpen();
     act(() => result.current.installHooks(PROJECT));
