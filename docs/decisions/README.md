@@ -27,6 +27,7 @@ alternatives, or (c) someone will later ask "why is it done this way." When in d
 | [0005](0005-policy-learning-security-invariants.md) | Policy-learning security invariants (I1–I10) | Proposed | 2026-07-03 | #422 |
 | [0006](0006-plugin-trust-model.md) | Decision-plugin trust model — observer-only, redacted, env-var shell hooks | Proposed | 2026-07-03 | #423, #425 |
 | [0007](0007-loop-supervisor-fails-toward-stop.md) | Loop supervisor fails toward stop | Proposed | 2026-07-03 | #421 |
+| [0008](0008-same-uid-tamper-evidence-not-tamper-proofing.md) | Same-UID config tampering — tamper-evidence, not tamper-proofing | Accepted | 2026-07-11 | #96, #508 |
 
 ## Status lifecycle
 
