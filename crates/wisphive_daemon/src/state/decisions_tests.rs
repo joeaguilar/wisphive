@@ -210,6 +210,190 @@ async fn drain_orphaned_pending_records_failopen_and_clears_table() {
 }
 
 #[tokio::test]
+async fn drain_orphaned_spawn_is_failclosed_while_hook_rows_remain_failopen() {
+    let db = test_db().await;
+    let hook = make_request("Bash", "cc-a", "/muse");
+    let hook_named_spawn = make_request("SpawnAgent", "cc-hook", "/muse");
+    let mut spawn = make_request("SpawnAgent", "wisphive-daemon:spawn", "/muse");
+    spawn.tool_input = serde_json::json!({
+        "agent_type": "claude_code",
+        "project": "/muse",
+        "prompt": "noop",
+    });
+    db.persist_pending(&hook).await.unwrap();
+    db.persist_pending(&hook_named_spawn).await.unwrap();
+    db.persist_pending(&spawn).await.unwrap();
+
+    assert_eq!(db.drain_orphaned_pending().await.unwrap(), 3);
+
+    let history = db.query_history(None, 10).await.unwrap();
+    let hook_entry = history.iter().find(|entry| entry.id == hook.id).unwrap();
+    assert_eq!(hook_entry.decision, Decision::Approve);
+    assert_eq!(
+        hook_entry.decided_by.as_deref(),
+        Some("daemon_restart:failopen")
+    );
+    let hook_named_spawn_entry = history
+        .iter()
+        .find(|entry| entry.id == hook_named_spawn.id)
+        .unwrap();
+    assert_eq!(
+        hook_named_spawn_entry.decision,
+        Decision::Approve,
+        "a real hook tool with the same name still follows hook fail-open semantics"
+    );
+    let spawn_entry = history.iter().find(|entry| entry.id == spawn.id).unwrap();
+    assert_eq!(
+        spawn_entry.decision,
+        Decision::Deny,
+        "an unexecuted managed spawn must never be fabricated as approved"
+    );
+    assert_eq!(
+        spawn_entry.decided_by.as_deref(),
+        Some("daemon_restart:failclosed_spawn")
+    );
+}
+
+#[tokio::test]
+async fn approved_spawn_audit_uses_complete_reviewed_request() {
+    let db = test_db().await;
+    let mut pending = make_request("SpawnAgent", "wisphive-daemon:spawn", "/original");
+    pending.tool_input = serde_json::json!({
+        "agent_type": "claude_code",
+        "project": "/original",
+        "prompt": "original prompt",
+    });
+    db.persist_pending(&pending).await.unwrap();
+    let reviewed: wisphive_protocol::SpawnAgentRequest =
+        serde_json::from_value(serde_json::json!({
+            "agent_type": "codex",
+            "project": "/reviewed",
+            "prompt": "reviewed prompt",
+            "model": "gpt-5-codex",
+            "reasoning": "high",
+            "output_format": "json",
+        }))
+        .unwrap();
+
+    assert!(
+        db.resolve_spawn_pending_by(pending.id, &reviewed, "human:tui")
+            .await
+            .unwrap()
+    );
+
+    assert_eq!(db.pending_count().await.unwrap(), 0);
+    let history = db.query_history(None, 10).await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].agent_type, wisphive_protocol::AgentType::Codex);
+    assert_eq!(history[0].project, std::path::PathBuf::from("/reviewed"));
+    assert_eq!(history[0].tool_input["prompt"], "reviewed prompt");
+    assert_eq!(history[0].decision, Decision::Approve);
+    assert_eq!(history[0].decided_by.as_deref(), Some("human:tui"));
+}
+
+#[tokio::test]
+async fn failclosed_spawn_reconciliation_handles_pending_and_committed_approval() {
+    let db = test_db().await;
+
+    let mut pending = make_request("SpawnAgent", "wisphive-daemon:spawn", "/muse");
+    pending.tool_input = serde_json::json!({
+        "agent_type": "claude_code",
+        "project": "/muse",
+        "prompt": "pending",
+    });
+    db.persist_pending(&pending).await.unwrap();
+    assert!(
+        db.force_failclosed_spawn_resolution(
+            pending.id,
+            "spawn_persistence_failure:deny",
+            &pending,
+        )
+        .await
+        .unwrap()
+    );
+
+    let mut approved = make_request("SpawnAgent", "wisphive-daemon:spawn", "/muse");
+    approved.tool_input = pending.tool_input.clone();
+    db.persist_pending(&approved).await.unwrap();
+    let reviewed: wisphive_protocol::SpawnAgentRequest =
+        serde_json::from_value(approved.tool_input.clone()).unwrap();
+    assert!(
+        db.resolve_spawn_pending_by(approved.id, &reviewed, "human:web")
+            .await
+            .unwrap()
+    );
+    assert!(
+        db.force_failclosed_spawn_resolution(
+            approved.id,
+            "spawn_persistence_failure:deny",
+            &approved,
+        )
+        .await
+        .unwrap()
+    );
+
+    let mut deleted = make_request("SpawnAgent", "wisphive-daemon:spawn", "/muse");
+    deleted.tool_input = pending.tool_input.clone();
+    db.persist_pending(&deleted).await.unwrap();
+    db.delete_pending(deleted.id).await.unwrap();
+    assert!(
+        db.force_failclosed_spawn_resolution(
+            deleted.id,
+            "spawn_persistence_failure:deny",
+            &deleted,
+        )
+        .await
+        .unwrap()
+    );
+
+    assert_eq!(db.pending_count().await.unwrap(), 0);
+    let history = db.query_history(None, 10).await.unwrap();
+    for id in [pending.id, approved.id, deleted.id] {
+        let entry = history.iter().find(|entry| entry.id == id).unwrap();
+        assert_eq!(entry.decision, Decision::Deny);
+        assert_eq!(
+            entry.decided_by.as_deref(),
+            Some("spawn_persistence_failure:deny")
+        );
+    }
+}
+
+#[tokio::test]
+async fn approved_spawn_action_failure_is_durable_and_redacted() {
+    let db = test_db().await;
+    let mut pending = make_request("SpawnAgent", "wisphive-daemon:spawn", "/muse");
+    pending.tool_input = serde_json::json!({
+        "agent_type": "claude_code",
+        "project": "/muse",
+        "prompt": "approved",
+    });
+    db.persist_pending(&pending).await.unwrap();
+    let reviewed: wisphive_protocol::SpawnAgentRequest =
+        serde_json::from_value(pending.tool_input.clone()).unwrap();
+    assert!(
+        db.resolve_spawn_pending_by(pending.id, &reviewed, "human:tui")
+            .await
+            .unwrap()
+    );
+
+    assert!(
+        db.record_spawn_action_failure(pending.id, "missing sk-secret123456789")
+            .await
+            .unwrap()
+    );
+    let history = db.query_history(None, 10).await.unwrap();
+    let entry = &history[0];
+    assert_eq!(entry.decision, Decision::Approve);
+    assert_eq!(
+        entry.decided_by.as_deref(),
+        Some("human:tui:spawn_action_failed")
+    );
+    let result = entry.tool_result.as_ref().unwrap();
+    assert_eq!(result["spawn_status"], "action_failed");
+    assert_ne!(result["error"], "missing sk-secret123456789");
+}
+
+#[tokio::test]
 async fn persist_pending_leaves_permission_suggestions_null() {
     // itr#300 (resolved by #299): suggestions are intentionally not persisted —
     // pending_decisions is drained, not re-served, so there is no read model to

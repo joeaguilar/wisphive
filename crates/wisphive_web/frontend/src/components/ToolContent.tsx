@@ -4,6 +4,26 @@
  */
 import { MarkdownText } from "./MarkdownText";
 import { CopyButton } from "./CopyButton";
+import { parseToolInput } from "./toolInput";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function stringField(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+function formatJson(value: unknown): string {
+  const json = JSON.stringify(value, null, 2);
+  return typeof json === "string" ? json : String(value ?? "");
+}
+
+function hasContent(value: unknown): boolean {
+  if (value === null || value === undefined) return false;
+  if (typeof value !== "object") return true;
+  return Object.keys(value).length > 0;
+}
 
 function CodeBlock({ text, className }: { text: string; className?: string }) {
   return (
@@ -38,29 +58,27 @@ function DiffView({ oldStr, newStr }: { oldStr: string; newStr: string }) {
 
 interface ToolContentProps {
   toolName: string;
-  toolInput: Record<string, unknown> | null;
+  toolInput: unknown;
   hookEventName?: string;
-  eventData?: Record<string, unknown>;
-  toolResult?: Record<string, unknown> | null;
+  eventData?: unknown;
+  toolResult?: unknown;
 }
 
 export function ToolContent({ toolName, toolInput, hookEventName, eventData, toolResult }: ToolContentProps) {
-  const input = toolInput ?? {};
-  const name = (toolName || "").toLowerCase();
-
-  // Extract common fields
-  const command = typeof input.command === "string" ? input.command : null;
-  const description = typeof input.description === "string" ? input.description : null;
-  const filePath = typeof input.file_path === "string" ? input.file_path : null;
-  const oldString = typeof input.old_string === "string" ? input.old_string : null;
-  const newString = typeof input.new_string === "string" ? input.new_string : null;
-  const content = typeof input.content === "string" ? input.content : null;
-  const pattern = typeof input.pattern === "string" ? input.pattern : null;
+  const parsed = parseToolInput(toolName, toolInput);
+  const input = parsed.value;
+  const name = toolName.toLowerCase();
+  const { filePath, content, pattern } = parsed.fields;
+  const command = parsed.kind === "bash" ? parsed.input.command : null;
+  const description = parsed.kind === "bash" ? parsed.input.description : null;
+  const oldString = parsed.kind === "edit" ? parsed.input.oldString : null;
+  const newString = parsed.kind === "edit" ? parsed.input.newString : null;
 
   // Event data fields
-  const lastMessage = typeof eventData?.last_assistant_message === "string" ? eventData.last_assistant_message : null;
-  const promptText = typeof eventData?.prompt === "string" ? eventData.prompt : null;
-  const stopHookActive = typeof eventData?.stop_hook_active === "boolean" ? eventData.stop_hook_active : null;
+  const event = isRecord(eventData) ? eventData : {};
+  const lastMessage = stringField(event.last_assistant_message);
+  const promptText = stringField(event.prompt);
+  const stopHookActive = typeof event.stop_hook_active === "boolean" ? event.stop_hook_active : null;
 
   // Determine which view to render based on event type first, then tool name
   const eventType = hookEventName || "";
@@ -74,9 +92,7 @@ export function ToolContent({ toolName, toolInput, hookEventName, eventData, too
           <h3>Stop Reason</h3>
           {(() => {
             const msg = lastMessage
-              ?? (typeof input.last_assistant_message === "string"
-                ? (input.last_assistant_message as string)
-                : null);
+              ?? parsed.fields.lastAssistantMessage;
             return msg ? <MarkdownText text={msg} /> : <CodeBlock text="(no message)" />;
           })()}
           {stopHookActive !== null && (
@@ -89,7 +105,7 @@ export function ToolContent({ toolName, toolInput, hookEventName, eventData, too
   }
 
   if (eventType === "UserPromptSubmit") {
-    const prompt = promptText || (typeof input.prompt === "string" ? input.prompt as string : null);
+    const prompt = promptText || parsed.fields.prompt;
     return (
       <>
         {prompt && (
@@ -104,8 +120,8 @@ export function ToolContent({ toolName, toolInput, hookEventName, eventData, too
   }
 
   if (eventType === "ConfigChange") {
-    const cfgFile = typeof eventData?.file_path === "string" ? eventData.file_path : (typeof input.file_path === "string" ? input.file_path as string : null);
-    const source = typeof eventData?.source === "string" ? eventData.source : (typeof input.source === "string" ? input.source as string : null);
+    const cfgFile = stringField(event.file_path) ?? parsed.fields.filePath;
+    const source = stringField(event.source) ?? parsed.fields.source;
     return (
       <>
         <div className="detail-section">
@@ -119,7 +135,7 @@ export function ToolContent({ toolName, toolInput, hookEventName, eventData, too
   }
 
   if (eventType === "TeammateIdle") {
-    const teammateName = typeof eventData?.teammate_name === "string" ? eventData.teammate_name : null;
+    const teammateName = stringField(event.teammate_name);
     return (
       <>
         <div className="detail-section">
@@ -132,8 +148,8 @@ export function ToolContent({ toolName, toolInput, hookEventName, eventData, too
   }
 
   if (eventType === "TaskCompleted") {
-    const taskSubject = typeof eventData?.task_subject === "string" ? eventData.task_subject : null;
-    const taskDesc = typeof eventData?.task_description === "string" ? eventData.task_description : null;
+    const taskSubject = stringField(event.task_subject);
+    const taskDesc = stringField(event.task_description);
     return (
       <>
         <div className="detail-section">
@@ -158,7 +174,7 @@ export function ToolContent({ toolName, toolInput, hookEventName, eventData, too
         )}
         <div className="detail-section">
           <h3>Command</h3>
-          <CodeBlock text={command || JSON.stringify(input, null, 2)} className="code-block code-bash" />
+          <CodeBlock text={command || formatJson(parsed.raw)} className="code-block code-bash" />
         </div>
         <ToolResultSection result={toolResult} />
       </>
@@ -177,7 +193,7 @@ export function ToolContent({ toolName, toolInput, hookEventName, eventData, too
         ) : (
           <div className="detail-section">
             <h3>Tool Input</h3>
-            <CodeBlock text={JSON.stringify(input, null, 2)} />
+            <CodeBlock text={formatJson(parsed.raw)} />
           </div>
         )}
         <ToolResultSection result={toolResult} />
@@ -191,7 +207,7 @@ export function ToolContent({ toolName, toolInput, hookEventName, eventData, too
         {filePath && <div className="file-path">{filePath}</div>}
         <div className="detail-section">
           <h3>Content (new file)</h3>
-          <CodeBlock text={content || JSON.stringify(input, null, 2)} />
+          <CodeBlock text={content || formatJson(parsed.raw)} />
         </div>
         <ToolResultSection result={toolResult} />
       </>
@@ -213,10 +229,10 @@ export function ToolContent({ toolName, toolInput, hookEventName, eventData, too
     return (
       <>
         {pattern && <div className="field-row"><strong>Pattern:</strong> <code>{pattern}</code></div>}
-        {typeof input.path === "string" && <div className="field-row"><strong>Path:</strong> {input.path as string}</div>}
-        {typeof input.type === "string" && <div className="field-row"><strong>Type:</strong> {input.type as string}</div>}
-        {typeof input.glob === "string" && <div className="field-row"><strong>Glob:</strong> {input.glob as string}</div>}
-        {typeof input.output_mode === "string" && <div className="field-row"><strong>Output:</strong> {input.output_mode as string}</div>}
+        {parsed.fields.path && <div className="field-row"><strong>Path:</strong> {parsed.fields.path}</div>}
+        {parsed.fields.fileType && <div className="field-row"><strong>Type:</strong> {parsed.fields.fileType}</div>}
+        {parsed.fields.glob && <div className="field-row"><strong>Glob:</strong> {parsed.fields.glob}</div>}
+        {parsed.fields.outputMode && <div className="field-row"><strong>Output:</strong> {parsed.fields.outputMode}</div>}
         <ToolResultSection result={toolResult} />
       </>
     );
@@ -226,25 +242,25 @@ export function ToolContent({ toolName, toolInput, hookEventName, eventData, too
     return (
       <>
         {pattern && <div className="field-row"><strong>Pattern:</strong> <code>{pattern}</code></div>}
-        {typeof input.path === "string" && <div className="field-row"><strong>Path:</strong> {input.path as string}</div>}
+        {parsed.fields.path && <div className="field-row"><strong>Path:</strong> {parsed.fields.path}</div>}
         <ToolResultSection result={toolResult} />
       </>
     );
   }
 
   // --- Generic fallback ---
-  const hasInput = input && Object.keys(input).length > 0 && !isNullish(input);
+  const hasInput = hasContent(parsed.raw);
   return (
     <>
       {hasInput ? (
         <div className="detail-section">
           <h3>Tool Input</h3>
-          <CodeBlock text={JSON.stringify(input, null, 2)} />
+          <CodeBlock text={formatJson(parsed.raw)} />
         </div>
       ) : eventData ? (
         <div className="detail-section">
           <h3>Event Data</h3>
-          <CodeBlock text={JSON.stringify(eventData, null, 2)} />
+          <CodeBlock text={formatJson(eventData)} />
         </div>
       ) : null}
       <ToolResultSection result={toolResult} />
@@ -252,16 +268,12 @@ export function ToolContent({ toolName, toolInput, hookEventName, eventData, too
   );
 }
 
-function ToolResultSection({ result }: { result?: Record<string, unknown> | null }) {
-  if (!result) return null;
+function ToolResultSection({ result }: { result?: unknown }) {
+  if (result === null || result === undefined) return null;
   return (
     <div className="detail-section">
       <h3>Tool Result</h3>
-      <CodeBlock text={JSON.stringify(result, null, 2)} />
+      <CodeBlock text={formatJson(result)} />
     </div>
   );
-}
-
-function isNullish(v: unknown): boolean {
-  return v === null || v === undefined || (typeof v === "object" && Object.keys(v as object).length === 0);
 }

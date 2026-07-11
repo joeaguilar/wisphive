@@ -5,6 +5,7 @@ import { ToolContent } from "./ToolContent";
 import { MarkdownText } from "./MarkdownText";
 import { CopyButton } from "./CopyButton";
 import { parseDeferredPrompt, shortProject } from "./queueUtils";
+import { parseToolInput } from "./toolInput";
 
 interface DetailViewProps {
   request: DecisionRequest;
@@ -14,6 +15,21 @@ interface DetailViewProps {
 
 // Safe string extraction from unknown values
 const str = (v: unknown): string => (typeof v === "string" ? v : String(v ?? ""));
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasContent(value: unknown): boolean {
+  if (value === null || value === undefined) return false;
+  if (typeof value !== "object") return true;
+  return Object.keys(value).length > 0;
+}
+
+function formatJson(value: unknown): string {
+  const json = JSON.stringify(value, null, 2);
+  return typeof json === "string" ? json : String(value ?? "");
+}
 
 interface DeferredDetailProps {
   decision: AuditDecision;
@@ -35,7 +51,7 @@ export function DeferredDetailView({ decision, onFocusTerminal }: DeferredDetail
   const sessionLabel = terminal_session_id
     ? `term ${terminal_session_id.slice(0, 8)}`
     : `session ${agent_id.slice(0, 8)}`;
-  const prompt = parseDeferredPrompt(decision.tool_input);
+  const prompt = parseDeferredPrompt(isRecord(decision.tool_input) ? decision.tool_input : null);
 
   return (
     <div className="deferred-detail" aria-label={`Deferred detail for ${tool_name}`}>
@@ -109,8 +125,9 @@ export function DeferredDetailView({ decision, onFocusTerminal }: DeferredDetail
 export function DetailView({ request, onApprove, onDeny }: DetailViewProps) {
   const [modal, setModal] = useState<"deny-msg" | "context" | "always" | null>(null);
   const { tool_name, tool_input: rawInput, agent_id, project, timestamp, hook_event_name, event_data } = request;
-  const tool_input = rawInput ?? {};
-  const planContent = typeof event_data?.plan_content === "string" ? event_data.plan_content : null;
+  const parsedInput = parseToolInput(tool_name, rawInput);
+  const eventData = isRecord(event_data) ? event_data : {};
+  const planContent = typeof eventData.plan_content === "string" ? eventData.plan_content : null;
 
   const buildFullText = (): string => {
     const lines: string[] = [];
@@ -122,11 +139,11 @@ export function DetailView({ request, onApprove, onDeny }: DetailViewProps) {
     if (planContent) {
       lines.push("", "--- Plan ---", planContent);
     }
-    if (rawInput && Object.keys(rawInput).length > 0) {
-      lines.push("", "--- Tool Input ---", JSON.stringify(rawInput, null, 2));
+    if (hasContent(rawInput)) {
+      lines.push("", "--- Tool Input ---", formatJson(rawInput));
     }
-    if (event_data && Object.keys(event_data).length > 0) {
-      lines.push("", "--- Event Data ---", JSON.stringify(event_data, null, 2));
+    if (hasContent(event_data)) {
+      lines.push("", "--- Event Data ---", formatJson(event_data));
     }
     return lines.join("\n");
   };
@@ -154,15 +171,15 @@ export function DetailView({ request, onApprove, onDeny }: DetailViewProps) {
       )}
 
       {/* AskUserQuestion */}
-      {Array.isArray(tool_input.questions) && (
+      {parsedInput.kind === "ask-user-question" && parsedInput.input && (
         <div className="detail-section">
-          {(tool_input.questions as Array<Record<string, unknown>>).map((q, i) => (
+          {parsedInput.input.questions.map((q, i) => (
             <div key={i}>
-              <h3>{str(q.header) || "Question"}</h3>
-              <p className="question-text">{str(q.question)}</p>
-              {Array.isArray(q.options) && (
+              <h3>{q.header || "Question"}</h3>
+              <p className="question-text">{q.question}</p>
+              {q.options.length > 0 && (
                 <div className="options-list">
-                  {(q.options as Array<Record<string, string>>).map((opt, j) => (
+                  {q.options.map((opt, j) => (
                     <button key={j} className="option-btn" onClick={() => onApprove(request.id)}>
                       <strong>{opt.label}</strong>
                       {opt.description && <span> — {opt.description}</span>}
@@ -174,9 +191,15 @@ export function DetailView({ request, onApprove, onDeny }: DetailViewProps) {
           ))}
         </div>
       )}
+      {parsedInput.kind === "ask-user-question" && !parsedInput.input && (
+        <div className="detail-section">
+          <h3>Question</h3>
+          <p className="question-text">Question details unavailable.</p>
+        </div>
+      )}
 
       {/* Shared tool/event content (unless handled above) */}
-      {!planContent && !Array.isArray(tool_input.questions) && (
+      {!planContent && parsedInput.kind !== "ask-user-question" && (
         <ToolContent
           toolName={tool_name}
           toolInput={rawInput}

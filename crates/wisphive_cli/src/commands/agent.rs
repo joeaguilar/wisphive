@@ -55,6 +55,18 @@ fn is_connect_snapshot(msg: &ServerMessage) -> bool {
     )
 }
 
+/// Match the daemon's synthetic queue event for this spawn content. This
+/// rejects hook-forged SpawnAgent events and other clients' different requests;
+/// identical concurrent submissions still need protocol correlation (itr#470).
+fn is_matching_spawn_queue_ack(sent: &SpawnAgentRequest, msg: &ServerMessage) -> bool {
+    let ServerMessage::NewDecision(decision) = msg else {
+        return false;
+    };
+    decision.agent_id == "wisphive-daemon:spawn"
+        && decision.tool_name == "SpawnAgent"
+        && serde_json::to_value(sent).is_ok_and(|value| value == decision.tool_input)
+}
+
 /// Send a message and read one response.
 fn send_and_recv(msg: &ClientMessage) -> Result<ServerMessage> {
     let (mut reader, mut writer) = connect_to_daemon()?;
@@ -83,6 +95,15 @@ fn send_and_recv(msg: &ClientMessage) -> Result<ServerMessage> {
         if is_connect_snapshot(&response) {
             continue;
         }
+        if let ClientMessage::SpawnAgent(sent) = msg
+            && matches!(response, ServerMessage::NewDecision(_))
+        {
+            if is_matching_spawn_queue_ack(sent, &response) {
+                return Ok(response);
+            }
+            // Another client's concurrent spawn queue event is not our reply.
+            continue;
+        }
         return Ok(response);
     }
 }
@@ -103,10 +124,17 @@ pub async fn start(req: SpawnAgentRequest) -> Result<()> {
             print_agent(&agent);
         }
         ServerMessage::Error { message } => {
-            eprintln!("Failed to start agent: {message}");
+            anyhow::bail!("failed to start agent: {message}");
+        }
+        ServerMessage::NewDecision(decision) if decision.tool_name == "SpawnAgent" => {
+            eprintln!(
+                "Agent spawn queued for human approval (decision {}, project {}).",
+                decision.id,
+                decision.project.display()
+            );
         }
         other => {
-            eprintln!("Unexpected response: {:?}", other);
+            anyhow::bail!("unexpected response while starting agent: {other:?}");
         }
     }
 
@@ -290,4 +318,58 @@ fn print_agent(agent: &ManagedAgent) {
         "  Started: {}",
         agent.started_at.format("%Y-%m-%d %H:%M:%S UTC")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spawn(prompt: &str) -> SpawnAgentRequest {
+        serde_json::from_value(serde_json::json!({
+            "agent_type": "claude_code",
+            "project": "/tmp/project",
+            "prompt": prompt,
+        }))
+        .unwrap()
+    }
+
+    fn queued(req: &SpawnAgentRequest) -> ServerMessage {
+        ServerMessage::NewDecision(wisphive_protocol::DecisionRequest {
+            id: uuid::Uuid::new_v4(),
+            agent_id: "wisphive-daemon:spawn".into(),
+            agent_type: req.agent_type.clone(),
+            project: req.project.clone(),
+            tool_name: "SpawnAgent".into(),
+            tool_input: serde_json::to_value(req).unwrap(),
+            timestamp: chrono::Utc::now(),
+            hook_event_name: Default::default(),
+            tool_use_id: None,
+            permission_suggestions: None,
+            event_data: None,
+            terminal_session_id: None,
+        })
+    }
+
+    #[test]
+    fn matching_spawn_queue_event_is_acknowledgment() {
+        let sent = spawn("review this repo");
+        assert!(is_matching_spawn_queue_ack(&sent, &queued(&sent)));
+    }
+
+    #[test]
+    fn concurrent_spawn_queue_event_is_not_our_acknowledgment() {
+        let sent = spawn("review this repo");
+        let other = spawn("unrelated request");
+        assert!(!is_matching_spawn_queue_ack(&sent, &queued(&other)));
+    }
+
+    #[test]
+    fn ordinary_queue_event_is_not_spawn_acknowledgment() {
+        let sent = spawn("review this repo");
+        let mut ordinary = queued(&sent);
+        if let ServerMessage::NewDecision(ref mut decision) = ordinary {
+            decision.tool_name = "Bash".into();
+        }
+        assert!(!is_matching_spawn_queue_ack(&sent, &ordinary));
+    }
 }

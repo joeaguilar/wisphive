@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { AgentInfo, DecisionRequest, HistoryEntry } from "../types/protocol";
 import { activate } from "./a11y";
+import { parseToolInput } from "./toolInput";
 
 interface AgentsProps {
   agents: AgentInfo[];
@@ -33,17 +34,16 @@ function timeAgo(ts: string): string {
   return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m ago`;
 }
 
-function inputSummary(input: Record<string, unknown> | null): string {
-  if (!input) return "";
-  if (typeof input.command === "string") {
-    const cmd = input.command as string;
+function inputSummary(toolName: string, input: unknown): string {
+  const parsed = parseToolInput(toolName, input);
+  if (parsed.kind === "bash" && parsed.input.command) {
+    const cmd = parsed.input.command;
     return cmd.length > 60 ? cmd.slice(0, 57) + "..." : cmd;
   }
-  if (typeof input.file_path === "string") return input.file_path as string;
-  if (typeof input.pattern === "string") return `/${input.pattern as string}/`;
-  if (Array.isArray(input.questions)) {
-    const q = input.questions[0] as Record<string, unknown> | undefined;
-    if (q && typeof q.question === "string") return q.question as string;
+  if (parsed.fields.filePath) return parsed.fields.filePath;
+  if (parsed.fields.pattern) return `/${parsed.fields.pattern}/`;
+  if (parsed.kind === "ask-user-question" && parsed.input) {
+    return parsed.input.questions[0]?.question ?? "";
   }
   return "";
 }
@@ -95,8 +95,8 @@ export function Agents({ agents, queue, timeline, selectedAgent, onSelectAgent, 
                     <span className="event-badge">{req.hook_event_name}</span>
                     <span className="time-ago">{timeAgo(req.timestamp)}</span>
                   </div>
-                  {inputSummary(req.tool_input) && (
-                    <div className="agent-pending-summary">{inputSummary(req.tool_input)}</div>
+                  {inputSummary(req.tool_name, req.tool_input) && (
+                    <div className="agent-pending-summary">{inputSummary(req.tool_name, req.tool_input)}</div>
                   )}
                   <div className="agent-pending-actions">
                     <button className="btn-approve btn-sm" onClick={() => onApprove(req.id)}>Approve</button>
@@ -142,10 +142,12 @@ export function Agents({ agents, queue, timeline, selectedAgent, onSelectAgent, 
                       <span className={`decision-badge ${cls}`}>{d.toUpperCase()}</span>
                       <span className="tool-name">{entry.tool_name}</span>
                       <span className="time-ago">{new Date(entry.resolved_at).toLocaleTimeString()}</span>
-                      {entry.tool_result && <span className="result-indicator">+</span>}
+                      {entry.tool_result !== null && entry.tool_result !== undefined && (
+                        <span className="result-indicator">+</span>
+                      )}
                     </div>
-                    {inputSummary(entry.tool_input) && !isExpanded && (
-                      <div className="queue-item-summary">{inputSummary(entry.tool_input)}</div>
+                    {inputSummary(entry.tool_name, entry.tool_input) && !isExpanded && (
+                      <div className="queue-item-summary">{inputSummary(entry.tool_name, entry.tool_input)}</div>
                     )}
                     {isExpanded && (
                       <div className="history-detail">
@@ -153,7 +155,7 @@ export function Agents({ agents, queue, timeline, selectedAgent, onSelectAgent, 
                           <h3>Tool Input</h3>
                           <pre className="code-block">{JSON.stringify(entry.tool_input, null, 2)}</pre>
                         </div>
-                        {entry.tool_result && (
+                        {entry.tool_result !== null && entry.tool_result !== undefined && (
                           <div className="detail-section">
                             <h3>Tool Result</h3>
                             <pre className="code-block">{JSON.stringify(entry.tool_result, null, 2)}</pre>
@@ -216,8 +218,8 @@ export function Agents({ agents, queue, timeline, selectedAgent, onSelectAgent, 
                   <div className="agent-card-current">
                     <span className="agent-card-blocked">⏳ Waiting:</span>
                     <span className="tool-name">{lastPending.tool_name}</span>
-                    {inputSummary(lastPending.tool_input) && (
-                      <span className="agent-card-input">{inputSummary(lastPending.tool_input)}</span>
+                    {inputSummary(lastPending.tool_name, lastPending.tool_input) && (
+                      <span className="agent-card-input">{inputSummary(lastPending.tool_name, lastPending.tool_input)}</span>
                     )}
                   </div>
                 )}

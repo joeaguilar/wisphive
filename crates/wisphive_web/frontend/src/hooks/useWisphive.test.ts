@@ -44,16 +44,28 @@ class MockWebSocket {
     this.onmessage?.({ data: JSON.stringify(msg) });
   }
 
+  emitRaw(data: string) {
+    this.onmessage?.({ data });
+  }
+
   sentMessages(): Array<Record<string, unknown>> {
     return this.sent.map((s) => JSON.parse(s));
   }
 }
 
 function latest(): MockWebSocket {
-  return MockWebSocket.instances[MockWebSocket.instances.length - 1];
+  const socket = MockWebSocket.instances.at(-1);
+  if (!socket) throw new Error("expected a WebSocket instance");
+  return socket;
 }
 
 const PROJECT = "/Users/j/controller";
+const REQUEST_ID = "00000000-0000-4000-8000-000000000001";
+const VALID_REQUEST_ID = "00000000-0000-4000-8000-000000000002";
+const BASH_REQUEST_ID = "00000000-0000-4000-8000-000000000003";
+const READ_REQUEST_ID = "00000000-0000-4000-8000-000000000004";
+const HISTORY_ID = "00000000-0000-4000-8000-000000000005";
+const TERMINAL_ID = "00000000-0000-4000-8000-000000000006";
 
 function status(overrides: Partial<ProjectHookStatus> = {}): ProjectHookStatus {
   return {
@@ -64,6 +76,20 @@ function status(overrides: Partial<ProjectHookStatus> = {}): ProjectHookStatus {
     missing_events: [],
     all_installed: true,
     all_enabled: true,
+    ...overrides,
+  };
+}
+
+function decisionRequest(overrides: Partial<Record<string, unknown>> = {}) {
+  return {
+    id: REQUEST_ID,
+    agent_id: "cc-1",
+    agent_type: "claude_code",
+    project: "/proj",
+    tool_name: "Read",
+    tool_input: { file_path: "/proj/README.md" },
+    timestamp: "2026-07-11T12:00:00Z",
+    hook_event_name: "PreToolUse",
     ...overrides,
   };
 }
@@ -107,6 +133,182 @@ describe("useWisphive hook-gating (itr#460)", () => {
     const { result } = await mountOpen();
     act(() => latest().emit({ type: "project_hook_status", ...status() }));
     expect(result.current.hookStatus[PROJECT]).toEqual(status());
+  });
+
+  it("rejects malformed and schema-invalid frames without breaking later valid messages", async () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { result } = await mountOpen();
+
+    const invalidFrames = [
+      { type: "new_decision", ...decisionRequest({ id: 42 }) },
+      { type: "new_decision", ...decisionRequest({ agent_type: "chatgpt" }) },
+      { type: "new_decision", ...decisionRequest({ id: "not-a-uuid" }) },
+      {
+        type: "new_decision",
+        ...decisionRequest({ timestamp: "2026-02-30T12:00:00Z" }),
+      },
+      { type: "new_decision", ...decisionRequest({ hook_event_name: "ToolMaybe" }) },
+      { type: "welcome", version: 4_294_967_296 },
+      { type: "agent_exited", agent_id: "managed-1", exit_code: 2_147_483_648 },
+      {
+        type: "term_catchup",
+        id: TERMINAL_ID,
+        cols: 65_536,
+        rows: 24,
+        next_seq: 0,
+        screen: "",
+      },
+      {
+        type: "term_chunk",
+        id: TERMINAL_ID,
+        seq: Number.MAX_SAFE_INTEGER + 1,
+        ts_us: 0,
+        direction: "output",
+        data: "",
+      },
+      {
+        type: "term_replay_chunk",
+        id: TERMINAL_ID,
+        seq: 0,
+        ts_us: Number.MIN_SAFE_INTEGER - 1,
+        direction: "output",
+        data: "",
+      },
+    ];
+
+    act(() => {
+      latest().emitRaw('{"type":"new_decision"');
+      for (const frame of invalidFrames) latest().emit(frame);
+    });
+
+    expect(result.current.queue).toEqual([]);
+    expect(warning).toHaveBeenCalledTimes(invalidFrames.length + 1);
+    expect(warning.mock.calls[0]?.[0]).toBe("Rejected invalid server message:");
+    expect(warning).toHaveBeenCalledWith(
+      "Rejected invalid server message:",
+      expect.objectContaining({ message: "message.agent_type: expected known AgentType value" }),
+    );
+    expect(warning).toHaveBeenCalledWith(
+      "Rejected invalid server message:",
+      expect.objectContaining({ message: "message.id: expected hyphenated UUID" }),
+    );
+    expect(warning).toHaveBeenCalledWith(
+      "Rejected invalid server message:",
+      expect.objectContaining({ message: "message.timestamp: expected RFC 3339 timestamp" }),
+    );
+    expect(warning).toHaveBeenCalledWith(
+      "Rejected invalid server message:",
+      expect.objectContaining({ message: "message.version: expected u32 integer" }),
+    );
+    expect(warning).toHaveBeenCalledWith(
+      "Rejected invalid server message:",
+      expect.objectContaining({ message: "message.seq: expected u64 (JavaScript-safe) integer" }),
+    );
+
+    act(() =>
+      latest().emit({
+        type: "new_decision",
+        ...decisionRequest({ id: VALID_REQUEST_ID, tool_input: { command: "pwd" } }),
+      }),
+    );
+
+    expect(result.current.queue).toEqual([
+      expect.objectContaining({ id: VALID_REQUEST_ID, tool_input: { command: "pwd" } }),
+    ]);
+
+    // Known protocol variants that this hook does not render are still
+    // validated and ignored, rather than mislabeled as wire drift.
+    act(() =>
+      latest().emit({
+        type: "agent_spawned",
+        agent_id: "managed-1",
+        agent_type: "codex",
+        pid: 1234,
+        project: "/proj",
+        model: null,
+        name: null,
+        started_at: "2026-07-11T12:00:00Z",
+        reasoning: null,
+        max_turns: null,
+        permission_mode: null,
+      }),
+    );
+    expect(warning).toHaveBeenCalledTimes(invalidFrames.length + 1);
+  });
+
+  it("preserves every serde_json::Value shape across inbound payload fields", async () => {
+    const { result } = await mountOpen();
+
+    act(() =>
+      latest().emit({
+        type: "new_decision",
+        ...decisionRequest({
+          tool_input: "scalar input",
+          event_data: [1, null, { nested: true }],
+        }),
+      }),
+    );
+    expect(result.current.queue.at(0)?.tool_input).toBe("scalar input");
+    expect(result.current.queue.at(0)?.event_data).toEqual([1, null, { nested: true }]);
+
+    const prototypeKeyInput = Object.fromEntries([
+      ["__proto__", { command: "inherited command must stay data" }],
+      ["safe", true],
+    ]);
+    act(() =>
+      latest().emit({
+        type: "new_decision",
+        ...decisionRequest({
+          id: "00000000-0000-4000-8000-000000000004",
+          tool_input: prototypeKeyInput,
+        }),
+      }),
+    );
+    const preserved = result.current.queue.at(1)?.tool_input;
+    expect(typeof preserved).toBe("object");
+    expect(preserved).not.toBeNull();
+    if (typeof preserved !== "object" || preserved === null || Array.isArray(preserved)) {
+      throw new Error("expected preserved JSON object");
+    }
+    expect(Object.hasOwn(preserved, "__proto__")).toBe(true);
+    expect(Object.hasOwn(preserved, "command")).toBe(false);
+    expect(Object.getPrototypeOf(preserved)).toBe(Object.prototype);
+
+    act(() =>
+      latest().emit({
+        type: "history_response",
+        entries: [
+          {
+            id: HISTORY_ID,
+            agent_id: "cc-1",
+            agent_type: "claude_code",
+            project: "/proj",
+            tool_name: "Read",
+            tool_input: null,
+            decision: "approve",
+            requested_at: "2026-07-11T07:00:00-05:00",
+            resolved_at: "2026-07-11T12:00:01.123456Z",
+            tool_result: [false, 7, { ok: true }],
+          },
+        ],
+      }),
+    );
+    expect(result.current.history.at(0)?.tool_input).toBeNull();
+    expect(result.current.history.at(0)?.tool_result).toEqual([false, 7, { ok: true }]);
+
+    act(() =>
+      latest().emit({
+        type: "audit_decision",
+        kind: "deferred",
+        decided_by: "always_ask:intrinsic",
+        project: "/proj",
+        agent_id: "cc-1",
+        tool_name: "AskUserQuestion",
+        ts: "2026-07-11T12:00:02Z",
+        tool_input: true,
+      }),
+    );
+    expect(result.current.auditDecisions.at(0)?.tool_input).toBe(true);
   });
 
   it("install_hooks_result success updates the badge status and clears any error", async () => {
@@ -165,7 +367,7 @@ describe("useWisphive hook-gating (itr#460)", () => {
 
     // Only the answered row is dropped; the other still waits.
     expect(result.current.auditDecisions).toHaveLength(1);
-    expect(result.current.auditDecisions[0].tool_use_id).toBe("toolu_b");
+    expect(result.current.auditDecisions.at(0)?.tool_use_id).toBe("toolu_b");
   });
 
   it("deferred_resolved for an unknown tool_use_id leaves all rows intact (itr#461)", async () => {
@@ -296,26 +498,12 @@ describe("useWisphive approve-stash tool-name cross-check (itr#275)", () => {
     return view;
   }
 
-  function decisionRequest(overrides: Partial<Record<string, unknown>> = {}) {
-    return {
-      id: "req-1",
-      agent_id: "cc-1",
-      agent_type: "claude_code",
-      project: "/proj",
-      tool_name: "Read",
-      tool_input: { file_path: "/proj/README.md" },
-      timestamp: "2026-07-11T12:00:00Z",
-      hook_event_name: "PreToolUse",
-      ...overrides,
-    };
-  }
-
   it("replays a matching sudo-class approve after reauth (regression guard alongside the InstallHooks path)", async () => {
     const { result } = await mountOpen();
-    const req = decisionRequest({ id: "req-bash-1", tool_name: "Bash" });
+    const req = decisionRequest({ id: BASH_REQUEST_ID, tool_name: "Bash" });
     act(() => latest().emit({ type: "queue_snapshot", items: [req] }));
 
-    act(() => result.current.approve("req-bash-1"));
+    act(() => result.current.approve(BASH_REQUEST_ID));
     expect(latest().sentMessages().filter((m) => m.type === "approve")).toHaveLength(1);
 
     // Daemon bounces this Bash approve — sudo-class, so a genuine gate.
@@ -323,13 +511,13 @@ describe("useWisphive approve-stash tool-name cross-check (itr#275)", () => {
       latest().emit({
         type: "web_reauth_required",
         device_id: "dev-1",
-        request_id: "req-bash-1",
+        request_id: BASH_REQUEST_ID,
         tool_name: "Bash",
         at: "2026-07-11T12:00:01Z",
       }),
     );
     expect(result.current.pendingReauth).toEqual({
-      request_id: "req-bash-1",
+      request_id: BASH_REQUEST_ID,
       tool_name: "Bash",
     });
 
@@ -339,18 +527,18 @@ describe("useWisphive approve-stash tool-name cross-check (itr#275)", () => {
     expect(result.current.pendingReauth).toBeNull();
     const replays = latest()
       .sentMessages()
-      .filter((m) => m.type === "approve" && m.id === "req-bash-1");
+      .filter((m) => m.type === "approve" && m.id === BASH_REQUEST_ID);
     expect(replays).toHaveLength(2);
   });
 
   it("does not replay a Read approve when the WebReauthRequired references a mismatched tool", async () => {
     const { result } = await mountOpen();
-    const req = decisionRequest({ id: "req-read-1", tool_name: "Read" });
+    const req = decisionRequest({ id: READ_REQUEST_ID, tool_name: "Read" });
     act(() => latest().emit({ type: "queue_snapshot", items: [req] }));
 
     // Submit the Read approve — useWisphive stashes {toolName: "Read", opts}
     // keyed by request_id, same bookkeeping as any other approve.
-    act(() => result.current.approve("req-read-1"));
+    act(() => result.current.approve(READ_REQUEST_ID));
     expect(latest().sentMessages().filter((m) => m.type === "approve")).toHaveLength(1);
 
     // Synthesize a stale/out-of-band WebReauthRequired: it reuses this
@@ -365,13 +553,13 @@ describe("useWisphive approve-stash tool-name cross-check (itr#275)", () => {
       latest().emit({
         type: "web_reauth_required",
         device_id: "dev-1",
-        request_id: "req-read-1",
+        request_id: READ_REQUEST_ID,
         tool_name: "Bash",
         at: "2026-07-11T12:00:01Z",
       }),
     );
     expect(result.current.pendingReauth).toEqual({
-      request_id: "req-read-1",
+      request_id: READ_REQUEST_ID,
       tool_name: "Bash",
     });
 

@@ -138,34 +138,74 @@ impl StateDb {
         Ok(())
     }
 
+    /// Confirm that a pending id belongs to the daemon-created managed-spawn
+    /// namespace. Used after INSERT OR IGNORE so a UUID collision can never
+    /// turn an unrelated hook row into an executable spawn approval.
+    pub async fn pending_is_managed_spawn(&self, id: uuid::Uuid) -> Result<bool> {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM pending_decisions \
+             WHERE id = ? AND agent_id = 'wisphive-daemon:spawn' AND tool_name = 'SpawnAgent'",
+        )
+        .bind(id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count == 1)
+    }
+
+    /// Delete only a daemon-provenance SpawnAgent pending row. Returns false
+    /// for a missing/colliding hook row so the caller can fail closed.
+    pub async fn delete_managed_spawn_pending(&self, id: uuid::Uuid) -> Result<bool> {
+        let deleted = sqlx::query(
+            "DELETE FROM pending_decisions \
+             WHERE id = ? AND agent_id = 'wisphive-daemon:spawn' AND tool_name = 'SpawnAgent'",
+        )
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(deleted.rows_affected() == 1)
+    }
+
     /// Drain pending rows left over from a prior daemon process (itr#299).
     ///
     /// `pending_decisions` is transient in-flight bookkeeping, NOT a recovery
-    /// queue. Each row's hook was blocked on a `oneshot` that died when the
-    /// daemon did, and that hook already resolved ITSELF the instant the socket
-    /// closed — an EOF-mid-wait is `DaemonUnreachable`, which fails **open**
-    /// (approve) per ADR-0001 (see `wisphive_hook`). The daemon cannot recreate
-    /// the decision or change what already happened; on restart it can only
-    /// record the truthful outcome. So every orphan is logged as `Approve` /
-    /// `daemon_restart:failopen` and removed.
+    /// queue. Hook rows were blocked on a `oneshot` that died when the daemon
+    /// did, and those hooks already resolved themselves fail-open per ADR-0001.
+    /// Synthetic `SpawnAgent` rows are different: no child is launched until
+    /// their in-daemon approval receiver fires, so a daemon crash means the
+    /// action definitely did **not** execute. Those rows are drained as Deny /
+    /// `daemon_restart:failclosed_spawn`; hook rows retain the truthful Approve /
+    /// `daemon_restart:failopen` outcome.
     ///
-    /// Recording a `Deny` here (as the hook-*disconnect* path does) would be an
-    /// audit lie: there the tool did NOT run, but here the hook fail-open ran it.
+    /// Recording a `Deny` for a hook row would be an audit lie because that hook
+    /// already ran its tool; the SpawnAgent special case is denied precisely
+    /// because no child ran.
     /// Returns the number of rows drained.
     pub async fn drain_orphaned_pending(&self) -> Result<usize> {
-        let ids: Vec<(String,)> = sqlx::query_as("SELECT id FROM pending_decisions")
-            .fetch_all(&self.pool)
-            .await?;
+        let ids: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT id, agent_id, tool_name FROM pending_decisions")
+                .fetch_all(&self.pool)
+                .await?;
         let mut drained = 0usize;
-        for (id,) in ids {
+        let mut failclosed_spawns = 0usize;
+        for (id, agent_id, tool_name) in ids {
             match id.parse::<uuid::Uuid>() {
                 Ok(uuid) => {
-                    self.resolve_pending_by(
-                        uuid,
-                        wisphive_protocol::Decision::Approve,
-                        "daemon_restart:failopen",
-                    )
-                    .await?;
+                    if agent_id == "wisphive-daemon:spawn" && tool_name == "SpawnAgent" {
+                        self.resolve_pending_by(
+                            uuid,
+                            wisphive_protocol::Decision::Deny,
+                            "daemon_restart:failclosed_spawn",
+                        )
+                        .await?;
+                        failclosed_spawns += 1;
+                    } else {
+                        self.resolve_pending_by(
+                            uuid,
+                            wisphive_protocol::Decision::Approve,
+                            "daemon_restart:failopen",
+                        )
+                        .await?;
+                    }
                     drained += 1;
                 }
                 Err(_) => {
@@ -179,7 +219,8 @@ impl StateDb {
         if drained > 0 {
             tracing::warn!(
                 drained,
-                "drained orphaned pending decisions as daemon_restart:failopen (itr#299)"
+                failclosed_spawns,
+                "drained orphaned pending decisions after daemon restart (itr#299, itr#94)"
             );
         }
         Ok(drained)
@@ -285,6 +326,228 @@ impl StateDb {
             .await?;
 
         Ok(())
+    }
+
+    /// Persist an approved, fully reviewed SpawnAgent request atomically before
+    /// its queue receiver is released. The reviewed request may differ from the
+    /// originally queued one, so agent type, project, and redacted tool input
+    /// are updated together with the audit move. Returns false if no pending row
+    /// existed or the audit insert conflicted; callers must fail closed then.
+    pub async fn resolve_spawn_pending_by(
+        &self,
+        id: uuid::Uuid,
+        reviewed: &wisphive_protocol::SpawnAgentRequest,
+        decided_by: &str,
+    ) -> Result<bool> {
+        let reviewed_input =
+            wisphive_protocol::redact::redact_value(&serde_json::to_value(reviewed)?);
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query(
+            "UPDATE pending_decisions SET agent_type = ?, project = ?, tool_input = ? \
+             WHERE id = ? AND agent_id = 'wisphive-daemon:spawn' AND tool_name = 'SpawnAgent'",
+        )
+        .bind(serde_json::to_string(&reviewed.agent_type)?)
+        .bind(reviewed.project.to_string_lossy().to_string())
+        .bind(serde_json::to_string(&reviewed_input)?)
+        .bind(id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(false);
+        }
+
+        let row = sqlx::query_as::<_, PendingRowWithTerm>(
+            "SELECT agent_id, agent_type, project, tool_name, tool_input, timestamp, tool_use_id, hook_event_name, terminal_session_id \
+             FROM pending_decisions \
+             WHERE id = ? AND agent_id = 'wisphive-daemon:spawn' AND tool_name = 'SpawnAgent'",
+        )
+        .bind(id.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        let (
+            agent_id,
+            agent_type,
+            project,
+            tool_name,
+            tool_input,
+            requested_at,
+            tool_use_id,
+            hook_event_name,
+            terminal_session_id,
+        ) = row;
+
+        let inserted = sqlx::query(
+            "INSERT OR IGNORE INTO decision_log (id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_use_id, hook_event_name, terminal_session_id, decided_by) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(agent_id)
+        .bind(agent_type)
+        .bind(project)
+        .bind(tool_name)
+        .bind(tool_input)
+        .bind(serde_json::to_string(
+            &wisphive_protocol::Decision::Approve,
+        )?)
+        .bind(requested_at)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(tool_use_id)
+        .bind(hook_event_name)
+        .bind(terminal_session_id)
+        .bind(decided_by)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("DELETE FROM pending_decisions WHERE id = ?")
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        if inserted.rows_affected() == 0 {
+            tracing::warn!(
+                %id,
+                decided_by,
+                "SpawnAgent approval NOT recorded due to decision-log conflict; refusing launch"
+            );
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Reconcile a managed spawn to a durable fail-closed outcome.
+    ///
+    /// A timeout can cancel the future that was moving a pending row into the
+    /// audit log without proving whether SQLite committed it. This transaction
+    /// deliberately waits behind that write, then overwrites a committed
+    /// approval or moves the still-pending row as a Deny. The queue receiver is
+    /// released with Deny before callers await this reconciliation, so no
+    /// process can launch while the database settles.
+    pub async fn force_failclosed_spawn_resolution(
+        &self,
+        id: uuid::Uuid,
+        decided_by: &str,
+        fallback: &wisphive_protocol::DecisionRequest,
+    ) -> Result<bool> {
+        if fallback.id != id
+            || fallback.agent_id != "wisphive-daemon:spawn"
+            || fallback.tool_name != "SpawnAgent"
+        {
+            anyhow::bail!("fail-closed SpawnAgent fallback lacks daemon provenance");
+        }
+        let id = id.to_string();
+        let denied = serde_json::to_string(&wisphive_protocol::Decision::Deny)?;
+        let resolved_at = chrono::Utc::now().to_rfc3339();
+        let fallback_input = wisphive_protocol::redact::redact_value(&fallback.tool_input);
+        let mut tx = self.pool.begin().await?;
+
+        // If an ambiguously timed-out approval actually committed, make its
+        // durable outcome fail closed before considering the reconciliation
+        // complete.
+        sqlx::query(
+            "UPDATE decision_log SET decision = ?, resolved_at = ?, decided_by = ? \
+             WHERE id = ? AND agent_id = 'wisphive-daemon:spawn' AND tool_name = 'SpawnAgent'",
+        )
+        .bind(&denied)
+        .bind(&resolved_at)
+        .bind(decided_by)
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Otherwise move the original synthetic row into the audit log. The
+        // internal agent id is reserved at the socket boundary, so this pair
+        // is daemon provenance rather than a hook-supplied label.
+        sqlx::query(
+            "INSERT OR IGNORE INTO decision_log \
+             (id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_use_id, hook_event_name, terminal_session_id, decided_by) \
+             SELECT id, agent_id, agent_type, project, tool_name, tool_input, ?, timestamp, ?, tool_use_id, hook_event_name, terminal_session_id, ? \
+             FROM pending_decisions \
+             WHERE id = ? AND agent_id = 'wisphive-daemon:spawn' AND tool_name = 'SpawnAgent'",
+        )
+        .bind(&denied)
+        .bind(&resolved_at)
+        .bind(decided_by)
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+
+        // A timed-out Ask cleanup may have committed its DELETE just before
+        // cancellation, leaving neither pending nor audit state. Reconstruct a
+        // truthful non-execution Deny from the daemon-owned in-memory request.
+        sqlx::query(
+            "INSERT OR IGNORE INTO decision_log \
+             (id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_use_id, hook_event_name, terminal_session_id, decided_by) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(&fallback.agent_id)
+        .bind(serde_json::to_string(&fallback.agent_type)?)
+        .bind(fallback.project.to_string_lossy().to_string())
+        .bind(&fallback.tool_name)
+        .bind(serde_json::to_string(&fallback_input)?)
+        .bind(&denied)
+        .bind(fallback.timestamp.to_rfc3339())
+        .bind(&resolved_at)
+        .bind(&fallback.tool_use_id)
+        .bind(fallback.hook_event_name.to_string())
+        .bind(fallback.terminal_session_id.map(|id| id.to_string()))
+        .bind(decided_by)
+        .execute(&mut *tx)
+        .await?;
+
+        // Repeat the update so INSERT conflicts cannot preserve an approval.
+        let reconciled = sqlx::query(
+            "UPDATE decision_log SET decision = ?, resolved_at = ?, decided_by = ? \
+             WHERE id = ? AND agent_id = 'wisphive-daemon:spawn' AND tool_name = 'SpawnAgent'",
+        )
+        .bind(&denied)
+        .bind(&resolved_at)
+        .bind(decided_by)
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+
+        sqlx::query(
+            "DELETE FROM pending_decisions \
+             WHERE id = ? AND agent_id = 'wisphive-daemon:spawn' AND tool_name = 'SpawnAgent'",
+        )
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(reconciled)
+    }
+
+    /// Attach the execution failure that happened after a reviewed approval.
+    /// The approval remains truthful, while `decided_by` and `tool_result`
+    /// make it durable that the approved action did not start successfully.
+    pub async fn record_spawn_action_failure(&self, id: uuid::Uuid, error: &str) -> Result<bool> {
+        let result = wisphive_protocol::redact::redact_value(&serde_json::json!({
+            "spawn_status": "action_failed",
+            "error": error,
+        }));
+        let updated = sqlx::query(
+            "UPDATE decision_log \
+             SET tool_result = ?, \
+                 decided_by = CASE \
+                   WHEN decided_by LIKE '%:spawn_action_failed' THEN decided_by \
+                   ELSE COALESCE(decided_by, 'unknown') || ':spawn_action_failed' \
+                 END \
+             WHERE id = ? AND agent_id = 'wisphive-daemon:spawn' \
+               AND tool_name = 'SpawnAgent' AND decision = ?",
+        )
+        .bind(serde_json::to_string(&result)?)
+        .bind(id.to_string())
+        .bind(serde_json::to_string(
+            &wisphive_protocol::Decision::Approve,
+        )?)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() > 0)
     }
 
     /// Query the decision history log.

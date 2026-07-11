@@ -8,11 +8,11 @@ import type {
   HistoryEntry,
   ProjectHookStatus,
   ProjectSummary,
-  ServerMessage,
   SessionSummary,
   SpawnAgentRequest,
   TerminalSessionMeta,
 } from "../types/protocol";
+import { parseServerMessage } from "../types/protocol";
 import { apiFetch, clearWebToken, getWebToken, subscribeAuthChange } from "../api";
 
 export interface WisphiveState {
@@ -156,7 +156,7 @@ export function useWisphive() {
 
   const handleMessage = useCallback((data: string) => {
     try {
-      const msg: ServerMessage = JSON.parse(data);
+      const msg = parseServerMessage(data);
 
       setState((prev) => {
         switch (msg.type) {
@@ -167,12 +167,12 @@ export function useWisphive() {
             return { ...prev, queue: msg.items };
 
           case "new_decision": {
-            const { type: _, ...req } = msg;
-            const newQueue = [...prev.queue, req as DecisionRequest];
+            const req = msg.request;
+            const newQueue = [...prev.queue, req];
             document.title = newQueue.length > 0 ? `(${newQueue.length}) Wisphive` : "Wisphive";
             if (document.hidden && Notification.permission === "granted") {
-              new Notification(`Wisphive: ${(req as DecisionRequest).tool_name}`, {
-                body: `${(req as DecisionRequest).agent_id.slice(0, 20)} needs a decision`,
+              new Notification(`Wisphive: ${req.tool_name}`, {
+                body: `${req.agent_id.slice(0, 20)} needs a decision`,
                 tag: "wisphive-decision",
               });
             }
@@ -194,10 +194,9 @@ export function useWisphive() {
             return { ...prev, auditDecisions: mergeAuditDecisions([], msg.items) };
 
           case "audit_decision": {
-            const { type: _, ...audit } = msg;
             return {
               ...prev,
-              auditDecisions: mergeAuditDecisions([audit as AuditDecision], prev.auditDecisions),
+              auditDecisions: mergeAuditDecisions([msg.audit], prev.auditDecisions),
             };
           }
 
@@ -226,10 +225,10 @@ export function useWisphive() {
           }
 
           case "agent_connected": {
-            const { type: _, ...info } = msg;
+            const info = msg.agent;
             return {
               ...prev,
-              agents: [...prev.agents, info as AgentInfo],
+              agents: [...prev.agents, info],
               // Reconnected → no longer gone.
               endedAgentIds: prev.endedAgentIds.filter((id) => id !== info.agent_id),
             };
@@ -262,10 +261,10 @@ export function useWisphive() {
             return { ...prev, projects: msg.projects };
 
           case "project_hook_status": {
-            const { type: _, ...status } = msg;
+            const status = msg.status;
             return {
               ...prev,
-              hookStatus: { ...prev.hookStatus, [status.project]: status as ProjectHookStatus },
+              hookStatus: { ...prev.hookStatus, [status.project]: status },
             };
           }
 
@@ -301,10 +300,10 @@ export function useWisphive() {
             return prev;
 
           case "term_created": {
-            const { type: _, ...meta } = msg;
+            const meta = msg.session;
             return {
               ...prev,
-              terminals: [meta as TerminalSessionMeta, ...prev.terminals.filter((t) => t.id !== (meta as TerminalSessionMeta).id)],
+              terminals: [meta, ...prev.terminals.filter((t) => t.id !== meta.id)],
             };
           }
 
@@ -384,8 +383,8 @@ export function useWisphive() {
             return prev;
         }
       });
-    } catch (e) {
-      console.warn("Failed to parse message:", e);
+    } catch (error) {
+      console.warn("Rejected invalid server message:", error);
     }
   }, []);
 
@@ -766,7 +765,7 @@ function decodeBase64(s: string): Uint8Array {
 
 function encodeBase64(bytes: Uint8Array): string {
   let binary = "";
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary);
 }
 

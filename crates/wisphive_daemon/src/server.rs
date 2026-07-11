@@ -1,15 +1,16 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, broadcast};
 use tracing::{debug, error, info, warn};
 use wisphive_protocol::{
-    ClientMessage, ClientType, Decision, PROTOCOL_VERSION, RichDecision, ServerMessage,
-    TerminalSessionMeta, encode,
+    ClientMessage, ClientType, Decision, DecisionRequest, PROTOCOL_VERSION, RichDecision,
+    ServerMessage, SpawnAgentRequest, TerminalSessionMeta, encode,
 };
 
 use crate::config::DaemonConfig;
@@ -27,7 +28,27 @@ const CONN_CHANNEL_CAPACITY: usize = 1024;
 /// the hook's 8 MiB stdin cap — comfortably above the largest legitimate
 /// message (queue snapshots, terminal catch-up) yet far below a memory threat.
 const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
-use crate::process_registry::ProcessRegistry;
+/// Managed spawns are expensive, security-sensitive pending actions. Bound
+/// both their lifetime and queue cardinality independently of hook decisions.
+const SPAWN_APPROVAL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const SPAWN_PERSIST_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_PENDING_SPAWNS: usize = 8;
+const SPAWN_DECISION_AGENT_ID: &str = "wisphive-daemon:spawn";
+const SPAWN_DECISION_TOOL: &str = "SpawnAgent";
+
+fn is_reserved_internal_agent_id(agent_id: &str) -> bool {
+    agent_id.starts_with("wisphive-daemon:")
+}
+
+fn hook_message_agent_id(msg: &ClientMessage) -> Option<&str> {
+    match msg {
+        ClientMessage::DecisionRequest(req) => Some(&req.agent_id),
+        ClientMessage::ToolResult(result) => Some(&result.agent_id),
+        ClientMessage::AgentRegister { agent_id, .. } => Some(agent_id),
+        _ => None,
+    }
+}
+use crate::process_registry::{ProcessRegistry, validate_spawn_request};
 use crate::queue::DecisionQueue;
 use crate::registry::AgentRegistry;
 use crate::replay_gate::ReplayRateLimiter;
@@ -75,12 +96,11 @@ impl Server {
         let db_path = config.db_path.to_string_lossy().to_string();
         let state_db = Arc::new(StateDb::open(&db_path).await?);
 
-        // Crash recovery (itr#299): any pending_decisions row present now is an
-        // in-flight decision from a prior process. Its hook already fail-open-
-        // approved when this socket last died (DaemonUnreachable, ADR-0001), so
-        // there is nothing to re-queue — record the truthful outcome and clear
-        // the table before accepting new work. Runs in `new()`, before `run()`
-        // binds the socket, so no live hook can race the drain.
+        // Crash recovery (itr#299/#94): hook rows already fail-open-approved
+        // when the old socket died; synthetic SpawnAgent rows never launched
+        // and therefore fail closed. Record each truthful outcome and clear the
+        // transient table before accepting new work. This runs before `run()`
+        // binds the socket, so no live request can race the drain.
         match state_db.drain_orphaned_pending().await {
             Ok(0) => {}
             Ok(n) => info!(
@@ -485,11 +505,48 @@ async fn handle_hook(
 
     let msg: ClientMessage = wisphive_protocol::decode(&line)?;
 
+    // All identities arriving on the hook socket are untrusted. Apply the
+    // reserved namespace guard before any registry or database operation,
+    // including fuzzy ToolResult attachment.
+    if let Some(agent_id) = hook_message_agent_id(&msg)
+        && is_reserved_internal_agent_id(agent_id)
+    {
+        let decision_id = match &msg {
+            ClientMessage::DecisionRequest(req) => Some(req.id),
+            _ => None,
+        };
+        warn!(
+            security_event = "reserved_agent_identity_rejected",
+            ?decision_id,
+            %agent_id,
+            "hook payload attempted to use a daemon-reserved identity"
+        );
+        if let Some(id) = decision_id {
+            write_msg(
+                &mut writer,
+                &ServerMessage::DecisionResponse {
+                    id,
+                    decision: Decision::Deny,
+                    message: Some(
+                        "Wisphive rejected this request: agent ids beginning with 'wisphive-daemon:' are reserved"
+                            .into(),
+                    ),
+                    updated_input: None,
+                    additional_context: None,
+                    selected_permission: None,
+                },
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+
     match msg {
         ClientMessage::DecisionRequest(req) => {
             let id = req.id;
             let agent_id = req.agent_id.clone();
             let req_tool_name = req.tool_name.clone();
+
             // The daemon's configured state root, not a fresh $HOME lookup —
             // they diverge when the daemon runs with a non-default home (itr#360).
             let config_home = ctx.home_dir.clone();
@@ -1061,7 +1118,7 @@ async fn dispatch_command(
         | ClientMessage::ListAgents
         | ClientMessage::StopAgent { .. }
         | ClientMessage::ReimportEvents => {
-            handle_agent_command(writer, ctx, msg).await?;
+            handle_agent_command(writer, ctx, msg, conn_tx).await?;
         }
         ClientMessage::QueryHistory { .. }
         | ClientMessage::SearchHistory(_)
@@ -1108,6 +1165,10 @@ async fn handle_decision_command(
             additional_context,
         } => {
             info!(?device_id, %id, "approve");
+            let (pending, is_spawn) = {
+                let queue = ctx.queue.lock().await;
+                (queue.peek(id).cloned(), queue.is_managed_spawn(id))
+            };
 
             // Sudo-mode gate: if the approve is coming from
             // an authenticated web device, the target tool is
@@ -1116,25 +1177,20 @@ async fn handle_decision_command(
             // WebReauthRequired back on this connection so
             // the browser can open the sudo modal. TUI
             // origin approvals (device_id = None) bypass.
-            if let Some(ref dev) = device_id {
-                let tool = {
-                    let q = ctx.queue.lock().await;
-                    q.peek(id).map(|r| r.tool_name.clone())
+            if let Some(ref dev) = device_id
+                && let Some(tool_name) = pending.as_ref().map(|req| req.tool_name.clone())
+                && crate::sudo_gate::is_sudo_tool(&tool_name)
+                && !ctx.reauth.is_fresh(dev).await
+            {
+                let reauth_msg = ServerMessage::WebReauthRequired {
+                    device_id: dev.0.clone(),
+                    request_id: id.to_string(),
+                    tool_name: tool_name.clone(),
+                    at: chrono::Utc::now(),
                 };
-                if let Some(tool_name) = tool
-                    && crate::sudo_gate::is_sudo_tool(&tool_name)
-                    && !ctx.reauth.is_fresh(dev).await
-                {
-                    let reauth_msg = ServerMessage::WebReauthRequired {
-                        device_id: dev.0.clone(),
-                        request_id: id.to_string(),
-                        tool_name: tool_name.clone(),
-                        at: chrono::Utc::now(),
-                    };
-                    write_msg(writer, &reauth_msg).await?;
-                    debug!(%id, tool = %tool_name, device_id = %dev.0, "sudo gate: reauth required");
-                    return Ok(());
-                }
+                write_msg(writer, &reauth_msg).await?;
+                debug!(%id, tool = %tool_name, device_id = %dev.0, "sudo gate: reauth required");
+                return Ok(());
             }
 
             let rich = RichDecision {
@@ -1146,6 +1202,26 @@ async fn handle_decision_command(
                 selected_permission: None,
                 resolver: Some(resolver_label(&device_id)),
             };
+            if is_spawn {
+                if let Err(e) = finalize_spawn_decision(
+                    &ctx.state_db,
+                    &ctx.queue,
+                    id,
+                    rich,
+                    &resolver_label(&device_id),
+                )
+                .await
+                {
+                    write_msg(
+                        writer,
+                        &ServerMessage::Error {
+                            message: format!("SpawnAgent approval rejected: {e}"),
+                        },
+                    )
+                    .await?;
+                }
+                return Ok(());
+            }
             let resolved = {
                 let mut q = ctx.queue.lock().await;
                 q.resolve(id, rich)
@@ -1172,6 +1248,30 @@ async fn handle_decision_command(
                 resolver: Some(resolver_label(&device_id)),
                 ..RichDecision::deny()
             };
+            let is_spawn = {
+                let queue = ctx.queue.lock().await;
+                queue.is_managed_spawn(id)
+            };
+            if is_spawn {
+                if let Err(e) = finalize_spawn_decision(
+                    &ctx.state_db,
+                    &ctx.queue,
+                    id,
+                    rich,
+                    &resolver_label(&device_id),
+                )
+                .await
+                {
+                    write_msg(
+                        writer,
+                        &ServerMessage::Error {
+                            message: format!("SpawnAgent denial persistence failed: {e}"),
+                        },
+                    )
+                    .await?;
+                }
+                return Ok(());
+            }
             let resolved = {
                 let mut q = ctx.queue.lock().await;
                 q.resolve(id, rich)
@@ -1188,6 +1288,34 @@ async fn handle_decision_command(
         }
         ClientMessage::Ask { id } => {
             info!(?device_id, %id, "ask");
+            let is_spawn = {
+                let queue = ctx.queue.lock().await;
+                queue.is_managed_spawn(id)
+            };
+            if is_spawn {
+                let rich = RichDecision {
+                    resolver: Some(resolver_label(&device_id)),
+                    ..RichDecision::from(Decision::Ask)
+                };
+                if let Err(e) = finalize_spawn_decision(
+                    &ctx.state_db,
+                    &ctx.queue,
+                    id,
+                    rich,
+                    &resolver_label(&device_id),
+                )
+                .await
+                {
+                    write_msg(
+                        writer,
+                        &ServerMessage::Error {
+                            message: format!("SpawnAgent deferral cleanup failed: {e}"),
+                        },
+                    )
+                    .await?;
+                }
+                return Ok(());
+            }
             let mut q = ctx.queue.lock().await;
             q.resolve(id, RichDecision::from(Decision::Ask));
             // Ask/defer decisions are not persisted to the audit log
@@ -1234,16 +1362,20 @@ async fn handle_decision_command(
 
                 let allowed_ids: Vec<uuid::Uuid> = {
                     let mut q = ctx.queue.lock().await;
-                    allowed
+                    let ordinary_ids: Vec<_> = allowed
                         .iter()
-                        .filter(|(id, _)| {
+                        .filter(|(id, _)| !q.is_managed_spawn(*id))
+                        .map(|(id, _)| *id)
+                        .collect();
+                    ordinary_ids
+                        .into_iter()
+                        .filter(|id| {
                             let rich = RichDecision {
                                 resolver: Some(resolver_label(&device_id)),
                                 ..RichDecision::from(Decision::Approve)
                             };
                             q.resolve(*id, rich)
                         })
-                        .map(|(id, _)| *id)
                         .collect()
                 };
                 info!(
@@ -1289,19 +1421,18 @@ async fn handle_decision_command(
             }
         }
         ClientMessage::DenyAll { ref filter } => {
-            let ids = {
-                let mut q = ctx.queue.lock().await;
-                q.resolve_all(filter, Decision::Deny, Some(&resolver_label(&device_id)))
-            };
-            info!(?device_id, count = ids.len(), "deny_all");
-            for id in ids {
-                eager_persist(
-                    &ctx.state_db,
-                    id,
-                    Decision::Deny,
-                    &resolver_label(&device_id),
-                )
-                .await;
+            let resolver = resolver_label(&device_id);
+            match resolve_bulk_deny(&ctx.state_db, &ctx.queue, filter, &resolver).await {
+                Ok(ids) => info!(?device_id, count = ids.len(), "deny_all"),
+                Err(error) => {
+                    write_msg(
+                        writer,
+                        &ServerMessage::Error {
+                            message: format!("one or more bulk denials failed: {error}"),
+                        },
+                    )
+                    .await?
+                }
             }
         }
         ClientMessage::MarkDeviceFresh => {
@@ -1470,29 +1601,567 @@ fn project_hook_status(
     }
 }
 
+/// Convert a validated managed-spawn request into the same queue item used for
+/// hook decisions. The full request is visible in `tool_input`, so reviewers
+/// see every flag before deciding and the redacted audit sink records it.
+fn spawn_approval_request(req: &SpawnAgentRequest) -> Result<DecisionRequest> {
+    Ok(DecisionRequest {
+        id: uuid::Uuid::new_v4(),
+        agent_id: SPAWN_DECISION_AGENT_ID.into(),
+        agent_type: req.agent_type.clone(),
+        project: req.project.clone(),
+        tool_name: SPAWN_DECISION_TOOL.into(),
+        tool_input: serde_json::to_value(req)?,
+        timestamp: chrono::Utc::now(),
+        hook_event_name: Default::default(),
+        tool_use_id: None,
+        permission_suggestions: None,
+        event_data: None,
+        terminal_session_id: None,
+    })
+}
+
+fn decode_complete_spawn_input(input: serde_json::Value) -> Result<SpawnAgentRequest> {
+    const REQUIRED: &[&str] = &["agent_type", "project", "prompt"];
+    const ALLOWED: &[&str] = &[
+        "agent_type",
+        "project",
+        "prompt",
+        "model",
+        "name",
+        "reasoning",
+        "max_turns",
+        "permission_mode",
+        "system_prompt",
+        "append_system_prompt",
+        "allowed_tools",
+        "disallowed_tools",
+        "continue_session",
+        "resume",
+        "output_format",
+        "verbose",
+    ];
+    let object = input
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("SpawnAgent input must be a JSON object"))?;
+    for field in REQUIRED {
+        if !object.contains_key(*field) {
+            anyhow::bail!("SpawnAgent complete request is missing required field '{field}'");
+        }
+    }
+    if let Some(field) = object
+        .keys()
+        .find(|field| !ALLOWED.contains(&field.as_str()))
+    {
+        anyhow::bail!("SpawnAgent complete request contains unknown field '{field}'");
+    }
+    serde_json::from_value(input)
+        .map_err(|e| anyhow::anyhow!("SpawnAgent complete request is invalid: {e}"))
+}
+
+fn ensure_spawn_mode_active(home_dir: &std::path::Path) -> Result<()> {
+    let mode = std::fs::read_to_string(home_dir.join("mode")).unwrap_or_else(|_| "off".to_string());
+    if mode.trim() != "active" {
+        anyhow::bail!(
+            "Wisphive hooks are not active (mode: {}); refusing managed spawn",
+            mode.trim()
+        );
+    }
+    Ok(())
+}
+
+async fn enqueue_spawn_for_approval(
+    state_db: &StateDb,
+    queue: &Mutex<DecisionQueue>,
+    req: &SpawnAgentRequest,
+) -> Result<(
+    DecisionRequest,
+    tokio::sync::oneshot::Receiver<RichDecision>,
+)> {
+    let decision = spawn_approval_request(req)?;
+    state_db.persist_pending(&decision).await?;
+    if !state_db.pending_is_managed_spawn(decision.id).await? {
+        anyhow::bail!("SpawnAgent pending id collided with an existing non-spawn row");
+    }
+
+    let rx = {
+        let mut queue = queue.lock().await;
+        if queue.managed_spawn_count() >= MAX_PENDING_SPAWNS {
+            None
+        } else {
+            queue.enqueue_managed_spawn(decision.clone())
+        }
+    };
+    let Some(rx) = rx else {
+        match state_db.delete_managed_spawn_pending(decision.id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(id = %decision.id, "rejected spawn enqueue had no managed pending row")
+            }
+            Err(e) => warn!(id = %decision.id, "failed to clean up rejected spawn enqueue: {e}"),
+        }
+        anyhow::bail!("pending SpawnAgent limit ({MAX_PENDING_SPAWNS}) reached");
+    };
+    Ok((decision, rx))
+}
+
+fn failclosed_spawn_decision(message: impl Into<String>, resolver: &str) -> RichDecision {
+    RichDecision {
+        message: Some(message.into()),
+        resolver: Some(resolver.into()),
+        ..RichDecision::deny()
+    }
+}
+
+/// Claim, durably persist/clean up, then release one SpawnAgent decision.
+/// This ordering is the security boundary: an Approve receiver cannot wake and
+/// launch until the exact reviewed request is in the audit log.
+async fn finalize_spawn_decision(
+    state_db: &StateDb,
+    queue: &Mutex<DecisionQueue>,
+    id: uuid::Uuid,
+    mut rich: RichDecision,
+    resolver: &str,
+) -> Result<bool> {
+    let (pending, is_spawn) = {
+        let queue = queue.lock().await;
+        (queue.peek(id).cloned(), queue.is_managed_spawn(id))
+    };
+    let Some(pending) = pending else {
+        return Ok(false);
+    };
+    if !is_spawn {
+        anyhow::bail!("decision {id} is not a SpawnAgent request");
+    }
+    let reviewed = if rich.decision == Decision::Approve {
+        let input = rich
+            .updated_input
+            .clone()
+            .unwrap_or_else(|| pending.tool_input.clone());
+        let mut reviewed = decode_complete_spawn_input(input)?;
+        validate_spawn_request(&mut reviewed)
+            .map_err(|e| anyhow::anyhow!("reviewed SpawnAgent request is invalid: {e}"))?;
+        rich.updated_input = Some(serde_json::to_value(&reviewed)?);
+        Some(reviewed)
+    } else {
+        None
+    };
+
+    // Deadline eligibility and the claim are one queue-lock operation. The
+    // validation above may touch the filesystem, so the earlier timestamp
+    // snapshot is not an authority for whether approval is still timely.
+    let (claim, age) = {
+        let mut queue = queue.lock().await;
+        let Some(current) = queue.peek(id) else {
+            return Ok(false);
+        };
+        let age = chrono::Utc::now()
+            .signed_duration_since(current.timestamp)
+            .to_std()
+            .unwrap_or_default();
+        if rich.decision == Decision::Approve && age >= SPAWN_APPROVAL_TIMEOUT {
+            anyhow::bail!("SpawnAgent approval window expired; launch refused");
+        }
+        (queue.claim(id), age)
+    };
+    let Some(claim) = claim else {
+        return Ok(false);
+    };
+    let fallback = claim.request().clone();
+
+    let persist_budget = SPAWN_PERSIST_TIMEOUT.min(SPAWN_APPROVAL_TIMEOUT.saturating_sub(age));
+    let persisted = match rich.decision {
+        Decision::Approve => match tokio::time::timeout(
+            persist_budget,
+            state_db.resolve_spawn_pending_by(
+                id,
+                reviewed
+                    .as_ref()
+                    .expect("Approve constructed reviewed request"),
+                resolver,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("SpawnAgent approval persistence timed out")),
+        },
+        Decision::Deny => match tokio::time::timeout(
+            SPAWN_PERSIST_TIMEOUT,
+            state_db.force_failclosed_spawn_resolution(id, resolver, &fallback),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("SpawnAgent denial persistence timed out")),
+        },
+        Decision::Ask => {
+            match tokio::time::timeout(
+                SPAWN_PERSIST_TIMEOUT,
+                state_db.delete_managed_spawn_pending(id),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!("SpawnAgent deferral cleanup timed out")),
+            }
+        }
+    };
+
+    match persisted {
+        Ok(true) => {
+            let mut queue = queue.lock().await;
+            queue.complete_claim(claim, rich);
+            Ok(true)
+        }
+        Ok(false) => {
+            {
+                let mut queue = queue.lock().await;
+                queue.complete_claim(
+                    claim,
+                    failclosed_spawn_decision(
+                        "SpawnAgent approval could not be recorded; launch refused",
+                        "daemon:persistence_failure",
+                    ),
+                );
+            }
+            let reconciled = state_db
+                .force_failclosed_spawn_resolution(id, "spawn_persistence_failure:deny", &fallback)
+                .await
+                .context("reconciling unrecorded SpawnAgent approval fail closed")?;
+            if !reconciled {
+                warn!(%id, "no durable SpawnAgent row remained to reconcile fail closed");
+            }
+            anyhow::bail!("SpawnAgent approval was not recorded; launch refused")
+        }
+        Err(e) => {
+            {
+                let mut queue = queue.lock().await;
+                queue.complete_claim(
+                    claim,
+                    failclosed_spawn_decision(
+                        "SpawnAgent decision persistence failed; launch refused",
+                        "daemon:persistence_failure",
+                    ),
+                );
+            }
+            let reconciled = state_db
+                .force_failclosed_spawn_resolution(id, "spawn_persistence_failure:deny", &fallback)
+                .await
+                .context("reconciling failed SpawnAgent persistence fail closed")?;
+            if !reconciled {
+                warn!(%id, "no durable SpawnAgent row remained to reconcile fail closed");
+            }
+            Err(e).context("persisting SpawnAgent decision before release")
+        }
+    }
+}
+
+async fn resolve_bulk_deny(
+    state_db: &StateDb,
+    queue: &Mutex<DecisionQueue>,
+    filter: &Option<wisphive_protocol::DecisionFilter>,
+    resolver: &str,
+) -> Result<Vec<uuid::Uuid>> {
+    let (ordinary_ids, spawn_ids) = {
+        let queue = queue.lock().await;
+        let matching: Vec<_> = queue
+            .snapshot()
+            .into_iter()
+            .filter(|req| filter.as_ref().is_none_or(|filter| filter.matches(req)))
+            .map(|req| req.id)
+            .collect();
+        matching
+            .into_iter()
+            .partition::<Vec<_>, _>(|id| !queue.is_managed_spawn(*id))
+    };
+
+    let mut resolved = {
+        let mut queue = queue.lock().await;
+        ordinary_ids
+            .into_iter()
+            .filter(|id| {
+                queue.resolve(
+                    *id,
+                    RichDecision {
+                        resolver: Some(resolver.to_string()),
+                        ..RichDecision::deny()
+                    },
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    for id in &resolved {
+        eager_persist(state_db, *id, Decision::Deny, resolver).await;
+    }
+
+    let mut first_error = None;
+    for id in spawn_ids {
+        let rich = RichDecision {
+            resolver: Some(resolver.to_string()),
+            ..RichDecision::deny()
+        };
+        match finalize_spawn_decision(state_db, queue, id, rich, resolver).await {
+            Ok(true) => resolved.push(id),
+            Ok(false) => {}
+            Err(error) => {
+                warn!(%id, "failed to bulk-deny managed SpawnAgent: {error}");
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error).context("one or more managed SpawnAgent bulk denials failed");
+    }
+    Ok(resolved)
+}
+
+async fn finalize_spawn_abandonment(
+    state_db: &StateDb,
+    queue: &Mutex<DecisionQueue>,
+    id: uuid::Uuid,
+    decided_by: &str,
+) -> Result<()> {
+    let fallback = {
+        let queue = queue.lock().await;
+        if !queue.is_managed_spawn(id) {
+            anyhow::bail!("abandoned decision is not a managed SpawnAgent");
+        }
+        queue
+            .snapshot()
+            .into_iter()
+            .find(|request| request.id == id)
+            .ok_or_else(|| anyhow::anyhow!("abandoned SpawnAgent request is missing"))?
+    };
+    state_db
+        .force_failclosed_spawn_resolution(id, decided_by, &fallback)
+        .await?;
+    let mut queue = queue.lock().await;
+    queue.finalize_local(id, Decision::Deny);
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+enum SpawnRunError {
+    #[error("agent spawn denied by human reviewer")]
+    Denied,
+    #[error("agent spawn was deferred; explicit approval is required")]
+    Deferred,
+    #[error("approval channel closed; refusing managed-agent spawn")]
+    ChannelClosed,
+    #[error("approved SpawnAgent request is invalid: {0}")]
+    InvalidRequest(String),
+    #[error("approved SpawnAgent action failed: {0}")]
+    Action(String),
+}
+
+/// Run `action` only after an explicit, complete, revalidated Approve arrives.
+/// Timeout, Deny, Ask, channel drop, invalid edited input, and action failure
+/// remain distinguishable so each lifecycle owner can record the right outcome.
+async fn run_after_spawn_approval<T, F, Fut>(
+    rx: tokio::sync::oneshot::Receiver<RichDecision>,
+    original: SpawnAgentRequest,
+    action: F,
+) -> std::result::Result<T, SpawnRunError>
+where
+    F: FnOnce(SpawnAgentRequest) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let rich = rx.await.map_err(|_| SpawnRunError::ChannelClosed)?;
+    match rich.decision {
+        Decision::Approve => {
+            let input = rich.updated_input.unwrap_or(
+                serde_json::to_value(original)
+                    .map_err(|e| SpawnRunError::InvalidRequest(e.to_string()))?,
+            );
+            let mut reviewed = decode_complete_spawn_input(input)
+                .map_err(|e| SpawnRunError::InvalidRequest(e.to_string()))?;
+            validate_spawn_request(&mut reviewed)
+                .map_err(|e| SpawnRunError::InvalidRequest(e.to_string()))?;
+            action(reviewed)
+                .await
+                .map_err(|e| SpawnRunError::Action(e.to_string()))
+        }
+        Decision::Deny => Err(SpawnRunError::Denied),
+        Decision::Ask => Err(SpawnRunError::Deferred),
+    }
+}
+
+async fn settle_spawn_expiry(expiry: tokio::task::JoinHandle<()>, started: &AtomicBool) {
+    if started.load(Ordering::SeqCst) {
+        // The finalizer may already have released a fail-closed Deny while it
+        // reconciles an ambiguously completed database transaction. Await it;
+        // aborting here would cancel the durable reconciliation.
+        if let Err(error) = expiry.await
+            && !error.is_cancelled()
+        {
+            warn!("SpawnAgent expiry task failed: {error}");
+        }
+    } else {
+        expiry.abort();
+    }
+}
+
 /// Dispatch agent-process commands: spawn, list, stop, and event re-import.
+///
+/// A spawn is deliberately asynchronous relative to this connection: the
+/// originating TUI/web client must remain able to receive the queued decision
+/// and send its approval on the same socket. The worker response returns over
+/// the connection's bounded channel after the decision resolves.
 async fn handle_agent_command(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     ctx: &ConnectionContext,
     msg: ClientMessage,
+    conn_tx: &tokio::sync::mpsc::Sender<ServerMessage>,
 ) -> Result<()> {
     match msg {
-        ClientMessage::SpawnAgent(req) => {
-            let mut pr = ctx.process_registry.lock().await;
-            match pr.spawn_agent(req).await {
-                Ok(agent) => {
-                    write_msg(writer, &ServerMessage::AgentSpawned(agent)).await?;
-                }
-                Err(e) => {
-                    write_msg(
-                        writer,
-                        &ServerMessage::Error {
-                            message: format!("failed to spawn agent: {e}"),
-                        },
-                    )
-                    .await?;
-                }
+        ClientMessage::SpawnAgent(mut req) => {
+            // The CLI performs this preflight too, but web/TUI callers do not.
+            // Mode can also change while a request waits for review, so the
+            // worker repeats the check immediately before process creation.
+            if let Err(e) = ensure_spawn_mode_active(&ctx.home_dir) {
+                write_msg(
+                    writer,
+                    &ServerMessage::Error {
+                        message: format!("failed to queue agent spawn: {e}"),
+                    },
+                )
+                .await?;
+                return Ok(());
             }
+
+            // Reject unsafe input before it is presented as an approvable item.
+            // `ProcessRegistry::spawn_agent` repeats this check at execution
+            // time so path ownership and other mutable state are revalidated.
+            if let Err(e) = validate_spawn_request(&mut req) {
+                warn!(
+                    security_event = "managed_agent_spawn_rejected",
+                    project = %req.project.display(),
+                    reason = %e,
+                    "rejected managed-agent spawn request"
+                );
+                write_msg(
+                    writer,
+                    &ServerMessage::Error {
+                        message: format!("invalid agent spawn request: {e}"),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+
+            let (decision_req, rx) =
+                match enqueue_spawn_for_approval(&ctx.state_db, &ctx.queue, &req).await {
+                    Ok(queued) => queued,
+                    Err(e) => {
+                        write_msg(
+                            writer,
+                            &ServerMessage::Error {
+                                message: format!("failed to queue agent spawn: {e}"),
+                            },
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+            let decision_id = decision_req.id;
+
+            if ctx.notifications_enabled {
+                crate::notify::notify_decision(&decision_req);
+            }
+
+            info!(
+                security_event = "managed_agent_spawn_queued",
+                %decision_id,
+                agent_type = %req.agent_type,
+                project = %req.project.display(),
+                "managed-agent spawn awaiting explicit human approval"
+            );
+
+            let process_registry = ctx.process_registry.clone();
+            let state_db = ctx.state_db.clone();
+            let queue = ctx.queue.clone();
+            let home_dir = ctx.home_dir.clone();
+            let response_tx = conn_tx.clone();
+            tokio::spawn(async move {
+                let expiry_state = state_db.clone();
+                let expiry_queue = queue.clone();
+                let expiry_started = Arc::new(AtomicBool::new(false));
+                let expiry_started_task = expiry_started.clone();
+                let expiry = tokio::spawn(async move {
+                    tokio::time::sleep(SPAWN_APPROVAL_TIMEOUT).await;
+                    expiry_started_task.store(true, Ordering::SeqCst);
+                    let rich = failclosed_spawn_decision(
+                        "SpawnAgent approval expired",
+                        "spawn_timeout:deny",
+                    );
+                    if let Err(e) = finalize_spawn_decision(
+                        &expiry_state,
+                        &expiry_queue,
+                        decision_id,
+                        rich,
+                        "spawn_timeout:deny",
+                    )
+                    .await
+                    {
+                        warn!(%decision_id, "failed to expire pending SpawnAgent: {e}");
+                    }
+                });
+                let result = run_after_spawn_approval(rx, req, |reviewed| async move {
+                    ensure_spawn_mode_active(&home_dir)?;
+                    let mut registry = process_registry.lock().await;
+                    registry.spawn_agent(reviewed)
+                })
+                .await;
+                settle_spawn_expiry(expiry, &expiry_started).await;
+
+                let response = match result {
+                    Ok(agent) => ServerMessage::AgentSpawned(agent),
+                    Err(e) => {
+                        match &e {
+                            SpawnRunError::ChannelClosed => {
+                                if let Err(cleanup_err) = finalize_spawn_abandonment(
+                                    &state_db,
+                                    &queue,
+                                    decision_id,
+                                    "spawn_channel_drop:deny",
+                                )
+                                .await
+                                {
+                                    warn!(%decision_id, "failed to persist spawn channel drop: {cleanup_err}");
+                                }
+                            }
+                            SpawnRunError::InvalidRequest(message)
+                            | SpawnRunError::Action(message) => {
+                                match state_db
+                                    .record_spawn_action_failure(decision_id, message)
+                                    .await
+                                {
+                                    Ok(true) => {}
+                                    Ok(false) => warn!(
+                                        %decision_id,
+                                        "approved spawn action failure had no matching audit row"
+                                    ),
+                                    Err(audit_err) => warn!(
+                                        %decision_id,
+                                        "failed to persist approved spawn action failure: {audit_err}"
+                                    ),
+                                }
+                            }
+                            SpawnRunError::Denied | SpawnRunError::Deferred => {}
+                        }
+                        ServerMessage::Error {
+                            message: format!("failed to spawn agent: {e}"),
+                        }
+                    }
+                };
+
+                if response_tx.send(response).await.is_err() {
+                    debug!(%decision_id, "spawn response dropped: originating client disconnected");
+                }
+            });
         }
         ClientMessage::ListAgents => {
             let pr = ctx.process_registry.lock().await;
@@ -2364,11 +3033,27 @@ fn peer_uid_allowed(peer_uid: u32, daemon_uid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONN_CHANNEL_CAPACITY, MAX_LINE_BYTES, attach_tool_result_with_retry, partition_sudo_gated,
-        peer_uid_allowed, persist_auto_approve, read_capped_line, set_socket_permissions,
+        CONN_CHANNEL_CAPACITY, MAX_LINE_BYTES, MAX_PENDING_SPAWNS, SpawnRunError,
+        attach_tool_result_with_retry, enqueue_spawn_for_approval, ensure_spawn_mode_active,
+        finalize_spawn_abandonment, finalize_spawn_decision, hook_message_agent_id,
+        is_reserved_internal_agent_id, partition_sudo_gated, peer_uid_allowed,
+        persist_auto_approve, read_capped_line, resolve_bulk_deny, run_after_spawn_approval,
+        set_socket_permissions, settle_spawn_expiry, spawn_approval_request,
         sweep_stale_session_markers,
     };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::BufReader;
+
+    fn spawn_req(project: &std::path::Path) -> wisphive_protocol::SpawnAgentRequest {
+        serde_json::from_value(serde_json::json!({
+            "agent_type": "claude_code",
+            "project": project,
+            "prompt": "review this repository",
+            "permission_mode": "plan",
+        }))
+        .expect("spawn request should deserialize")
+    }
 
     fn tool_result(tool_use_id: &str) -> wisphive_protocol::ToolResult {
         wisphive_protocol::ToolResult {
@@ -2393,6 +3078,513 @@ mod tests {
             "tool_use_id": tool_use_id,
         })
         .to_string()
+    }
+
+    fn spawn_queue() -> tokio::sync::Mutex<crate::queue::DecisionQueue> {
+        let (broadcast, _) = tokio::sync::broadcast::channel(32);
+        tokio::sync::Mutex::new(crate::queue::DecisionQueue::new(broadcast))
+    }
+
+    /// itr#94: dispatch's enqueue seam persists before broadcasting the complete
+    /// validated request for human review.
+    #[tokio::test]
+    async fn spawn_request_is_persisted_and_enqueued_for_review() {
+        let project = tempfile::tempdir().unwrap();
+        let req = spawn_req(project.path());
+        let db = crate::state::StateDb::open(":memory:").await.unwrap();
+        let queue = spawn_queue();
+
+        let (decision, _rx) = enqueue_spawn_for_approval(&db, &queue, &req).await.unwrap();
+
+        let queued = queue.lock().await.snapshot();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].id, decision.id);
+        assert_eq!(queued[0].tool_name, "SpawnAgent");
+        assert_eq!(queued[0].tool_input["permission_mode"], "plan");
+        assert_eq!(queued[0].tool_input["prompt"], "review this repository");
+        assert_eq!(db.pending_count().await.unwrap(), 1);
+    }
+
+    /// itr#94: the process action is not even constructed while approval is
+    /// pending, and an explicit Approve is the only resolution that invokes it.
+    #[tokio::test]
+    async fn spawn_action_cannot_run_before_explicit_approval() {
+        let project = tempfile::tempdir().unwrap();
+        let original = spawn_req(project.path());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let action_called = Arc::new(AtomicBool::new(false));
+        let action_flag = action_called.clone();
+        let mut gated = Box::pin(run_after_spawn_approval(rx, original, move |_reviewed| {
+            action_flag.store(true, Ordering::SeqCst);
+            async { Ok::<_, anyhow::Error>(()) }
+        }));
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), gated.as_mut())
+                .await
+                .is_err(),
+            "spawn gate must remain pending without a decision"
+        );
+        assert!(
+            !action_called.load(Ordering::SeqCst),
+            "spawn action must not be constructed before approval"
+        );
+
+        tx.send(wisphive_protocol::RichDecision::approve()).unwrap();
+        gated.await.expect("explicit approval should release spawn");
+        assert!(action_called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn denied_spawn_never_invokes_action() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let project = tempfile::tempdir().unwrap();
+        let action_called = Arc::new(AtomicBool::new(false));
+        let action_flag = action_called.clone();
+        tx.send(wisphive_protocol::RichDecision::deny()).unwrap();
+
+        let err = run_after_spawn_approval(rx, spawn_req(project.path()), move |_reviewed| {
+            action_flag.store(true, Ordering::SeqCst);
+            async { Ok::<_, anyhow::Error>(()) }
+        })
+        .await
+        .expect_err("deny must fail closed");
+
+        assert_eq!(err, SpawnRunError::Denied);
+        assert!(!action_called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn edited_spawn_is_revalidated_persisted_then_executed() {
+        let original_dir = tempfile::tempdir().unwrap();
+        let reviewed_dir = tempfile::tempdir().unwrap();
+        let original = spawn_req(original_dir.path());
+        let mut reviewed = spawn_req(reviewed_dir.path());
+        reviewed.prompt = "edited reviewed prompt".into();
+        reviewed.permission_mode = Some("default".into());
+        let db = crate::state::StateDb::open(":memory:").await.unwrap();
+        let queue = spawn_queue();
+        let (decision, rx) = enqueue_spawn_for_approval(&db, &queue, &original)
+            .await
+            .unwrap();
+        let rich = wisphive_protocol::RichDecision {
+            updated_input: Some(serde_json::to_value(&reviewed).unwrap()),
+            resolver: Some("human:tui".into()),
+            ..wisphive_protocol::RichDecision::approve()
+        };
+
+        assert!(
+            finalize_spawn_decision(&db, &queue, decision.id, rich, "human:tui")
+                .await
+                .unwrap()
+        );
+        let history = db.query_history(None, 10).await.unwrap();
+        assert_eq!(history[0].tool_input["prompt"], "edited reviewed prompt");
+        assert_eq!(
+            history[0].project,
+            std::fs::canonicalize(reviewed_dir.path()).unwrap()
+        );
+
+        let executed = run_after_spawn_approval(rx, original, |request| async move { Ok(request) })
+            .await
+            .unwrap();
+        assert_eq!(executed.prompt, "edited reviewed prompt");
+        assert_eq!(
+            executed.project,
+            std::fs::canonicalize(reviewed_dir.path()).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn unsafe_edited_spawn_stays_pending_and_never_releases_original() {
+        let project = tempfile::tempdir().unwrap();
+        let original = spawn_req(project.path());
+        let db = crate::state::StateDb::open(":memory:").await.unwrap();
+        let queue = spawn_queue();
+        let (decision, mut rx) = enqueue_spawn_for_approval(&db, &queue, &original)
+            .await
+            .unwrap();
+        let mut unsafe_edit = original;
+        unsafe_edit.permission_mode = Some("bypassPermissions".into());
+        let rich = wisphive_protocol::RichDecision {
+            updated_input: Some(serde_json::to_value(unsafe_edit).unwrap()),
+            ..wisphive_protocol::RichDecision::approve()
+        };
+
+        let err = finalize_spawn_decision(&db, &queue, decision.id, rich, "human:tui")
+            .await
+            .expect_err("unsafe edit must be rejected before claim/release");
+        assert!(err.to_string().contains("bypassPermissions"));
+        assert_eq!(queue.lock().await.count_tool("SpawnAgent"), 1);
+        assert_eq!(db.pending_count().await.unwrap(), 1);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut rx)
+                .await
+                .is_err(),
+            "rejected edit must not fall back to executing the original request"
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_or_unknown_edited_spawn_input_stays_pending() {
+        for edited in [
+            serde_json::json!({
+                "project": "/tmp",
+                "prompt": "missing agent type",
+            }),
+            serde_json::json!({
+                "agent_type": "claude_code",
+                "project": "/tmp",
+                "prompt": "unknown field",
+                "shell": "unreviewed",
+            }),
+        ] {
+            let project = tempfile::tempdir().unwrap();
+            let original = spawn_req(project.path());
+            let db = crate::state::StateDb::open(":memory:").await.unwrap();
+            let queue = spawn_queue();
+            let (decision, mut rx) = enqueue_spawn_for_approval(&db, &queue, &original)
+                .await
+                .unwrap();
+            let rich = wisphive_protocol::RichDecision {
+                updated_input: Some(edited),
+                ..wisphive_protocol::RichDecision::approve()
+            };
+
+            finalize_spawn_decision(&db, &queue, decision.id, rich, "human:tui")
+                .await
+                .expect_err("partial or extended input must not be approved");
+            assert_eq!(queue.lock().await.count_tool("SpawnAgent"), 1);
+            assert_eq!(db.pending_count().await.unwrap(), 1);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(10), &mut rx)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn deny_and_ask_have_distinct_persisted_outcomes() {
+        let project = tempfile::tempdir().unwrap();
+
+        let deny_db = crate::state::StateDb::open(":memory:").await.unwrap();
+        let deny_queue = spawn_queue();
+        let (deny_decision, deny_rx) =
+            enqueue_spawn_for_approval(&deny_db, &deny_queue, &spawn_req(project.path()))
+                .await
+                .unwrap();
+        finalize_spawn_decision(
+            &deny_db,
+            &deny_queue,
+            deny_decision.id,
+            wisphive_protocol::RichDecision::deny(),
+            "human:tui",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            deny_rx.await.unwrap().decision,
+            wisphive_protocol::Decision::Deny
+        );
+        let history = deny_db.query_history(None, 10).await.unwrap();
+        assert_eq!(history[0].decision, wisphive_protocol::Decision::Deny);
+        assert_eq!(history[0].decided_by.as_deref(), Some("human:tui"));
+
+        let ask_db = crate::state::StateDb::open(":memory:").await.unwrap();
+        let ask_queue = spawn_queue();
+        let (ask_decision, ask_rx) =
+            enqueue_spawn_for_approval(&ask_db, &ask_queue, &spawn_req(project.path()))
+                .await
+                .unwrap();
+        finalize_spawn_decision(
+            &ask_db,
+            &ask_queue,
+            ask_decision.id,
+            wisphive_protocol::RichDecision::from(wisphive_protocol::Decision::Ask),
+            "human:tui",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ask_rx.await.unwrap().decision,
+            wisphive_protocol::Decision::Ask
+        );
+        assert_eq!(ask_db.pending_count().await.unwrap(), 0);
+        assert!(ask_db.query_history(None, 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bulk_deny_uses_managed_spawn_finalizer_and_persists_both_classes() {
+        let project = tempfile::tempdir().unwrap();
+        let db = crate::state::StateDb::open(":memory:").await.unwrap();
+        let queue = spawn_queue();
+        let ordinary = crate::state::test_support::make_request(
+            "Bash",
+            "claude-session",
+            project.path().to_str().unwrap(),
+        );
+        db.persist_pending(&ordinary).await.unwrap();
+        let ordinary_rx = queue.lock().await.enqueue(ordinary.clone()).unwrap();
+        let (spawn, spawn_rx) = enqueue_spawn_for_approval(&db, &queue, &spawn_req(project.path()))
+            .await
+            .unwrap();
+
+        let resolved = resolve_bulk_deny(&db, &queue, &None, "human:tui")
+            .await
+            .unwrap();
+        assert!(resolved.contains(&ordinary.id));
+        assert!(resolved.contains(&spawn.id));
+        assert_eq!(
+            ordinary_rx.await.unwrap().decision,
+            wisphive_protocol::Decision::Deny
+        );
+        assert_eq!(
+            spawn_rx.await.unwrap().decision,
+            wisphive_protocol::Decision::Deny
+        );
+        assert_eq!(queue.lock().await.count_tool("SpawnAgent"), 0);
+        assert_eq!(db.pending_count().await.unwrap(), 0);
+        let history = db.query_history(None, 10).await.unwrap();
+        assert_eq!(history.len(), 2);
+        assert!(
+            history
+                .iter()
+                .all(|entry| entry.decision == wisphive_protocol::Decision::Deny)
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_expiry_is_recorded_failclosed() {
+        let project = tempfile::tempdir().unwrap();
+        let original = spawn_req(project.path());
+        let db = crate::state::StateDb::open(":memory:").await.unwrap();
+        let queue = spawn_queue();
+        let (decision, rx) = enqueue_spawn_for_approval(&db, &queue, &original)
+            .await
+            .unwrap();
+
+        finalize_spawn_decision(
+            &db,
+            &queue,
+            decision.id,
+            super::failclosed_spawn_decision("expired", "spawn_timeout:deny"),
+            "spawn_timeout:deny",
+        )
+        .await
+        .unwrap();
+        let err = run_after_spawn_approval(rx, original, |_reviewed| async {
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err, SpawnRunError::Denied);
+
+        assert_eq!(queue.lock().await.count_tool("SpawnAgent"), 0);
+        assert_eq!(db.pending_count().await.unwrap(), 0);
+        let history = db.query_history(None, 10).await.unwrap();
+        assert_eq!(history[0].decision, wisphive_protocol::Decision::Deny);
+        assert_eq!(history[0].decided_by.as_deref(), Some("spawn_timeout:deny"));
+    }
+
+    #[tokio::test]
+    async fn approval_claim_rechecks_deadline_after_validation() {
+        let project = tempfile::tempdir().unwrap();
+        let original = spawn_req(project.path());
+        let db = crate::state::StateDb::open(":memory:").await.unwrap();
+        let queue = spawn_queue();
+        let mut decision = spawn_approval_request(&original).unwrap();
+        decision.timestamp =
+            chrono::Utc::now() - chrono::Duration::from_std(super::SPAWN_APPROVAL_TIMEOUT).unwrap();
+        db.persist_pending(&decision).await.unwrap();
+        let mut rx = queue
+            .lock()
+            .await
+            .enqueue_managed_spawn(decision.clone())
+            .unwrap();
+
+        let err = finalize_spawn_decision(
+            &db,
+            &queue,
+            decision.id,
+            wisphive_protocol::RichDecision::approve(),
+            "human:tui",
+        )
+        .await
+        .expect_err("approval cannot claim after its absolute deadline");
+        assert!(err.to_string().contains("window expired"));
+        assert_eq!(queue.lock().await.count_tool("SpawnAgent"), 1);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut rx)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn fired_expiry_task_is_awaited_instead_of_aborted_mid_reconciliation() {
+        let started = AtomicBool::new(true);
+        let reconciled = Arc::new(AtomicBool::new(false));
+        let reconciled_task = reconciled.clone();
+        let expiry = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            reconciled_task.store(true, Ordering::SeqCst);
+        });
+
+        settle_spawn_expiry(expiry, &started).await;
+        assert!(
+            reconciled.load(Ordering::SeqCst),
+            "once expiry fires, worker wake-up must not cancel reconciliation"
+        );
+    }
+
+    #[tokio::test]
+    async fn expiry_does_not_cancel_approval_claimed_before_deadline() {
+        let project = tempfile::tempdir().unwrap();
+        let original = spawn_req(project.path());
+        let db = crate::state::StateDb::open(":memory:").await.unwrap();
+        let queue = spawn_queue();
+        let (decision, rx) = enqueue_spawn_for_approval(&db, &queue, &original)
+            .await
+            .unwrap();
+        let approval_claim = queue.lock().await.claim(decision.id).unwrap();
+        let rich = super::failclosed_spawn_decision("expired", "spawn_timeout:deny");
+        assert!(
+            !finalize_spawn_decision(&db, &queue, decision.id, rich, "spawn_timeout:deny")
+                .await
+                .unwrap(),
+            "expiry cannot steal a decision already claimed by an approval"
+        );
+        assert!(
+            db.resolve_spawn_pending_by(decision.id, &original, "human:tui")
+                .await
+                .unwrap()
+        );
+        assert!(
+            queue
+                .lock()
+                .await
+                .complete_claim(approval_claim, wisphive_protocol::RichDecision::approve())
+        );
+
+        run_after_spawn_approval(rx, original, |_reviewed| async {
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(queue.lock().await.count_tool("SpawnAgent"), 0);
+        assert_eq!(db.pending_count().await.unwrap(), 0);
+        assert_eq!(
+            db.query_history(None, 10).await.unwrap()[0].decision,
+            wisphive_protocol::Decision::Approve
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_channel_drop_is_recorded_failclosed() {
+        let project = tempfile::tempdir().unwrap();
+        let original = spawn_req(project.path());
+        let db = crate::state::StateDb::open(":memory:").await.unwrap();
+        let queue = spawn_queue();
+        let (decision, rx) = enqueue_spawn_for_approval(&db, &queue, &original)
+            .await
+            .unwrap();
+        let claim = queue.lock().await.claim(decision.id).unwrap();
+        drop(claim);
+
+        let err = run_after_spawn_approval(rx, original, |_reviewed| async {
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err, SpawnRunError::ChannelClosed);
+        finalize_spawn_abandonment(&db, &queue, decision.id, "spawn_channel_drop:deny")
+            .await
+            .unwrap();
+        let history = db.query_history(None, 10).await.unwrap();
+        assert_eq!(history[0].decision, wisphive_protocol::Decision::Deny);
+        assert_eq!(
+            history[0].decided_by.as_deref(),
+            Some("spawn_channel_drop:deny")
+        );
+    }
+
+    #[tokio::test]
+    async fn approved_action_failure_is_recorded_on_approval_audit() {
+        let project = tempfile::tempdir().unwrap();
+        let original = spawn_req(project.path());
+        let db = crate::state::StateDb::open(":memory:").await.unwrap();
+        let queue = spawn_queue();
+        let (decision, rx) = enqueue_spawn_for_approval(&db, &queue, &original)
+            .await
+            .unwrap();
+        finalize_spawn_decision(
+            &db,
+            &queue,
+            decision.id,
+            wisphive_protocol::RichDecision::approve(),
+            "human:tui",
+        )
+        .await
+        .unwrap();
+
+        let err = run_after_spawn_approval(rx, original, |_reviewed| async {
+            Err::<(), _>(anyhow::anyhow!("binary missing"))
+        })
+        .await
+        .unwrap_err();
+        let SpawnRunError::Action(message) = err else {
+            panic!("expected action failure")
+        };
+        assert!(
+            db.record_spawn_action_failure(decision.id, &message)
+                .await
+                .unwrap()
+        );
+        assert_eq!(db.pending_count().await.unwrap(), 0);
+        let history = db.query_history(None, 10).await.unwrap();
+        assert_eq!(history[0].decision, wisphive_protocol::Decision::Approve);
+        assert_eq!(
+            history[0].decided_by.as_deref(),
+            Some("human:tui:spawn_action_failed")
+        );
+        assert_eq!(
+            history[0].tool_result.as_ref().unwrap()["spawn_status"],
+            "action_failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_spawn_cap_rejects_and_cleans_extra_db_row() {
+        let project = tempfile::tempdir().unwrap();
+        let db = crate::state::StateDb::open(":memory:").await.unwrap();
+        let queue = spawn_queue();
+        let mut receivers = Vec::new();
+        let mut ids = Vec::new();
+        for _ in 0..MAX_PENDING_SPAWNS {
+            let (decision, rx) =
+                enqueue_spawn_for_approval(&db, &queue, &spawn_req(project.path()))
+                    .await
+                    .unwrap();
+            ids.push(decision.id);
+            receivers.push(rx);
+        }
+        let claims: Vec<_> = {
+            let mut queue = queue.lock().await;
+            ids.into_iter().map(|id| queue.claim(id).unwrap()).collect()
+        };
+
+        let err = enqueue_spawn_for_approval(&db, &queue, &spawn_req(project.path()))
+            .await
+            .expect_err("cap must reject the ninth pending spawn");
+        assert!(err.to_string().contains("pending SpawnAgent limit"));
+        assert_eq!(
+            queue.lock().await.count_tool("SpawnAgent"),
+            MAX_PENDING_SPAWNS
+        );
+        assert_eq!(db.pending_count().await.unwrap(), MAX_PENDING_SPAWNS as i64);
+        drop(claims);
+        drop(receivers);
     }
 
     #[tokio::test]
@@ -2613,6 +3805,49 @@ mod tests {
         // Stale device: sudo-class (Bash, Edit) held back; read-only (Read) passes.
         assert_eq!(ids(&gated), vec![bash.0, edit.0]);
         assert_eq!(ids(&allowed), vec![read.0]);
+    }
+
+    #[test]
+    fn partition_stale_device_gates_spawn_agent() {
+        let spawn = (uuid::Uuid::new_v4(), "SpawnAgent".to_string());
+        let (gated, allowed) = partition_sudo_gated(false, vec![spawn.clone()]);
+        assert_eq!(ids(&gated), vec![spawn.0]);
+        assert!(allowed.is_empty());
+
+        let (gated, allowed) = partition_sudo_gated(true, vec![spawn.clone()]);
+        assert!(gated.is_empty());
+        assert_eq!(ids(&allowed), vec![spawn.0]);
+    }
+
+    #[test]
+    fn managed_spawn_requires_active_mode_and_reserves_internal_ids() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(ensure_spawn_mode_active(home.path()).is_err());
+        std::fs::write(home.path().join("mode"), "off\n").unwrap();
+        assert!(ensure_spawn_mode_active(home.path()).is_err());
+        std::fs::write(home.path().join("mode"), "active\n").unwrap();
+        ensure_spawn_mode_active(home.path()).unwrap();
+
+        assert!(is_reserved_internal_agent_id("wisphive-daemon:spawn"));
+        assert!(is_reserved_internal_agent_id("wisphive-daemon:future"));
+        assert!(!is_reserved_internal_agent_id("claude-session"));
+
+        let mut result = tool_result("reserved-result");
+        result.agent_id = "wisphive-daemon:spawn".into();
+        let result_msg = wisphive_protocol::ClientMessage::ToolResult(result);
+        assert_eq!(
+            hook_message_agent_id(&result_msg),
+            Some("wisphive-daemon:spawn")
+        );
+        let register = wisphive_protocol::ClientMessage::AgentRegister {
+            agent_id: "wisphive-daemon:spawn".into(),
+            agent_type: wisphive_protocol::AgentType::ClaudeCode,
+            project: home.path().to_path_buf(),
+        };
+        assert_eq!(
+            hook_message_agent_id(&register),
+            Some("wisphive-daemon:spawn")
+        );
     }
 
     #[test]

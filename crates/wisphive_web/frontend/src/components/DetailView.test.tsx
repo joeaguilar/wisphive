@@ -1,7 +1,8 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { DeferredDetailView } from "./DetailView";
-import type { AuditDecision } from "../types/protocol";
+import { DeferredDetailView, DetailView } from "./DetailView";
+import type { AuditDecision, DecisionRequest, JsonValue } from "../types/protocol";
+import { Queue } from "./Queue";
 
 function deferred(overrides: Partial<AuditDecision>): AuditDecision {
   return {
@@ -136,5 +137,107 @@ describe("DeferredDetailView", () => {
     expect(within(detail).getByText(evil)).toBeInTheDocument();
     // ...and never became a real element.
     expect(detail.querySelector("img")).toBeNull();
+  });
+
+  it("renders malformed deferred options through the raw fallback", () => {
+    render(
+      <DeferredDetailView
+        decision={deferred({
+          tool_input: {
+            questions: [{
+              question: "Choose a deployment target",
+              options: [{ description: "missing required label" }],
+            }],
+          },
+        })}
+        onFocusTerminal={vi.fn()}
+      />,
+    );
+
+    const detail = screen.getByLabelText("Deferred detail for AskUserQuestion");
+    expect(within(detail).getByText(/"description": "missing required label"/)).toBeInTheDocument();
+    expect(within(detail).queryByRole("listitem")).not.toBeInTheDocument();
+  });
+});
+
+function pending(toolInput: JsonValue): DecisionRequest {
+  return {
+    id: "request-1",
+    agent_id: "cc-agent-alpha",
+    agent_type: "claude_code",
+    project: "/Users/dev/AI_Projects/wisphive",
+    tool_name: "AskUserQuestion",
+    tool_input: toolInput,
+    timestamp: "2026-07-04T11:58:00Z",
+    hook_event_name: "PreToolUse",
+  };
+}
+
+describe("DetailView", () => {
+  afterEach(cleanup);
+
+  it("falls back without throwing for malformed questions and options arrays", () => {
+    const props = { onApprove: vi.fn(), onDeny: vi.fn() };
+    render(
+      <DetailView
+        request={pending({ questions: ["not a question"] })}
+        {...props}
+      />,
+    );
+    expect(screen.getByText("Question details unavailable.")).toBeInTheDocument();
+
+    cleanup();
+
+    render(
+      <DetailView
+        request={pending({
+          questions: [{
+            question: "Choose a deployment target",
+            options: [{ description: "missing required label" }],
+          }],
+        })}
+        {...props}
+      />,
+    );
+    expect(screen.getByText("Question details unavailable.")).toBeInTheDocument();
+    expect(screen.queryByText("Choose a deployment target")).not.toBeInTheDocument();
+  });
+});
+
+describe("Queue", () => {
+  afterEach(cleanup);
+
+  it("summarizes only validated AskUserQuestion payloads", () => {
+    const handlers = {
+      selectedId: null,
+      onSelect: vi.fn(),
+      onApprove: vi.fn(),
+      onDeny: vi.fn(),
+    };
+    const { container, rerender } = render(
+      <Queue
+        items={[pending({
+          questions: [{
+            question: "Choose a deployment target",
+            options: [{ label: "Staging" }],
+          }],
+        })]}
+        {...handlers}
+      />,
+    );
+    expect(screen.getByText("Choose a deployment target")).toBeInTheDocument();
+
+    rerender(
+      <Queue
+        items={[pending({
+          questions: [{
+            question: "Choose a deployment target",
+            options: [{ description: "missing required label" }],
+          }],
+        })]}
+        {...handlers}
+      />,
+    );
+    expect(container.querySelector(".queue-item-summary")).toBeNull();
   });
 });

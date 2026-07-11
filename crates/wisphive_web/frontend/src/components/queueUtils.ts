@@ -1,4 +1,5 @@
 import type { DecisionRequest } from "../types/protocol";
+import { parseToolInput } from "./toolInput";
 
 export function timeAgo(timestamp: string, nowMs = Date.now()): string {
   const seconds = Math.floor(
@@ -25,31 +26,27 @@ export function eventPrefix(eventName: string): string {
 
 // Extract a brief summary of tool input for the queue list.
 export function inputSummary(item: DecisionRequest): string | null {
-  const input = item.tool_input;
-  if (!input) return null;
+  const parsed = parseToolInput(item.tool_name, item.tool_input);
+  const eventData = isRecord(item.event_data) ? item.event_data : null;
 
-  if (typeof input.command === "string") {
-    const cmd = input.command as string;
+  if (parsed.kind === "bash" && parsed.input.command) {
+    const cmd = parsed.input.command;
     return cmd.length > 80 ? cmd.slice(0, 77) + "..." : cmd;
   }
-  if (typeof input.file_path === "string") return input.file_path as string;
-  if (item.tool_name === "Write" && typeof input.file_path === "string") return input.file_path as string;
-  if (typeof input.pattern === "string") return `/${input.pattern as string}/`;
+  if (parsed.fields.filePath) return parsed.fields.filePath;
+  if (parsed.fields.pattern) return `/${parsed.fields.pattern}/`;
 
-  if (Array.isArray(input.questions)) {
-    const q = input.questions[0] as Record<string, unknown> | undefined;
-    if (q && typeof q.question === "string") {
-      const text = q.question as string;
-      return text.length > 80 ? text.slice(0, 77) + "..." : text;
-    }
+  if (parsed.kind === "ask-user-question" && parsed.input) {
+    const text = parsed.input.questions[0]?.question;
+    if (text) return text.length > 80 ? text.slice(0, 77) + "..." : text;
   }
 
-  if (item.event_data && typeof item.event_data.last_assistant_message === "string") {
-    const msg = item.event_data.last_assistant_message as string;
+  if (typeof eventData?.last_assistant_message === "string") {
+    const msg = eventData.last_assistant_message;
     return msg.length > 80 ? msg.slice(0, 77) + "..." : msg;
   }
 
-  if (item.event_data && typeof item.event_data.plan_content === "string") {
+  if (typeof eventData?.plan_content === "string") {
     return "Plan ready for review";
   }
   return null;
@@ -74,35 +71,32 @@ export type DeferredPrompt =
   | { kind: "raw"; text: string }
   | { kind: "none" };
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 // Parse a deferred tool_input into a shape both the row summary and the full
 // detail view can render. Never throws on unexpected shapes; falls back to a
 // pretty-printed JSON blob, then to `none` for null/empty input.
 export function parseDeferredPrompt(
-  input: Record<string, unknown> | null | undefined,
+  input: unknown,
 ): DeferredPrompt {
-  if (input == null || typeof input !== "object") return { kind: "none" };
+  if (!isRecord(input)) return { kind: "none" };
 
   // AskUserQuestion: { questions: [{ question, header?, options: [{label, description?}] }] }
-  if (Array.isArray(input.questions)) {
-    const questions: DeferredQuestion[] = [];
-    for (const raw of input.questions as unknown[]) {
-      if (raw == null || typeof raw !== "object") continue;
-      const q = raw as Record<string, unknown>;
-      const question = typeof q.question === "string" ? q.question : "";
-      const header = typeof q.header === "string" ? q.header : undefined;
-      const options: DeferredQuestion["options"] = [];
-      if (Array.isArray(q.options)) {
-        for (const optRaw of q.options as unknown[]) {
-          if (optRaw == null || typeof optRaw !== "object") continue;
-          const opt = optRaw as Record<string, unknown>;
-          const label = typeof opt.label === "string" ? opt.label : "";
-          const description = typeof opt.description === "string" ? opt.description : undefined;
-          options.push({ label, description });
-        }
-      }
-      if (question || options.length > 0) questions.push({ question, header, options });
-    }
-    if (questions.length > 0) return { kind: "questions", questions };
+  const parsed = parseToolInput("AskUserQuestion", input);
+  if (parsed.kind === "ask-user-question" && parsed.input) {
+    return {
+      kind: "questions",
+      questions: parsed.input.questions.map((question) => ({
+        question: question.question,
+        header: question.header ?? undefined,
+        options: question.options.map((option) => ({
+          label: option.label,
+          description: option.description ?? undefined,
+        })),
+      })),
+    };
   }
 
   // ExitPlanMode: { plan: "<markdown>" }
@@ -124,7 +118,7 @@ export function parseDeferredPrompt(
 // untruncated prompt stays reachable via DeferredDetailView (no single-place
 // truncation — project no-truncation rule).
 export function deferredPromptSummary(
-  input: Record<string, unknown> | null | undefined,
+  input: unknown,
 ): string | null {
   const prompt = parseDeferredPrompt(input);
   const clip = (s: string) => (s.length > 80 ? s.slice(0, 77) + "..." : s);

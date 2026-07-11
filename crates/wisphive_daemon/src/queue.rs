@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tokio::sync::{broadcast, oneshot};
 use tracing::{info, warn};
@@ -14,8 +14,30 @@ pub struct DecisionQueue {
     pending_senders: HashMap<Uuid, oneshot::Sender<RichDecision>>,
     /// Ordered list of pending requests (for TUI display).
     pending_items: Vec<DecisionRequest>,
+    /// Requests claimed for durable resolution but not released yet. Keeping
+    /// them accounted here prevents the SpawnAgent cap from being bypassed by
+    /// many concurrent slow persistence operations.
+    claimed_items: HashMap<Uuid, DecisionRequest>,
+    /// Server-side provenance for synthetic managed-spawn decisions. Wire
+    /// fields are attacker-controlled, so identity cannot be inferred from a
+    /// tool/agent string supplied by a hook.
+    managed_spawn_ids: HashSet<Uuid>,
     /// Broadcast channel to push events to all connected TUI clients.
     tui_tx: broadcast::Sender<ServerMessage>,
+}
+
+/// A decision removed from the live queue but not yet released to its waiting
+/// worker. Spawn decisions use this two-phase path so their audit write can
+/// complete before an approval is capable of launching a process.
+pub struct ClaimedDecision {
+    request: DecisionRequest,
+    sender: oneshot::Sender<RichDecision>,
+}
+
+impl ClaimedDecision {
+    pub fn request(&self) -> &DecisionRequest {
+        &self.request
+    }
 }
 
 impl DecisionQueue {
@@ -23,6 +45,8 @@ impl DecisionQueue {
         Self {
             pending_senders: HashMap::new(),
             pending_items: Vec::new(),
+            claimed_items: HashMap::new(),
+            managed_spawn_ids: HashSet::new(),
             tui_tx,
         }
     }
@@ -36,7 +60,25 @@ impl DecisionQueue {
     /// instant fail-open approve — and leave two items sharing one sender
     /// (itr#370). The caller must reject the duplicate.
     pub fn enqueue(&mut self, req: DecisionRequest) -> Option<oneshot::Receiver<RichDecision>> {
-        if self.pending_senders.contains_key(&req.id) {
+        self.enqueue_inner(req, false)
+    }
+
+    pub fn enqueue_managed_spawn(
+        &mut self,
+        req: DecisionRequest,
+    ) -> Option<oneshot::Receiver<RichDecision>> {
+        self.enqueue_inner(req, true)
+    }
+
+    fn enqueue_inner(
+        &mut self,
+        req: DecisionRequest,
+        managed_spawn: bool,
+    ) -> Option<oneshot::Receiver<RichDecision>> {
+        if self.pending_senders.contains_key(&req.id)
+            || self.claimed_items.contains_key(&req.id)
+            || self.managed_spawn_ids.contains(&req.id)
+        {
             warn!(
                 id = %req.id,
                 agent = %req.agent_id,
@@ -58,6 +100,9 @@ impl DecisionQueue {
 
         self.pending_senders.insert(req.id, tx);
         self.pending_items.push(req.clone());
+        if managed_spawn {
+            self.managed_spawn_ids.insert(req.id);
+        }
 
         // Notify all connected TUIs
         let _ = self.tui_tx.send(ServerMessage::NewDecision(req));
@@ -74,7 +119,9 @@ impl DecisionQueue {
         let had_sender = self.pending_senders.remove(&id).is_some();
         let before = self.pending_items.len();
         self.pending_items.retain(|r| r.id != id);
-        let removed = had_sender || self.pending_items.len() != before;
+        let had_claim = self.claimed_items.remove(&id).is_some();
+        self.managed_spawn_ids.remove(&id);
+        let removed = had_sender || had_claim || self.pending_items.len() != before;
         if removed {
             info!(%id, ?decision, "decision finalized outside the queue");
             let _ = self
@@ -84,10 +131,45 @@ impl DecisionQueue {
         removed
     }
 
+    /// Atomically remove a decision and its sender without resolving it yet.
+    /// The caller owns the returned claim and must call [`Self::complete_claim`]
+    /// after durable persistence/cleanup. Dropping a claim fails closed because
+    /// it drops the oneshot sender without sending an approval.
+    pub fn claim(&mut self, id: Uuid) -> Option<ClaimedDecision> {
+        let position = self.pending_items.iter().position(|req| req.id == id)?;
+        let sender = self.pending_senders.remove(&id)?;
+        let request = self.pending_items.remove(position);
+        self.claimed_items.insert(id, request.clone());
+        info!(%id, tool = %request.tool_name, "decision claimed for durable resolution");
+        Some(ClaimedDecision { request, sender })
+    }
+
+    /// Release a previously claimed decision after its persistence owner has
+    /// completed, removing it from the in-flight accounting at the same time.
+    pub fn complete_claim(&mut self, claim: ClaimedDecision, rich: RichDecision) -> bool {
+        let id = claim.request.id;
+        if self.claimed_items.remove(&id).is_none() {
+            warn!(%id, "claimed decision was already finalized");
+            return false;
+        }
+        self.managed_spawn_ids.remove(&id);
+        info!(%id, decision = ?rich.decision, "claimed decision completed");
+        let _ = self.tui_tx.send(ServerMessage::DecisionResolved {
+            id,
+            decision: rich.decision,
+        });
+        claim.sender.send(rich).is_ok()
+    }
+
     /// Resolve a pending decision with a rich response. Returns true if found.
     pub fn resolve(&mut self, id: Uuid, rich: RichDecision) -> bool {
+        if self.managed_spawn_ids.contains(&id) {
+            warn!(%id, "generic resolve refused managed SpawnAgent decision");
+            return false;
+        }
         if let Some(tx) = self.pending_senders.remove(&id) {
             self.pending_items.retain(|r| r.id != id);
+            self.managed_spawn_ids.remove(&id);
 
             info!(%id, decision = ?rich.decision, "decision resolved");
 
@@ -119,6 +201,10 @@ impl DecisionQueue {
             .pending_items
             .iter()
             .filter(|req| filter.as_ref().is_none_or(|f| f.matches(req)))
+            // A managed process must never be released through the generic
+            // bulk path for any outcome. Its two-phase finalizer is the sole
+            // persistence/release owner (itr#94).
+            .filter(|req| !self.managed_spawn_ids.contains(&req.id))
             .map(|req| req.id)
             .collect();
 
@@ -134,7 +220,9 @@ impl DecisionQueue {
 
     /// Get a snapshot of all pending items (for TUI initial sync).
     pub fn snapshot(&self) -> Vec<DecisionRequest> {
-        self.pending_items.clone()
+        let mut snapshot = self.pending_items.clone();
+        snapshot.extend(self.claimed_items.values().cloned());
+        snapshot
     }
 
     /// Look up a pending request by id without removing it. Used by the
@@ -146,14 +234,33 @@ impl DecisionQueue {
         self.pending_items.iter().find(|r| r.id == id)
     }
 
+    /// Count queued items for one tool. Used to enforce small per-class caps
+    /// while holding the queue lock, so concurrent connections cannot race the
+    /// check and enqueue steps.
+    pub fn count_tool(&self, tool_name: &str) -> usize {
+        self.pending_items
+            .iter()
+            .chain(self.claimed_items.values())
+            .filter(|req| req.tool_name == tool_name)
+            .count()
+    }
+
+    pub fn managed_spawn_count(&self) -> usize {
+        self.managed_spawn_ids.len()
+    }
+
+    pub fn is_managed_spawn(&self, id: Uuid) -> bool {
+        self.managed_spawn_ids.contains(&id)
+    }
+
     /// Number of pending decisions.
     pub fn len(&self) -> usize {
-        self.pending_items.len()
+        self.pending_items.len() + self.claimed_items.len()
     }
 
     /// Whether the queue is empty.
     pub fn is_empty(&self) -> bool {
-        self.pending_items.is_empty()
+        self.pending_items.is_empty() && self.claimed_items.is_empty()
     }
 }
 
@@ -243,6 +350,25 @@ mod tests {
         assert_eq!(victim_rx.await.unwrap().decision, Decision::Approve);
     }
 
+    #[tokio::test]
+    async fn duplicate_id_is_rejected_while_victim_is_claimed() {
+        let mut q = make_queue();
+        let victim = make_request("SpawnAgent", "wisphive-daemon:spawn", "/muse");
+        let id = victim.id;
+        let victim_rx = q.enqueue(victim).unwrap();
+        let claim = q.claim(id).unwrap();
+
+        let mut attacker = make_request("Write", "cc-attacker", "/evil");
+        attacker.id = id;
+        assert!(
+            q.enqueue(attacker).is_none(),
+            "claimed IDs remain reserved until durable completion"
+        );
+        assert_eq!(q.len(), 1);
+        assert!(q.complete_claim(claim, RichDecision::approve()));
+        assert_eq!(victim_rx.await.unwrap().decision, Decision::Approve);
+    }
+
     #[test]
     fn finalize_local_removes_entry_and_broadcasts() {
         // itr#363: a timeout/disconnect resolution outside the queue must
@@ -300,6 +426,32 @@ mod tests {
         assert!(q.resolve(id, RichDecision::deny()));
         let decision = rx.await.unwrap();
         assert_eq!(decision.decision, Decision::Deny);
+    }
+
+    #[tokio::test]
+    async fn claim_does_not_release_worker_until_completed() {
+        let mut q = make_queue();
+        let req = make_request("SpawnAgent", "wisphive-daemon:spawn", "/muse");
+        let id = req.id;
+        let mut rx = Box::pin(q.enqueue_managed_spawn(req).unwrap());
+
+        let claimed = q.claim(id).expect("pending decision should be claimable");
+        assert_eq!(claimed.request().tool_name, "SpawnAgent");
+        assert_eq!(
+            q.count_tool("SpawnAgent"),
+            1,
+            "claimed work remains inside the global pending cap"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), rx.as_mut())
+                .await
+                .is_err(),
+            "claim alone must not release the waiting worker"
+        );
+
+        assert!(q.complete_claim(claimed, RichDecision::approve()));
+        assert_eq!(q.count_tool("SpawnAgent"), 0);
+        assert_eq!(rx.await.unwrap().decision, Decision::Approve);
     }
 
     #[test]
@@ -374,6 +526,29 @@ mod tests {
         assert_eq!(rx1.await.unwrap().decision, Decision::Approve);
         assert_eq!(rx2.await.unwrap().decision, Decision::Approve);
         assert_eq!(rx3.await.unwrap().decision, Decision::Approve);
+    }
+
+    #[tokio::test]
+    async fn generic_bulk_resolution_always_skips_managed_spawn() {
+        let mut q = make_queue();
+        let spawn = make_request("SpawnAgent", "wisphive-daemon:spawn", "/muse");
+        let spawn_id = spawn.id;
+        let spawn_rx = q.enqueue_managed_spawn(spawn).unwrap();
+        let bash = make_request("Bash", "cc-1", "/muse");
+        let bash_rx = q.enqueue(bash).unwrap();
+
+        let approved = q.resolve_all(&None, Decision::Approve, Some("human:tui"));
+        assert_eq!(approved.len(), 1, "only the ordinary tool is bulk-approved");
+        assert_eq!(bash_rx.await.unwrap().decision, Decision::Approve);
+        assert_eq!(q.count_tool("SpawnAgent"), 1);
+
+        let denied = q.resolve_all(&None, Decision::Deny, Some("human:tui"));
+        assert!(denied.is_empty());
+        assert_eq!(q.count_tool("SpawnAgent"), 1);
+        assert!(!q.resolve(spawn_id, RichDecision::deny()));
+        let claim = q.claim(spawn_id).unwrap();
+        assert!(q.complete_claim(claim, RichDecision::deny()));
+        assert_eq!(spawn_rx.await.unwrap().decision, Decision::Deny);
     }
 
     #[tokio::test]

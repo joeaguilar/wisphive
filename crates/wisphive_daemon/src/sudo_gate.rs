@@ -1,6 +1,7 @@
 //! Sudo-mode gate for web-device approvals.
 //!
-//! Certain tools (Bash, Write, Edit, NotebookEdit, MultiEdit, ConfigChange)
+//! Certain tools (Bash, Write, Edit, NotebookEdit, MultiEdit, ConfigChange,
+//! SpawnAgent)
 //! are powerful enough that a stolen device token shouldn't be able to
 //! approve them on its own — the operator must re-enter the account password
 //! within a short window first. This mirrors `sudo`: the shell is
@@ -46,6 +47,7 @@ use wisphive_protocol::DeviceId;
 /// - `ConfigChange` — updates `~/.wisphive/config.json` (mode flips,
 ///   auto-approve list edits); exfiltrating this list is how an attacker
 ///   would broaden blast radius silently.
+/// - `SpawnAgent` — launches a long-lived child with workspace-write access.
 ///
 /// Read-only tools (Read, Grep, Glob, WebFetch, WebSearch) are intentionally
 /// not gated: the UX cost of a sudo prompt isn't worth the marginal
@@ -57,6 +59,7 @@ pub const SUDO_TOOLS: &[&str] = &[
     "MultiEdit",
     "NotebookEdit",
     "ConfigChange",
+    "SpawnAgent",
 ];
 
 /// How long a reauth "counts" for. After this, approvals of sudo-class
@@ -153,6 +156,7 @@ mod tests {
         assert!(is_sudo_tool("MultiEdit"));
         assert!(is_sudo_tool("NotebookEdit"));
         assert!(is_sudo_tool("ConfigChange"));
+        assert!(is_sudo_tool("SpawnAgent"));
 
         // Non-sudo tools
         assert!(!is_sudo_tool("Read"));
