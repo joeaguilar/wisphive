@@ -187,3 +187,7 @@ All 22 sprint-3 stories closed across 7 waves, zero quarantines, zero foundation
 **Epic itr#496** left open per project convention — closing epics is a `/sprint-review` responsibility, not `/blitz`'s.
 
 **Next steps**: run `/sprint-review` to walk acceptance, fill Outcomes/Demo/Retro in `plan.md`, triage the Login.tsx follow-up, and close itr#496. Review the diff and commit — nothing was committed during this blitz.
+
+## Post-blitz addendum (2026-07-11, same day)
+
+The 7-wave run above was committed as `a38ea02`, then run through `/crossfire-review` (Codex adversarial-review + Opus, independent lanes). Both lanes converged on itr#497 (sticky `password_set` cache breaking live `reset-password`) — strong corroboration. 7 findings total filed (itr#497–503), all parented to itr#496, groomed via `/groom`, and added to `sprint-3/plan.md` as **Wave 8** (see plan.md for the full table, complexity/route tags, and file-contention notes: `auth.rs`×3, `tls.rs`×3, `security.rs` standalone). Wave 8 has not been executed yet — this file will gain new wave sections when it runs, following the same file-ownership/verify-gate/wave-gate pattern as Waves 1–7. itr#503 needs a maintainer decision (self-heal vs. hard-fail semantics) before it's dispatchable; the rest are ready.
