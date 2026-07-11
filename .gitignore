@@ -17,3 +17,6 @@ __pycache__/
 # .impeccable/design.json, .impeccable/live/config.json — are committed).
 **/.impeccable/hook.cache.json
 **/.impeccable/config.local.json
+
+# Transient Playwright-MCP browser output (console logs, screenshots)
+.playwright-mcp/
