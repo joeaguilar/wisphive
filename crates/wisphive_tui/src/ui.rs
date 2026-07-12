@@ -265,8 +265,13 @@ fn draw_detail_view(frame: &mut Frame, app: &App) {
 
     if let Some(req) = app.detail_request() {
         let lines = detail::render_detail_lines(req, app.markdown_preview);
-        let total_lines = lines.len();
-        let visible_height = chunks[0].height.saturating_sub(2) as usize;
+        let total_lines = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+        let visible_height = chunks[0].height.saturating_sub(2);
+        let max_scroll = total_lines.saturating_sub(visible_height);
+        let displayed_scroll = u16::try_from(app.detail_scroll)
+            .unwrap_or(u16::MAX)
+            .min(max_scroll);
+        app.detail_max_scroll.set(max_scroll);
 
         let paragraph = Paragraph::new(lines)
             .block(
@@ -276,14 +281,14 @@ fn draw_detail_view(frame: &mut Frame, app: &App) {
                     .title(format!(" Review: {} ", req.tool_name)),
             )
             .wrap(Wrap { trim: false })
-            .scroll((app.detail_scroll as u16, 0));
+            .scroll((displayed_scroll, 0));
 
         frame.render_widget(paragraph, chunks[0]);
 
-        let scroll_info = if total_lines > visible_height {
-            let max_scroll = total_lines.saturating_sub(visible_height);
-            let pos = app.detail_scroll.min(max_scroll) + 1;
-            format!(" [{}/{}]", pos, max_scroll + 1)
+        let scroll_info = if max_scroll > 0 {
+            let pos = usize::from(displayed_scroll).saturating_add(1);
+            let positions = usize::from(max_scroll).saturating_add(1);
+            format!(" [{pos}/{positions}]")
         } else {
             String::new()
         };
@@ -1210,10 +1215,72 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use wisphive_protocol::{AgentType, DecisionRequest};
 
     use super::*;
+
+    #[test]
+    fn detail_end_key_renders_last_screen_without_trapping_scroll() {
+        let command = (0..40)
+            .map(|line| format!("detail line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let request = DecisionRequest {
+            id: uuid::Uuid::new_v4(),
+            agent_id: "agent-1".into(),
+            agent_type: AgentType::Codex,
+            project: PathBuf::from("/tmp/project"),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({"command": command}),
+            timestamp: chrono::Utc::now(),
+            hook_event_name: Default::default(),
+            tool_use_id: None,
+            permission_suggestions: None,
+            event_data: None,
+            terminal_session_id: None,
+        };
+        let mut app = App::new();
+        app.queue.push(request);
+        app.enter_detail_view();
+
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let expected_max = u16::try_from(
+            detail::render_detail_lines(app.detail_request().unwrap(), app.markdown_preview).len(),
+        )
+        .unwrap_or(u16::MAX)
+        .saturating_sub(7);
+        assert_eq!(app.detail_max_scroll.get(), expected_max);
+
+        crate::input::handle_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE)),
+        );
+        assert_eq!(app.detail_scroll, usize::from(expected_max));
+
+        crate::input::handle_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        );
+        assert_eq!(app.detail_scroll, usize::from(expected_max));
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut content = String::new();
+        for y in 1..8 {
+            for x in 1..79 {
+                content.push_str(buffer[(x, y)].symbol());
+            }
+        }
+        assert!(!content.trim().is_empty(), "last detail screen is blank");
+    }
 
     #[test]
     fn status_bar_renders_status_error_in_red() {

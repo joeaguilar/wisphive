@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use wisphive_daemon::state::StateDb;
 use wisphive_web::auth;
 use wisphive_web::tls;
+use zeroize::Zeroize;
 
 /// `~/.wisphive` — mirrors `hooks::wisphive_home` so we don't drag that
 /// private helper out of its module.
@@ -42,16 +43,26 @@ async fn open_db() -> Result<StateDb> {
 /// Double-prompt for a password with confirmation. Returns `None` if the two
 /// entries disagree or the entered password is empty.
 fn prompt_password_twice() -> Result<Option<String>> {
-    let first = rpassword::prompt_password("New web password: ")?;
+    let mut first = rpassword::prompt_password("New web password: ")?;
     if first.is_empty() {
         eprintln!("empty password — aborted");
+        first.zeroize();
         return Ok(None);
     }
-    let second = rpassword::prompt_password("Confirm password: ")?;
+    let mut second = match rpassword::prompt_password("Confirm password: ") {
+        Ok(password) => password,
+        Err(error) => {
+            first.zeroize();
+            return Err(error.into());
+        }
+    };
     if first != second {
         eprintln!("passwords did not match — aborted");
+        first.zeroize();
+        second.zeroize();
         return Ok(None);
     }
+    second.zeroize();
     Ok(Some(first))
 }
 
@@ -73,23 +84,37 @@ fn confirm_typed(expected: &str) -> Result<bool> {
 /// touch existing device tokens — already-logged-in browsers keep working
 /// until their tokens are revoked or the operator runs `reset-password`.
 pub async fn set_password() -> Result<()> {
-    let Some(password) = prompt_password_twice()? else {
+    let Some(mut password) = prompt_password_twice()? else {
         return Ok(());
     };
-    let db = open_db().await?;
-    persist_password(&db, &password).await?;
+    let db = match open_db().await {
+        Ok(db) => db,
+        Err(error) => {
+            password.zeroize();
+            return Err(error);
+        }
+    };
+    persist_password(&db, &mut password).await?;
     eprintln!("Web password updated.");
     Ok(())
 }
 
 /// Hash-and-store implementation extracted from [`set_password`] so tests
 /// can drive it with a temp-dir `StateDb` (no TTY, no global `$HOME`).
-async fn persist_password(db: &StateDb, password: &str) -> Result<()> {
-    let phc = auth::hash_password(password).context("hashing password")?;
+async fn persist_password(db: &StateDb, password: &mut String) -> Result<()> {
+    let phc = hash_password_zeroizing(password)?;
     db.set_web_password(&phc)
         .await
         .context("storing password hash in state db")?;
     Ok(())
+}
+
+/// Hash a plaintext password, then wipe its caller-owned buffer regardless
+/// of whether hashing succeeds.
+fn hash_password_zeroizing(password: &mut String) -> Result<String> {
+    let result = auth::hash_password(password).context("hashing password");
+    password.zeroize();
+    result
 }
 
 /// `wisphive web reset-password`
@@ -230,12 +255,24 @@ mod tests {
     #[tokio::test]
     async fn persist_password_round_trips_through_verify() {
         let (_dir, db) = tmp_db().await;
-        persist_password(&db, "hunter2-correct-horse")
-            .await
-            .unwrap();
+        let mut password = "hunter2-correct-horse".to_string();
+        persist_password(&db, &mut password).await.unwrap();
+        assert!(password.is_empty());
         let phc = db.get_web_password_hash().await.unwrap().unwrap();
         assert!(auth::verify_password("hunter2-correct-horse", &phc));
         assert!(!auth::verify_password("wrong-password", &phc));
+    }
+
+    /// Hashing must not leave the prompt's plaintext in its caller-owned
+    /// allocation after Argon2 has consumed it.
+    #[test]
+    fn hash_password_zeroizes_plaintext_buffer() {
+        let mut password = "hunter2-correct-horse".to_string();
+
+        let phc = hash_password_zeroizing(&mut password).unwrap();
+
+        assert!(!phc.is_empty());
+        assert!(password.is_empty());
     }
 
     /// `persist_password` upserts, not inserts: a second call must replace
@@ -244,8 +281,10 @@ mod tests {
     #[tokio::test]
     async fn persist_password_upserts() {
         let (_dir, db) = tmp_db().await;
-        persist_password(&db, "first").await.unwrap();
-        persist_password(&db, "second").await.unwrap();
+        let mut first = "first".to_string();
+        persist_password(&db, &mut first).await.unwrap();
+        let mut second = "second".to_string();
+        persist_password(&db, &mut second).await.unwrap();
         let phc = db.get_web_password_hash().await.unwrap().unwrap();
         assert!(!auth::verify_password("first", &phc));
         assert!(auth::verify_password("second", &phc));

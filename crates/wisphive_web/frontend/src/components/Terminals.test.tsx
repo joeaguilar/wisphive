@@ -1,6 +1,7 @@
 import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { Terminals } from "./Terminals";
 import type { TerminalSessionMeta } from "../types/protocol";
 import type { TerminalOutputHandler } from "../hooks/useWisphive";
@@ -18,6 +19,22 @@ globalThis.ResizeObserver = ResizeObserverStub as unknown as typeof ResizeObserv
 if (!window.matchMedia) {
   window.matchMedia = ((query: string) => ({
     matches: false,
+    media: query,
+    onchange: null,
+    addEventListener() {},
+    removeEventListener() {},
+    addListener() {},
+    removeListener() {},
+    dispatchEvent() {
+      return false;
+    },
+  })) as unknown as typeof window.matchMedia;
+}
+const defaultMatchMedia = window.matchMedia;
+
+function setMobileViewport(matches: boolean) {
+  window.matchMedia = vi.fn((query: string) => ({
+    matches: query === "(max-width: 900px)" && matches,
     media: query,
     onchange: null,
     addEventListener() {},
@@ -54,6 +71,7 @@ interface MountOverrides {
     options?: { replayMode?: boolean },
   ) => () => void;
   strict?: boolean;
+  shell?: boolean;
 }
 
 function mountTerminals(overrides: MountOverrides = {}) {
@@ -61,7 +79,7 @@ function mountTerminals(overrides: MountOverrides = {}) {
   const onDetach = overrides.onDetach ?? vi.fn();
   const onReplay = overrides.onReplay ?? vi.fn();
   const registerHandler = overrides.registerHandler ?? vi.fn(() => () => {});
-  const view = (
+  const terminalsView = (
     <Terminals
       terminals={[session]}
       queue={[]}
@@ -83,6 +101,14 @@ function mountTerminals(overrides: MountOverrides = {}) {
       registerHandler={registerHandler}
     />
   );
+  const view = overrides.shell ? (
+    <div className="app">
+      <nav className="sidebar">
+        <button type="button">Occluded navigation</button>
+      </nav>
+      <main className="content">{terminalsView}</main>
+    </div>
+  ) : terminalsView;
   const utils = render(overrides.strict ? <StrictMode>{view}</StrictMode> : view);
   return { ...utils, onAttach, onDetach, onReplay, registerHandler };
 }
@@ -95,6 +121,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  window.matchMedia = defaultMatchMedia;
 });
 
 describe("Terminals two-step mobile workflow (itr#487)", () => {
@@ -134,6 +161,27 @@ describe("Terminals two-step mobile workflow (itr#487)", () => {
     expect(container.querySelector(".terminals-mobile-header")).toBeNull();
     expect(onDetach).toHaveBeenCalledWith(session.id);
     expect(document.activeElement).toBe(attach);
+  });
+});
+
+describe("Terminals mobile dialog accessibility (itr#488)", () => {
+  it("makes the sub-window modal and prevents Tab reaching occluded navigation", async () => {
+    setMobileViewport(true);
+    const user = userEvent.setup();
+    const { container } = mountTerminals({ shell: true });
+
+    await user.click(screen.getByRole("button", { name: "Attach" }));
+
+    const dialog = screen.getByRole("dialog", { name: "claude" });
+    const occludedNavigation = screen.getByRole("navigation");
+    expect(dialog).toHaveAttribute("aria-modal", "true");
+    expect(occludedNavigation).toHaveAttribute("inert");
+
+    // Browser focus navigation skips an inert subtree. jsdom does not model
+    // that native behavior, so assert the platform-recognized inert boundary
+    // rather than emulating a second tab-order algorithm in the test.
+    expect(occludedNavigation.contains(document.activeElement)).toBe(false);
+    expect(container.querySelector(".terminals-main")).toBe(dialog);
   });
 });
 

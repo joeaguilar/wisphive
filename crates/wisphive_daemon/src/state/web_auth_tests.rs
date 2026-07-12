@@ -42,6 +42,33 @@ async fn web_password_set_get_and_reset() {
 }
 
 #[tokio::test]
+async fn web_password_rehash_compare_and_swap_preserves_newer_hash() {
+    let db = test_db().await;
+    let weak_hash = "$argon2id$weak";
+    let first_upgrade = "$argon2id$upgrade-one";
+    let stale_upgrade = "$argon2id$upgrade-two";
+    db.set_web_password(weak_hash).await.unwrap();
+
+    // Model two successful logins which both verified `weak_hash`. The first
+    // replacement wins, while the second's stale compare-and-swap must not
+    // clobber it with a different random-salt replacement.
+    assert!(
+        db.replace_web_password_hash_if_current(weak_hash, first_upgrade)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !db.replace_web_password_hash_if_current(weak_hash, stale_upgrade)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        db.get_web_password_hash().await.unwrap().as_deref(),
+        Some(first_upgrade)
+    );
+}
+
+#[tokio::test]
 async fn initial_web_password_and_device_rolls_back_when_device_insert_fails() {
     let db = test_db().await;
     db.insert_web_device("existing-device", "phone", "existing-token")

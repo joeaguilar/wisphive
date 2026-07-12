@@ -752,11 +752,6 @@ async fn handle_hook(
             }
 
             let agent_id = req.agent_id.clone();
-            let req_tool_name = req.tool_name.clone();
-
-            // The daemon's configured state root, not a fresh $HOME lookup —
-            // they diverge when the daemon runs with a non-default home (itr#360).
-            let config_home = ctx.home_dir.clone();
 
             // Register agent and broadcast to TUI clients (only if new)
             let (agent_info, is_new) = {
@@ -884,19 +879,6 @@ async fn handle_hook(
                     return Ok(());
                 }
             };
-
-            // Persist auto-approve if requested (blocking file I/O off the runtime)
-            if rich.always_allow {
-                let tool = req_tool_name.clone();
-                let persisted =
-                    tokio::task::spawn_blocking(move || persist_auto_approve(&tool, &config_home))
-                        .await;
-                match persisted {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => warn!("failed to persist auto-approve: {e}"),
-                    Err(e) => warn!("persist auto-approve task panicked: {e}"),
-                }
-            }
 
             // Log resolution. An Ask/defer is not an auditable terminal
             // decision, so it skips decision_log — but the pending row must
@@ -1459,6 +1441,48 @@ async fn handle_decision_command(
                     &resolver_label(&device_id),
                 )
                 .await;
+
+                // Always Allow affects future requests only. Resolve this request
+                // even if its rule cannot be persisted, then tell this specific
+                // client how to repair the failed persistence.
+                if always_allow && let Some(request) = pending {
+                    let tool = request.tool_name;
+                    let config_home = ctx.home_dir.clone();
+                    let config_path = config_home.join("config.json");
+                    let persistence_tool = tool.clone();
+                    let persisted = tokio::task::spawn_blocking(move || {
+                        persist_auto_approve(&persistence_tool, &config_home)
+                    })
+                    .await;
+                    match persisted {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            warn!(%tool, %error, "failed to persist auto-approve");
+                            write_msg(
+                                writer,
+                                &ServerMessage::Error {
+                                    message: format!(
+                                        "Approved this request, but could not save an Always Allow rule for {tool}: {error}. Fix {} and try again.",
+                                        config_path.display(),
+                                    ),
+                                },
+                            )
+                            .await?;
+                        }
+                        Err(error) => {
+                            warn!(%tool, %error, "persist auto-approve task failed");
+                            write_msg(
+                                writer,
+                                &ServerMessage::Error {
+                                    message: format!(
+                                        "Approved this request, but could not save an Always Allow rule for {tool}: persistence task failed ({error}). Try again."
+                                    ),
+                                },
+                            )
+                            .await?;
+                        }
+                    }
+                }
             }
         }
         ClientMessage::Deny { id, message } => {
@@ -4247,6 +4271,103 @@ mod tests {
         let (gated, allowed) = partition_sudo_gated(true, vec![spawn.clone()]);
         assert!(gated.is_empty());
         assert_eq!(ids(&allowed), vec![spawn.0]);
+    }
+
+    #[tokio::test]
+    async fn always_allow_persist_failure_is_sent_to_resolving_tui() {
+        use std::time::Duration;
+
+        use tokio::net::UnixStream;
+        use wisphive_protocol::{
+            AgentType, ClientMessage, Decision, DecisionRequest, HookEventType, ServerMessage,
+        };
+
+        let home = tempfile::tempdir().unwrap();
+        let config = crate::DaemonConfig::new(home.path().to_path_buf());
+        let server = super::Server::new(config).await.unwrap();
+        let config_path = server.config.home_dir.join("config.json");
+        std::fs::write(&config_path, "{ broken").unwrap();
+        let ctx = super::ConnectionContext {
+            queue: server.queue.clone(),
+            process_registry: server.process_registry.clone(),
+            agent_registry: server.agent_registry.clone(),
+            tui_tx: server.tui_tx.clone(),
+            state_db: server.state_db.clone(),
+            terminal_manager: server.terminal_manager.clone(),
+            reauth: server.reauth.clone(),
+            replay_gate: server.replay_gate.clone(),
+            bad_hello_gate: server.bad_hello_gate.clone(),
+            hook_timeout_secs: server.config.hook_timeout_secs,
+            notifications_enabled: server.config.notifications_enabled,
+            home_dir: server.config.home_dir.clone(),
+            audit_snapshot_limit: server.config.audit_snapshot_limit,
+        };
+
+        let request = DecisionRequest {
+            id: uuid::Uuid::new_v4(),
+            agent_id: "cc-always-allow-test".into(),
+            agent_type: AgentType::ClaudeCode,
+            project: home.path().join("project"),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({ "command": "cargo test" }),
+            timestamp: chrono::Utc::now(),
+            hook_event_name: HookEventType::PreToolUse,
+            tool_use_id: None,
+            permission_suggestions: None,
+            event_data: None,
+            terminal_session_id: None,
+        };
+        let request_id = request.id;
+        let mut hook_response = {
+            let mut queue = ctx.queue.lock().await;
+            queue.enqueue(request).expect("request should enqueue")
+        };
+
+        let (server_stream, client_stream) = UnixStream::pair().unwrap();
+        let (_, mut writer) = server_stream.into_split();
+        let mut responses = BufReader::new(client_stream).lines();
+        let mut attachments = std::collections::HashMap::new();
+        let (conn_tx, _conn_rx) = tokio::sync::mpsc::channel(1);
+        let flow = super::dispatch_command(
+            &mut writer,
+            &ctx,
+            None,
+            ClientMessage::Approve {
+                id: request_id,
+                message: None,
+                updated_input: None,
+                always_allow: true,
+                additional_context: None,
+            },
+            &mut attachments,
+            &conn_tx,
+        )
+        .await
+        .unwrap();
+        assert!(flow.is_continue());
+
+        let line = tokio::time::timeout(Duration::from_secs(2), responses.next_line())
+            .await
+            .expect("persist failure should be sent to the resolving TUI")
+            .unwrap()
+            .unwrap();
+        let response: ServerMessage = wisphive_protocol::decode(&line).unwrap();
+        match response {
+            ServerMessage::Error { message } => {
+                assert!(message.starts_with(
+                    "Approved this request, but could not save an Always Allow rule for Bash:"
+                ));
+                assert!(message.contains(&format!("Fix {} and try again.", config_path.display())));
+            }
+            other => panic!("expected Always Allow persistence error, got {other:?}"),
+        }
+
+        let resolved = tokio::time::timeout(Duration::from_secs(2), &mut hook_response)
+            .await
+            .expect("the user's approval should still resolve the tool")
+            .expect("decision sender should remain live");
+        assert_eq!(resolved.decision, Decision::Approve);
+        assert!(resolved.always_allow);
     }
 
     #[tokio::test]

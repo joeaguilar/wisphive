@@ -184,6 +184,31 @@ impl StateDb {
         Ok(row.map(|(h,)| h))
     }
 
+    /// Replace the web password hash only when it still equals `expected`.
+    ///
+    /// This is the rehash-on-verify compare-and-swap boundary. Two requests
+    /// can both verify an older hash, but only the first conditional update
+    /// wins; the second cannot overwrite that newer hash with its own salt.
+    /// An explicit password change or reset also makes a stale migration a
+    /// harmless `false` rather than allowing it to resurrect the old secret.
+    pub async fn replace_web_password_hash_if_current(
+        &self,
+        expected: &str,
+        replacement: &str,
+    ) -> WebAuthResult<bool> {
+        let result = sqlx::query(
+            "UPDATE web_password SET argon2_hash = ?, updated_at = ?
+             WHERE id = 1 AND argon2_hash = ?",
+        )
+        .bind(replacement)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(expected)
+        .execute(&self.pool)
+        .await
+        .map_err(WebAuthError::from_sqlx)?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Wipe the password + all devices + passkeys (reset). The audit rows
     /// stay so the operator can see the reset event.
     ///

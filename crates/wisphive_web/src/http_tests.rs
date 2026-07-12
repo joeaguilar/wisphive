@@ -8,6 +8,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use argon2::password_hash::{PasswordHasher, SaltString};
+use argon2::{Algorithm, Argon2, Params, Version};
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use http_body_util::BodyExt;
@@ -18,7 +20,9 @@ use wisphive_daemon::logging::{LogRecord, LogStore};
 use wisphive_daemon::state::StateDb;
 use wisphive_protocol::{ClientCommand, ClientMessage, PROTOCOL_VERSION, ServerMessage, encode};
 
-use crate::auth::{generate_device_token, hash_password};
+use crate::auth::{
+    PasswordVerification, generate_device_token, hash_password, verify_password_with_migration,
+};
 use crate::auth_profile::AuthProfile;
 use crate::security::{ClientIp, SecurityConfig};
 use crate::{AppState, build_router};
@@ -50,6 +54,48 @@ async fn test_db() -> (tempfile::TempDir, StateDb) {
     let phc = hash_password(PASSWORD).unwrap();
     db.set_web_password(&phc).await.unwrap();
     (tmp, db)
+}
+
+/// Produce a valid Argon2id hash that can verify the fixture password but is
+/// intentionally below the current login cost floor. A fixed test salt is
+/// safe here and makes the pre-migration value easy to compare exactly.
+fn below_floor_password_hash(password: &str) -> String {
+    let params = Params::new(1_024, 1, 1, None).unwrap();
+    let salt = SaltString::encode_b64(b"below-floor-test").unwrap();
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+        .hash_password(password.as_bytes(), &salt)
+        .unwrap()
+        .to_string()
+}
+
+async fn seed_below_floor_password(state: &AppState) -> String {
+    let weak_hash = below_floor_password_hash(PASSWORD);
+    state
+        .security
+        .state_db()
+        .set_web_password(&weak_hash)
+        .await
+        .unwrap();
+    weak_hash
+}
+
+async fn assert_password_hash_migrated(state: &AppState, previous_hash: &str) {
+    let migrated_hash = state
+        .security
+        .state_db()
+        .get_web_password_hash()
+        .await
+        .unwrap()
+        .expect("successful verification must keep a password hash");
+    assert_ne!(
+        migrated_hash, previous_hash,
+        "below-floor hash was not replaced"
+    );
+    assert_eq!(
+        verify_password_with_migration(PASSWORD, &migrated_hash),
+        PasswordVerification::Ok,
+        "replacement hash must meet the current Argon2 cost floor"
+    );
 }
 
 /// Seed one pre-enrolled device so the tests can present a known-good token.
@@ -716,6 +762,35 @@ async fn login_with_correct_password_issues_device_token() {
     assert_eq!(s2, StatusCode::OK);
 }
 
+/// itr#504: a correct login against a valid but below-floor Argon2id hash
+/// must retain the normal successful response while persisting a fresh hash
+/// at the current parameters.
+#[tokio::test]
+async fn login_rehashes_below_floor_password_hash() {
+    let (_tmp, state) = test_state().await;
+    let weak_hash = seed_below_floor_password(&state).await;
+    let body = serde_json::json!({ "password": PASSWORD, "device_name": "iphone" });
+    let r = req("POST", "/api/auth/login")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+
+    let (status, body) = run_with(state.clone(), r).await;
+    assert_eq!(status, StatusCode::OK);
+    let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        response["device_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
+    assert!(
+        response["token"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty())
+    );
+    assert_password_hash_migrated(&state, &weak_hash).await;
+}
+
 #[tokio::test]
 async fn login_with_wrong_password_returns_401_and_bumps_throttle() {
     let (_tmp, state) = test_state().await;
@@ -923,6 +998,27 @@ async fn reauth_returns_503_when_daemon_socket_unreachable() {
         .unwrap();
     let (status, _) = run_with(state, r).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// Reauth has a later daemon IPC step, but password verification occurs
+/// first. Its below-floor migration must therefore complete even when the
+/// existing daemon-unreachable response remains a 503.
+#[tokio::test]
+async fn reauth_rehashes_below_floor_password_before_daemon_response() {
+    let (_tmp, state) = test_state().await;
+    let (token, _id) = seed_device(state.security.state_db(), "iphone").await;
+    let weak_hash = seed_below_floor_password(&state).await;
+    let r = req("POST", "/api/auth/reauth")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            serde_json::json!({ "password": PASSWORD }).to_string(),
+        ))
+        .unwrap();
+
+    let (status, _) = run_with(state.clone(), r).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_password_hash_migrated(&state, &weak_hash).await;
 }
 
 /// A second back-to-back login attempt from the same IP should hit the
@@ -1724,6 +1820,25 @@ async fn devices_revoke_other_device() {
         .unwrap();
     let (s3, _) = run_with(state, r3).await;
     assert_eq!(s3, StatusCode::OK);
+}
+
+/// Device revocation re-proves the account password, so it must share the
+/// same below-floor hash migration as the login and reauth paths.
+#[tokio::test]
+async fn devices_revoke_rehashes_below_floor_password_hash() {
+    let (_tmp, state) = test_state().await;
+    let (actor_token, _) = seed_device(state.security.state_db(), "laptop").await;
+    let (_, victim_id) = seed_device(state.security.state_db(), "phone").await;
+    let weak_hash = seed_below_floor_password(&state).await;
+    let r = req("POST", &format!("/api/devices/{victim_id}/revoke"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {actor_token}"))
+        .body(revoke_body(PASSWORD))
+        .unwrap();
+
+    let (status, _) = run_with(state.clone(), r).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_password_hash_migrated(&state, &weak_hash).await;
 }
 
 #[tokio::test]

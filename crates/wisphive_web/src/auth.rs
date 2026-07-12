@@ -88,15 +88,12 @@ pub fn hash_password(password: &str) -> anyhow::Result<String> {
 /// out* below-floor accounts. The *write* path (`argon2_instance`) still
 /// mints at these floors, so newly stored hashes are never below them.
 ///
-/// **The transparent rehash-on-login migration is not yet wired** (itr#502
-/// closed only the lockout ratchet; the rehash sink is a tracked follow-up).
-/// No production caller consumes `OkRehashNeeded` today — every login path
-/// uses the `verify_password` bool wrapper and discards the signal — so a
-/// below-floor hash keeps verifying at its weak parameters indefinitely; it
-/// is accepted, not upgraded. Until a caller branches on `OkRehashNeeded` and
-/// re-persists a floor-compliant hash, raising a floor still requires a forced
-/// password reset for every below-floor account to actually migrate it. Do
-/// not reintroduce a bare below-floor `return false`.
+/// Web password handlers consume `OkRehashNeeded` and transparently replace
+/// the stored hash at the current parameters while the cleartext is still in
+/// hand. The persistence update is a compare-and-swap against the verified
+/// PHC string, so a concurrent login, password change, or reset cannot be
+/// clobbered by a stale migration. Do not reintroduce a bare below-floor
+/// `return false`.
 const MIN_M_COST: u32 = 19_456;
 const MIN_T_COST: u32 = 2;
 const MIN_P_COST: u32 = 1;
@@ -105,9 +102,9 @@ const MIN_P_COST: u32 = 1;
 ///
 /// Distinguishes a plain mismatch from a *correct* password whose stored hash
 /// was minted below the current `MIN_*_COST` floor and so warrants a
-/// transparent rehash on this successful login (itr#502). Callers that hold a
-/// write sink for the stored hash should branch on `OkRehashNeeded` and
-/// re-persist `hash_password(password)` while the cleartext is still in hand.
+/// transparent rehash on this successful verification (itr#502). Web auth
+/// handlers branch on `OkRehashNeeded` and re-persist `hash_password(password)`
+/// while the cleartext is still in hand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PasswordVerification {
     /// Password matched and the stored hash already meets the current floor.
@@ -181,7 +178,7 @@ pub fn verify_password_with_migration(password: &str, phc: &str) -> PasswordVeri
             min_m_cost = MIN_M_COST,
             min_t_cost = MIN_T_COST,
             min_p_cost = MIN_P_COST,
-            "web password verified against an Argon2id hash below the current cost floor; rehash on next successful login or force a password reset"
+            "web password verified against an Argon2id hash below the current cost floor; attempting transparent rehash"
         );
         return PasswordVerification::OkRehashNeeded;
     }

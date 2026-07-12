@@ -341,7 +341,7 @@ fn handle_detail_input(app: &mut App, key: KeyEvent) -> InputAction {
         }
         KeyCode::Char('Q') => return InputAction::Quit,
         KeyCode::Char('j') | KeyCode::Down => {
-            app.detail_scroll = app.detail_scroll.saturating_add(1);
+            scroll_detail_down(app, 1);
             return InputAction::None;
         }
         KeyCode::Char('k') | KeyCode::Up => {
@@ -349,7 +349,7 @@ fn handle_detail_input(app: &mut App, key: KeyEvent) -> InputAction {
             return InputAction::None;
         }
         KeyCode::PageDown | KeyCode::Char(' ') => {
-            app.detail_scroll = app.detail_scroll.saturating_add(20);
+            scroll_detail_down(app, 20);
             return InputAction::None;
         }
         KeyCode::PageUp => {
@@ -361,7 +361,7 @@ fn handle_detail_input(app: &mut App, key: KeyEvent) -> InputAction {
             return InputAction::None;
         }
         KeyCode::Char('G') => {
-            app.detail_scroll = usize::MAX / 2;
+            app.detail_scroll = usize::from(app.detail_max_scroll.get());
             return InputAction::None;
         }
         KeyCode::Char('p') | KeyCode::Char('P') => {
@@ -1050,6 +1050,11 @@ fn handle_history_search_input(app: &mut App, key: KeyEvent) -> InputAction {
         }
         _ => InputAction::None,
     }
+}
+
+fn scroll_detail_down(app: &mut App, amount: usize) {
+    let max_scroll = usize::from(app.detail_max_scroll.get());
+    app.detail_scroll = app.detail_scroll.saturating_add(amount).min(max_scroll);
 }
 
 fn handle_history_detail_input(app: &mut App, key: KeyEvent) -> InputAction {

@@ -3,6 +3,7 @@ import type { DecisionRequest, ProjectSummary, TerminalSessionMeta } from "../ty
 import { TerminalView } from "./TerminalView";
 import { TerminalQueueDock } from "./TerminalQueueDock";
 import { activate } from "./a11y";
+import { useIsMobile } from "../hooks/useViewport";
 
 interface TerminalsProps {
   terminals: TerminalSessionMeta[];
@@ -52,6 +53,7 @@ export function Terminals(props: TerminalsProps) {
   } = props;
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [replayMode, setReplayMode] = useState(false);
+  const isMobile = useIsMobile();
   const [showProjectPicker, setShowProjectPicker] = useState(false);
   const [orphanedOpen, setOrphanedOpen] = useState<boolean>(() => readBool("wisphive.terminals.orphaned.open", true));
   const [archivedOpen, setArchivedOpen] = useState<boolean>(() => readBool("wisphive.terminals.archived.open", false));
@@ -97,6 +99,22 @@ export function Terminals(props: TerminalsProps) {
     () => terminals.find((t) => t.id === selectedId) ?? null,
     [terminals, selectedId],
   );
+  const mobileSubwindowOpen = isMobile && selected !== null;
+
+  // The fixed mobile terminal sub-window covers the app navigation, but that
+  // navigation remains in the DOM. Make it inert while the sub-window is open
+  // so keyboard focus cannot escape to the occluded shell. This component is
+  // nested inside <main>, so the sibling <nav> must be managed imperatively.
+  useEffect(() => {
+    if (!mobileSubwindowOpen) return;
+    const backgroundShell = document.querySelector<HTMLElement>(".app > .sidebar");
+    if (!backgroundShell) return;
+    const wasInert = backgroundShell.hasAttribute("inert");
+    backgroundShell.setAttribute("inert", "");
+    return () => {
+      if (!wasInert) backgroundShell.removeAttribute("inert");
+    };
+  }, [mobileSubwindowOpen]);
 
   // Count pending approvals per terminal by joining the queue on terminal_session_id.
   const pendingByTerminal = useMemo(() => {
@@ -522,7 +540,16 @@ export function Terminals(props: TerminalsProps) {
         </div>
       </div>
 
-      <div className="terminals-main">
+      <div
+        className="terminals-main"
+        {...(mobileSubwindowOpen
+          ? {
+              role: "dialog",
+              "aria-modal": true,
+              "aria-labelledby": "terminals-mobile-dialog-title",
+            }
+          : {})}
+      >
         {selected ? (
           <>
             {/* Visible only inside the mobile sub-window (CSS hides it on
@@ -541,7 +568,7 @@ export function Terminals(props: TerminalsProps) {
               >
                 ‹ Terminals
               </button>
-              <strong className="terminals-mobile-title">
+              <strong id="terminals-mobile-dialog-title" className="terminals-mobile-title">
                 {selected.label || "(no label)"}
               </strong>
             </div>

@@ -4107,6 +4107,7 @@ dependencies = [
  "wisphive_protocol",
  "wisphive_tui",
  "wisphive_web",
+ "zeroize",
 ]
 
 [[package]]

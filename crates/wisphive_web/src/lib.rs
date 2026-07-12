@@ -57,6 +57,94 @@ fn audit_reason(reason: &str) -> String {
     serde_json::json!({ "reason": reason }).to_string()
 }
 
+/// Verify a web password and, when its Argon2id cost is below the current
+/// floor, opportunistically replace the exact hash that was verified.
+///
+/// Both Argon2 operations run on the blocking pool. A migration failure is
+/// deliberately non-fatal after a successful verification: it must not turn
+/// an otherwise successful login, reauth, or device action into a new client
+/// failure mode. The conditional DB update prevents a concurrent successful
+/// request, explicit password change, or reset from being overwritten by the
+/// stale hash we fetched before verification.
+async fn verify_and_migrate_web_password(
+    db: &StateDb,
+    password: &str,
+    phc: &str,
+    operation: &'static str,
+) -> bool {
+    let password = password.to_owned();
+    let expected_phc = phc.to_owned();
+    let password_for_verify = password.clone();
+    let phc_for_verify = expected_phc.clone();
+    let verify_handle = tokio::task::spawn_blocking(move || {
+        auth::verify_password_with_migration(&password_for_verify, &phc_for_verify)
+    });
+    let verification = match tokio::time::timeout(VERIFY_DEADLINE, verify_handle).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(join_err)) => {
+            tracing::warn!(operation, error = %join_err, "password verify task panicked");
+            return false;
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                operation,
+                deadline_secs = VERIFY_DEADLINE.as_secs(),
+                "password verify exceeded deadline"
+            );
+            return false;
+        }
+    };
+
+    match verification {
+        auth::PasswordVerification::Failed => false,
+        auth::PasswordVerification::Ok => true,
+        auth::PasswordVerification::OkRehashNeeded => {
+            let rehash_handle = tokio::task::spawn_blocking(move || auth::hash_password(&password));
+            let replacement = match tokio::time::timeout(VERIFY_DEADLINE, rehash_handle).await {
+                Ok(Ok(Ok(hash))) => hash,
+                Ok(Ok(Err(error))) => {
+                    tracing::warn!(operation, %error, "password rehash failed after verification");
+                    return true;
+                }
+                Ok(Err(join_err)) => {
+                    tracing::warn!(operation, error = %join_err, "password rehash task panicked");
+                    return true;
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        operation,
+                        deadline_secs = VERIFY_DEADLINE.as_secs(),
+                        "password rehash exceeded deadline"
+                    );
+                    return true;
+                }
+            };
+
+            match db
+                .replace_web_password_hash_if_current(&expected_phc, &replacement)
+                .await
+            {
+                Ok(true) => {
+                    info!(
+                        operation,
+                        "upgraded web password hash to the current Argon2 cost floor"
+                    );
+                }
+                Ok(false) => {
+                    tracing::debug!(
+                        operation,
+                        "web password hash changed before rehash migration could persist"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(operation, %error, "failed to persist upgraded web password hash");
+                }
+            }
+            true
+        }
+    }
+}
+
 /// Shared server state.
 #[derive(Clone)]
 struct AppState {
@@ -545,33 +633,9 @@ async fn post_auth_login(
         }
     };
 
-    // (3) Verify under a hard deadline.
-    //
-    // Argon2id verify is CPU-bound (~50 ms at our params); run it on the
-    // blocking pool so the async runtime keeps responding to other
-    // requests. Moving the password into the closure means we don't hold
-    // a reference across await points — the spawn_blocking JoinHandle is
-    // 'static.
-    let password = body.password.clone();
-    let phc_owned = phc.clone();
-    let verify_handle =
-        tokio::task::spawn_blocking(move || auth::verify_password(&password, &phc_owned));
-    let verified = match tokio::time::timeout(VERIFY_DEADLINE, verify_handle).await {
-        Ok(Ok(v)) => v,
-        Ok(Err(join_err)) => {
-            tracing::warn!(error = %join_err, "password verify task panicked");
-            false
-        }
-        Err(_elapsed) => {
-            tracing::warn!(
-                deadline_secs = VERIFY_DEADLINE.as_secs(),
-                "password verify exceeded deadline"
-            );
-            false
-        }
-    };
-
-    if !verified {
+    // (3) Verify under a hard deadline and transparently rehash a successful
+    // below-floor result. The helper keeps the original PHC for its DB CAS.
+    if !verify_and_migrate_web_password(&db, &body.password, &phc, "login").await {
         guard.record_failure().await;
         return (axum::http::StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
     }
@@ -682,26 +746,7 @@ async fn post_auth_reauth(
         }
     };
 
-    let password = body.password.clone();
-    let phc_owned = phc.clone();
-    let verify_handle =
-        tokio::task::spawn_blocking(move || auth::verify_password(&password, &phc_owned));
-    let verified = match tokio::time::timeout(VERIFY_DEADLINE, verify_handle).await {
-        Ok(Ok(v)) => v,
-        Ok(Err(join_err)) => {
-            tracing::warn!(error = %join_err, "reauth verify task panicked");
-            false
-        }
-        Err(_elapsed) => {
-            tracing::warn!(
-                deadline_secs = VERIFY_DEADLINE.as_secs(),
-                "reauth verify exceeded deadline"
-            );
-            false
-        }
-    };
-
-    if !verified {
+    if !verify_and_migrate_web_password(&db, &body.password, &phc, "reauth").await {
         guard.record_failure().await;
         return (axum::http::StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
     }
@@ -1420,26 +1465,7 @@ async fn verify_revoke_password(
         }
     };
 
-    let password = password.to_string();
-    let phc_owned = phc.clone();
-    let verify_handle =
-        tokio::task::spawn_blocking(move || auth::verify_password(&password, &phc_owned));
-    let verified = match tokio::time::timeout(VERIFY_DEADLINE, verify_handle).await {
-        Ok(Ok(v)) => v,
-        Ok(Err(join_err)) => {
-            tracing::warn!(error = %join_err, "device revoke verify task panicked");
-            false
-        }
-        Err(_elapsed) => {
-            tracing::warn!(
-                deadline_secs = VERIFY_DEADLINE.as_secs(),
-                "device revoke verify exceeded deadline"
-            );
-            false
-        }
-    };
-
-    if verified {
+    if verify_and_migrate_web_password(&db, password, &phc, "device_revoke").await {
         guard.record_success().await;
         true
     } else {

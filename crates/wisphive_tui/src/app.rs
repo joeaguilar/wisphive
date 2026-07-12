@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::path::PathBuf;
 
 use std::collections::{HashMap, HashSet};
@@ -252,6 +253,12 @@ pub struct App {
     pub view_mode: ViewMode,
     /// Scroll offset for the detail view content area.
     pub detail_scroll: usize,
+    /// Last renderable scroll offset for the detail view content area.
+    ///
+    /// The renderer updates this through shared access so input can keep the
+    /// stored offset within the viewport-specific range without changing the
+    /// public `ui::draw` API.
+    pub detail_max_scroll: Cell<u16>,
     /// The UUID of the decision being viewed in detail.
     pub detail_request_id: Option<Uuid>,
     /// Decision history from the audit log.
@@ -424,6 +431,7 @@ impl App {
             status_error: None,
             view_mode: ViewMode::Dashboard,
             detail_scroll: 0,
+            detail_max_scroll: Cell::new(0),
             detail_request_id: None,
             history: Vec::new(),
             history_index: 0,
