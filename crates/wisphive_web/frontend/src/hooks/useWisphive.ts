@@ -14,6 +14,7 @@ import type {
 } from "../types/protocol";
 import { parseServerMessage } from "../types/protocol";
 import { apiFetch, clearWebToken, getWebToken, subscribeAuthChange } from "../api";
+import { environment } from "../env";
 
 export interface WisphiveState {
   connected: boolean;
@@ -95,7 +96,7 @@ interface TerminalHandlerRegistration {
 // hatch for split-host dev setups where the Vite page and the WS backend
 // are on different origins entirely.
 const WS_BASE =
-  import.meta.env.VITE_WS_URL ||
+  environment.wsUrl ||
   `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}/ws`;
 
 // Well-known request_id prefixes for routing responses

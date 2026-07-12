@@ -286,9 +286,9 @@ enum DaemonAction {
             value_parser = parse_host_arg
         )]
         host: String,
-        /// Web UI HTTP port (implies --web).
-        #[arg(long, default_value = "3100")]
-        port: u16,
+        /// Web UI HTTP port (default: 3100; explicitly setting it implies --web).
+        #[arg(long)]
+        port: Option<u16>,
         /// Dev mode: only serve the WebSocket, expect Vite dev server for the frontend.
         #[arg(long)]
         web_dev: bool,
@@ -472,6 +472,10 @@ enum ProjectsAction {
     },
 }
 
+fn daemon_web_requested(web: bool, host: &str, port: Option<u16>, web_dev: bool) -> bool {
+    web || web_dev || host != "127.0.0.1" || port.is_some()
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -595,9 +599,12 @@ fn main() -> anyhow::Result<()> {
                         auth_profile,
                         auth_rp_id,
                     } => {
-                        // Any of --web / non-default --host / non-default --port / --web-dev
-                        // implies "serve the web UI too".
-                        let web_requested = web || web_dev || host != "127.0.0.1" || port != 3100;
+                        // Any of --web / non-default --host / explicit --port / --web-dev
+                        // implies "serve the web UI too". Keeping `port` optional at the
+                        // Clap boundary preserves whether the operator specified the flag,
+                        // including the sentinel default port 3100.
+                        let web_requested = daemon_web_requested(web, &host, port, web_dev);
+                        let port = port.unwrap_or(3100);
                         let web_opts = if web_requested {
                             // Use the same parser as `web serve` — including
                             // the `0.0.0.0` LAN-exposure WARNING. Prior to
@@ -977,6 +984,52 @@ mod cli_tests {
 
         assert_eq!(error.exit_code(), 2);
         assert!(error.to_string().contains("invalid host address 'bogus'"));
+    }
+
+    #[test]
+    fn daemon_start_explicit_default_port_requests_web() {
+        let cli = Cli::try_parse_from(["wisphive", "daemon", "start", "--port", "3100"])
+            .expect("daemon start with an explicit default port should parse");
+
+        match cli.command {
+            Command::Daemon {
+                action:
+                    DaemonAction::Start {
+                        web,
+                        host,
+                        port,
+                        web_dev,
+                        ..
+                    },
+            } => {
+                assert_eq!(port, Some(3100));
+                assert!(daemon_web_requested(web, &host, port, web_dev));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn daemon_start_without_web_flags_does_not_request_web() {
+        let cli = Cli::try_parse_from(["wisphive", "daemon", "start"])
+            .expect("bare daemon start should parse");
+
+        match cli.command {
+            Command::Daemon {
+                action:
+                    DaemonAction::Start {
+                        web,
+                        host,
+                        port,
+                        web_dev,
+                        ..
+                    },
+            } => {
+                assert_eq!(port, None);
+                assert!(!daemon_web_requested(web, &host, port, web_dev));
+            }
+            _ => panic!("unexpected command"),
+        }
     }
 
     #[test]

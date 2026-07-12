@@ -210,6 +210,8 @@ impl StateDb {
         .execute(&self.pool)
         .await?;
 
+        migrate_decision_log_fts(&self.pool).await?;
+
         // Unique index on tool_use_id for deduplication (NULL values excluded)
         sqlx::query(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_decision_log_tool_use_id
@@ -330,6 +332,104 @@ impl StateDb {
 
         Ok(())
     }
+}
+
+/// Install the trigram FTS5 mirror and backfill it exactly once.
+///
+/// The durable marker is claimed in the same transaction as the table rebuild,
+/// so a failed migration rolls both back. A steady-state boot performs one
+/// primary-key lookup instead of scanning `decision_log`. Rebuilding also
+/// replaces the rejected `unicode61` version of this table if it exists.
+async fn migrate_decision_log_fts(pool: &SqlitePool) -> Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS wisphive_schema_migrations (
+            name TEXT PRIMARY KEY,
+            applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    let mut tx = pool.begin().await?;
+    let claim = sqlx::query(
+        "INSERT INTO wisphive_schema_migrations (name)
+         VALUES ('decision_log_fts_trigram_v1')
+         ON CONFLICT(name) DO NOTHING",
+    )
+    .execute(&mut *tx)
+    .await?;
+    let claimed = claim.rows_affected() == 1;
+
+    if !claimed {
+        tx.commit().await?;
+        return Ok(());
+    }
+
+    for statement in [
+        "DROP TRIGGER IF EXISTS decision_log_fts_after_insert",
+        "DROP TRIGGER IF EXISTS decision_log_fts_after_delete",
+        "DROP TRIGGER IF EXISTS decision_log_fts_after_update",
+    ] {
+        sqlx::query(statement).execute(&mut *tx).await?;
+    }
+    sqlx::query("DROP TABLE IF EXISTS decision_log_fts")
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query(
+        "CREATE VIRTUAL TABLE decision_log_fts USING fts5(
+            tool_input,
+            tool_result,
+            tool_name,
+            content='decision_log',
+            content_rowid='rowid',
+            tokenize='trigram'
+        )",
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    // External-content tables start with an empty index. This command scans
+    // decision_log only on the marker-claiming migration, never on later boots.
+    sqlx::query("INSERT INTO decision_log_fts(decision_log_fts) VALUES ('rebuild')")
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query(
+        "CREATE TRIGGER decision_log_fts_after_insert
+         AFTER INSERT ON decision_log BEGIN
+             INSERT INTO decision_log_fts(rowid, tool_input, tool_result, tool_name)
+             VALUES (new.rowid, new.tool_input, new.tool_result, new.tool_name);
+         END",
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "CREATE TRIGGER decision_log_fts_after_delete
+         AFTER DELETE ON decision_log BEGIN
+             INSERT INTO decision_log_fts(decision_log_fts, rowid, tool_input, tool_result, tool_name)
+             VALUES ('delete', old.rowid, old.tool_input, old.tool_result, old.tool_name);
+         END",
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "CREATE TRIGGER decision_log_fts_after_update
+         AFTER UPDATE OF tool_input, tool_result, tool_name ON decision_log BEGIN
+             INSERT INTO decision_log_fts(decision_log_fts, rowid, tool_input, tool_result, tool_name)
+             VALUES ('delete', old.rowid, old.tool_input, old.tool_result, old.tool_name);
+             INSERT INTO decision_log_fts(rowid, tool_input, tool_result, tool_name)
+             VALUES (new.rowid, new.tool_input, new.tool_result, new.tool_name);
+         END",
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    info!("installed decision history FTS5 trigram index");
+    Ok(())
 }
 
 /// Idempotently add a column to an existing SQLite table.

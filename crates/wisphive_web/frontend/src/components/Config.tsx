@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { apiFetch } from "../api";
+import "../env";
 
 const LEVELS = ["off", "read", "write", "execute", "all"] as const;
 type Level = typeof LEVELS[number];

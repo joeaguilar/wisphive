@@ -1,4 +1,5 @@
 use anyhow::Result;
+use sqlx::QueryBuilder;
 
 use super::{DecisionLogRow, StateDb};
 
@@ -71,6 +72,36 @@ pub struct AutoApprovedEntry<'a> {
     pub decided_by: Option<&'a str>,
     /// Truncated SHA-256 of config.json at decision time.
     pub config_hash: Option<&'a str>,
+}
+
+/// Start another parameterized predicate in a dynamically filtered history
+/// query. Predicate text is static SQL; caller-provided values are added by
+/// the caller through [`QueryBuilder::push_bind`].
+fn push_history_condition(
+    query: &mut QueryBuilder<'_, sqlx::Sqlite>,
+    has_where: &mut bool,
+    predicate: &str,
+) {
+    query.push(if *has_where { " AND " } else { " WHERE " });
+    *has_where = true;
+    query.push(predicate);
+}
+
+/// Quote arbitrary text as one literal FTS5 phrase.
+///
+/// Binding prevents SQL injection, while quoting also prevents FTS operators
+/// such as `OR`, `*`, and column filters from changing search semantics.
+fn fts_trigram_phrase(text: &str) -> String {
+    let mut phrase = String::with_capacity(text.len() + 2);
+    phrase.push('"');
+    for character in text.chars() {
+        if character == '"' {
+            phrase.push('"');
+        }
+        phrase.push(character);
+    }
+    phrase.push('"');
+    phrase
 }
 
 impl StateDb {
@@ -660,59 +691,74 @@ impl StateDb {
     ) -> Result<Vec<wisphive_protocol::HistoryEntry>> {
         let limit = search.limit.unwrap_or(200);
 
-        // Build WHERE clause dynamically
-        let mut conditions = Vec::new();
-        let mut binds: Vec<String> = Vec::new();
+        // Empty, whitespace-only, and punctuation-only input has no searchable
+        // term. It therefore omits the text predicate while preserving any
+        // exact filters below, matching the old empty-LIKE behaviour.
+        let text_filter = search
+            .query
+            .as_deref()
+            .filter(|text| text.chars().any(char::is_alphanumeric));
+        let use_fts =
+            text_filter.is_some_and(|text| text.chars().count() >= 3 && !text.contains('\0'));
 
-        if let Some(ref q) = search.query {
-            conditions.push(
-                "(tool_input LIKE '%' || ? || '%' OR tool_result LIKE '%' || ? || '%' OR tool_name LIKE '%' || ? || '%')"
-                    .to_string(),
-            );
-            binds.push(q.clone());
-            binds.push(q.clone());
-            binds.push(q.clone());
+        let mut query = QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT d.id, d.agent_id, d.agent_type, d.project, d.tool_name, d.tool_input, \
+             d.decision, d.requested_at, d.resolved_at, d.tool_result, d.tool_use_id, \
+             d.hook_event_name, d.terminal_session_id, d.decided_by, d.config_hash \
+             FROM decision_log AS d",
+        );
+        if use_fts {
+            query.push(" JOIN decision_log_fts ON decision_log_fts.rowid = d.rowid");
+        }
+
+        let mut has_where = false;
+        if let Some(text) = text_filter {
+            if use_fts {
+                push_history_condition(&mut query, &mut has_where, "decision_log_fts MATCH ");
+                query.push_bind(fts_trigram_phrase(text));
+            } else {
+                // FTS5 trigram queries shorter than three Unicode characters
+                // cannot use the index, and its query parser rejects embedded
+                // NUL. Preserve graceful type-ahead with bound LIKE for these
+                // cases.
+                push_history_condition(&mut query, &mut has_where, "(d.tool_input LIKE '%' || ");
+                query.push_bind(text);
+                query.push(" || '%' OR d.tool_result LIKE '%' || ");
+                query.push_bind(text);
+                query.push(" || '%' OR d.tool_name LIKE '%' || ");
+                query.push_bind(text);
+                query.push(" || '%')");
+            }
         }
         if let Some(ref tool) = search.tool_name {
-            conditions.push("tool_name = ?".to_string());
-            binds.push(tool.clone());
+            push_history_condition(&mut query, &mut has_where, "d.tool_name = ");
+            query.push_bind(tool);
         }
         if let Some(ref aid) = search.agent_id {
-            conditions.push("agent_id = ?".to_string());
-            binds.push(aid.clone());
+            push_history_condition(&mut query, &mut has_where, "d.agent_id = ");
+            query.push_bind(aid);
         }
         if let Some(since) = search.since {
-            conditions.push("resolved_at >= ?".to_string());
-            binds.push(since.to_rfc3339());
+            push_history_condition(&mut query, &mut has_where, "d.resolved_at >= ");
+            query.push_bind(since.to_rfc3339());
         }
         if let Some(ref project) = search.project {
-            conditions.push("project = ?".to_string());
-            binds.push(project.clone());
+            push_history_condition(&mut query, &mut has_where, "d.project = ");
+            query.push_bind(project);
         }
         if let Some(ref rule) = search.decided_by {
-            conditions.push("decided_by LIKE '%' || ? || '%'".to_string());
-            binds.push(rule.clone());
+            push_history_condition(&mut query, &mut has_where, "d.decided_by LIKE '%' || ");
+            query.push_bind(rule);
+            query.push(" || '%'");
         }
 
-        let where_clause = if conditions.is_empty() {
-            "1=1".to_string()
-        } else {
-            conditions.join(" AND ")
-        };
+        query.push(" ORDER BY d.resolved_at DESC LIMIT ");
+        query.push_bind(limit);
 
-        let sql = format!(
-            "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, requested_at, resolved_at, tool_result, tool_use_id, hook_event_name, terminal_session_id, decided_by, config_hash
-             FROM decision_log WHERE {} ORDER BY resolved_at DESC LIMIT ?",
-            where_clause
-        );
-
-        let mut query = sqlx::query_as::<_, DecisionLogRow>(&sql);
-        for bind in &binds {
-            query = query.bind(bind);
-        }
-        query = query.bind(limit);
-
-        let rows = query.fetch_all(&self.pool).await?;
+        let rows = query
+            .build_query_as::<DecisionLogRow>()
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows_to_entries(rows))
     }
 

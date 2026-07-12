@@ -1170,9 +1170,10 @@ async fn handle_tui(
                                 }
                             };
                         // Every decision arm logs `%device_id` (None = local TUI,
-                        // implicitly trusted). The Approve / ApproveAll arms
-                        // consult `ctx.reauth` before honouring web-origin
-                        // approvals of sudo-class tools (itr#218).
+                        // implicitly trusted). The Approve, ApprovePermission,
+                        // and ApproveAll arms consult `ctx.reauth` before
+                        // honouring web-origin approvals of sudo-class tools
+                        // (itr#218, itr#410).
                         let device_id = command.device_id.clone();
                         let msg = command.body;
                         if dispatch_command(
@@ -1584,16 +1585,43 @@ async fn handle_decision_command(
             message,
         } => {
             info!(?device_id, %id, suggestion_index, "approve_permission");
-            // Look up the selected suggestion from the queued request
-            let selected = {
+            // Fetch the pending request once: the sudo gate needs its tool
+            // name, and the selected permission must come from that same
+            // still-pending request.
+            let pending = {
                 let q = ctx.queue.lock().await;
-                q.snapshot()
-                    .iter()
-                    .find(|r| r.id == id)
-                    .and_then(|r| r.permission_suggestions.as_ref())
-                    .and_then(|s| s.get(suggestion_index))
-                    .cloned()
+                q.peek(id).cloned()
             };
+
+            // Apply the same stale-web-device sudo gate as a single Approve.
+            // A permission selection can grant a Bash/Write/etc. call, so it
+            // must not bypass the second-factor reauth requirement.
+            if let Some(ref dev) = device_id
+                && let Some(tool_name) = pending.as_ref().map(|req| req.tool_name.clone())
+                && crate::sudo_gate::is_sudo_tool(&tool_name)
+                && !ctx.reauth.is_fresh(dev).await
+            {
+                let reauth_msg = ServerMessage::WebReauthRequired {
+                    device_id: dev.0.clone(),
+                    request_id: id.to_string(),
+                    tool_name: tool_name.clone(),
+                    at: chrono::Utc::now(),
+                };
+                write_msg(writer, &reauth_msg).await?;
+                debug!(
+                    %id,
+                    tool = %tool_name,
+                    device_id = %dev.0,
+                    "sudo gate: reauth required (approve_permission)"
+                );
+                return Ok(());
+            }
+
+            let selected = pending
+                .as_ref()
+                .and_then(|req| req.permission_suggestions.as_ref())
+                .and_then(|suggestions| suggestions.get(suggestion_index))
+                .cloned();
             // Fail closed on a bad index (itr#297): approving with
             // selected_permission=None would grant the call without any
             // permission actually chosen. Leave the request pending.
@@ -4082,6 +4110,118 @@ mod tests {
         let (gated, allowed) = partition_sudo_gated(true, vec![spawn.clone()]);
         assert!(gated.is_empty());
         assert_eq!(ids(&allowed), vec![spawn.0]);
+    }
+
+    #[tokio::test]
+    async fn web_origin_sudo_approve_permission_without_fresh_reauth_emits_reauth_required() {
+        use std::time::Duration;
+
+        use tokio::net::UnixStream;
+        use wisphive_protocol::{
+            AgentType, ClientCommand, ClientMessage, DecisionRequest, DeviceId, HookEventType,
+            PermissionRule, PermissionSuggestion, ServerMessage,
+        };
+
+        let home = tempfile::tempdir().unwrap();
+        let config = crate::DaemonConfig::new(home.path().to_path_buf());
+        let server = super::Server::new(config).await.unwrap();
+        let ctx = super::ConnectionContext {
+            queue: server.queue.clone(),
+            process_registry: server.process_registry.clone(),
+            agent_registry: server.agent_registry.clone(),
+            tui_tx: server.tui_tx.clone(),
+            state_db: server.state_db.clone(),
+            terminal_manager: server.terminal_manager.clone(),
+            reauth: server.reauth.clone(),
+            replay_gate: server.replay_gate.clone(),
+            hook_timeout_secs: server.config.hook_timeout_secs,
+            notifications_enabled: server.config.notifications_enabled,
+            home_dir: server.config.home_dir.clone(),
+            audit_snapshot_limit: server.config.audit_snapshot_limit,
+        };
+
+        let request = DecisionRequest {
+            id: uuid::Uuid::new_v4(),
+            agent_id: "cc-permission-test".into(),
+            agent_type: AgentType::ClaudeCode,
+            project: home.path().join("project"),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({ "command": "cargo test" }),
+            timestamp: chrono::Utc::now(),
+            hook_event_name: HookEventType::PermissionRequest,
+            tool_use_id: None,
+            permission_suggestions: Some(vec![PermissionSuggestion {
+                suggestion_type: "addRules".into(),
+                rules: vec![PermissionRule {
+                    tool_name: "Bash".into(),
+                    rule_content: "Bash(cargo test)".into(),
+                }],
+                behavior: "allow".into(),
+                destination: "session".into(),
+                mode: None,
+            }]),
+            event_data: None,
+            terminal_session_id: None,
+        };
+        let request_id = request.id;
+        let mut hook_response = {
+            let mut queue = ctx.queue.lock().await;
+            queue.enqueue(request).expect("request should enqueue")
+        };
+
+        let approve_permission = ClientCommand::from(ClientMessage::ApprovePermission {
+            id: request_id,
+            suggestion_index: 0,
+            message: None,
+        })
+        .with_device_id(DeviceId::from("dev-phone"));
+        let encoded = wisphive_protocol::encode(&approve_permission).unwrap();
+        let command: ClientCommand = wisphive_protocol::decode(&encoded).unwrap();
+
+        let (server_stream, client_stream) = UnixStream::pair().unwrap();
+        let (_, mut writer) = server_stream.into_split();
+        let mut responses = BufReader::new(client_stream).lines();
+        let mut attachments = std::collections::HashMap::new();
+        let (conn_tx, _conn_rx) = tokio::sync::mpsc::channel(1);
+        let flow = super::dispatch_command(
+            &mut writer,
+            &ctx,
+            command.device_id,
+            command.body,
+            &mut attachments,
+            &conn_tx,
+        )
+        .await
+        .unwrap();
+        assert!(flow.is_continue());
+
+        let line = tokio::time::timeout(Duration::from_secs(2), responses.next_line())
+            .await
+            .expect("stale web approval should request reauth")
+            .unwrap()
+            .unwrap();
+        let reauth: ServerMessage = wisphive_protocol::decode(&line).unwrap();
+        match reauth {
+            ServerMessage::WebReauthRequired {
+                device_id,
+                request_id: reauth_request_id,
+                tool_name,
+                ..
+            } => {
+                assert_eq!(device_id, "dev-phone");
+                assert_eq!(reauth_request_id, request_id.to_string());
+                assert_eq!(tool_name, "Bash");
+            }
+            _ => unreachable!("loop returns only WebReauthRequired"),
+        }
+
+        assert!(ctx.queue.lock().await.peek(request_id).is_some());
+        let hook_response =
+            tokio::time::timeout(Duration::from_millis(200), &mut hook_response).await;
+        assert!(
+            hook_response.is_err(),
+            "the sudo gate must leave the permission request pending"
+        );
     }
 
     #[test]

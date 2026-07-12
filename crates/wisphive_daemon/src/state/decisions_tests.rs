@@ -792,7 +792,7 @@ async fn attach_tool_result_does_not_overwrite() {
 // ════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn search_history_by_query() {
+async fn search_history_matches_partial_token_substring() {
     let db = test_db().await;
 
     log_auto(
@@ -820,13 +820,344 @@ async fn search_history_by_query() {
     )
     .await;
 
+    for query in ["carg", "arg"] {
+        let search = wisphive_protocol::HistorySearch {
+            query: Some(query.into()),
+            ..Default::default()
+        };
+        let results = db.search_history(&search).await.unwrap();
+        assert_eq!(results.len(), 1, "substring {query:?} must match cargo");
+        assert_eq!(results[0].tool_name, "Bash");
+    }
+}
+
+#[tokio::test]
+async fn search_history_sql_shaped_query_is_literal() {
+    let db = test_db().await;
+
+    log_auto(
+        &db,
+        "cc-1",
+        "\"claude_code\"",
+        "/muse",
+        "Bash",
+        "{\"command\":\"cargo build\"}",
+        "2024-01-01T00:00:00Z",
+        Some("safe"),
+        None,
+    )
+    .await;
+    log_auto(
+        &db,
+        "cc-2",
+        "\"claude_code\"",
+        "/muse",
+        "Edit",
+        "{\"file\":\"main.rs\"}",
+        "2024-01-01T00:01:00Z",
+        Some("other"),
+        None,
+    )
+    .await;
+
+    for query in ["cargo' OR 1=1 --", "cargo\" OR \"main"] {
+        let search = wisphive_protocol::HistorySearch {
+            query: Some(query.into()),
+            ..Default::default()
+        };
+        assert!(
+            db.search_history(&search).await.unwrap().is_empty(),
+            "SQL/FTS-shaped text must remain a literal bound substring: {query:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn search_history_empty_or_whitespace_query_preserves_other_filters() {
+    let db = test_db().await;
+
+    for (agent_id, tool_name, timestamp, tool_use_id) in [
+        ("cc-1", "Bash", "2024-01-01T00:00:00Z", "empty-a"),
+        ("cc-1", "Edit", "2024-01-01T00:01:00Z", "empty-b"),
+        ("cc-2", "Write", "2024-01-01T00:02:00Z", "empty-c"),
+    ] {
+        log_auto(
+            &db,
+            agent_id,
+            "\"claude_code\"",
+            "/muse",
+            tool_name,
+            "{}",
+            timestamp,
+            Some(tool_use_id),
+            None,
+        )
+        .await;
+    }
+
+    for query in ["", " \t\n ", "---"] {
+        let search = wisphive_protocol::HistorySearch {
+            query: Some(query.into()),
+            agent_id: Some("cc-1".into()),
+            ..Default::default()
+        };
+        let results = db.search_history(&search).await.unwrap();
+        assert_eq!(
+            results.len(),
+            2,
+            "no-term query {query:?} must omit only the text predicate"
+        );
+        assert!(results.iter().all(|entry| entry.agent_id == "cc-1"));
+    }
+}
+
+#[tokio::test]
+async fn search_history_short_query_falls_back_without_error() {
+    let db = test_db().await;
+    log_auto(
+        &db,
+        "cc-1",
+        "\"claude_code\"",
+        "/muse",
+        "Bash",
+        "{\"command\":\"cargo build\"}",
+        "2024-01-01T00:00:00Z",
+        Some("short"),
+        None,
+    )
+    .await;
+
+    for query in ["c", "ca", "ar"] {
+        let search = wisphive_protocol::HistorySearch {
+            query: Some(query.into()),
+            ..Default::default()
+        };
+        let results = db.search_history(&search).await.unwrap();
+        assert_eq!(results.len(), 1, "short substring {query:?} must match");
+        assert_eq!(results[0].tool_name, "Bash");
+    }
+}
+
+#[tokio::test]
+async fn search_history_nul_query_falls_back_without_error() {
+    let db = test_db().await;
+    log_auto(
+        &db,
+        "cc-1",
+        "\"claude_code\"",
+        "/muse",
+        "Bash",
+        "{\"command\":\"cargo build\"}",
+        "2024-01-01T00:00:00Z",
+        Some("nul"),
+        None,
+    )
+    .await;
+
     let search = wisphive_protocol::HistorySearch {
-        query: Some("cargo".into()),
+        query: Some("car\0go".into()),
+        ..Default::default()
+    };
+    assert!(
+        db.search_history(&search).await.unwrap().is_empty(),
+        "embedded NUL must remain literal and must not reach the FTS parser"
+    );
+}
+
+#[tokio::test]
+async fn search_history_fts_mirror_tracks_tool_result_updates_and_deletes() {
+    let db = test_db().await;
+    log_auto(
+        &db,
+        "cc-1",
+        "\"claude_code\"",
+        "/muse",
+        "Bash",
+        "{\"command\":\"build project\"}",
+        "2024-01-01T00:00:00Z",
+        Some("result-index"),
+        None,
+    )
+    .await;
+
+    db.attach_tool_result(
+        "cc-1",
+        "Bash",
+        &serde_json::json!({"output": "cargo build completed"}),
+        Some("result-index"),
+    )
+    .await
+    .unwrap();
+
+    let search = wisphive_protocol::HistorySearch {
+        query: Some("carg".into()),
         ..Default::default()
     };
     let results = db.search_history(&search).await.unwrap();
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].tool_name, "Bash");
+    assert_eq!(results.len(), 1, "updated tool_result must enter FTS");
+
+    sqlx::query("DELETE FROM decision_log WHERE id = ?")
+        .bind(results[0].id.to_string())
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(
+        db.search_history(&search).await.unwrap().is_empty(),
+        "deleting a decision_log row must remove its FTS entry"
+    );
+}
+
+#[tokio::test]
+async fn search_history_100k_substring_completes_under_50ms() {
+    let db = test_db().await;
+    sqlx::query(
+        "WITH RECURSIVE rows(n) AS (
+             SELECT 1
+             UNION ALL
+             SELECT n + 1 FROM rows WHERE n < 100000
+         )
+         INSERT INTO decision_log (
+             id, agent_id, agent_type, project, tool_name, tool_input,
+             decision, requested_at, resolved_at
+         )
+         SELECT
+             printf('00000000-0000-0000-0000-%012d', n),
+             'perf-agent',
+             '\"claude_code\"',
+             '/perf',
+             CASE WHEN n = 54321 THEN 'Bash' ELSE 'Edit' END,
+             CASE WHEN n = 54321
+                  THEN '{\"command\":\"cargo build target\"}'
+                  ELSE printf('{\"file\":\"module-%d.rs\",\"operation\":\"replace symbols\"}', n)
+             END,
+             '\"approve\"',
+             '2024-01-01T00:00:00Z',
+             '2024-01-01T00:00:00Z'
+         FROM rows",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let search = wisphive_protocol::HistorySearch {
+        query: Some("carg".into()),
+        limit: Some(10),
+        ..Default::default()
+    };
+    assert_eq!(db.search_history(&search).await.unwrap().len(), 1);
+
+    let mut samples = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let started = std::time::Instant::now();
+        let results = db.search_history(&search).await.unwrap();
+        samples.push(started.elapsed());
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].tool_name, "Bash");
+    }
+    samples.sort_unstable();
+    assert!(
+        samples[2] < std::time::Duration::from_millis(50),
+        "median 100k-row substring latency must be <50ms; samples={samples:?}"
+    );
+}
+
+#[tokio::test]
+async fn search_history_migration_replaces_legacy_fts_and_backfills() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let database_path = tempdir.path().join("wisphive.db");
+    let database_path = database_path.to_string_lossy().into_owned();
+    let db = StateDb::open(&database_path).await.unwrap();
+    for statement in [
+        "DROP TRIGGER IF EXISTS decision_log_fts_after_insert",
+        "DROP TRIGGER IF EXISTS decision_log_fts_after_delete",
+        "DROP TRIGGER IF EXISTS decision_log_fts_after_update",
+        "DROP TABLE IF EXISTS decision_log_fts",
+        "DELETE FROM wisphive_schema_migrations WHERE name = 'decision_log_fts_trigram_v1'",
+    ] {
+        sqlx::query(statement).execute(db.pool()).await.unwrap();
+    }
+
+    sqlx::query(
+        "CREATE VIRTUAL TABLE decision_log_fts USING fts5(
+             tool_input,
+             tool_result,
+             tool_name,
+             content='decision_log',
+             content_rowid='rowid',
+             tokenize='unicode61'
+         )",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO decision_log (
+             id, agent_id, agent_type, project, tool_name, tool_input,
+             decision, requested_at, resolved_at
+         ) VALUES (
+             '00000000-0000-0000-0000-000000000091',
+             'migration-agent',
+             '\"claude_code\"',
+             '/migration',
+             'Bash',
+             '{\"command\":\"cargo build\"}',
+             '\"approve\"',
+             '2024-01-01T00:00:00Z',
+             '2024-01-01T00:00:00Z'
+         )",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    db.migrate().await.unwrap();
+
+    let (schema,): (String,) = sqlx::query_as(
+        "SELECT sql FROM sqlite_schema
+         WHERE type = 'table' AND name = 'decision_log_fts'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(
+        schema.contains("tokenize='trigram'"),
+        "legacy tokenizer was not replaced: {schema}"
+    );
+
+    let search = wisphive_protocol::HistorySearch {
+        query: Some("carg".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        db.search_history(&search).await.unwrap().len(),
+        1,
+        "the one-time rebuild must index pre-migration rows"
+    );
+
+    // Deliberately empty only the FTS index. A second O(n) rebuild would make
+    // this row searchable again; a marker-gated steady boot must leave it
+    // untouched. Reopen a file-backed DB to prove that marker is durable.
+    sqlx::query("INSERT INTO decision_log_fts(decision_log_fts) VALUES ('delete-all')")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(db.search_history(&search).await.unwrap().is_empty());
+    db.pool().close().await;
+    drop(db);
+
+    let reopened = StateDb::open(&database_path).await.unwrap();
+    assert!(
+        reopened.search_history(&search).await.unwrap().is_empty(),
+        "steady-state reopen must not rescan decision_log"
+    );
+    let (markers,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM wisphive_schema_migrations
+         WHERE name = 'decision_log_fts_trigram_v1'",
+    )
+    .fetch_one(reopened.pool())
+    .await
+    .unwrap();
+    assert_eq!(markers, 1, "the backfill marker must remain durable");
 }
 
 #[tokio::test]

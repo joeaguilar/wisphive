@@ -9,6 +9,8 @@ use tokio::process::{Child, Command};
 use tracing::{error, info, warn};
 use wisphive_protocol::{AgentType, ManagedAgent, SpawnAgentRequest};
 
+use crate::config::require_active_mode;
+
 /// Managed spawns are a local control-plane boundary, not an unrestricted
 /// pass-through to the underlying agent CLI. Keep every attacker-controlled
 /// string bounded even though `Command` avoids shell expansion.
@@ -27,6 +29,17 @@ const SYSTEM_PROMPT_DENY_PATTERNS: &[&str] = &[
     "disable wisphive",
     "skip human approval",
 ];
+
+fn default_mode_path() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
+        .join(".wisphive")
+        .join("mode")
+}
+
+fn require_managed_spawn_mode(mode_path: &Path) -> Result<()> {
+    require_active_mode(mode_path)
+        .context("Wisphive hooks do not have a secure active mode; refusing managed spawn")
+}
 
 /// Validate and canonicalize all untrusted fields of a managed-spawn request.
 ///
@@ -605,6 +618,9 @@ pub struct ProcessRegistry {
     /// bypass would run headlessly). Fail-safe default is `false` (refuse).
     /// Captured from config at daemon start.
     codex_allow_foreign_hooks: bool,
+    /// The local kill switch that makes the managed agent's bypassed native
+    /// permission prompts safe to use.
+    mode_path: PathBuf,
 }
 
 struct ManagedProcess {
@@ -614,9 +630,14 @@ struct ManagedProcess {
 
 impl ProcessRegistry {
     pub fn new(codex_allow_foreign_hooks: bool) -> Self {
+        Self::with_mode_path(codex_allow_foreign_hooks, default_mode_path())
+    }
+
+    fn with_mode_path(codex_allow_foreign_hooks: bool, mode_path: PathBuf) -> Self {
         Self {
             processes: HashMap::new(),
             codex_allow_foreign_hooks,
+            mode_path,
         }
     }
 
@@ -624,6 +645,11 @@ impl ProcessRegistry {
     ///
     /// Returns the `ManagedAgent` metadata on success.
     pub fn spawn_agent(&mut self, mut req: SpawnAgentRequest) -> Result<ManagedAgent> {
+        // The CLI rejects managed spawns while the kill switch is off. Keep the
+        // same fail-closed rule at the process boundary so direct callers
+        // cannot launch an ungated agent.
+        require_managed_spawn_mode(&self.mode_path)?;
+
         validate_spawn_request(&mut req)?;
 
         let agent_id = format!("agent-{}", uuid::Uuid::new_v4().as_simple());
@@ -724,6 +750,10 @@ impl ProcessRegistry {
             full_argv = ?argv,
             "authorized managed-agent process spawn"
         );
+
+        // Hook inspection and command construction above perform file I/O, so
+        // revalidate immediately before launching if the kill switch changed.
+        require_managed_spawn_mode(&self.mode_path)?;
 
         let child = cmd.spawn().with_context(|| {
             format!(
@@ -887,11 +917,47 @@ mod tests {
         serde_json::json!({"matcher": "", "hooks": [{"type": "command", "command": command}]})
     }
 
+    fn registry_with_active_mode(project: &std::path::Path) -> ProcessRegistry {
+        let mode_path = project.join(".wisphive").join("mode");
+        crate::config::write_mode_file_atomic(&mode_path, "active")
+            .expect("test mode should be written securely");
+        ProcessRegistry::with_mode_path(false, mode_path)
+    }
+
     fn argv_strings(cmd: &Command) -> Vec<String> {
         command_argv(cmd)
             .into_iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect()
+    }
+
+    /// itr#472: direct registry callers must not launch a managed agent after
+    /// the kill switch turns off, even if server/CLI preflight was bypassed.
+    #[test]
+    fn spawn_refuses_inactive_mode_before_hook_validation() {
+        let proj = tempfile::tempdir().unwrap();
+        let mode_path = proj.path().join(".wisphive").join("mode");
+        crate::config::write_mode_file_atomic(&mode_path, "off")
+            .expect("test mode should be written securely");
+        let mut registry = ProcessRegistry::with_mode_path(false, mode_path);
+
+        let err = registry
+            .spawn_agent(codex_req(proj.path()))
+            .expect_err("an inactive kill switch must refuse managed spawn");
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("secure active mode") && message.contains("mode is off"),
+            "refusal should identify the inactive kill switch, got: {message}"
+        );
+        assert!(
+            !message.contains("hooks install"),
+            "mode refusal must happen before hook validation, got: {message}"
+        );
+        assert!(
+            registry.is_empty(),
+            "an inactive kill switch must prevent process tracking or launch"
+        );
     }
 
     /// itr#467: spawning Codex into a project without the Wisphive Codex hook
@@ -901,7 +967,7 @@ mod tests {
     #[test]
     fn codex_spawn_fails_closed_without_wisphive_hook() {
         let proj = tempfile::tempdir().unwrap();
-        let mut registry = ProcessRegistry::new(false);
+        let mut registry = registry_with_active_mode(proj.path());
         let err = registry
             .spawn_agent(codex_req(proj.path()))
             .expect_err("Codex spawn into an unhooked project must be refused");
@@ -931,7 +997,7 @@ mod tests {
             ]}}),
         );
 
-        let mut registry = ProcessRegistry::new(false);
+        let mut registry = registry_with_active_mode(proj.path());
         let err = registry
             .spawn_agent(codex_req(proj.path()))
             .expect_err("foreign hook + no opt-in must be refused");
@@ -957,7 +1023,7 @@ mod tests {
         let proj = tempfile::tempdir().unwrap();
         let mut req = claude_req(proj.path());
         req.permission_mode = Some("bypassPermissions".into());
-        let mut registry = ProcessRegistry::new(false);
+        let mut registry = registry_with_active_mode(proj.path());
 
         let err = registry
             .spawn_agent(req)
@@ -973,7 +1039,7 @@ mod tests {
     #[test]
     fn claude_spawn_fails_closed_without_wisphive_hook() {
         let proj = tempfile::tempdir().unwrap();
-        let mut registry = ProcessRegistry::new(false);
+        let mut registry = registry_with_active_mode(proj.path());
         let err = registry
             .spawn_agent(claude_req(proj.path()))
             .expect_err("Claude spawn without a gating hook must be refused");
@@ -1141,7 +1207,7 @@ mod tests {
             vec!["<command hook: /tmp/unreviewed-hook>"]
         );
 
-        let mut registry = ProcessRegistry::new(false);
+        let mut registry = registry_with_active_mode(proj.path());
         let err = registry
             .spawn_agent(claude_req(proj.path()))
             .expect_err("print-mode spawn must refuse a foreign project hook");
