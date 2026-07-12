@@ -338,6 +338,21 @@ describe("Login — login-with-passkey behavior", () => {
 // ---------------------------------------------------------------------------
 
 describe("Login — enroll-after-set-password step (prop-driven)", () => {
+  it("shows the custom password-floor error for a below-minimum setup password", async () => {
+    const user = userEvent.setup();
+    const onSetPassword = vi.fn().mockResolvedValue(true);
+    renderLogin({ phase: "setup", onSetPassword });
+
+    await user.type(screen.getByLabelText(/new password/i), "shortpass");
+    await user.type(screen.getByLabelText(/confirm password/i), "shortpass");
+    await user.click(screen.getByRole("button", { name: /set password/i }));
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Password must be at least 12 characters.",
+    );
+    expect(onSetPassword).not.toHaveBeenCalled();
+  });
+
   it("renders the enroll card when phase=authed-pending-enroll", () => {
     // The card is now driven directly off the parent's phase. This
     // mirrors what App.tsx (via useAuth) emits after a successful

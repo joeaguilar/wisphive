@@ -67,3 +67,46 @@ jobs:
 
       - name: Lint
         run: npm run lint
+
+  security:
+    name: Dependency and SQL safety
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install dependency audit tools
+        run: |
+          cargo install cargo-deny --locked
+          cargo install cargo-audit --locked
+
+      - name: cargo-deny
+        run: cargo deny check advisories bans sources
+
+      - name: cargo-audit
+        run: |
+          cargo audit \
+            --ignore RUSTSEC-2017-0008 \
+            --ignore RUSTSEC-2024-0384 \
+            --ignore RUSTSEC-2024-0436 \
+            --ignore RUSTSEC-2025-0134
+
+      - name: DENY-LIST dynamically formatted SQL
+        shell: bash
+        run: |
+          # The DML-shaped format! pattern intentionally requires an
+          # interpolation. This avoids flagging logs or comments that merely
+          # mention SQL keywords. No source files are currently allowlisted.
+          # Keep any approved exceptions as --glob exclusions below, with a
+          # justification and issue link.
+          readonly -a sql_format_allowlist=(
+          )
+          if matches="$(rg --pcre2 --multiline --line-number --glob '*.rs' \
+            '(?is)format!\s*\((?=[^)]*\b(?:select\s+.+\s+from|insert\s+(?:or\s+\w+\s+)?into|update\s+\w+\s+set|delete\s+from)\b)(?=[^)]*\{[^}]*\})[^)]*\)' \
+            "${sql_format_allowlist[@]}" crates/wisphive_daemon)"; then
+            echo "DENY-LIST violation: use parameter binding or QueryBuilder, never format! for DML."
+            echo "$matches"
+            exit 1
+          fi

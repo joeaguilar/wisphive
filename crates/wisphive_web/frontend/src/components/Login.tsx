@@ -421,7 +421,6 @@ export function Login({
                 if (error) onClearError();
               }}
               disabled={disabled}
-              minLength={isSetup ? MIN_PASSWORD_LEN : undefined}
             />
           </label>
           {isSetup && (

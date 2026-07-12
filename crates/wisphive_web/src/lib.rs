@@ -445,11 +445,14 @@ fn validate_config_json(value: &serde_json::Value) -> Result<(), &'static str> {
                 }
             }
             "tool_rules" => {
-                if serde_json::from_value::<HashMap<String, wisphive_protocol::ToolRule>>(
-                    value.clone(),
-                )
-                .is_err()
-                {
+                let Some(rules) = value.as_object() else {
+                    return Err("tool_rules schema is invalid");
+                };
+                if rules.values().any(|rule| {
+                    !rule.is_null()
+                        && serde_json::from_value::<wisphive_protocol::ToolRule>(rule.clone())
+                            .is_err()
+                }) {
                     return Err("tool_rules schema is invalid");
                 }
             }
@@ -2476,6 +2479,69 @@ mod config_concurrency_tests {
 
     const WRITERS: usize = 8;
     const HOST: &str = "localhost:3100";
+
+    #[tokio::test]
+    async fn api_config_put_deletes_one_tool_rule_with_nested_null() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("wisphive.db");
+        let db = StateDb::open(db_path.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        let token = auth::generate_device_token();
+        db.insert_web_device("nested-tool-rule-delete", "test", &token.hash_hex)
+            .await
+            .unwrap();
+
+        let security = SecurityConfig::for_test(Vec::new(), vec![HOST.to_string()], db);
+        security.mark_password_set();
+        let config_path = tmp.path().join("config.json");
+        std::fs::write(
+            &config_path,
+            serde_json::json!({
+                "tool_rules": {
+                    "Bash": {"deny_patterns": ["rm -rf"]},
+                    "Edit": {"allow_patterns": ["README.md"]},
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let app = build_router(
+            AppState {
+                socket_path: tmp.path().join("wisphive.sock"),
+                config_path: config_path.clone(),
+                security,
+                auth_policy: AuthProfile::LocalLAN.policy(),
+                passkey_challenges: passkey::ChallengeStore::new(),
+                log_store: None,
+                revoke_limiter: DeviceRevokeLimiter::default(),
+            },
+            false,
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/config")
+                    .header("host", HOST)
+                    .header("authorization", format!("Bearer {}", token.raw))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"tool_rules":{"Bash":null}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
+        assert!(after["tool_rules"].get("Bash").is_none());
+        assert_eq!(
+            after["tool_rules"]["Edit"]["allow_patterns"],
+            serde_json::json!(["README.md"])
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn api_config_put_concurrent_requests_preserve_all_patches() {

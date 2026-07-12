@@ -1488,7 +1488,7 @@ fn handle_spawn_modal_input(app: &mut App, mut modal: Modal, key: KeyEvent) -> I
         }
         KeyCode::Enter => {
             let project = spawn.project_path();
-            let prompt = spawn.prompt.lines()[0].clone();
+            let prompt = spawn.prompt.lines().join("\n");
             if prompt.is_empty() {
                 app.modal = Some(modal);
                 return InputAction::None;
@@ -1523,6 +1523,33 @@ fn handle_spawn_modal_input(app: &mut App, mut modal: Modal, key: KeyEvent) -> I
             app.modal = Some(modal);
             InputAction::None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spawn_agent_sends_full_multiline_prompt() {
+        let mut app = App::new();
+        let mut modal = Modal::spawn_agent();
+        modal.spawn.as_mut().unwrap().prompt = tui_textarea::TextArea::new(vec![
+            "first line".into(),
+            "second line".into(),
+            "third line".into(),
+        ]);
+        app.modal = Some(modal);
+
+        let action = handle_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+
+        let InputAction::SpawnAgent(request) = action else {
+            panic!("expected spawn-agent action");
+        };
+        assert_eq!(request.prompt, "first line\nsecond line\nthird line");
     }
 }
 

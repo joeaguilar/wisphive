@@ -56,7 +56,7 @@ pub struct TermFrame {
     pub bytes: Bytes,
 }
 
-/// One running (or recently ended) terminal session.
+/// One running terminal session.
 pub struct TerminalSession {
     pub id: Uuid,
     /// Metadata. Guarded by async mutex because shutdown/wait tasks update it
@@ -635,10 +635,10 @@ async fn run_waiter(
         status,
     });
 
-    // Keep the session in the sessions map so late attaches can still see
-    // the final screen via catchup; a future retention sweep can prune.
+    // Ended sessions are retained in SQLite for replay, but must no longer
+    // keep their PTY handles alive in the live-session map.
+    manager.sessions.lock().await.remove(&id);
     info!(session_id = %id, ?status, "terminal session ended");
-    drop(manager);
 }
 
 /// Encode raw PTY bytes as a `TermChunk` ready to ship on the wire.
@@ -716,6 +716,19 @@ mod tests {
         .expect("terminal exit was not persisted")
     }
 
+    async fn wait_for_session_removal(manager: &TerminalSessionManager, id: Uuid) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if manager.get(id).await.is_none() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("ended terminal session was not removed from live map");
+    }
+
     #[tokio::test]
     async fn manager_close_terminates_real_pty_with_single_close_behavior() {
         let state_db = Arc::new(StateDb::open(":memory:").await.expect("open test db"));
@@ -744,5 +757,39 @@ mod tests {
         let ended = wait_for_persisted_exit(&state_db, meta.id).await;
         assert_eq!(ended.status, TerminalStatus::Exited);
         assert_eq!(ended.exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn ended_session_is_removed_from_live_map_and_rejects_io() {
+        let state_db = Arc::new(StateDb::open(":memory:").await.expect("open test db"));
+        let (tui_tx, _) = broadcast::channel(16);
+        let manager = Arc::new(TerminalSessionManager::new(state_db.clone(), tui_tx));
+        let meta = manager
+            .create(
+                Some("exit-test".into()),
+                Some("/bin/sh".into()),
+                Some(vec!["-c".into(), "exit 0".into()]),
+                None,
+                80,
+                24,
+                None,
+                Some("test".into()),
+            )
+            .await
+            .expect("create real PTY session");
+
+        let ended = wait_for_persisted_exit(&state_db, meta.id).await;
+        assert_eq!(ended.status, TerminalStatus::Exited);
+        wait_for_session_removal(&manager, meta.id).await;
+
+        assert!(manager.get(meta.id).await.is_none());
+        assert!(manager.list_running().await.is_empty());
+        assert!(
+            manager
+                .write_input(meta.id, b"input".to_vec())
+                .await
+                .is_err()
+        );
+        assert!(manager.resize(meta.id, 100, 30).await.is_err());
     }
 }
