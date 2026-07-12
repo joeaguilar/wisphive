@@ -1,7 +1,9 @@
+import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { Terminals } from "./Terminals";
 import type { TerminalSessionMeta } from "../types/protocol";
+import type { TerminalOutputHandler } from "../hooks/useWisphive";
 
 // jsdom has no ResizeObserver; xterm's open() path touches it via TerminalView.
 class ResizeObserverStub {
@@ -42,10 +44,24 @@ const session: TerminalSessionMeta = {
   sort_order: 0,
 };
 
-function mountTerminals(overrides: { onAttach?: () => void; onDetach?: (id: string) => void } = {}) {
+interface MountOverrides {
+  onAttach?: (id: string) => void;
+  onDetach?: (id: string) => void;
+  onReplay?: (id: string, fromSeq?: number) => void;
+  registerHandler?: (
+    id: string,
+    handler: TerminalOutputHandler,
+    options?: { replayMode?: boolean },
+  ) => () => void;
+  strict?: boolean;
+}
+
+function mountTerminals(overrides: MountOverrides = {}) {
   const onAttach = overrides.onAttach ?? vi.fn();
   const onDetach = overrides.onDetach ?? vi.fn();
-  const utils = render(
+  const onReplay = overrides.onReplay ?? vi.fn();
+  const registerHandler = overrides.registerHandler ?? vi.fn(() => () => {});
+  const view = (
     <Terminals
       terminals={[session]}
       queue={[]}
@@ -56,7 +72,7 @@ function mountTerminals(overrides: { onAttach?: () => void; onDetach?: (id: stri
       onAttach={onAttach}
       onDetach={onDetach}
       onClose={() => {}}
-      onReplay={() => {}}
+      onReplay={onReplay}
       onInput={() => {}}
       onResize={() => {}}
       onSetGroup={() => {}}
@@ -64,10 +80,11 @@ function mountTerminals(overrides: { onAttach?: () => void; onDetach?: (id: stri
       onApprove={() => {}}
       onDeny={() => {}}
       onJumpToQueue={() => {}}
-      registerHandler={() => () => {}}
-    />,
+      registerHandler={registerHandler}
+    />
   );
-  return { ...utils, onAttach, onDetach };
+  const utils = render(overrides.strict ? <StrictMode>{view}</StrictMode> : view);
+  return { ...utils, onAttach, onDetach, onReplay, registerHandler };
 }
 
 beforeEach(() => {
@@ -117,5 +134,51 @@ describe("Terminals two-step mobile workflow (itr#487)", () => {
     expect(container.querySelector(".terminals-mobile-header")).toBeNull();
     expect(onDetach).toHaveBeenCalledWith(session.id);
     expect(document.activeElement).toBe(attach);
+  });
+});
+
+describe("Terminals stream lifecycle (itr#375)", () => {
+  it("detaches before replaying the currently-live session and marks replay routing", () => {
+    const events: string[] = [];
+    const onAttach = vi.fn((id: string) => events.push(`attach:${id}`));
+    const onDetach = vi.fn((id: string) => events.push(`detach:${id}`));
+    const onReplay = vi.fn((id: string) => events.push(`replay:${id}`));
+    const registerHandler = vi.fn(
+      (_id: string, _handler: TerminalOutputHandler, _options?: { replayMode?: boolean }) =>
+        () => {},
+    );
+    mountTerminals({ onAttach, onDetach, onReplay, registerHandler });
+
+    fireEvent.click(screen.getByRole("button", { name: "Attach" }));
+    fireEvent.click(screen.getByRole("button", { name: "Replay" }));
+
+    expect(events).toEqual([
+      `attach:${session.id}`,
+      `detach:${session.id}`,
+      `replay:${session.id}`,
+    ]);
+    expect(onDetach).toHaveBeenCalledTimes(1);
+    expect(registerHandler.mock.calls.at(-1)?.[2]).toEqual({ replayMode: true });
+  });
+
+  it("detaches the current live stream exactly once on StrictMode unmount", () => {
+    const onDetach = vi.fn();
+    const { unmount } = mountTerminals({ onDetach, strict: true });
+
+    fireEvent.click(screen.getByRole("button", { name: "Attach" }));
+    unmount();
+
+    expect(onDetach).toHaveBeenCalledTimes(1);
+    expect(onDetach).toHaveBeenCalledWith(session.id);
+  });
+
+  it("does not detach a replay-only selection on unmount", () => {
+    const onDetach = vi.fn();
+    const { unmount } = mountTerminals({ onDetach, strict: true });
+
+    fireEvent.click(screen.getByRole("button", { name: "Replay" }));
+    unmount();
+
+    expect(onDetach).not.toHaveBeenCalled();
   });
 });

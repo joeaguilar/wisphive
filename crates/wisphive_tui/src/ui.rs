@@ -456,7 +456,11 @@ fn draw_history_view(frame: &mut Frame, app: &App) {
             .title(title),
     );
 
-    frame.render_widget(list, chunks[0]);
+    let mut state = ratatui::widgets::ListState::default();
+    if !app.history.is_empty() {
+        state.select(Some(app.history_index));
+    }
+    frame.render_stateful_widget(list, chunks[0], &mut state);
 
     let page_info = if app.history_page > 0 || app.history_has_more {
         format!(" pg {} ", app.history_page + 1)
@@ -819,7 +823,11 @@ fn draw_projects_explorer(frame: &mut Frame, app: &App) {
             .border_style(Style::default().fg(Color::Cyan))
             .title(title),
     );
-    frame.render_widget(list, chunks[0]);
+    let mut state = ratatui::widgets::ListState::default();
+    if !app.project_summaries.is_empty() {
+        state.select(Some(app.project_summaries_index));
+    }
+    frame.render_stateful_widget(list, chunks[0], &mut state);
 
     let bar = Paragraph::new(Line::from(Span::styled(
         " [j/k]navigate [Enter]activity [n]spawn agent [r]efresh [q/Esc]back [Q]uit ",
@@ -923,7 +931,11 @@ fn draw_sessions_view(frame: &mut Frame, app: &App) {
             .border_style(Style::default().fg(Color::Cyan))
             .title(title),
     );
-    frame.render_widget(list, chunks[0]);
+    let mut state = ratatui::widgets::ListState::default();
+    if !app.sessions.is_empty() {
+        state.select(Some(app.sessions_index));
+    }
+    frame.render_stateful_widget(list, chunks[0], &mut state);
 
     let bar = Paragraph::new(Line::from(Span::styled(
         " [j/k]navigate [Enter]timeline [r]efresh [q/Esc]back [Q]uit ",
@@ -1016,7 +1028,11 @@ fn draw_session_timeline_view(frame: &mut Frame, app: &App) {
             .border_style(Style::default().fg(Color::Cyan))
             .title(title),
     );
-    frame.render_widget(list, chunks[0]);
+    let mut state = ratatui::widgets::ListState::default();
+    if !app.session_timeline.is_empty() {
+        state.select(Some(app.session_timeline_index));
+    }
+    frame.render_stateful_widget(list, chunks[0], &mut state);
 
     let page_info = if app.session_timeline_page > 0 || app.session_timeline_has_more {
         format!(" pg {} ", app.session_timeline_page + 1)
@@ -1071,7 +1087,11 @@ fn draw_queue_panel(frame: &mut Frame, app: &App, area: Rect) {
             .title(title),
     );
 
-    frame.render_widget(list, area);
+    let mut state = ratatui::widgets::ListState::default();
+    if !filtered.is_empty() {
+        state.select(Some(app.queue_index));
+    }
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn draw_agents_panel(frame: &mut Frame, app: &App, area: Rect) {
@@ -1114,7 +1134,11 @@ fn draw_agents_panel(frame: &mut Frame, app: &App, area: Rect) {
             .title(format!(" Agents ({}) ", app.agents.len())),
     );
 
-    frame.render_widget(list, area);
+    let mut state = ratatui::widgets::ListState::default();
+    if !app.agents.is_empty() {
+        state.select(Some(app.agents_index));
+    }
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn draw_projects_panel(frame: &mut Frame, app: &App, area: Rect) {
@@ -1147,7 +1171,11 @@ fn draw_projects_panel(frame: &mut Frame, app: &App, area: Rect) {
             .title(format!(" Projects ({}) ", app.projects.len())),
     );
 
-    frame.render_widget(list, area);
+    let mut state = ratatui::widgets::ListState::default();
+    if !app.projects.is_empty() {
+        state.select(Some(app.projects_panel_index));
+    }
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
@@ -1259,7 +1287,9 @@ fn draw_picker_modal(frame: &mut Frame, app: &App) {
         .collect();
 
     let list = List::new(items);
-    frame.render_widget(list, chunks[1]);
+    let mut state = ratatui::widgets::ListState::default();
+    state.select(Some(picker.index));
+    frame.render_stateful_widget(list, chunks[1], &mut state);
 }
 
 fn draw_modal(frame: &mut Frame, modal: &Modal) {

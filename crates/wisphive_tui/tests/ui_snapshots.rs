@@ -293,7 +293,7 @@ mod fixtures {
 
 use fixtures::{
     ask_user_question_request, bash_request, dashboard_app, detail_app, edit_request,
-    exit_plan_mode_request, unicode_bash_request, unicode_session_timeline_app,
+    exit_plan_mode_request, request, unicode_bash_request, unicode_session_timeline_app,
 };
 
 // ── Snapshot tests: queue panel + detail views ───────────────────────
@@ -302,6 +302,36 @@ use fixtures::{
 fn dashboard_queue_with_pending_decisions() {
     let app = dashboard_app();
     assert_frame_snapshot("dashboard_queue_pending", render_app(&app, 100, 24));
+}
+
+/// Approval-safety regression: a selected request below the fold must be
+/// rendered, otherwise `y` would approve an invisible queue entry.
+#[test]
+fn dashboard_queue_scrolls_deep_selection_into_view() {
+    let mut app = App::new();
+    app.connected = true;
+    app.queue = (0_u128..24)
+        .map(|index| {
+            request(
+                100 + index,
+                "Bash",
+                serde_json::json!({"command": format!("queue-item-{index:02}")}),
+            )
+        })
+        .collect();
+    app.queue_index = 23;
+    app.rebuild_projects();
+
+    // Eighteen rows leave only seven visible entries inside the queue panel.
+    let frame = render_app(&app, 100, 18);
+    assert!(
+        frame.contains("queue-item-23"),
+        "the deeply selected queue request must scroll into view\n{frame}"
+    );
+    assert!(
+        !frame.contains("queue-item-00"),
+        "the viewport should move away from the first queue request\n{frame}"
+    );
 }
 
 #[test]

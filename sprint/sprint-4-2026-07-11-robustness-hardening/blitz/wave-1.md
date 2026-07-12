@@ -83,9 +83,9 @@
 - **#367 — Skip unknown server messages without disconnecting**
   - Files: `crates/wisphive_tui/src/connection.rs`, `crates/wisphive_cli/src/commands/tui.rs`, `crates/wisphive_protocol/src/wire.rs`
 - **#369 — Scroll selected TUI list rows into view**
-  - Files: `crates/wisphive_tui/src/ui.rs`
+  - Files: `crates/wisphive_tui/src/ui.rs`, `crates/wisphive_tui/tests/ui_snapshots.rs`
 - **#375 — Detach web terminal streams on replay/view changes**
-  - Files: `crates/wisphive_web/frontend/src/components/Terminals.tsx`, `crates/wisphive_web/frontend/src/hooks/useWisphive.ts`
+  - Files: `crates/wisphive_web/frontend/src/components/Terminals.tsx`, `crates/wisphive_web/frontend/src/components/Terminals.test.tsx`, `crates/wisphive_web/frontend/src/hooks/useWisphive.ts`, `crates/wisphive_web/frontend/src/hooks/useWisphive.test.ts`
 
 ### Wave 9
 
@@ -267,6 +267,11 @@ No wave contains a shared owned file. Co-located tests inherit the same ownershi
 - **Wave 7 / #307 shared-boundary repair:** independent review found the CLI-only prevalidation left the daemon/web `InstallHooks` path able to reach the same `hooks`-object `expect`. Reopened #307 and added `crates/wisphive_daemon/src/hook_install.rs`; malformed shapes must return `Result` from the shared library before either caller mutates files.
 - **Wave 7 / #262 pre-existing-file repair:** independent security review found the fresh-file permission pass happened too late for existing WAL/SHM files and did not validate parent ownership/writeability or descriptor file type/effective UID. Reopened #262 for secure-parent validation, descriptor preflight of main/WAL/SHM before SQLite consumes them, postflight of newly-created sidecars, and loose-mode/symlink/nonregular regressions.
 - **Wave 7 gate:** after both review repairs, the orchestrator reran both repository gates: `GATR exit=0 dur=34.0s errors=0 warnings=0 adapter=generic tag=blitz-wave7-final-rust` and `GATR exit=0 dur=6.6s errors=0 warnings=0 adapter=generic tag=blitz-wave7-final-frontend` (15 files, 125 tests). Final re-reviews for #262 and #307: PASS; #306 review: PASS.
+- **Pre-Wave 8 test ownership:** added the existing TUI snapshot harness to #369 and `Terminals.test.tsx` to #375 so both behavioral changes have runtime evidence; the additions are conflict-free within the wave.
+- **Wave 8 / #375 hook-test grant:** added `useWisphive.test.ts` to prove the shared handler registry drops live chunks in replay mode and a stale same-ID unregister cannot remove the replacement replay handler; no Wave 8 neighbor owns the path.
+- **Wave 8 / #367 bounded-log repair:** cross-review confirmed framing/order/EOF behavior but found `%serde_json::Error` could echo an unbounded, newline-bearing unknown type into `tui.log`. Reopened #367 to log only bounded error category/location/frame-size metadata and add an adversarial unknown-tag regression.
+- **Wave 8 / #375 direction-isolation repair:** cross-review confirmed detach ordering and cleanup but found replay registrations still accepted live catchup and live registrations still accepted replay chunks. Reopened #375 so live handlers accept only chunk/catchup, replay handlers accept only replay chunks, with symmetric routing regressions.
+- **Wave 8 gate:** after both cross-review repairs, the orchestrator reran both repository gates: `GATR exit=0 dur=26.1s errors=0 warnings=0 adapter=generic tag=blitz-wave8-final-rust` and `GATR exit=0 dur=6.3s errors=0 warnings=0 adapter=generic tag=blitz-wave8-final-frontend` (15 files, 129 tests). Final cross-reviews for #367, #369, and #375: PASS.
 - **Wave 4 / #111 lint repair:** its first frontend pass caught a React hooks rule violation from assigning the actions ref during render. The worker moved the ref refresh into `useLayoutEffect`; both required gates then passed.
 - **Wave 4 gate:** orchestrator reran both repository gates after all workers settled: `GATR exit=0 dur=23.5s errors=0 warnings=0 adapter=generic tag=blitz-wave4-final-rust` and `GATR exit=0 dur=5.8s errors=0 warnings=0 adapter=generic tag=blitz-wave4-final-frontend` (14 files, 122 tests).
 
@@ -307,6 +312,11 @@ No wave contains a shared owned file. Co-located tests inherit the same ownershi
   - **#306 closed:** both daemon-web start and standalone web-serve hosts are validated by Clap before side effects and invalid input exits 2 with an actionable error; runtime parsing also propagates errors if called outside Clap. Regression tests cover both affected commands and valid IPv4/localhost behavior remains.
   - **#307 closed:** the shared Claude/Codex installer now parses and validates both user configs before writing either one, returns contextual errors for malformed roots or non-object hooks, and is used by CLI plus daemon/web paths. Tests cover array/string/number/bool hooks, malformed document roots, unchanged rejected files, and cross-agent no-partial-mutation behavior.
   - **#262 closed:** daemon and CLI database opens hold a no-follow, effective-user-owned, non-group/world-writable parent descriptor; preflight existing main/WAL/SHM entries by descriptor, securely create a missing main file, enforce exact `0600`, and postflight parent identity plus newly-created sidecars. Six adversarial tests cover fresh and `06777` files, symlinks, nonregular entries, and unsafe parents.
+  - **Commit:** `b8a39f8` — `fix(runtime): harden startup configuration boundaries`.
+- **Wave 8 — 2026-07-12T00:40Z–2026-07-12T01:03Z — 3 workers + cross-review repairs.**
+  - **#367 closed:** the Rust TUI connection consumes and skips unknown or malformed complete frames, preserves later known-message order, returns `None` only on EOF, and propagates real socket I/O failures. Diagnostics expose only fixed decode categories and numeric location/frame-size metadata; a 64 KiB newline-bearing unknown tag proves bounded, injection-safe logging and continued ordered processing.
+  - **#369 closed:** all nine selectable TUI lists now use `ListState` and stateful rendering; a constrained-height approval-queue regression proves the selected 24th request scrolls into view while the first row leaves the viewport. Existing visual snapshots and Unicode coverage remain green.
+  - **#375 closed:** live terminal forwarders detach before every reattach/replay (including same ID) and exactly once on live-view unmount; replay-only selections do not detach. Handler identity protects replacements from stale cleanup, and routing is symmetric: live accepts chunk/catchup only, replay accepts replay chunks only. StrictMode and all-frame tests pass.
   - **Commit:** pending immediately after this log update.
 
 ## Quarantine triage notes

@@ -298,6 +298,8 @@ async fn run_loop(
 
             // Check for daemon messages
             msg = conn.recv() => {
+                // `recv` filters per-frame decode failures; an error here is
+                // a real socket I/O failure and should still exit the TUI.
                 match msg? {
                     Some(ServerMessage::AgentsSnapshot { agents }) => {
                         tracing::info!(count = agents.len(), "received agents snapshot");

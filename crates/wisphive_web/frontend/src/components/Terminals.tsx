@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DecisionRequest, ProjectSummary, TerminalSessionMeta } from "../types/protocol";
 import { TerminalView } from "./TerminalView";
 import { TerminalQueueDock } from "./TerminalQueueDock";
@@ -30,6 +30,7 @@ interface TerminalsProps {
   registerHandler: (
     id: string,
     handler: (id: string, direction: "chunk" | "catchup" | "replay_chunk", bytes: Uint8Array) => void,
+    options?: { replayMode?: boolean },
   ) => () => void;
 }
 
@@ -62,11 +63,30 @@ export function Terminals(props: TerminalsProps) {
   const [renameDraft, setRenameDraft] = useState("");
   const [drag, setDrag] = useState<DragPayload | null>(null);
   const [dropHint, setDropHint] = useState<{ group: string; index: number } | null>(null);
+  // The daemon owns one long-lived forwarder for each live attachment. Keep
+  // that imperative resource in a ref so event handlers and unmount cleanup
+  // always act on the current attachment rather than a stale render snapshot.
+  const liveSelectionRef = useRef<string | null>(null);
+  const onDetachRef = useRef(onDetach);
 
   useEffect(() => {
     onRefresh();
     onRefreshProjects();
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    onDetachRef.current = onDetach;
+  }, [onDetach]);
+
+  // Leaving the Terminals view must stop any live daemon forwarder. The ref
+  // is cleared before sending so React StrictMode cleanup and any later stale
+  // cleanup cannot detach the same attachment twice. Replay-only selections
+  // never enter this ref and therefore do not emit a spurious detach.
+  useEffect(() => () => {
+    const liveId = liveSelectionRef.current;
+    liveSelectionRef.current = null;
+    if (liveId) onDetachRef.current(liveId);
   }, []);
 
   // Persist collapsed-section state.
@@ -151,14 +171,41 @@ export function Terminals(props: TerminalsProps) {
   // item goes display:none while the sub-window is open).
   const returnFocusRef = useRef<HTMLElement | null>(null);
 
+  const detachLiveSelection = () => {
+    const liveId = liveSelectionRef.current;
+    if (!liveId) return;
+    liveSelectionRef.current = null;
+    onDetach(liveId);
+  };
+
   const handleSelect = (t: TerminalSessionMeta, replay: boolean) => {
-    if (selectedId && selectedId !== t.id) onDetach(selectedId);
+    // Detach before issuing the next attach/replay command. This includes a
+    // same-id live -> replay transition, whose old forwarder would otherwise
+    // interleave live chunks into the replay stream.
+    detachLiveSelection();
     returnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     setSelectedId(t.id);
     setReplayMode(replay);
     if (replay) onReplay(t.id);
-    else onAttach(t.id);
+    else {
+      liveSelectionRef.current = t.id;
+      onAttach(t.id);
+    }
   };
+
+  // Register replay panes with the shared router in replay mode so a queued
+  // live chunk cannot reach xterm even after the synchronous detach above.
+  const registerSelectedHandler = useCallback(
+    (
+      id: string,
+      handler: (
+        id: string,
+        direction: "chunk" | "catchup" | "replay_chunk",
+        bytes: Uint8Array,
+      ) => void,
+    ) => registerHandler(id, handler, { replayMode }),
+    [registerHandler, replayMode],
+  );
 
   // Mobile sub-window back action (itr#487): below the breakpoint selecting a
   // terminal opens it full-screen (CSS keys on the `terminal-open` class);
@@ -166,7 +213,7 @@ export function Terminals(props: TerminalsProps) {
   // list. Detach so the daemon stops streaming to a pane nobody is viewing.
   // No Escape-to-close: inside a terminal, Escape belongs to the PTY.
   const handleBack = () => {
-    if (selectedId) onDetach(selectedId);
+    detachLiveSelection();
     setSelectedId(null);
     setReplayMode(false);
     const el = returnFocusRef.current;
@@ -512,7 +559,7 @@ export function Terminals(props: TerminalsProps) {
                 replayMode={replayMode}
                 onInput={onInput}
                 onResize={onResize}
-                registerHandler={registerHandler}
+                registerHandler={registerSelectedHandler}
               />
             </div>
           </>

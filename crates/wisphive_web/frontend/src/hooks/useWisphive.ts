@@ -78,6 +78,15 @@ export type TerminalOutputHandler = (
   bytes: Uint8Array,
 ) => void;
 
+export interface TerminalHandlerOptions {
+  replayMode?: boolean;
+}
+
+interface TerminalHandlerRegistration {
+  handler: TerminalOutputHandler;
+  replayMode: boolean;
+}
+
 // Match the page's protocol so an HTTPS-served page uses wss://. itr#214
 // flipped the backend to TLS in production (via axum_server::bind_rustls),
 // and browsers refuse mixed-content: a page loaded over https:// cannot
@@ -98,7 +107,7 @@ export function useWisphive() {
   const wsRef = useRef<WebSocket | null>(null);
   const wsEverOpenedRef = useRef<boolean>(false);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
-  const terminalHandlersRef = useRef<Map<string, TerminalOutputHandler>>(new Map());
+  const terminalHandlersRef = useRef<Map<string, TerminalHandlerRegistration>>(new Map());
   // Mirrors state.queue for synchronous reads inside plain (non-setState)
   // callbacks — approve() needs the tool_name of the request it's approving
   // at call time, and useState's setter doesn't hand back the current value
@@ -202,25 +211,25 @@ export function useWisphive() {
       // so decoding and dispatching it here preserves the existing validation.
       switch (msg.type) {
         case "term_chunk": {
-          const handler = terminalHandlersRef.current.get(msg.id);
-          if (handler && msg.direction === "output") {
-            handler(msg.id, "chunk", decodeBase64(msg.data));
+          const registration = terminalHandlersRef.current.get(msg.id);
+          if (registration && !registration.replayMode && msg.direction === "output") {
+            registration.handler(msg.id, "chunk", decodeBase64(msg.data));
           }
           return;
         }
 
         case "term_catchup": {
-          const handler = terminalHandlersRef.current.get(msg.id);
-          if (handler) {
-            handler(msg.id, "catchup", decodeBase64(msg.screen));
+          const registration = terminalHandlersRef.current.get(msg.id);
+          if (registration && !registration.replayMode) {
+            registration.handler(msg.id, "catchup", decodeBase64(msg.screen));
           }
           return;
         }
 
         case "term_replay_chunk": {
-          const handler = terminalHandlersRef.current.get(msg.id);
-          if (handler && msg.direction === "output") {
-            handler(msg.id, "replay_chunk", decodeBase64(msg.data));
+          const registration = terminalHandlersRef.current.get(msg.id);
+          if (registration?.replayMode && msg.direction === "output") {
+            registration.handler(msg.id, "replay_chunk", decodeBase64(msg.data));
           }
           return;
         }
@@ -766,12 +775,23 @@ export function useWisphive() {
     [send],
   );
 
-  const registerTerminalHandler = useCallback((id: string, handler: TerminalOutputHandler) => {
-    terminalHandlersRef.current.set(id, handler);
-    return () => {
-      terminalHandlersRef.current.delete(id);
-    };
-  }, []);
+  const registerTerminalHandler = useCallback(
+    (id: string, handler: TerminalOutputHandler, options?: TerminalHandlerOptions) => {
+      const registration: TerminalHandlerRegistration = {
+        handler,
+        replayMode: options?.replayMode ?? false,
+      };
+      terminalHandlersRef.current.set(id, registration);
+      return () => {
+        // A same-id live -> replay remount replaces the registration. Ignore a
+        // stale live cleanup rather than deleting the newer replay handler.
+        if (terminalHandlersRef.current.get(id) === registration) {
+          terminalHandlersRef.current.delete(id);
+        }
+      };
+    },
+    [],
+  );
 
   return {
     ...state,
