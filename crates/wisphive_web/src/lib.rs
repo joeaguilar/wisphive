@@ -7,9 +7,7 @@ pub mod tls;
 mod ws_bridge;
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -225,31 +223,24 @@ async fn put_config(
         return (axum::http::StatusCode::BAD_REQUEST, reason).into_response();
     }
 
-    let current: serde_json::Value = match std::fs::read_to_string(&state.config_path) {
-        Ok(content) => match serde_json::from_str(&content) {
-            Ok(v) => v,
-            Err(_) => {
-                return (
-                    axum::http::StatusCode::CONFLICT,
-                    "existing config.json is not valid JSON; refusing to overwrite it — fix or remove the file on disk",
-                )
-                    .into_response();
-            }
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(e) => {
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("read failed: {e}"),
-            )
-                .into_response();
-        }
-    };
+    // `update_config_json` takes a blocking cross-process flock. Keep the
+    // complete read → merge → atomic rename transaction off the Tokio worker.
+    let config_path = state.config_path.clone();
+    let update = tokio::task::spawn_blocking(move || {
+        wisphive_daemon::config::update_config_json(&config_path, |obj| {
+            let current = serde_json::Value::Object(std::mem::take(obj));
+            let merged = json_merge_patch(current, parsed);
+            *obj = merged
+                .as_object()
+                .cloned()
+                .ok_or_else(|| "validated config patch did not produce an object".to_string())?;
+            Ok(())
+        })
+    })
+    .await;
 
-    let merged = json_merge_patch(current, parsed);
-    let merged_body = serde_json::to_string_pretty(&merged).unwrap_or_else(|_| "{}".into());
-    match write_config_atomic(&state.config_path, &merged_body) {
-        Ok(_) => {
+    match update {
+        Ok(Ok(())) => {
             let _ = state
                 .security
                 .state_db()
@@ -262,9 +253,21 @@ async fn put_config(
                 .await;
             (axum::http::StatusCode::OK, "saved").into_response()
         }
-        Err(e) => (
+        Ok(Err(error)) => {
+            let status = if matches!(
+                &error,
+                wisphive_daemon::config::ConfigUpdateError::Corrupt(_)
+                    | wisphive_daemon::config::ConfigUpdateError::NotAnObject
+            ) {
+                axum::http::StatusCode::CONFLICT
+            } else {
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, format!("config update failed: {error}")).into_response()
+        }
+        Err(error) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            format!("write failed: {e}"),
+            format!("config update task failed: {error}"),
         )
             .into_response(),
     }
@@ -367,34 +370,6 @@ fn validate_config_json(value: &serde_json::Value) -> Result<(), &'static str> {
     }
 
     Ok(())
-}
-
-fn write_config_atomic(path: &std::path::Path, body: &str) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("config.json");
-    let tmp_path = parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
-
-    let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp_path)?;
-        file.write_all(body.as_bytes())?;
-        file.sync_all()?;
-        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
-        std::fs::rename(&tmp_path, path)?;
-        Ok(())
-    })();
-
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp_path);
-    }
-    result
 }
 
 fn dev_cors_layer() -> tower_http::cors::CorsLayer {

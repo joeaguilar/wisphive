@@ -3032,62 +3032,89 @@ async fn attach_tool_result_with_retry(
 /// absent; a corrupt config.json refuses the update rather than clobbering it
 /// (itr#308).
 fn persist_auto_approve(tool_name: &str, wisphive_dir: &std::path::Path) -> Result<()> {
+    persist_auto_approve_with_observer(tool_name, wisphive_dir, || {})
+}
+
+/// Test seam invoked after authority selection while `config.json.lock` is
+/// still held. Production passes a no-op; concurrency tests use channels to
+/// prove another writer cannot select or read either store until the first
+/// transaction completes.
+fn persist_auto_approve_with_observer(
+    tool_name: &str,
+    wisphive_dir: &std::path::Path,
+    after_authority_selection: impl FnOnce(),
+) -> Result<()> {
     let config_path = wisphive_dir.join("config.json");
-    if config_path.exists() {
-        crate::config::update_config_json(&config_path, |obj| {
-            let add = obj
-                .entry("auto_approve_add")
-                .or_insert(serde_json::json!([]));
-            // A wrong-typed existing value is an error, not a silent success —
-            // the hook would never honor the "addition" (itr#308 posture).
-            let arr = add
-                .as_array_mut()
-                .ok_or_else(|| "auto_approve_add exists but is not an array".to_string())?;
-            if !arr.iter().any(|v| v.as_str() == Some(tool_name)) {
-                arr.push(serde_json::Value::String(tool_name.to_string()));
-            }
-            if let Some(arr) = obj
-                .get_mut("auto_approve_remove")
-                .and_then(|v| v.as_array_mut())
-            {
-                arr.retain(|v| v.as_str() != Some(tool_name));
-            }
-            Ok(())
-        })
-        .map_err(|e| anyhow::anyhow!("config.json: {e}"))?;
-        info!(tool = tool_name, "added to auto_approve_add in config.json");
-        return Ok(());
-    }
+    crate::config::with_config_update_transaction(&config_path, |transaction| -> Result<()> {
+        // Authority selection is part of the transaction. A config writer
+        // that created config.json while we waited for the lock therefore
+        // wins, and this daemon update lands in the file the hook reads.
+        let config_exists = transaction
+            .config_path()
+            .try_exists()
+            .with_context(|| format!("failed to inspect {}", config_path.display()))?;
+        after_authority_selection();
 
-    // No config.json — the hook is on the legacy/defaults path, so the legacy
-    // file is what it will actually read.
-    let path = wisphive_dir.join("auto-approve.json");
-    let mut config: serde_json::Value = if path.exists() {
-        let content = std::fs::read_to_string(&path)?;
-        // A corrupt legacy file is refused, not silently replaced with `{}`
-        // and rewritten (itr#308).
-        serde_json::from_str(&content).map_err(|e| {
-            anyhow::anyhow!("auto-approve.json is not valid JSON ({e}); refusing to overwrite it")
-        })?
-    } else {
-        serde_json::json!({})
-    };
+        if config_exists {
+            transaction
+                .update_json(|obj| {
+                    let add = obj
+                        .entry("auto_approve_add")
+                        .or_insert(serde_json::json!([]));
+                    // A wrong-typed existing value is an error, not a silent success —
+                    // the hook would never honor the "addition" (itr#308 posture).
+                    let arr = add
+                        .as_array_mut()
+                        .ok_or_else(|| "auto_approve_add exists but is not an array".to_string())?;
+                    if !arr.iter().any(|v| v.as_str() == Some(tool_name)) {
+                        arr.push(serde_json::Value::String(tool_name.to_string()));
+                    }
+                    if let Some(arr) = obj
+                        .get_mut("auto_approve_remove")
+                        .and_then(|v| v.as_array_mut())
+                    {
+                        arr.retain(|v| v.as_str() != Some(tool_name));
+                    }
+                    Ok(())
+                })
+                .map_err(|e| anyhow::anyhow!("config.json: {e}"))?;
+            info!(tool = tool_name, "added to auto_approve_add in config.json");
+            return Ok(());
+        }
 
-    let arr = config
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("auto-approve.json is not an object"))?
-        .entry("auto_approve")
-        .or_insert(serde_json::json!([]))
-        .as_array_mut()
-        .ok_or_else(|| anyhow::anyhow!("auto_approve is not an array"))?;
+        // No config.json after acquiring the shared lock — the hook is on
+        // the legacy/defaults path, so update that file under the same
+        // transaction. This serializes parallel Always Allow choices too.
+        let path = wisphive_dir.join("auto-approve.json");
+        let mut config: serde_json::Value = if path.try_exists()? {
+            let content = std::fs::read_to_string(&path)?;
+            // A corrupt legacy file is refused, not silently replaced with
+            // `{}` and rewritten (itr#308).
+            serde_json::from_str(&content).map_err(|e| {
+                anyhow::anyhow!(
+                    "auto-approve.json is not valid JSON ({e}); refusing to overwrite it"
+                )
+            })?
+        } else {
+            serde_json::json!({})
+        };
 
-    if !arr.iter().any(|v| v.as_str() == Some(tool_name)) {
-        arr.push(serde_json::Value::String(tool_name.to_string()));
-        info!(tool = tool_name, "added to legacy auto-approve list");
-    }
+        let arr = config
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("auto-approve.json is not an object"))?
+            .entry("auto_approve")
+            .or_insert(serde_json::json!([]))
+            .as_array_mut()
+            .ok_or_else(|| anyhow::anyhow!("auto_approve is not an array"))?;
 
-    crate::config::write_config_atomic(&path, &serde_json::to_string_pretty(&config)?)?;
-    Ok(())
+        if !arr.iter().any(|v| v.as_str() == Some(tool_name)) {
+            arr.push(serde_json::Value::String(tool_name.to_string()));
+            info!(tool = tool_name, "added to legacy auto-approve list");
+        }
+
+        crate::config::write_config_atomic(&path, &serde_json::to_string_pretty(&config)?)?;
+        Ok(())
+    })
 }
 
 fn sweep_stale_session_markers(sessions_dir: &std::path::Path) {
@@ -3153,8 +3180,9 @@ mod tests {
         enqueue_spawn_for_approval, ensure_spawn_mode_active, finalize_spawn_abandonment,
         finalize_spawn_decision, hook_decision_mode_denial, hook_message_agent_id,
         is_reserved_internal_agent_id, is_valid_hook_agent_id, partition_sudo_gated,
-        peer_uid_allowed, persist_auto_approve, read_capped_line, reject_connection_at_capacity,
-        resolve_bulk_deny, run_after_spawn_approval, set_socket_permissions, settle_spawn_expiry,
+        peer_uid_allowed, persist_auto_approve, persist_auto_approve_with_observer,
+        read_capped_line, reject_connection_at_capacity, resolve_bulk_deny,
+        run_after_spawn_approval, set_socket_permissions, settle_spawn_expiry,
         spawn_approval_request, sweep_stale_session_markers, try_acquire_connection_permit,
     };
     use std::sync::Arc;
@@ -3854,6 +3882,127 @@ mod tests {
         .unwrap();
         assert_eq!(legacy["auto_approve"][0], "Bash");
         assert!(!dir.path().join("config.json").exists());
+    }
+
+    #[test]
+    fn concurrent_always_allow_legacy_writers_preserve_both_tools() {
+        use std::sync::mpsc::{RecvTimeoutError, channel};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let (first_selected_tx, first_selected_rx) = channel();
+        let (release_first_tx, release_first_rx) = channel();
+        let first_root = root.clone();
+        let first = std::thread::spawn(move || {
+            persist_auto_approve_with_observer("Bash", &first_root, move || {
+                first_selected_tx.send(()).unwrap();
+                release_first_rx.recv().unwrap();
+            })
+        });
+        first_selected_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("first legacy writer must select authority while holding the lock");
+
+        let (second_started_tx, second_started_rx) = channel();
+        let (second_selected_tx, second_selected_rx) = channel();
+        let second_root = root.clone();
+        let second = std::thread::spawn(move || {
+            second_started_tx.send(()).unwrap();
+            persist_auto_approve_with_observer("Edit", &second_root, move || {
+                second_selected_tx.send(()).unwrap();
+            })
+        });
+        second_started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("second legacy writer must start");
+        let second_before_release =
+            second_selected_rx.recv_timeout(std::time::Duration::from_millis(100));
+
+        release_first_tx.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        if matches!(second_before_release, Err(RecvTimeoutError::Timeout)) {
+            second_selected_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("second writer must select authority after the first unlocks");
+        }
+        second.join().unwrap().unwrap();
+
+        assert!(
+            matches!(second_before_release, Err(RecvTimeoutError::Timeout)),
+            "second writer selected legacy authority before the first transaction released"
+        );
+        let legacy: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("auto-approve.json")).unwrap())
+                .unwrap();
+        let mut tools: Vec<_> = legacy["auto_approve"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        tools.sort_unstable();
+        assert_eq!(tools, ["Bash", "Edit"]);
+        assert!(!root.join("config.json").exists());
+    }
+
+    #[test]
+    fn always_allow_rechecks_authority_after_concurrent_config_creation() {
+        use std::sync::mpsc::{RecvTimeoutError, channel};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let config_path = root.join("config.json");
+        let creator_path = config_path.clone();
+        let (creator_entered_tx, creator_entered_rx) = channel();
+        let (release_creator_tx, release_creator_rx) = channel();
+        let creator = std::thread::spawn(move || {
+            crate::config::update_config_json(&creator_path, |obj| {
+                creator_entered_tx.send(()).unwrap();
+                release_creator_rx.recv().unwrap();
+                obj.insert("auto_approve_level".into(), "read".into());
+                Ok(())
+            })
+        });
+        creator_entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("config creator must hold the shared transaction before writing");
+
+        let (server_started_tx, server_started_rx) = channel();
+        let (server_selected_tx, server_selected_rx) = channel();
+        let server_root = root.clone();
+        let server = std::thread::spawn(move || {
+            server_started_tx.send(()).unwrap();
+            persist_auto_approve_with_observer("Bash", &server_root, move || {
+                server_selected_tx.send(()).unwrap();
+            })
+        });
+        server_started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("Always Allow writer must start");
+        let server_before_creation =
+            server_selected_rx.recv_timeout(std::time::Duration::from_millis(100));
+
+        release_creator_tx.send(()).unwrap();
+        creator.join().unwrap().unwrap();
+        if matches!(server_before_creation, Err(RecvTimeoutError::Timeout)) {
+            server_selected_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("server must recheck authority after config creation unlocks");
+        }
+        server.join().unwrap().unwrap();
+
+        assert!(
+            matches!(server_before_creation, Err(RecvTimeoutError::Timeout)),
+            "server selected the legacy store while config creation held the shared lock"
+        );
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(config["auto_approve_level"], "read");
+        assert_eq!(config["auto_approve_add"][0], "Bash");
+        assert!(
+            !root.join("auto-approve.json").exists(),
+            "authoritative config creation must prevent a legacy write"
+        );
     }
 
     #[test]

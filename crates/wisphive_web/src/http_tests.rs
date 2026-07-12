@@ -341,6 +341,56 @@ async fn api_config_put_merges_instead_of_replacing() {
     assert_eq!(after["retention_vacuum_max_mb"], 512);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_config_put_serializes_with_daemon_config_update() {
+    let (_tmp, state) = test_state().await;
+    let (token, _id) = seed_device(state.security.state_db(), "laptop").await;
+    std::fs::write(
+        &state.config_path,
+        serde_json::json!({"future_field": {"keep": true}}).to_string(),
+    )
+    .unwrap();
+
+    // Hold the daemon-side mutation inside the shared transaction while the
+    // HTTP request starts. Without the web path taking the same lock, its
+    // stale read/write races this mutation and one disjoint update is lost.
+    let daemon_path = state.config_path.clone();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let daemon_update = tokio::task::spawn_blocking(move || {
+        wisphive_daemon::config::update_config_json(&daemon_path, |obj| {
+            entered_tx
+                .send(())
+                .map_err(|_| "test receiver dropped".to_string())?;
+            release_rx
+                .recv()
+                .map_err(|_| "test release sender dropped".to_string())?;
+            obj.insert("auto_approve_add".into(), serde_json::json!(["Bash"]));
+            Ok(())
+        })
+    });
+    entered_rx.await.unwrap();
+
+    let request = req("PUT", "/api/config")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"notifications":false}"#))
+        .unwrap();
+    let web_update = tokio::spawn(run_with(state.clone(), request));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    release_tx.send(()).unwrap();
+
+    daemon_update.await.unwrap().unwrap();
+    let (status, _) = web_update.await.unwrap();
+    assert_eq!(status, StatusCode::OK);
+
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state.config_path).unwrap()).unwrap();
+    assert_eq!(after["auto_approve_add"][0], "Bash");
+    assert_eq!(after["notifications"], false);
+    assert_eq!(after["future_field"]["keep"], true);
+}
+
 #[tokio::test]
 async fn api_config_put_accepts_all_documented_keys() {
     // itr#358: a faithful round-trip of a real config.json (retention knobs,

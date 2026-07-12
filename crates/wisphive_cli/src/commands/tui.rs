@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -8,12 +9,19 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use wisphive_daemon::DaemonConfig;
 use wisphive_protocol::{ClientMessage, ServerMessage};
-use wisphive_tui::app::App;
+use wisphive_tui::app::{App, ConfigMutation};
 use wisphive_tui::connection::DaemonConnection;
 use wisphive_tui::input::{self, InputAction};
 use wisphive_tui::ui;
 
 const HISTORY_PAGE_SIZE: u32 = 50;
+
+fn persist_tui_config(
+    path: &Path,
+    mutation: ConfigMutation,
+) -> Result<(), wisphive_daemon::ConfigUpdateError> {
+    wisphive_daemon::update_config_json(path, |obj| mutation.apply_to(obj))
+}
 
 /// Run the TUI client.
 pub async fn run() -> Result<()> {
@@ -69,7 +77,8 @@ pub async fn run() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     tracing::info!("entering main loop");
-    let result = run_loop(&mut terminal, &mut app, &mut conn).await;
+    let config_path = config.config_json_path();
+    let result = run_loop(&mut terminal, &mut app, &mut conn, &config_path).await;
 
     // Restore terminal
     terminal::disable_raw_mode()?;
@@ -88,6 +97,7 @@ async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
     conn: &mut DaemonConnection,
+    config_path: &Path,
 ) -> Result<()> {
     loop {
         // Draw
@@ -180,6 +190,30 @@ async fn run_loop(
                         InputAction::QueryProjects => {
                             tracing::info!("querying projects");
                             conn.send(&ClientMessage::QueryProjects).await?;
+                        }
+                        InputAction::SaveConfig(mutation) => {
+                            let path = config_path.to_owned();
+                            let display_path = path.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                persist_tui_config(&path, mutation)
+                            })
+                            .await
+                            {
+                                Ok(Ok(())) => tracing::info!(
+                                    path = %display_path.display(),
+                                    "saved TUI config"
+                                ),
+                                Ok(Err(error)) => tracing::error!(
+                                    path = %display_path.display(),
+                                    %error,
+                                    "failed to save TUI config; fix the on-disk config and retry"
+                                ),
+                                Err(error) => tracing::error!(
+                                    path = %display_path.display(),
+                                    %error,
+                                    "TUI config save worker failed; retry the change"
+                                ),
+                            }
                         }
                         InputAction::QuerySessionTimeline { agent_id } => {
                             tracing::info!(%agent_id, "querying session timeline");
@@ -454,4 +488,74 @@ async fn run_loop(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn concurrent_tui_rule_transactions_preserve_same_tool_allow_and_deny() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "tool_rules": {"Bash": {"future_rule_field": {"keep": true}}},
+                "future_top_level": true,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let start = Arc::new(Barrier::new(3));
+        let deny_start = start.clone();
+        let deny_path = path.clone();
+        let deny = std::thread::spawn(move || {
+            deny_start.wait();
+            persist_tui_config(
+                &deny_path,
+                ConfigMutation::ToolRulePattern {
+                    tool: "Bash".into(),
+                    pattern: "sudo".into(),
+                    deny: true,
+                    include: true,
+                },
+            )
+        });
+        let allow_start = start.clone();
+        let allow_path = path.clone();
+        let allow = std::thread::spawn(move || {
+            allow_start.wait();
+            persist_tui_config(
+                &allow_path,
+                ConfigMutation::ToolRulePattern {
+                    tool: "Bash".into(),
+                    pattern: "cargo test".into(),
+                    deny: false,
+                    include: true,
+                },
+            )
+        });
+        start.wait();
+        deny.join().unwrap().unwrap();
+        allow.join().unwrap().unwrap();
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            after["tool_rules"]["Bash"]["deny_patterns"],
+            serde_json::json!(["sudo"])
+        );
+        assert_eq!(
+            after["tool_rules"]["Bash"]["allow_patterns"],
+            serde_json::json!(["cargo test"])
+        );
+        assert_eq!(
+            after["tool_rules"]["Bash"]["future_rule_field"]["keep"],
+            true
+        );
+        assert_eq!(after["future_top_level"], true);
+    }
 }

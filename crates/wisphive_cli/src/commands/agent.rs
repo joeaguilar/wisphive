@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use wisphive_daemon::project_audit::{AgentHookAudit, audit_project};
 use wisphive_protocol::{
     AgentType, ClientMessage, ClientType, ManagedAgent, PROTOCOL_VERSION, ServerMessage,
     SpawnAgentRequest,
@@ -239,45 +240,51 @@ fn preflight_checks(project: &Path, agent_type: &AgentType) -> Result<()> {
         }
     }
 
-    // 3. Check hooks are installed in the project
-    let hooks_path = match agent_type {
-        AgentType::Codex => project.join(".codex").join("hooks.json"),
-        AgentType::ClaudeCode => project.join(".claude").join("settings.json"),
+    // 3. Require the security-critical PreToolUse gate, but distinguish it
+    // from a complete hook install. The shared audit layer uses the same exact
+    // wisphive-hook matcher as install/status (itr#411), so partial telemetry
+    // coverage can warn without weakening the existing fail-closed gate.
+    if let Some(warning) = check_agent_hook_coverage(project, agent_type)? {
+        eprintln!("{warning}");
+    }
+
+    Ok(())
+}
+
+fn check_agent_hook_coverage(project: &Path, agent_type: &AgentType) -> Result<Option<String>> {
+    let project_audit = audit_project(project);
+    let (agent_name, audit): (&str, &AgentHookAudit) = match agent_type {
+        AgentType::ClaudeCode => ("Claude Code", &project_audit.hooks.claude),
+        AgentType::Codex => ("Codex", &project_audit.hooks.codex),
         AgentType::Red | AgentType::LocalLlm => {
             anyhow::bail!("managed spawn currently supports Claude Code and Codex")
         }
     };
-    if !hooks_path.exists() {
+
+    if !audit.config_present {
         anyhow::bail!(
             "No {} in {}.\n  fix: wisphive hooks install --project {}",
-            hooks_path.display(),
+            audit.config_path.display(),
             project.display(),
             project.display()
         );
     }
-    // Verify a wisphive hook is actually installed — matched precisely on the
-    // wisphive-hook binary (itr#359), not a substring that a user hook under a
-    // "wisphive" directory would satisfy. Fail closed: an unreadable or
-    // malformed hook file blocks the spawn rather than skipping the check,
-    // and the hook must be on PreToolUse — the event that actually gates
-    // tool calls — not merely on some telemetry event.
-    let content = std::fs::read_to_string(&hooks_path)
-        .with_context(|| format!("could not read {}", hooks_path.display()))?;
-    let settings: serde_json::Value = serde_json::from_str(&content).with_context(|| {
-        format!(
+
+    if !audit.config_valid {
+        if let Some(error) = audit.read_error.as_deref() {
+            anyhow::bail!("could not read {}: {error}", audit.config_path.display());
+        }
+        anyhow::bail!(
             "{} is malformed JSON — fix its syntax before starting an agent",
-            hooks_path.display()
-        )
-    })?;
-    let installed = settings
-        .get("hooks")
-        .and_then(|hooks| hooks.get("PreToolUse"))
-        .and_then(|rules| rules.as_array())
-        .is_some_and(|arr| {
-            arr.iter()
-                .any(wisphive_daemon::hook_install::has_wisphive_hook)
-        });
-    if !installed {
+            audit.config_path.display()
+        );
+    }
+
+    let gated = audit
+        .installed_events
+        .iter()
+        .any(|event| event == "PreToolUse");
+    if !gated {
         anyhow::bail!(
             "Wisphive PreToolUse hook not installed in {}.\n  fix: wisphive hooks install --project {}",
             project.display(),
@@ -285,7 +292,17 @@ fn preflight_checks(project: &Path, agent_type: &AgentType) -> Result<()> {
         );
     }
 
-    Ok(())
+    if audit.installed {
+        return Ok(None);
+    }
+
+    let installed = audit.installed_events.len();
+    let total = installed + audit.missing_events.len();
+    Ok(Some(format!(
+        "WARN  {agent_name} is safely gated, but hooks are only partially installed ({installed}/{total} expected events).\n      missing expected events: {}\n      fix: wisphive hooks install --project {}",
+        audit.missing_events.join(", "),
+        project.display()
+    )))
 }
 
 #[cfg(unix)]
@@ -331,9 +348,33 @@ fn print_agent(agent: &ManagedAgent) {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::os::unix::net::UnixListener;
 
     use super::*;
+    use wisphive_daemon::hook_install::install_hooks;
+    use wisphive_daemon::project_audit::{CLAUDE_HOOK_EVENTS, CODEX_HOOK_EVENTS};
+
+    fn write_hook_settings(path: &Path, events: &[&str], command: &str) {
+        let hooks = events
+            .iter()
+            .map(|event| {
+                (
+                    (*event).to_string(),
+                    serde_json::json!([{
+                        "matcher": "",
+                        "hooks": [{ "type": "command", "command": command }]
+                    }]),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            path,
+            serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks })).unwrap(),
+        )
+        .unwrap();
+    }
 
     fn spawn(prompt: &str) -> SpawnAgentRequest {
         serde_json::from_value(serde_json::json!({
@@ -382,6 +423,78 @@ mod tests {
             decision.tool_name = "Bash".into();
         }
         assert!(!is_matching_spawn_queue_ack(&sent, &ordinary));
+    }
+
+    #[test]
+    fn pretool_only_configs_warn_with_every_missing_event_for_both_agents() {
+        let project = tempfile::tempdir().unwrap();
+        write_hook_settings(
+            &project.path().join(".claude/settings.json"),
+            &["PreToolUse"],
+            "wisphive-hook",
+        );
+        write_hook_settings(
+            &project.path().join(".codex/hooks.json"),
+            &["PreToolUse"],
+            "env WISPHIVE_AGENT_TYPE=codex wisphive-hook",
+        );
+
+        for (agent_type, expected) in [
+            (AgentType::ClaudeCode, CLAUDE_HOOK_EVENTS),
+            (AgentType::Codex, CODEX_HOOK_EVENTS),
+        ] {
+            let warning = check_agent_hook_coverage(project.path(), &agent_type)
+                .unwrap()
+                .expect("PreToolUse-only coverage must warn, not fail");
+            assert!(warning.contains("safely gated"));
+            assert!(warning.contains("wisphive hooks install --project"));
+            for event in expected
+                .iter()
+                .copied()
+                .filter(|event| *event != "PreToolUse")
+            {
+                assert!(warning.contains(event), "missing {event} in: {warning}");
+            }
+        }
+    }
+
+    #[test]
+    fn full_hook_installs_pass_without_warnings_for_both_agents() {
+        let project = tempfile::tempdir().unwrap();
+        install_hooks(project.path()).unwrap();
+
+        assert!(
+            check_agent_hook_coverage(project.path(), &AgentType::ClaudeCode)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            check_agent_hook_coverage(project.path(), &AgentType::Codex)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn absent_and_malformed_hook_configs_fail_with_actionable_errors() {
+        let project = tempfile::tempdir().unwrap();
+        for agent_type in [AgentType::ClaudeCode, AgentType::Codex] {
+            let error = check_agent_hook_coverage(project.path(), &agent_type).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("wisphive hooks install --project"));
+            assert!(message.contains(project.path().to_string_lossy().as_ref()));
+        }
+
+        fs::create_dir_all(project.path().join(".claude")).unwrap();
+        fs::create_dir_all(project.path().join(".codex")).unwrap();
+        fs::write(project.path().join(".claude/settings.json"), "{").unwrap();
+        fs::write(project.path().join(".codex/hooks.json"), "{").unwrap();
+        for agent_type in [AgentType::ClaudeCode, AgentType::Codex] {
+            let error = check_agent_hook_coverage(project.path(), &agent_type).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("malformed JSON"));
+            assert!(message.contains("fix its syntax"));
+        }
     }
 
     #[test]

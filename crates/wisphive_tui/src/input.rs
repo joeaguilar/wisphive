@@ -1,6 +1,6 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
-use crate::app::{App, FocusPanel, ViewMode};
+use crate::app::{App, ConfigMutation, FocusPanel, ViewMode};
 use crate::modal::{Modal, ModalAction};
 
 /// Action the main loop should take after processing input.
@@ -49,6 +49,8 @@ pub enum InputAction {
     QuerySessionTimelinePage { agent_id: String, page: usize },
     /// Request project summaries from the daemon.
     QueryProjects,
+    /// Persist the TUI config view through the CLI's off-runtime locked writer.
+    SaveConfig(ConfigMutation),
     /// Approve a PermissionRequest with a specific suggestion selected.
     ApprovePermission {
         id: uuid::Uuid,
@@ -1130,7 +1132,7 @@ fn handle_config_input(app: &mut App, key: KeyEvent) -> InputAction {
                     current.saturating_sub(1)
                 };
                 app.config_level = levels[next];
-                app.save_config();
+                return InputAction::SaveConfig(ConfigMutation::AutoApproveLevel(app.config_level));
             }
             InputAction::None
         }
@@ -1138,8 +1140,12 @@ fn handle_config_input(app: &mut App, key: KeyEvent) -> InputAction {
         KeyCode::Enter | KeyCode::Char(' ') => {
             if let Some(ConfigRow::EventToggle(key)) = rows.get(app.config_index) {
                 let current = app.config_event_toggles.get(*key).copied().unwrap_or(false);
-                app.config_event_toggles.insert(key.to_string(), !current);
-                app.save_config();
+                let enabled = !current;
+                app.config_event_toggles.insert(key.to_string(), enabled);
+                InputAction::SaveConfig(ConfigMutation::EventToggle {
+                    key: key.to_string(),
+                    enabled,
+                })
             } else if let Some(ConfigRow::Tool(tool_idx)) = rows.get(app.config_index) {
                 let tool = ALL_TOOLS[*tool_idx].to_string();
                 let in_level = app.config_level.includes(&tool);
@@ -1151,17 +1157,22 @@ fn handle_config_input(app: &mut App, key: KeyEvent) -> InputAction {
                         app.config_remove.retain(|t| *t != tool);
                     } else {
                         app.config_add.retain(|t| *t != tool);
-                        app.config_remove.push(tool);
+                        app.config_remove.push(tool.clone());
                     }
                 } else if in_add {
                     app.config_add.retain(|t| *t != tool);
                 } else {
                     app.config_remove.retain(|t| *t != tool);
-                    app.config_add.push(tool);
+                    app.config_add.push(tool.clone());
                 }
-                app.save_config();
+                InputAction::SaveConfig(ConfigMutation::ToolOverride {
+                    add: app.config_add.contains(&tool),
+                    remove: app.config_remove.contains(&tool),
+                    tool,
+                })
+            } else {
+                InputAction::None
             }
-            InputAction::None
         }
         // Add rule (+) — on a tool row, start rule input
         KeyCode::Char('+') | KeyCode::Char('=') => {
@@ -1190,19 +1201,34 @@ fn handle_config_input(app: &mut App, key: KeyEvent) -> InputAction {
                 let tool = ALL_TOOLS[*tool_idx].to_string();
                 let is_deny = *is_deny;
                 let rule_idx = *rule_idx;
-                let rule = app.config_tool_rules.entry(tool).or_default();
-                if is_deny {
+                let rule = app.config_tool_rules.entry(tool.clone()).or_default();
+                let pattern = if is_deny {
                     if rule_idx < rule.deny_patterns.len() {
-                        rule.deny_patterns.remove(rule_idx);
+                        Some(rule.deny_patterns.remove(rule_idx))
+                    } else {
+                        None
                     }
                 } else if rule_idx < rule.allow_patterns.len() {
-                    rule.allow_patterns.remove(rule_idx);
+                    Some(rule.allow_patterns.remove(rule_idx))
+                } else {
+                    None
+                };
+                let rule_is_empty = rule.deny_patterns.is_empty() && rule.allow_patterns.is_empty();
+                if rule_is_empty {
+                    app.config_tool_rules.remove(&tool);
                 }
                 let new_rows = app.config_rows();
                 if app.config_index >= new_rows.len() {
                     app.config_index = new_rows.len().saturating_sub(1);
                 }
-                app.save_config();
+                if let Some(pattern) = pattern {
+                    return InputAction::SaveConfig(ConfigMutation::ToolRulePattern {
+                        tool,
+                        pattern,
+                        deny: is_deny,
+                        include: false,
+                    });
+                }
             }
             InputAction::None
         }
@@ -1221,22 +1247,28 @@ fn handle_config_rule_input(app: &mut App, key: KeyEvent) -> InputAction {
         }
         KeyCode::Enter => {
             let pattern = app.config_rule_buffer.trim().to_string();
+            let mut mutation = None;
             if !pattern.is_empty()
                 && let Some(tool) = app.config_rule_target_tool.take()
             {
-                let rule = app.config_tool_rules.entry(tool).or_default();
+                let rule = app.config_tool_rules.entry(tool.clone()).or_default();
                 if app.config_rule_is_deny {
                     if !rule.deny_patterns.contains(&pattern) {
-                        rule.deny_patterns.push(pattern);
+                        rule.deny_patterns.push(pattern.clone());
                     }
                 } else if !rule.allow_patterns.contains(&pattern) {
-                    rule.allow_patterns.push(pattern);
+                    rule.allow_patterns.push(pattern.clone());
                 }
-                app.save_config();
+                mutation = Some(ConfigMutation::ToolRulePattern {
+                    tool,
+                    pattern,
+                    deny: app.config_rule_is_deny,
+                    include: true,
+                });
             }
             app.config_rule_input_mode = false;
             app.config_rule_buffer.clear();
-            InputAction::None
+            mutation.map_or(InputAction::None, InputAction::SaveConfig)
         }
         KeyCode::Backspace => {
             app.config_rule_buffer.pop();

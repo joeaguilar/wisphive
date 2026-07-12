@@ -90,9 +90,9 @@
 ### Wave 9
 
 - **#376 — Guard browsers without the Notification API**
-  - Files: `crates/wisphive_web/frontend/src/hooks/useWisphive.ts`
+  - Files: `crates/wisphive_web/frontend/src/hooks/useWisphive.ts`, `crates/wisphive_web/frontend/src/hooks/useWisphive.test.ts`
 - **#407 — Serialize every config.json writer**
-  - Files: `crates/wisphive_daemon/src/config.rs`, `crates/wisphive_daemon/src/server.rs`, `crates/wisphive_web/src/lib.rs`, `crates/wisphive_cli/src/commands/config.rs`
+  - Files: `crates/wisphive_daemon/src/config.rs`, `crates/wisphive_daemon/src/server.rs`, `crates/wisphive_web/src/lib.rs`, `crates/wisphive_web/src/http_tests.rs`, `crates/wisphive_cli/src/commands/config.rs`, `crates/wisphive_cli/src/commands/tui.rs`, `crates/wisphive_tui/src/app.rs`, `crates/wisphive_tui/src/input.rs`, `crates/wisphive_tui/Cargo.toml`, `Cargo.lock`, `AGENTS.md`
 - **#412 — Detect partial hook installations in doctor/agent preflight**
   - Files: `crates/wisphive_cli/src/commands/doctor.rs`, `crates/wisphive_cli/src/commands/agent.rs`
 
@@ -199,6 +199,7 @@
 - `crates/wisphive_web/frontend/src/hooks/useWisphive.ts`: #105 → #295 → #296 → #114 → #303 → #375 → #376 → #118.
 - `crates/wisphive_web/frontend/src/types/protocol.ts`: #105 → #303.
 - `crates/wisphive_web/src/lib.rs`: #407 → #504 → #495 → #408 → #277 → #281.
+- `crates/wisphive_web/src/http_tests.rs`: #407 → #281.
 - `crates/wisphive_cli/src/main.rs`: #303 → #306 → #348 → #371 → #277 → #318.
 - `crates/wisphive_hook/src/main.rs`: #86 → #95 → #102.
 - `crates/wisphive_cli/src/commands/agent.rs`: #94 → #294 → #412 → #470.
@@ -211,14 +212,17 @@
 - `crates/wisphive_daemon/src/terminal.rs`: #303 → #365.
 - `crates/wisphive_protocol/src/wire.rs`: #303 → #367.
 - `crates/wisphive_cli/src/commands/tui.rs`: #303 → #367.
-- `crates/wisphive_tui/src/input.rs`: #374 → #377.
+- `crates/wisphive_tui/src/input.rs`: #407 → #374 → #377.
+- `crates/wisphive_cli/src/commands/tui.rs`: #303 → #367 → #407.
+- `crates/wisphive_tui/src/app.rs`: #407 → #373.
+- `Cargo.lock`: #407 → #261.
 - `crates/wisphive_web/frontend/src/App.tsx` and `useKeyboard.ts`: #111 → #378.
 - `crates/wisphive_web/frontend/src/components/Terminals.tsx`: #375 → #488.
 - `Cargo.toml`: #261 → #318.
 - `ToolContent.tsx`: #106 → #205.
 - `crates/wisphive_daemon/src/queue.rs`: #94 → #97.
 - `crates/wisphive_daemon/src/state/decisions.rs`: #94 → #91.
-- `AGENTS.md`: #95 → #262.
+- `AGENTS.md`: #95 → #262 → #407.
 
 No wave contains a shared owned file. Co-located tests inherit the same ownership chain as their source; a worker must request an ownership expansion before touching any additional test file.
 
@@ -272,6 +276,13 @@ No wave contains a shared owned file. Co-located tests inherit the same ownershi
 - **Wave 8 / #367 bounded-log repair:** cross-review confirmed framing/order/EOF behavior but found `%serde_json::Error` could echo an unbounded, newline-bearing unknown type into `tui.log`. Reopened #367 to log only bounded error category/location/frame-size metadata and add an adversarial unknown-tag regression.
 - **Wave 8 / #375 direction-isolation repair:** cross-review confirmed detach ordering and cleanup but found replay registrations still accepted live catchup and live registrations still accepted replay chunks. Reopened #375 so live handlers accept only chunk/catchup, replay handlers accept only replay chunks, with symmetric routing regressions.
 - **Wave 8 gate:** after both cross-review repairs, the orchestrator reran both repository gates: `GATR exit=0 dur=26.1s errors=0 warnings=0 adapter=generic tag=blitz-wave8-final-rust` and `GATR exit=0 dur=6.3s errors=0 warnings=0 adapter=generic tag=blitz-wave8-final-frontend` (15 files, 129 tests). Final cross-reviews for #367, #369, and #375: PASS.
+- **Pre-Wave 9 test ownership:** added the existing `useWisphive.test.ts` surface to #376 so the missing-Notification hidden-tab crash is exercised without creating a parallel harness; no Wave 9 conflict was introduced.
+- **Wave 9 / #407 HTTP-test grant:** added `crates/wisphive_web/src/http_tests.rs` for deterministic web-vs-daemon concurrent disjoint-update evidence; its later #281 owner is inactive.
+- **Wave 9 / #407 runtime-doc grant:** the new durable `~/.wisphive/config.json.lock` falls under the repository's runtime-file documentation rule, so #407 also owns `AGENTS.md` for flock/permission/lifetime semantics.
+- **Wave 9 / #407 TUI-writer grant:** self-audit found a fourth lossy writer in `wisphive_tui::App::save_config`. Added `app.rs`, the TUI manifest, and `Cargo.lock` so it can use the same daemon config primitive; later #373/#261 owners are inactive and must preserve this serialization.
+- **Wave 9 / #407 async TUI routing grant:** direct flock I/O in the TUI select loop would block the runtime. Added `wisphive_tui/src/input.rs` to emit a save action and CLI `commands/tui.rs` to execute the shared mutation in `spawn_blocking` with visible failure handling; later #374/#377 are inactive.
+- **Wave 9 / #407 authority-branch repair:** adversarial cross-review found `persist_auto_approve` checked for `config.json` before locking, so two legacy writers could still lose updates and a concurrent config creator could make the daemon write the now-nonauthoritative legacy file. Reopened #407 to take the same config lock before selecting config versus legacy, hold it through the chosen RMW without recursive locking, and add deterministic dual-legacy/config-creation plus concurrent same-tool TUI pattern tests.
+- **Wave 9 gate:** after the #407 authority repair, the orchestrator reran both repository gates: `GATR exit=0 dur=43.5s errors=0 warnings=0 adapter=generic tag=blitz-wave9-final-rust` and `GATR exit=0 dur=6.0s errors=0 warnings=0 adapter=generic tag=blitz-wave9-final-frontend` (15 files, 130 tests). Final cross-reviews for #376, #407, and #412: PASS.
 - **Wave 4 / #111 lint repair:** its first frontend pass caught a React hooks rule violation from assigning the actions ref during render. The worker moved the ref refresh into `useLayoutEffect`; both required gates then passed.
 - **Wave 4 gate:** orchestrator reran both repository gates after all workers settled: `GATR exit=0 dur=23.5s errors=0 warnings=0 adapter=generic tag=blitz-wave4-final-rust` and `GATR exit=0 dur=5.8s errors=0 warnings=0 adapter=generic tag=blitz-wave4-final-frontend` (14 files, 122 tests).
 
@@ -317,6 +328,11 @@ No wave contains a shared owned file. Co-located tests inherit the same ownershi
   - **#367 closed:** the Rust TUI connection consumes and skips unknown or malformed complete frames, preserves later known-message order, returns `None` only on EOF, and propagates real socket I/O failures. Diagnostics expose only fixed decode categories and numeric location/frame-size metadata; a 64 KiB newline-bearing unknown tag proves bounded, injection-safe logging and continued ordered processing.
   - **#369 closed:** all nine selectable TUI lists now use `ListState` and stateful rendering; a constrained-height approval-queue regression proves the selected 24th request scrolls into view while the first row leaves the viewport. Existing visual snapshots and Unicode coverage remain green.
   - **#375 closed:** live terminal forwarders detach before every reattach/replay (including same ID) and exactly once on live-view unmount; replay-only selections do not detach. Handler identity protects replacements from stale cleanup, and routing is symmetric: live accepts chunk/catchup only, replay accepts replay chunks only. StrictMode and all-frame tests pass.
+  - **Commit:** `dade8b5` — `fix(clients): preserve TUI and terminal stream state`.
+- **Wave 9 — 2026-07-12T01:04Z–2026-07-12T01:54Z — 3 workers + adversarial repair reviews.**
+  - **#376 closed:** every Notification API access is guarded at use time, including the deferred click callback. A hidden-document test deletes the API, processes a new decision without crashing or notifying, then proves a later resolution frame still clears state on the same socket.
+  - **#407 closed:** every daemon, web, CLI, and TUI config mutation now uses one owner-only persistent `config.json.lock` transaction covering authority selection, raw-JSON read, precise mutation, and atomic rename. TUI saves execute off-runtime as per-setting/per-pattern mutations; typed CLI updates preserve future nested fields. Deterministic tests cover 16 concurrent tools, HTTP-vs-daemon, dual legacy writers, concurrent config creation/recheck, same-tool allow/deny patterns, corrupt inputs, symlinked locks, and panic release.
+  - **#412 closed:** doctor reuses the exact hook audit to distinguish full installation from PreToolUse-only gating and names every missing Claude/Codex event. Agent preflight stays fail-closed when the minimum gate is absent, warns on partial coverage, and remains silent for full installs; both-agent absent/malformed/partial/full fixtures pass.
   - **Commit:** pending immediately after this log update.
 
 ## Quarantine triage notes

@@ -178,7 +178,12 @@ export function useWisphive() {
     }
 
     const requestNotificationPermission = () => {
-      if (window.Notification.permission === "default") {
+      // The API can disappear with a WebView lifecycle change after this
+      // effect registered its click listener. Re-check before every access.
+      if (
+        "Notification" in window &&
+        window.Notification.permission === "default"
+      ) {
         void window.Notification.requestPermission();
       }
     };

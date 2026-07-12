@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use wisphive_daemon::UserConfig;
 
 fn config_path() -> PathBuf {
@@ -8,8 +8,8 @@ fn config_path() -> PathBuf {
 }
 
 /// Load config.json for read-only display. A corrupt file falls back to
-/// defaults with a warning; write paths must use [`load_for_write`] instead so
-/// they can never rewrite the file from that lossy fallback (itr#308).
+/// defaults with a warning; write paths must use [`update_for_write`] instead
+/// so they can never rewrite the file from that lossy fallback (itr#308).
 fn load() -> UserConfig {
     let path = config_path();
     match std::fs::read_to_string(&path) {
@@ -27,29 +27,54 @@ fn load() -> UserConfig {
     }
 }
 
-/// Load config.json ahead of a save. Unlike [`load`], a corrupt existing file
-/// is an error: proceeding would rewrite the file from defaults and silently
-/// destroy whatever the operator had in it (itr#308). Unknown keys survive the
-/// round-trip via `UserConfig::extra` (itr#361).
-fn load_for_write() -> Result<UserConfig> {
-    let path = config_path();
-    match std::fs::read_to_string(&path) {
-        Ok(content) => serde_json::from_str(&content).with_context(|| {
-            format!(
-                "{} could not be parsed as a Wisphive config (invalid JSON or a wrong-typed field); refusing to overwrite it — fix or remove the file",
-                path.display()
-            )
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(UserConfig::default()),
-        Err(e) => Err(e).context("failed to read config.json"),
-    }
+/// Apply one typed CLI mutation inside the daemon's shared cross-process
+/// config transaction. Unknown keys survive through `UserConfig::extra`, and
+/// malformed/wrong-typed existing files refuse the update without a rewrite.
+fn update_for_write(mutate: impl FnOnce(&mut UserConfig)) -> Result<()> {
+    update_for_write_at(&config_path(), mutate)
 }
 
-fn save(config: &UserConfig) -> Result<()> {
-    let path = config_path();
-    let json = serde_json::to_string_pretty(config)?;
-    wisphive_daemon::write_config_atomic(&path, &json).context("failed to write config.json")?;
-    Ok(())
+fn update_for_write_at(path: &Path, mutate: impl FnOnce(&mut UserConfig)) -> Result<()> {
+    wisphive_daemon::config::update_config_json(path, |obj| {
+        let mut config: UserConfig =
+            serde_json::from_value(serde_json::Value::Object(obj.clone())).map_err(|error| {
+                format!(
+                    "existing config could not be parsed as a Wisphive config ({error}); refusing to overwrite it"
+                )
+            })?;
+        let before = serde_json::to_value(&config)
+            .map_err(|error| format!("existing config could not be serialized: {error}"))?
+            .as_object()
+            .cloned()
+            .ok_or_else(|| "existing config did not serialize as a JSON object".to_string())?;
+        mutate(&mut config);
+        let after = serde_json::to_value(config)
+            .map_err(|error| format!("updated config could not be serialized: {error}"))?
+            .as_object()
+            .cloned()
+            .ok_or_else(|| "updated config is not a JSON object".to_string())?;
+
+        // Apply only top-level fields the requested CLI mutation changed.
+        // Replacing the whole typed round-trip would discard future nested
+        // fields inside modeled values such as tool_rules.<tool>.
+        for key in before.keys() {
+            if before.get(key) != after.get(key) {
+                if let Some(value) = after.get(key) {
+                    obj.insert(key.clone(), value.clone());
+                } else {
+                    obj.remove(key);
+                }
+            }
+        }
+        for (key, value) in &after {
+            if !before.contains_key(key) {
+                obj.insert(key.clone(), value.clone());
+            }
+        }
+        Ok(())
+    })
+    .map_err(|error| anyhow::anyhow!(error))
+    .with_context(|| format!("failed to update {}", path.display()))
 }
 
 pub fn get(key: &str) -> Result<()> {
@@ -74,37 +99,36 @@ pub fn get(key: &str) -> Result<()> {
 }
 
 pub fn set(key: &str, value: &str) -> Result<()> {
-    let mut config = load_for_write()?;
     match key {
         "notifications" => {
-            config.notifications = match value {
+            let notifications = match value {
                 "true" | "1" | "on" | "yes" => true,
                 "false" | "0" | "off" | "no" => false,
                 _ => anyhow::bail!("invalid value for notifications: {value} (use true/false)"),
             };
+            update_for_write(|config| config.notifications = notifications)?;
         }
         "hook_timeout_secs" => {
             let secs: u64 = value
                 .parse()
                 .context("hook_timeout_secs must be a number")?;
-            config.hook_timeout_secs = Some(secs);
+            update_for_write(|config| config.hook_timeout_secs = Some(secs))?;
         }
         "agent_timeout_secs" => {
             let secs: u64 = value
                 .parse()
                 .context("agent_timeout_secs must be a number")?;
-            config.agent_timeout_secs = Some(secs);
+            update_for_write(|config| config.agent_timeout_secs = Some(secs))?;
         }
         "auto_approve_level" => {
             let level: wisphive_protocol::AutoApproveLevel =
                 value.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-            config.auto_approve_level = Some(level);
+            update_for_write(|config| config.auto_approve_level = Some(level))?;
         }
         _ => anyhow::bail!(
             "unknown config key: {key}. Valid: notifications, hook_timeout_secs, agent_timeout_secs, auto_approve_level"
         ),
     }
-    save(&config)?;
     eprintln!("{key} = {value}");
     eprintln!("Note: restart the daemon for changes to take effect.");
     Ok(())
@@ -213,52 +237,50 @@ pub fn auto_approve_status() -> Result<()> {
 pub fn auto_approve_level(level_str: &str) -> Result<()> {
     let level: wisphive_protocol::AutoApproveLevel =
         level_str.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-    let mut config = load_for_write()?;
-    config.auto_approve_level = Some(level);
-    save(&config)?;
+    update_for_write(|config| config.auto_approve_level = Some(level))?;
     eprintln!("auto_approve_level = {level}");
     Ok(())
 }
 
 pub fn auto_approve_add(tool: &str) -> Result<()> {
-    let mut config = load_for_write()?;
-    let add = config.auto_approve_add.get_or_insert_with(Vec::new);
-    if !add.iter().any(|t| t == tool) {
-        add.push(tool.to_string());
-    }
-    // Remove from the remove list if present
-    if let Some(ref mut remove) = config.auto_approve_remove {
-        remove.retain(|t| t != tool);
-    }
-    save(&config)?;
+    update_for_write(|config| {
+        let add = config.auto_approve_add.get_or_insert_with(Vec::new);
+        if !add.iter().any(|t| t == tool) {
+            add.push(tool.to_string());
+        }
+        // Remove from the remove list if present
+        if let Some(ref mut remove) = config.auto_approve_remove {
+            remove.retain(|t| t != tool);
+        }
+    })?;
     eprintln!("Added {tool} to auto-approve overrides");
     Ok(())
 }
 
 pub fn auto_approve_remove(tool: &str) -> Result<()> {
-    let mut config = load_for_write()?;
-    let remove = config.auto_approve_remove.get_or_insert_with(Vec::new);
-    if !remove.iter().any(|t| t == tool) {
-        remove.push(tool.to_string());
-    }
-    // Remove from the add list if present
-    if let Some(ref mut add) = config.auto_approve_add {
-        add.retain(|t| t != tool);
-    }
-    save(&config)?;
+    update_for_write(|config| {
+        let remove = config.auto_approve_remove.get_or_insert_with(Vec::new);
+        if !remove.iter().any(|t| t == tool) {
+            remove.push(tool.to_string());
+        }
+        // Remove from the add list if present
+        if let Some(ref mut add) = config.auto_approve_add {
+            add.retain(|t| t != tool);
+        }
+    })?;
     eprintln!("Removed {tool} from auto-approve (will be queued)");
     Ok(())
 }
 
 pub fn auto_approve_reset() -> Result<()> {
-    let mut config = load_for_write()?;
-    config.auto_approve_level = None;
-    config.auto_approve_add = None;
-    config.auto_approve_remove = None;
-    config.always_ask = None;
-    config.always_ask_remove = None;
-    config.auto_approve_dangerous = false;
-    save(&config)?;
+    update_for_write(|config| {
+        config.auto_approve_level = None;
+        config.auto_approve_add = None;
+        config.auto_approve_remove = None;
+        config.always_ask = None;
+        config.always_ask_remove = None;
+        config.auto_approve_dangerous = false;
+    })?;
     eprintln!("Auto-approve reset to defaults (level: read, balanced posture)");
     Ok(())
 }
@@ -273,20 +295,21 @@ pub fn auto_approve_reset() -> Result<()> {
 ///   prompt, so auto-approving them would discard the human's selection.
 ///   Use only for fully unattended, trusted runs.
 pub fn auto_approve_mode(mode: &str) -> Result<()> {
-    let mut config = load_for_write()?;
     match mode {
         "balanced" | "safe" => {
-            config.auto_approve_level = Some(wisphive_protocol::AutoApproveLevel::All);
-            config.auto_approve_dangerous = false;
-            save(&config)?;
+            update_for_write(|config| {
+                config.auto_approve_level = Some(wisphive_protocol::AutoApproveLevel::All);
+                config.auto_approve_dangerous = false;
+            })?;
             eprintln!(
                 "Posture: balanced — level=all for tools, but questions/plan-mode/harmful actions always defer to you."
             );
         }
         "dangerous" | "danger" | "yolo" => {
-            config.auto_approve_level = Some(wisphive_protocol::AutoApproveLevel::All);
-            config.auto_approve_dangerous = true;
-            save(&config)?;
+            update_for_write(|config| {
+                config.auto_approve_level = Some(wisphive_protocol::AutoApproveLevel::All);
+                config.auto_approve_dangerous = true;
+            })?;
             eprintln!(
                 "Posture: DANGEROUS — all tools auto-approved, including operator always_ask entries. Only questions/plan-mode/elicitations still defer to you."
             );
@@ -299,18 +322,18 @@ pub fn auto_approve_mode(mode: &str) -> Result<()> {
 
 /// Add a tool/event to the always-defer set (e.g. a harmful-action tool).
 pub fn auto_approve_defer_add(tool: &str) -> Result<()> {
-    let mut config = load_for_write()?;
-    // Clear any prior removal so the tool actually defers again.
-    if let Some(ref mut remove) = config.always_ask_remove {
-        remove.retain(|t| t != tool);
-    }
-    if !wisphive_protocol::DEFAULT_ALWAYS_ASK.contains(&tool) {
-        let add = config.always_ask.get_or_insert_with(Vec::new);
-        if !add.iter().any(|t| t == tool) {
-            add.push(tool.to_string());
+    update_for_write(|config| {
+        // Clear any prior removal so the tool actually defers again.
+        if let Some(ref mut remove) = config.always_ask_remove {
+            remove.retain(|t| t != tool);
         }
-    }
-    save(&config)?;
+        if !wisphive_protocol::DEFAULT_ALWAYS_ASK.contains(&tool) {
+            let add = config.always_ask.get_or_insert_with(Vec::new);
+            if !add.iter().any(|t| t == tool) {
+                add.push(tool.to_string());
+            }
+        }
+    })?;
     eprintln!("{tool} will always defer to you (regardless of auto-approve level).");
     Ok(())
 }
@@ -318,19 +341,88 @@ pub fn auto_approve_defer_add(tool: &str) -> Result<()> {
 /// Drop a tool/event from the always-defer set so it follows the normal
 /// auto-approve level again.
 pub fn auto_approve_defer_remove(tool: &str) -> Result<()> {
-    let mut config = load_for_write()?;
-    // Drop from operator additions if present.
-    if let Some(ref mut add) = config.always_ask {
-        add.retain(|t| t != tool);
-    }
-    // If it's a built-in default, record an explicit removal.
-    if wisphive_protocol::DEFAULT_ALWAYS_ASK.contains(&tool) {
-        let remove = config.always_ask_remove.get_or_insert_with(Vec::new);
-        if !remove.iter().any(|t| t == tool) {
-            remove.push(tool.to_string());
+    update_for_write(|config| {
+        // Drop from operator additions if present.
+        if let Some(ref mut add) = config.always_ask {
+            add.retain(|t| t != tool);
         }
-    }
-    save(&config)?;
+        // If it's a built-in default, record an explicit removal.
+        if wisphive_protocol::DEFAULT_ALWAYS_ASK.contains(&tool) {
+            let remove = config.always_ask_remove.get_or_insert_with(Vec::new);
+            if !remove.iter().any(|t| t == tool) {
+                remove.push(tool.to_string());
+            }
+        }
+    })?;
     eprintln!("{tool} no longer always-defers; it follows the auto-approve level now.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn cli_update_uses_shared_transaction_and_preserves_unrelated_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "notifications": true,
+                "auto_approve_remove": ["Edit"],
+                "tool_rules": {
+                    "Read": {
+                        "allow_patterns": ["safe"],
+                        "future_rule_field": {"keep": true}
+                    }
+                },
+                "future_cli_field": {"nested": [1, 2, 3]},
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        update_for_write_at(&path, |config| {
+            config.notifications = false;
+            config
+                .auto_approve_add
+                .get_or_insert_with(Vec::new)
+                .push("Bash".into());
+        })
+        .unwrap();
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after["notifications"], false);
+        assert_eq!(after["auto_approve_add"][0], "Bash");
+        assert_eq!(after["auto_approve_remove"][0], "Edit");
+        assert_eq!(after["tool_rules"]["Read"]["allow_patterns"][0], "safe");
+        assert_eq!(
+            after["tool_rules"]["Read"]["future_rule_field"]["keep"],
+            true
+        );
+        assert_eq!(after["future_cli_field"]["nested"][2], 3);
+        assert_eq!(
+            std::fs::metadata(dir.path().join("config.json.lock"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn cli_update_refuses_wrong_typed_existing_config_without_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let original = r#"{"notifications":"sometimes","future_key":true}"#;
+        std::fs::write(&path, original).unwrap();
+
+        update_for_write_at(&path, |config| config.notifications = false)
+            .expect_err("wrong-typed existing config must refuse");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
 }

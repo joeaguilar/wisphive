@@ -260,6 +260,42 @@ describe("useWisphive hook-gating (itr#460)", () => {
     hidden.mockRestore();
   });
 
+  it("keeps processing hidden-tab decisions when Notification is unavailable (itr#376)", async () => {
+    const notificationDescriptor = Object.getOwnPropertyDescriptor(window, "Notification");
+    Reflect.deleteProperty(window, "Notification");
+    expect("Notification" in window).toBe(false);
+    const hidden = vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+
+    try {
+      const { result } = await mountOpenStrict();
+
+      act(() =>
+        latest().emit({
+          type: "new_decision",
+          ...decisionRequest({ id: VALID_REQUEST_ID, tool_name: "Bash" }),
+        }),
+      );
+      expect(result.current.queue.map((request) => request.id)).toEqual([VALID_REQUEST_ID]);
+      expect("Notification" in window).toBe(false);
+
+      // A later frame must still reach the same WebSocket handler; the absent
+      // API cannot throw and strand all subsequent state transitions.
+      act(() =>
+        latest().emit({
+          type: "decision_resolved",
+          id: VALID_REQUEST_ID,
+          decision: "approve",
+        }),
+      );
+      expect(result.current.queue).toEqual([]);
+    } finally {
+      hidden.mockRestore();
+      if (notificationDescriptor) {
+        Object.defineProperty(window, "Notification", notificationDescriptor);
+      }
+    }
+  });
+
   it("requests notification permission only after a user click (itr#114)", async () => {
     const requestPermission = vi.fn(async () => "denied" as NotificationPermission);
     class DefaultNotification {

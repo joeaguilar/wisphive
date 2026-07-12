@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// Parsed value of the security-sensitive `~/.wisphive/mode` file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -620,6 +621,109 @@ pub fn write_config_atomic(path: &Path, body: &str) -> std::io::Result<()> {
     result
 }
 
+/// RAII guard for the stable sibling lockfile used by every `config.json`
+/// read-modify-write. The kernel releases the `flock(2)` when `_file` drops,
+/// including error and panic unwinds. `_guard` serializes threads in this
+/// process as defense in depth; the flock serializes separate processes.
+#[must_use = "dropping ConfigFileLock releases the config update lock"]
+struct ConfigFileLock {
+    // Fields drop in declaration order: release the flock before the mutex.
+    _file: std::fs::File,
+    _guard: MutexGuard<'static, ()>,
+}
+
+static CONFIG_UPDATE_MUTEX: Mutex<()> = Mutex::new(());
+
+impl ConfigFileLock {
+    fn acquire(config_path: &Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+        let guard = CONFIG_UPDATE_MUTEX
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let lock_path = config_lock_path(config_path)?;
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&lock_path)?;
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("config lock {} is not a regular file", lock_path.display()),
+            ));
+        }
+        // SAFETY: `geteuid` has no arguments or preconditions.
+        let effective_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != effective_uid {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "config lock {} is owned by uid {}, expected effective uid {effective_uid}",
+                    lock_path.display(),
+                    metadata.uid()
+                ),
+            ));
+        }
+
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        let repaired = file.metadata()?;
+        if repaired.mode() & 0o7777 != 0o600 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "config lock {} permissions are {:#06o}, expected 0o0600",
+                    lock_path.display(),
+                    repaired.mode() & 0o7777
+                ),
+            ));
+        }
+
+        flock_exclusive(&file)?;
+        Ok(Self {
+            _file: file,
+            _guard: guard,
+        })
+    }
+}
+
+fn config_lock_path(config_path: &Path) -> std::io::Result<PathBuf> {
+    let file_name = config_path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("config path {} has no file name", config_path.display()),
+        )
+    })?;
+    let mut lock_name = file_name.to_os_string();
+    lock_name.push(".lock");
+    Ok(config_path.with_file_name(lock_name))
+}
+
+fn flock_exclusive(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    loop {
+        // SAFETY: the fd comes from `file`, which remains alive for the call
+        // and for the lifetime of the returned `ConfigFileLock`.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return Err(error);
+        }
+    }
+}
+
 /// Error from [`update_config_json`].
 #[derive(Debug)]
 pub enum ConfigUpdateError {
@@ -651,26 +755,73 @@ impl std::fmt::Display for ConfigUpdateError {
 
 impl std::error::Error for ConfigUpdateError {}
 
+/// One held `config.json.lock` transaction. Internal callers that must inspect
+/// related state before deciding what to update (for example the daemon's
+/// config-vs-legacy Always Allow authority) receive this token so the
+/// selection and write share one critical section without recursively taking
+/// the process mutex or flock.
+pub(crate) struct ConfigUpdateTransaction<'a> {
+    config_path: &'a Path,
+    _lock: ConfigFileLock,
+}
+
+impl<'a> ConfigUpdateTransaction<'a> {
+    fn acquire(config_path: &'a Path) -> Result<Self, ConfigUpdateError> {
+        Ok(Self {
+            config_path,
+            _lock: ConfigFileLock::acquire(config_path).map_err(ConfigUpdateError::Io)?,
+        })
+    }
+
+    pub(crate) fn config_path(&self) -> &Path {
+        self.config_path
+    }
+
+    /// Update the transaction's config without reacquiring its lock.
+    pub(crate) fn update_json(
+        &self,
+        mutate: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>) -> Result<(), String>,
+    ) -> Result<(), ConfigUpdateError> {
+        let mut root: serde_json::Value = match std::fs::read_to_string(self.config_path) {
+            Ok(content) => serde_json::from_str(&content).map_err(ConfigUpdateError::Corrupt)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+            Err(e) => return Err(ConfigUpdateError::Io(e)),
+        };
+        let obj = root.as_object_mut().ok_or(ConfigUpdateError::NotAnObject)?;
+        mutate(obj).map_err(ConfigUpdateError::Rejected)?;
+        let body = serde_json::to_string_pretty(&root).expect("JSON value always serializes");
+        write_config_atomic(self.config_path, &body).map_err(ConfigUpdateError::Io)
+    }
+}
+
+/// Run an operation while holding the stable lock associated with
+/// `config_path`. `E` lets reusable config code return [`ConfigUpdateError`]
+/// while application-layer callers add `anyhow` context around a wider
+/// authority-selection transaction.
+pub(crate) fn with_config_update_transaction<T, E>(
+    config_path: &Path,
+    operation: impl FnOnce(&ConfigUpdateTransaction<'_>) -> Result<T, E>,
+) -> Result<T, E>
+where
+    E: From<ConfigUpdateError>,
+{
+    let transaction = ConfigUpdateTransaction::acquire(config_path).map_err(E::from)?;
+    operation(&transaction)
+}
+
 /// Read-modify-write a JSON config file, preserving every key the mutation
 /// doesn't touch. This is the single owner of "edit one key in config.json"
-/// (itr#358/#360/#361): the file is read as raw JSON (unknown keys survive),
-/// `mutate` edits the top-level object in place, and the result is written
-/// atomically. A missing file starts from `{}`; a corrupt file refuses the
-/// update instead of being overwritten. `mutate` returning `Err` aborts the
-/// update before anything is written (no false "saved").
+/// (itr#358/#360/#361/#407): an owner-only sibling lockfile serializes the
+/// complete read → mutate → atomic-rename transaction across threads and
+/// processes. The file is read as raw JSON (unknown keys survive). A missing
+/// file starts from `{}`; a corrupt file refuses the update instead of being
+/// overwritten. `mutate` returning `Err` aborts the update before anything is
+/// written (no false "saved").
 pub fn update_config_json(
     path: &Path,
     mutate: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>) -> Result<(), String>,
 ) -> Result<(), ConfigUpdateError> {
-    let mut root: serde_json::Value = match std::fs::read_to_string(path) {
-        Ok(content) => serde_json::from_str(&content).map_err(ConfigUpdateError::Corrupt)?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(e) => return Err(ConfigUpdateError::Io(e)),
-    };
-    let obj = root.as_object_mut().ok_or(ConfigUpdateError::NotAnObject)?;
-    mutate(obj).map_err(ConfigUpdateError::Rejected)?;
-    let body = serde_json::to_string_pretty(&root).expect("JSON value always serializes");
-    write_config_atomic(path, &body).map_err(ConfigUpdateError::Io)
+    with_config_update_transaction(path, |transaction| transaction.update_json(mutate))
 }
 
 fn dirs_home() -> PathBuf {
@@ -788,6 +939,115 @@ mod tests {
         .expect_err("corrupt config must refuse the update");
         assert!(matches!(err, ConfigUpdateError::Corrupt(_)));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json !!");
+    }
+
+    #[test]
+    fn concurrent_config_updates_keep_every_tool_and_unrelated_field() {
+        use std::sync::{Arc, Barrier};
+
+        const WRITERS: usize = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "auto_approve_add": [],
+                "unrelated_future_field": {"keep": true},
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let barrier = Arc::new(Barrier::new(WRITERS));
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|index| {
+                let barrier = barrier.clone();
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let tool = format!("DistinctTool{index:02}");
+                    barrier.wait();
+                    update_config_json(&path, |obj| {
+                        let tools = obj
+                            .get_mut("auto_approve_add")
+                            .and_then(serde_json::Value::as_array_mut)
+                            .ok_or_else(|| "auto_approve_add must be an array".to_string())?;
+                        tools.push(tool.into());
+                        Ok(())
+                    })
+                    .unwrap();
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let mut tools: Vec<_> = after["auto_approve_add"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_string())
+            .collect();
+        tools.sort();
+        assert_eq!(
+            tools,
+            (0..WRITERS)
+                .map(|index| format!("DistinctTool{index:02}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(after["unrelated_future_field"]["keep"], true);
+    }
+
+    #[test]
+    fn config_lock_is_owner_only_rejects_symlinks_and_releases_after_panic() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        update_config_json(&path, |obj| {
+            obj.insert("notifications".into(), true.into());
+            Ok(())
+        })
+        .unwrap();
+
+        let lock_path = config_lock_path(&path).unwrap();
+        let metadata = std::fs::metadata(&lock_path).unwrap();
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.mode() & 0o7777, 0o600);
+        // SAFETY: `geteuid` has no arguments or preconditions.
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = update_config_json(&path, |_obj| -> Result<(), String> {
+                panic!("mutation panic must release config lock")
+            });
+        }));
+        assert!(panicked.is_err());
+        update_config_json(&path, |obj| {
+            obj.insert("hook_timeout_secs".into(), 900.into());
+            Ok(())
+        })
+        .expect("lock must be reusable after panic unwind");
+
+        std::fs::remove_file(&lock_path).unwrap();
+        let target = dir.path().join("lock-target");
+        std::fs::write(&target, "do-not-touch").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&target, &lock_path).unwrap();
+
+        let error = update_config_json(&path, |obj| {
+            obj.insert("agent_timeout_secs".into(), 900.into());
+            Ok(())
+        })
+        .expect_err("symlink lockfile must be rejected");
+        assert!(matches!(error, ConfigUpdateError::Io(_)));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "do-not-touch");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+            0o644
+        );
     }
 
     #[test]

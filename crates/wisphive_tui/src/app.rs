@@ -59,6 +59,120 @@ pub struct ConfigSnapshot {
     pub auto_approve_config_change: Option<bool>,
 }
 
+/// One config-view change handed to the CLI for off-runtime persistence.
+/// Applying only the selected setting prevents a stale TUI view from replacing
+/// disjoint changes made by the daemon, web UI, or another CLI process.
+pub enum ConfigMutation {
+    AutoApproveLevel(AutoApproveLevel),
+    EventToggle {
+        key: String,
+        enabled: bool,
+    },
+    ToolOverride {
+        tool: String,
+        add: bool,
+        remove: bool,
+    },
+    ToolRulePattern {
+        tool: String,
+        pattern: String,
+        deny: bool,
+        include: bool,
+    },
+}
+
+impl ConfigMutation {
+    pub fn apply_to(
+        self,
+        obj: &mut serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), String> {
+        match self {
+            Self::AutoApproveLevel(level) => {
+                obj.insert(
+                    "auto_approve_level".into(),
+                    serde_json::Value::String(level.to_string()),
+                );
+            }
+            Self::EventToggle { key, enabled } => {
+                obj.insert(key, serde_json::Value::Bool(enabled));
+            }
+            Self::ToolOverride { tool, add, remove } => {
+                update_string_list(obj, "auto_approve_add", &tool, add)?;
+                update_string_list(obj, "auto_approve_remove", &tool, remove)?;
+            }
+            Self::ToolRulePattern {
+                tool,
+                pattern,
+                deny,
+                include,
+            } => {
+                let mut rules = match obj.get("tool_rules") {
+                    None => serde_json::Map::new(),
+                    Some(serde_json::Value::Object(rules)) => rules.clone(),
+                    Some(_) => return Err("tool_rules must be a JSON object".into()),
+                };
+                let mut rule = match rules.get(&tool) {
+                    None => serde_json::Map::new(),
+                    Some(serde_json::Value::Object(rule)) => rule.clone(),
+                    Some(_) => return Err(format!("tool_rules.{tool} must be a JSON object")),
+                };
+                let key = if deny {
+                    "deny_patterns"
+                } else {
+                    "allow_patterns"
+                };
+                update_string_list(&mut rule, key, &pattern, include)?;
+                if rule.is_empty() {
+                    rules.remove(&tool);
+                } else {
+                    rules.insert(tool, serde_json::Value::Object(rule));
+                }
+                if rules.is_empty() {
+                    obj.remove("tool_rules");
+                } else {
+                    obj.insert("tool_rules".into(), serde_json::Value::Object(rules));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn update_string_list(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    item: &str,
+    include: bool,
+) -> Result<(), String> {
+    let mut items = match obj.get(key) {
+        None => Vec::new(),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| format!("{key} must contain only strings"))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => return Err(format!("{key} must be a JSON array")),
+    };
+
+    items.retain(|existing| existing != item);
+    if include {
+        items.push(item.to_owned());
+    }
+    if items.is_empty() {
+        obj.remove(key);
+    } else {
+        obj.insert(
+            key.into(),
+            serde_json::Value::Array(items.into_iter().map(serde_json::Value::String).collect()),
+        );
+    }
+    Ok(())
+}
+
 /// Which screen the TUI is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
@@ -618,82 +732,6 @@ impl App {
         self.navigate_back();
     }
 
-    /// Save current config state to disk.
-    pub fn save_config(&self) {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        let path = std::path::PathBuf::from(home)
-            .join(".wisphive")
-            .join("config.json");
-
-        let mut config = match std::fs::read_to_string(&path) {
-            Ok(content) => {
-                serde_json::from_str::<serde_json::Value>(&content).unwrap_or(serde_json::json!({}))
-            }
-            Err(_) => serde_json::json!({}),
-        };
-
-        let obj = config.as_object_mut().unwrap();
-        obj.insert(
-            "auto_approve_level".into(),
-            serde_json::Value::String(self.config_level.to_string()),
-        );
-        if self.config_add.is_empty() {
-            obj.remove("auto_approve_add");
-        } else {
-            obj.insert(
-                "auto_approve_add".into(),
-                serde_json::Value::Array(
-                    self.config_add
-                        .iter()
-                        .map(|s| serde_json::Value::String(s.clone()))
-                        .collect(),
-                ),
-            );
-        }
-        if self.config_remove.is_empty() {
-            obj.remove("auto_approve_remove");
-        } else {
-            obj.insert(
-                "auto_approve_remove".into(),
-                serde_json::Value::Array(
-                    self.config_remove
-                        .iter()
-                        .map(|s| serde_json::Value::String(s.clone()))
-                        .collect(),
-                ),
-            );
-        }
-
-        // Persist tool_rules — remove tools with empty rules
-        let non_empty: HashMap<String, ToolRule> = self
-            .config_tool_rules
-            .iter()
-            .filter(|(_, r)| !r.deny_patterns.is_empty() || !r.allow_patterns.is_empty())
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        if non_empty.is_empty() {
-            obj.remove("tool_rules");
-        } else {
-            obj.insert(
-                "tool_rules".into(),
-                serde_json::to_value(&non_empty).unwrap_or(serde_json::json!({})),
-            );
-        }
-
-        // Persist event-type auto-approve toggles
-        for (key, value) in &self.config_event_toggles {
-            obj.insert(key.clone(), serde_json::Value::Bool(*value));
-        }
-
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(
-            &path,
-            serde_json::to_string_pretty(&config).unwrap_or_default(),
-        );
-    }
-
     fn load_user_config() -> ConfigSnapshot {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
         let path = std::path::PathBuf::from(home)
@@ -902,5 +940,85 @@ impl App {
 impl Default for App {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_mutations_preserve_disjoint_and_unrelated_raw_fields() {
+        let mut obj = serde_json::json!({
+            "auto_approve_add": ["Bash", "Read"],
+            "auto_approve_remove": ["Write"],
+            "tool_rules": {
+                "Bash": {"deny_patterns": ["rm -rf"]},
+                "Read": {"future_rule_field": true}
+            },
+            "future_tui_field": {"keep": true},
+            "retention_max_rows": 1234,
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        ConfigMutation::AutoApproveLevel(AutoApproveLevel::Execute)
+            .apply_to(&mut obj)
+            .unwrap();
+        ConfigMutation::EventToggle {
+            key: "auto_approve_stop".into(),
+            enabled: true,
+        }
+        .apply_to(&mut obj)
+        .unwrap();
+        ConfigMutation::ToolOverride {
+            tool: "Edit".into(),
+            add: true,
+            remove: false,
+        }
+        .apply_to(&mut obj)
+        .unwrap();
+        ConfigMutation::ToolRulePattern {
+            tool: "Bash".into(),
+            pattern: "sudo".into(),
+            deny: true,
+            include: true,
+        }
+        .apply_to(&mut obj)
+        .unwrap();
+
+        assert_eq!(obj["auto_approve_level"], "execute");
+        assert_eq!(
+            obj["auto_approve_add"],
+            serde_json::json!(["Bash", "Read", "Edit"])
+        );
+        assert_eq!(obj["auto_approve_remove"], serde_json::json!(["Write"]));
+        assert_eq!(obj["auto_approve_stop"], true);
+        assert_eq!(
+            obj["tool_rules"]["Bash"]["deny_patterns"],
+            serde_json::json!(["rm -rf", "sudo"])
+        );
+        assert_eq!(obj["tool_rules"]["Read"]["future_rule_field"], true);
+        assert_eq!(obj["future_tui_field"]["keep"], true);
+        assert_eq!(obj["retention_max_rows"], 1234);
+    }
+
+    #[test]
+    fn config_mutation_rejects_malformed_managed_fields() {
+        let mut obj = serde_json::json!({"auto_approve_add": "Bash"})
+            .as_object()
+            .unwrap()
+            .clone();
+
+        let error = ConfigMutation::ToolOverride {
+            tool: "Edit".into(),
+            add: true,
+            remove: false,
+        }
+        .apply_to(&mut obj)
+        .unwrap_err();
+
+        assert!(error.contains("auto_approve_add must be a JSON array"));
     }
 }
