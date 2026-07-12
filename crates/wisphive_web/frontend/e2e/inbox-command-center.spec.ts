@@ -36,7 +36,7 @@
  */
 import { test, expect, request as pwRequest, type APIRequestContext, type Page } from '@playwright/test'
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { startWisphiveDaemonServer, type WisphiveDaemonServer } from './fixtures/daemon-server'
@@ -166,7 +166,9 @@ test.beforeAll(async () => {
   // auto-approve (decided_by=level:all); AskUserQuestion still defers because
   // intrinsic always-defer beats every level (ADR-0002).
   const wisphiveDir = path.join(server.home, '.wisphive')
-  writeFileSync(path.join(wisphiveDir, 'mode'), 'active')
+  const modePath = path.join(wisphiveDir, 'mode')
+  writeFileSync(modePath, 'active')
+  chmodSync(modePath, 0o600)
   writeFileSync(path.join(wisphiveDir, 'config.json'), JSON.stringify({ auto_approve_level: 'all' }))
 
   api = await pwRequest.newContext({ baseURL: server.baseURL, ignoreHTTPSErrors: true })

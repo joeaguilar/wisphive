@@ -135,6 +135,17 @@ export async function startWisphiveDaemonServer(): Promise<WisphiveDaemonServer>
   }
   await mkdir(path.join(home, '.wisphive'), { recursive: true, mode: 0o700 })
 
+  // Secure-mode file: the daemon re-validates mode per hook DecisionRequest
+  // (crates/wisphive_daemon/src/server.rs `hook_decision_mode_denial`, main
+  // commit b6a1551) and denies before enqueue unless `<home>/.wisphive/mode`
+  // is a 0600 regular file reading `active` inside the 0700 state dir. A
+  // real hook only ever sends a DecisionRequest when mode is active, so the
+  // fixture daemon must start in that state or every injected decision is
+  // denied without ever reaching the queue.
+  const modePath = path.join(home, '.wisphive', 'mode')
+  await writeFile(modePath, 'active')
+  await chmod(modePath, 0o600)
+
   // Notification no-op stubs, first on PATH.
   const binDir = path.join(home, 'stub-bin')
   await mkdir(binDir, { recursive: true })

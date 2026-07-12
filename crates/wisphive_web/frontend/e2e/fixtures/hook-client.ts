@@ -30,7 +30,14 @@ export const PROTOCOL_VERSION = 1
 export interface DecisionRequestOptions {
   toolName: string
   toolInput: unknown
-  /** Defaults to a recognizable fixture agent id. */
+  /**
+   * Defaults to a recognizable fixture agent id. Must satisfy the daemon's
+   * hook-identity validation (`is_valid_hook_agent_id` in
+   * crates/wisphive_daemon/src/server.rs, main commit 3851024): a supported
+   * prefix (`cc-`, `codex-`, `red-`, `local-`, `agent-`) plus a 1-64 byte
+   * ASCII `[A-Za-z0-9_-]` suffix — otherwise the daemon denies the request
+   * before it ever reaches the queue.
+   */
   agentId?: string
   /** Defaults to `/tmp/wisphive-e2e-project`. */
   project?: string
@@ -151,7 +158,7 @@ export async function sendDecisionRequest(
   send({
     type: 'decision_request',
     id,
-    agent_id: opts.agentId ?? 'e2e-hook-fixture',
+    agent_id: opts.agentId ?? 'cc-e2e-hook-fixture',
     agent_type: 'claude_code',
     project: opts.project ?? '/tmp/wisphive-e2e-project',
     tool_name: opts.toolName,

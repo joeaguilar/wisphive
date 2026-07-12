@@ -18,7 +18,7 @@
  * only thing synthesised is the operator's clicks (Playwright).
  */
 import { test, expect, request as pwRequest, type APIRequestContext, type Page } from '@playwright/test'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import { startWisphiveDaemonServer, type WisphiveDaemonServer } from './fixtures/daemon-server'
@@ -75,8 +75,11 @@ async function shot(page: Page, name: string): Promise<void> {
 
 test.beforeAll(async () => {
   server = await startWisphiveDaemonServer()
-  // Global mode active so a fully-installed project audits as "Gated".
-  writeFileSync(path.join(server.home, '.wisphive', 'mode'), 'active')
+  // Global mode active so a fully-installed project audits as "Gated". The
+  // daemon's secure-mode read requires the file to be a 0600 regular file.
+  const modePath = path.join(server.home, '.wisphive', 'mode')
+  writeFileSync(modePath, 'active')
+  chmodSync(modePath, 0o600)
   api = await pwRequest.newContext({ baseURL: server.baseURL, ignoreHTTPSErrors: true })
   const res = await api.post('/api/auth/set-password', { data: { password: PASSWORD, device_name: 'e2e-setup' } })
   if (!res.ok()) throw new Error(`set-password failed: ${res.status()} ${await res.text()}`)
