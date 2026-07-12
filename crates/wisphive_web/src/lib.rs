@@ -2368,6 +2368,34 @@ pub async fn serve(
     auth_profile: AuthProfile,
     log_store: Option<Arc<LogStore>>,
 ) -> anyhow::Result<()> {
+    serve_with_readiness(
+        socket_path,
+        port,
+        dev_mode,
+        host,
+        auth_profile,
+        log_store,
+        None,
+    )
+    .await
+}
+
+/// Start the web server and, when requested, report the listener's bound
+/// address before accepting requests.
+///
+/// [`serve`] remains the backwards-compatible entry point for callers that
+/// do not need to coordinate startup. The readiness sender is optional so
+/// callers can await the actual TCP bind without forcing every existing
+/// consumer to create a channel.
+pub async fn serve_with_readiness(
+    socket_path: PathBuf,
+    port: u16,
+    dev_mode: bool,
+    host: [u8; 4],
+    auth_profile: AuthProfile,
+    log_store: Option<Arc<LogStore>>,
+    readiness: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
+) -> anyhow::Result<()> {
     // Dev mode serves plain HTTP so Vite (http://localhost:5173) can talk
     // to it without a self-signed-cert trust dance. That's fine on
     // loopback, where the only attacker is one that already owns the
@@ -2436,7 +2464,7 @@ pub async fn serve(
     info!(%addr, dev_mode, "web server starting");
 
     if dev_mode {
-        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let listener = bind_listener_with_readiness(addr, readiness).await?;
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -2457,15 +2485,75 @@ pub async fn serve(
         }
         let tls_config =
             axum_server::tls_rustls::RustlsConfig::from_pem(cert.cert_pem, cert.key_pem).await?;
-        axum_server::bind_rustls(addr, tls_config)
+        let listener = bind_listener_with_readiness(addr, readiness).await?;
+        let listener = listener.into_std()?;
+        axum_server::from_tcp_rustls(listener, tls_config)
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await?;
     }
     Ok(())
 }
 
+fn notify_listener_ready(
+    readiness: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
+    bound_addr: SocketAddr,
+) {
+    if let Some(sender) = readiness {
+        // The receiver may disappear when shutdown wins the startup race.
+        // Binding still succeeded, so this is informational rather than an
+        // error that should stop the server.
+        let _ = sender.send(bound_addr);
+    }
+}
+
+async fn bind_listener_with_readiness(
+    addr: SocketAddr,
+    readiness: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
+) -> anyhow::Result<tokio::net::TcpListener> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    notify_listener_ready(readiness, listener.local_addr()?);
+    Ok(listener)
+}
+
 #[cfg(test)]
 mod http_tests;
+
+#[cfg(test)]
+mod readiness_tests {
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use tokio::net::TcpStream;
+    use tokio::sync::oneshot;
+
+    use super::bind_listener_with_readiness;
+
+    #[tokio::test]
+    async fn serve_readiness_fires_after_tcp_bind() {
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+
+        let listener = tokio::spawn(async move {
+            let listener =
+                bind_listener_with_readiness(SocketAddr::from(([127, 0, 0, 1], 0)), Some(ready_tx))
+                    .await
+                    .expect("listener should bind");
+            release_rx.await.expect("test should release listener");
+            drop(listener);
+        });
+
+        let bound_addr = tokio::time::timeout(Duration::from_secs(3), ready_rx)
+            .await
+            .expect("serve should signal listener readiness")
+            .expect("serve should not exit before binding");
+        TcpStream::connect(bound_addr)
+            .await
+            .expect("readiness must signal an accepting TCP listener");
+
+        release_tx.send(()).expect("listener task should still run");
+        listener.await.expect("listener task should not panic");
+    }
+}
 
 #[cfg(test)]
 mod config_concurrency_tests {

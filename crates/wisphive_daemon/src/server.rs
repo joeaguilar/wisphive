@@ -369,7 +369,15 @@ impl Server {
                         // a stored identity into traversal.
                         if is_valid_hook_agent_id(&agent_id) {
                             let marker = self.config.home_dir.join("sessions").join(&agent_id);
-                            let _ = std::fs::remove_file(marker);
+                            if let Err(error) = std::fs::remove_file(&marker) {
+                                // Marker cleanup is best-effort: a concurrent
+                                // hook or cleanup may have changed the path.
+                                info!(
+                                    path = %marker.display(),
+                                    %error,
+                                    "session marker cleanup skipped"
+                                );
+                            }
                         } else {
                             warn!(
                                 security_event = "invalid_agent_marker_rejected",

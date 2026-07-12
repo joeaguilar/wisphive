@@ -1552,17 +1552,13 @@ fn register_agent_once(
     project: &std::path::Path,
     wisphive_dir: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Defense in depth: validate before even checking marker existence. This
-    // keeps `sessions_dir.join(agent_id)` from interpreting caller-controlled
+    // Defense in depth: validate before any marker I/O. This keeps
+    // `sessions_dir.join(agent_id)` from interpreting caller-controlled
     // separators or parent components.
     validate_agent_id(agent_id)?;
 
-    // Fast path: check marker file (single stat syscall)
     let sessions_dir = wisphive_dir.join("sessions");
     let marker = sessions_dir.join(agent_id);
-    if marker.exists() {
-        return Ok(());
-    }
 
     // The caller intentionally swallows transport errors to preserve
     // registration's fail-open behavior. Returning them keeps validation and
@@ -1593,10 +1589,28 @@ fn register_agent_once(
         agent_type,
         project: project.to_path_buf(),
     })?;
-    writer.write_all(msg.as_bytes())?;
 
+    // Claim the marker after the daemon handshake but before sending the
+    // registration. `create_new` maps to O_EXCL, so concurrent hooks for the
+    // same session cannot both send AgentRegister. Waiting until the handshake
+    // succeeds preserves retries when the daemon is unreachable.
     std::fs::create_dir_all(&sessions_dir)?;
-    std::fs::write(&marker, "")?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+    {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+
+    if let Err(error) = writer.write_all(msg.as_bytes()) {
+        // A failed write did not register this session, so allow a later hook
+        // invocation to retry rather than leaving a stale reservation behind.
+        let _ = std::fs::remove_file(&marker);
+        return Err(error.into());
+    }
 
     Ok(())
 }
@@ -2500,6 +2514,88 @@ mod tests {
             !sessions.exists(),
             "validation must run before marker directory inspection or creation"
         );
+    }
+
+    #[test]
+    fn racing_hooks_emit_one_agent_connected_and_marker() {
+        use std::os::unix::net::UnixListener;
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let home = tempfile::tempdir().unwrap();
+        let socket_path = home.path().join("wisphive.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let agent_id = "cc-race";
+        let project = PathBuf::from("/opaque/project");
+        let start = Arc::new(Barrier::new(3));
+
+        let mut hooks = Vec::new();
+        for _ in 0..2 {
+            let home = home.path().to_path_buf();
+            let project = project.clone();
+            let start = Arc::clone(&start);
+            hooks.push(thread::spawn(move || {
+                start.wait();
+                register_agent_once(agent_id, AgentType::ClaudeCode, &project, &home)
+                    .map_err(|error| error.to_string())
+            }));
+        }
+
+        // Both hooks reach the daemon handshake before either is allowed to
+        // claim the marker. Before the O_EXCL claim, both would send
+        // AgentRegister after these welcomes.
+        start.wait();
+        let mut connections = Vec::new();
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut hello = String::new();
+            reader.read_line(&mut hello).unwrap();
+            let hello: ClientMessage = wisphive_protocol::decode(&hello).unwrap();
+            assert!(matches!(
+                hello,
+                ClientMessage::Hello {
+                    client: ClientType::Hook,
+                    version: PROTOCOL_VERSION,
+                }
+            ));
+            connections.push((reader, stream));
+        }
+
+        for (_, stream) in &mut connections {
+            send_welcome(stream);
+        }
+
+        let mut registrations = 0;
+        for (reader, _) in &mut connections {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 {
+                continue;
+            }
+            let message: ClientMessage = wisphive_protocol::decode(&line).unwrap();
+            assert!(matches!(
+                message,
+                ClientMessage::AgentRegister { agent_id: id, .. } if id == agent_id
+            ));
+            registrations += 1;
+        }
+
+        for hook in hooks {
+            hook.join()
+                .expect("hook thread must not panic")
+                .expect("duplicate registration must be idempotent");
+        }
+
+        // The real daemon suppresses duplicate AgentConnected broadcasts in
+        // its registry. Count registrations as well as the marker so that
+        // deduplication cannot hide this hook-side race.
+        assert_eq!(registrations, 1, "only one hook may cause AgentConnected");
+        let sessions = home.path().join("sessions");
+        assert!(sessions.join(agent_id).is_file());
+        assert_eq!(std::fs::read_dir(sessions).unwrap().count(), 1);
     }
 
     #[test]

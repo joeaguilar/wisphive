@@ -874,6 +874,7 @@ async fn serve_web(
     // between the Login and Onboarding screens based on /api/auth/status,
     // so we always open the root `/` — no `?token=` in the URL, since the
     // per-process web.token bootstrap was retired in itr#213.
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let browser_task = if no_open {
         None
     } else {
@@ -882,10 +883,20 @@ async fn serve_web(
             host_octets,
             port,
             dev,
+            ready_rx,
         )))
     };
 
-    let result = wisphive_web::serve(socket_path, port, dev, host_octets, profile, None).await;
+    let result = wisphive_web::serve_with_readiness(
+        socket_path,
+        port,
+        dev,
+        host_octets,
+        profile,
+        None,
+        Some(ready_tx),
+    )
+    .await;
     if let Some(h) = browser_task {
         h.abort();
     }
@@ -905,12 +916,12 @@ pub(crate) async fn maybe_open_browser(
     host: [u8; 4],
     port: u16,
     dev: bool,
+    listener_ready: tokio::sync::oneshot::Receiver<std::net::SocketAddr>,
 ) {
-    // Small delay so the axum/axum-server `bind` has a chance to land
-    // before we point a browser at the port. Without this the first tab
-    // races the bind and usually reloads once — ugly but not fatal.
-    // 400ms is enough in practice and still feels instant to the human.
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    if !await_listener_ready(listener_ready).await {
+        tracing::warn!("first-run browser: web server exited before binding; skipping");
+        return;
+    }
 
     // Open the same DB the web server will — WAL + connection pooling
     // makes this safe. We hold the handle only for the first-run check.
@@ -956,6 +967,12 @@ pub(crate) async fn maybe_open_browser(
             "first-run: failed to open default browser; visit the URL manually"
         ),
     }
+}
+
+async fn await_listener_ready(
+    listener_ready: tokio::sync::oneshot::Receiver<std::net::SocketAddr>,
+) -> bool {
+    listener_ready.await.is_ok()
 }
 
 /// Emit the pre-serve banner: scheme + bind + every LAN URL the TLS cert
@@ -1113,5 +1130,26 @@ mod cli_tests {
 
         let internal = ResolveAuthProfileError::InternalRpOrigin("test parse failure".to_string());
         assert_eq!(internal.exit_code(), 1);
+    }
+
+    #[tokio::test]
+    async fn browser_open_waits_for_listener_readiness() {
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let wait_for_browser = tokio::spawn(await_listener_ready(ready_rx));
+
+        tokio::task::yield_now().await;
+        assert!(
+            !wait_for_browser.is_finished(),
+            "browser startup must wait for the listener readiness signal"
+        );
+
+        ready_tx
+            .send(std::net::SocketAddr::from(([127, 0, 0, 1], 3100)))
+            .expect("browser task should still await readiness");
+        assert!(
+            wait_for_browser
+                .await
+                .expect("browser wait task should not panic")
+        );
     }
 }

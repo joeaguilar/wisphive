@@ -74,12 +74,13 @@ pub async fn start(web: Option<WebOptions>) -> Result<()> {
         // itr#267: auto-open the default browser on first-run. Fire-and-
         // forget in its own task so a missing browser (CI, headless) can't
         // block — or crash — daemon startup.
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let browser = if opts.no_open {
             None
         } else {
             let db_path = config.db_path.clone();
             Some(tokio::spawn(crate::maybe_open_browser(
-                db_path, opts.host, opts.port, opts.dev,
+                db_path, opts.host, opts.port, opts.dev, ready_rx,
             )))
         };
 
@@ -89,9 +90,16 @@ pub async fn start(web: Option<WebOptions>) -> Result<()> {
         let profile = opts.auth_profile;
         let web_log_store = log_store.clone();
         let serve = tokio::spawn(async move {
-            if let Err(e) =
-                wisphive_web::serve(socket_path, port, dev, host, profile, Some(web_log_store))
-                    .await
+            if let Err(e) = wisphive_web::serve_with_readiness(
+                socket_path,
+                port,
+                dev,
+                host,
+                profile,
+                Some(web_log_store),
+                Some(ready_tx),
+            )
+            .await
             {
                 tracing::error!("embedded web server exited: {e}");
             }
