@@ -18,6 +18,7 @@ import { Terminals } from "./components/Terminals";
 import { Login } from "./components/Login";
 import { SudoModal } from "./components/SudoModal";
 import { DiskAlertBanner } from "./components/DiskAlertBanner";
+import { ConfigAlertBanner } from "./components/ConfigAlertBanner";
 import "./app.css";
 
 type View = "inbox" | "queue" | "history" | "sessions" | "projects" | "agents" | "config" | "terminals";
@@ -59,7 +60,7 @@ function App() {
 function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
   const {
     connected, queue, agents, projects, hookStatus, hookErrors, auditDecisions, endedAgentIds, history, agentTimeline, sessionTimeline, sessions, terminals,
-    pendingReauth, diskAlerts, approve, deny, dismissReauth, retryPendingApprove,
+    pendingReauth, diskAlerts, configAlerts, approve, deny, dismissReauth, retryPendingApprove,
     spawnAgent, queryProjects, installHooks, queryProjectHookStatus, queryHistory, queryAgentTimeline, querySessionTimeline, searchHistory, querySessions,
     termList, termCreate, termAttach, termDetach, termInput, termResize, termClose, termReplay, termSetGroup, termReorder, registerTerminalHandler,
   } = useWisphive();
@@ -199,6 +200,7 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
 
       <main className="content">
         <DiskAlertBanner alerts={diskAlerts} />
+        <ConfigAlertBanner alerts={configAlerts} />
         {view === "inbox" && (
           <Inbox
             items={queue}

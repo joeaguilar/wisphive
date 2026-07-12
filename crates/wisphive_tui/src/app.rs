@@ -341,11 +341,20 @@ pub struct App {
     /// per kind. Rendered as a banner. Wisphive never deletes audit data; the
     /// daemon raises these instead (itr#340).
     pub disk_alerts: Vec<DiskAlertNotice>,
+    /// Active config-trust and policy-widening alerts, at most one per kind.
+    /// They share the non-dismissable top banner strip with disk alerts.
+    pub config_alerts: Vec<ConfigAlertNotice>,
 }
 
 /// A single active resource alert surfaced by the daemon.
 pub struct DiskAlertNotice {
     pub kind: wisphive_protocol::DiskAlertKind,
+    pub message: String,
+}
+
+/// A single active configuration alert surfaced by the daemon.
+pub struct ConfigAlertNotice {
+    pub kind: wisphive_protocol::ConfigAlertKind,
     pub message: String,
 }
 
@@ -470,6 +479,7 @@ impl App {
             replay_terminal: None,
             last_terminal_esc: None,
             disk_alerts: Vec::new(),
+            config_alerts: Vec::new(),
         }
     }
 
@@ -484,6 +494,21 @@ impl App {
         self.disk_alerts.retain(|a| a.kind != kind);
         if active {
             self.disk_alerts.push(DiskAlertNotice { kind, message });
+        }
+    }
+
+    /// Apply a daemon `config_alert`: a raise (`active`) upserts the alert for
+    /// its kind; a clear removes it. No keybinding or dismissal path is added:
+    /// this is an operator-visible state signal, not an interaction surface.
+    pub fn apply_config_alert(
+        &mut self,
+        kind: wisphive_protocol::ConfigAlertKind,
+        active: bool,
+        message: String,
+    ) {
+        self.config_alerts.retain(|alert| alert.kind != kind);
+        if active {
+            self.config_alerts.push(ConfigAlertNotice { kind, message });
         }
     }
 

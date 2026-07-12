@@ -583,6 +583,17 @@ pub enum ServerMessage {
         message: String,
         at: chrono::DateTime<chrono::Utc>,
     },
+
+    /// A non-blocking configuration trust or policy-widening alert. The
+    /// daemon keeps accepting work with safe defaults when config is
+    /// untrusted; this gives the operator immediate evidence in TUI/web.
+    #[serde(rename = "config_alert")]
+    ConfigAlert {
+        kind: ConfigAlertKind,
+        active: bool,
+        message: String,
+        at: chrono::DateTime<chrono::Utc>,
+    },
 }
 
 /// Which resource condition a [`ServerMessage::DiskAlert`] describes.
@@ -593,6 +604,16 @@ pub enum DiskAlertKind {
     ArchiveSize,
     /// Free space on the Wisphive state filesystem dropped below the floor.
     LowDiskSpace,
+}
+
+/// Which configuration condition a [`ServerMessage::ConfigAlert`] describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigAlertKind {
+    /// The effective approval policy became more permissive.
+    PolicyWidened,
+    /// The user config cannot be trusted as a policy input.
+    UntrustedConfig,
 }
 
 /// Protocol version. Increment on breaking wire format changes.
@@ -1642,6 +1663,32 @@ mod tests {
         let decoded: ServerMessage = decode(&encoded).unwrap();
         match decoded {
             ServerMessage::MarkDeviceFreshAck { device_id } => assert_eq!(device_id, "dev-5"),
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_config_alert() {
+        let msg = ServerMessage::ConfigAlert {
+            kind: ConfigAlertKind::PolicyWidened,
+            active: true,
+            message: "auto_approve_level increased from read to all".into(),
+            at: chrono::Utc::now(),
+        };
+        let encoded = encode(&msg).unwrap();
+        assert!(encoded.contains("\"type\":\"config_alert\""));
+        let decoded: ServerMessage = decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::ConfigAlert {
+                kind,
+                active,
+                message,
+                ..
+            } => {
+                assert_eq!(kind, ConfigAlertKind::PolicyWidened);
+                assert!(active);
+                assert_eq!(message, "auto_approve_level increased from read to all");
+            }
             _ => panic!("unexpected variant"),
         }
     }

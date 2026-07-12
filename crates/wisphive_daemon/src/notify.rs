@@ -35,6 +35,39 @@ pub fn notify_decision(req: &DecisionRequest) {
     });
 }
 
+/// Send a passive notification when the effective approval policy widens.
+/// The watcher owns the `notifications_enabled` decision and calls this only
+/// when the daemon's startup configuration permits desktop notifications.
+pub fn notify_config_widened(deltas: &[String]) {
+    let title = "Wisphive: approval policy widened".to_string();
+    let body = sanitize_for_log(&deltas.join("\n"));
+
+    tokio::spawn(async move {
+        if let Err(error) = send_passive_notification(&title, &body).await {
+            warn!("failed to send config-widening notification: {error}");
+        } else {
+            info!("sent config-widening notification: {title}");
+        }
+    });
+}
+
+/// Send a passive notification when a present policy file cannot be trusted.
+/// Like widening alerts, the watcher calls this only when the daemon's startup
+/// notification setting allows it; the body is sanitized before reaching the
+/// platform renderer.
+pub fn notify_config_untrusted(message: &str) {
+    let title = "Wisphive: config untrusted".to_string();
+    let body = sanitize_for_log(message);
+
+    tokio::spawn(async move {
+        if let Err(error) = send_passive_notification(&title, &body).await {
+            warn!("failed to send untrusted-config notification: {error}");
+        } else {
+            info!("sent untrusted-config notification: {title}");
+        }
+    });
+}
+
 /// Remove control characters before untrusted text reaches a human-readable
 /// sink such as tracing or a passive notification.
 ///

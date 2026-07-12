@@ -2279,6 +2279,59 @@ kbd {
   color: var(--text);
 }
 
+/* Config integrity evidence: a widened policy is warning-level; an
+ * untrusted config is urgent because hooks are safely ignoring it. */
+.config-alert-banner {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  margin-bottom: var(--space-md);
+}
+
+.config-alert {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-sm);
+  padding: 8px 12px;
+  border: 1px solid var(--yellow);
+  border-radius: 4px;
+  color: var(--yellow);
+  background: rgba(255, 183, 77, 0.08);
+  font-size: var(--font-sm);
+}
+
+.config-alert-untrusted_config {
+  border-color: var(--red);
+  color: var(--red);
+  background: rgba(244, 67, 54, 0.08);
+}
+
+.config-alert-icon,
+.config-alert-label {
+  flex-shrink: 0;
+}
+
+.config-alert-label {
+  font-weight: 600;
+}
+
+.config-alert-message {
+  color: var(--text);
+}
+
+/* Keep long policy deltas legible rather than forcing horizontal overflow on
+ * phone-sized control-plane screens. */
+@media (max-width: 480px) {
+  .config-alert {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .config-alert-message {
+    flex-basis: 100%;
+  }
+}
+
 .login-setup {
   display: flex;
   flex-direction: column;

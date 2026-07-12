@@ -220,6 +220,20 @@ impl StateDb {
         .execute(&self.pool)
         .await?;
 
+        // Last observed config policy snapshot. The daemon compares this
+        // baseline at startup so a policy widening made while it was stopped
+        // remains visible (itr#96). One row is sufficient by design.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS config_watch_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                snapshot TEXT NOT NULL,
+                hash TEXT,
+                updated_at TEXT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
         // ── Web UI auth tables ───────────────────────────────────────
         // Single-row password table (id always = 1); argon2id hash.
         sqlx::query(

@@ -4123,6 +4123,7 @@ dependencies = [
  "portable-pty",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tempfile",
  "thiserror 2.0.18",
@@ -4154,8 +4155,10 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
+ "libc",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "uuid",
 ]

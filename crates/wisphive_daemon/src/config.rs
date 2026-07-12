@@ -288,7 +288,7 @@ impl DaemonConfig {
 
     fn load_user_config(home_dir: &Path) -> UserConfig {
         let path = home_dir.join("config.json");
-        match std::fs::read_to_string(&path) {
+        match wisphive_protocol::fs_trust::read_trusted(&path) {
             Ok(content) => match serde_json::from_str(&content) {
                 Ok(config) => config,
                 Err(e) => {
@@ -308,7 +308,26 @@ impl DaemonConfig {
                     UserConfig::default()
                 }
             },
-            Err(_) => UserConfig::default(),
+            Err(wisphive_protocol::fs_trust::TrustError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                UserConfig::default()
+            }
+            Err(error) => {
+                // A config another local account could alter is equivalent to
+                // absent for daemon policy. Never repair or write it here: that
+                // would conceal the evidence and could overwrite an operator's
+                // hand-edited file.
+                let msg = format!(
+                    "UNTRUSTED CONFIG: {} cannot be used ({error}); \
+                     running with built-in defaults. The file was NOT modified — \
+                     fix its ownership or permissions, then restart the daemon.",
+                    path.display()
+                );
+                eprintln!("wisphive: {msg}");
+                tracing::warn!("{msg}");
+                UserConfig::default()
+            }
         }
     }
 }
@@ -882,6 +901,28 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn load_user_config_ignores_world_writable_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let contents = serde_json::json!({
+            "auto_approve_level": "all",
+            "codex_allow_foreign_hooks": true,
+        })
+        .to_string();
+        std::fs::write(&path, &contents).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let config = DaemonConfig::load_user_config(dir.path());
+
+        assert!(config.auto_approve_level.is_none());
+        assert!(!config.codex_allow_foreign_hooks);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+    }
+
+    #[test]
     fn update_config_json_preserves_untouched_keys() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
@@ -922,6 +963,57 @@ mod tests {
         let after: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(after["auto_approve_add"][0], "Bash");
+    }
+
+    #[test]
+    fn concurrent_update_config_json_loses_no_updates() {
+        use std::collections::BTreeSet;
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        const WRITERS: usize = 8;
+        let barrier = Arc::new(Barrier::new(WRITERS));
+
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|writer| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    update_config_json(&path, |obj| {
+                        let entries = obj
+                            .entry("itr96_entries")
+                            .or_insert_with(|| serde_json::json!([]));
+                        let entries = entries.as_array_mut().ok_or_else(|| {
+                            "itr96_entries must remain an array during concurrent update"
+                                .to_string()
+                        })?;
+                        entries.push(serde_json::Value::String(format!("writer-{writer}")));
+                        Ok(())
+                    })
+                    .unwrap();
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let actual: BTreeSet<_> = after["itr96_entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.as_str().unwrap().to_string())
+            .collect();
+        let expected: BTreeSet<_> = (0..WRITERS)
+            .map(|writer| format!("writer-{writer}"))
+            .collect();
+
+        assert_eq!(actual, expected, "every concurrent mutation must survive");
     }
 
     #[test]

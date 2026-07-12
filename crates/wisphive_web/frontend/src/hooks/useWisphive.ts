@@ -3,6 +3,7 @@ import type {
   AgentInfo,
   AuditDecision,
   ClientMessage,
+  ConfigAlertKind,
   DecisionRequest,
   DiskAlertKind,
   HistoryEntry,
@@ -51,10 +52,19 @@ export interface WisphiveState {
    * `kind`. The daemon raises these instead of deleting audit data (itr#340);
    * a `disk_alert` with `active:false` clears its kind. */
   diskAlerts: DiskAlert[];
+  /** Currently-active config trust / policy-widening alerts, one per kind.
+   * A `config_alert` with `active:false` clears its kind. */
+  configAlerts: ConfigAlert[];
 }
 
 export interface DiskAlert {
   kind: DiskAlertKind;
+  message: string;
+  at: string;
+}
+
+export interface ConfigAlert {
+  kind: ConfigAlertKind;
   message: string;
   at: string;
 }
@@ -162,6 +172,7 @@ export function useWisphive() {
     terminals: [],
     pendingReauth: null,
     diskAlerts: [],
+    configAlerts: [],
   });
 
   // Keep document side effects out of state updaters. React may invoke a
@@ -443,6 +454,19 @@ export function useWisphive() {
             return {
               ...prev,
               diskAlerts: [...others, { kind: msg.kind, message: msg.message, at: msg.at }],
+            };
+          }
+
+          case "config_alert": {
+            // Mirror resource alerts: trust loss and widening state are keyed
+            // by kind, with active:false retiring the matching banner.
+            const others = prev.configAlerts.filter((a) => a.kind !== msg.kind);
+            if (!msg.active) {
+              return { ...prev, configAlerts: others };
+            }
+            return {
+              ...prev,
+              configAlerts: [...others, { kind: msg.kind, message: msg.message, at: msg.at }],
             };
           }
 

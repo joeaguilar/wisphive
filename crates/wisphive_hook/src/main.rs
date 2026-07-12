@@ -1648,9 +1648,7 @@ fn event_auto_approved_by(
     };
 
     let config_path = wisphive_dir.join("config.json");
-    let enabled = std::fs::read_to_string(&config_path)
-        .ok()
-        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+    let enabled = trusted_config_json(&config_path)
         .and_then(|config| config.get(config_key)?.as_bool())
         .unwrap_or(default);
     enabled.then_some(config_key)
@@ -1671,6 +1669,15 @@ fn config_snapshot_hash(wisphive_dir: &std::path::Path) -> Option<String> {
             .map(|b| format!("{b:02x}"))
             .collect::<String>(),
     )
+}
+
+/// Read a JSON policy file only when another local account cannot modify it.
+/// Any trust or parse failure is deliberately indistinguishable from an absent
+/// config at the hook decision layer, preserving the safe default fallback.
+fn trusted_config_json(path: &std::path::Path) -> Option<serde_json::Value> {
+    wisphive_protocol::fs_trust::read_trusted(path)
+        .ok()
+        .and_then(|contents| serde_json::from_str(&contents).ok())
 }
 
 /// How the always-defer classification resolved for a tool (itr#397 audit).
@@ -1709,10 +1716,7 @@ fn always_defer_classification(tool_name: &str, wisphive_dir: &std::path::Path) 
         return DeferClass::Intrinsic;
     }
 
-    let Some(config) = std::fs::read_to_string(wisphive_dir.join("config.json"))
-        .ok()
-        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-    else {
+    let Some(config) = trusted_config_json(&wisphive_dir.join("config.json")) else {
         return DeferClass::No;
     };
 
@@ -1765,9 +1769,7 @@ fn auto_approved_by(
 ) -> Option<String> {
     let config_path = wisphive_dir.join("config.json");
 
-    let config: Option<serde_json::Value> = std::fs::read_to_string(&config_path)
-        .ok()
-        .and_then(|c| serde_json::from_str(&c).ok());
+    let config = trusted_config_json(&config_path);
 
     // Determine base approval from level/add/remove
     let base_rule = if let Some(ref config) = config {
@@ -1861,9 +1863,7 @@ fn check_base_approved(
 /// identifier for a match.
 fn legacy_auto_approved(tool_name: &str, wisphive_dir: &std::path::Path) -> Option<String> {
     let legacy_path = wisphive_dir.join("auto-approve.json");
-    if legacy_path.exists()
-        && let Ok(content) = std::fs::read_to_string(&legacy_path)
-        && let Ok(config) = serde_json::from_str::<serde_json::Value>(&content)
+    if let Some(config) = trusted_config_json(&legacy_path)
         && let Some(arr) = config.get("auto_approve").and_then(|v| v.as_array())
     {
         return arr
@@ -2072,9 +2072,7 @@ fn home_dir() -> PathBuf {
 /// keeps the guard on — the secure default; `true` lets the agent edit its own
 /// `~/.wisphive` state without human review.
 fn allow_self_modification(wisphive_dir: &std::path::Path) -> bool {
-    std::fs::read_to_string(wisphive_dir.join("config.json"))
-        .ok()
-        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+    trusted_config_json(&wisphive_dir.join("config.json"))
         .and_then(|cfg| cfg.get("allow_self_modification")?.as_bool())
         .unwrap_or(false)
 }
@@ -2240,6 +2238,45 @@ mod tests {
             &serde_json::Value::Null,
             dir.path()
         ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn world_writable_config_level_all_is_ignored() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = dir_with_config(serde_json::json!({ "auto_approve_level": "all" }));
+        let path = dir.path().join("config.json");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        assert!(
+            !is_auto_approved("Bash", &serde_json::Value::Null, dir.path()),
+            "untrusted level:all must not approve Bash"
+        );
+        assert!(
+            is_auto_approved("Read", &serde_json::Value::Null, dir.path()),
+            "the trusted fallback remains the default read tier"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn group_writable_legacy_auto_approve_is_ignored() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auto-approve.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({ "auto_approve": ["Bash"] }).to_string(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+
+        assert!(
+            !is_auto_approved("Bash", &serde_json::Value::Null, dir.path()),
+            "a group-writable legacy allowlist must not approve Bash"
+        );
     }
 
     #[test]

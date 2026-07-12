@@ -1,3 +1,4 @@
+pub mod fs_trust;
 pub mod redact;
 mod types;
 mod wire;

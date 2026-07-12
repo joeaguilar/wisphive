@@ -25,6 +25,7 @@ portable-pty.workspace = true
 vt100.workspace = true
 bytes.workspace = true
 base64.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

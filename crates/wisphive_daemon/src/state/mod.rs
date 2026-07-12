@@ -173,6 +173,46 @@ impl StateDb {
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
+
+    /// Load the prior config-policy baseline used for widening detection.
+    /// Invalid persisted JSON is surfaced rather than silently discarded: the
+    /// next snapshot must not be falsely treated as a first boot.
+    pub async fn load_config_watch_snapshot(
+        &self,
+    ) -> Result<Option<crate::config_watch::PolicySnapshot>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT snapshot FROM config_watch_state WHERE id = 1")
+                .fetch_optional(&self.pool)
+                .await?;
+        row.map(|(snapshot,)| {
+            serde_json::from_str(&snapshot).context("parse persisted config-watch snapshot")
+        })
+        .transpose()
+    }
+
+    /// Persist the latest config-policy observation after its alert transition
+    /// has been evaluated. The upsert makes the one-row baseline crash-safe
+    /// under SQLite WAL without growing an audit table for every editor save.
+    pub async fn save_config_watch_snapshot(
+        &self,
+        snapshot: &crate::config_watch::PolicySnapshot,
+    ) -> Result<()> {
+        let serialized = serde_json::to_string(snapshot)?;
+        sqlx::query(
+            "INSERT INTO config_watch_state (id, snapshot, hash, updated_at)
+             VALUES (1, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                 snapshot = excluded.snapshot,
+                 hash = excluded.hash,
+                 updated_at = excluded.updated_at",
+        )
+        .bind(serialized)
+        .bind(snapshot.hash.as_deref())
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 fn database_filesystem_path(path: &str) -> Option<PathBuf> {

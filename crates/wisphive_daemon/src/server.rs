@@ -289,6 +289,17 @@ impl Server {
             self.tui_tx.clone(),
         );
 
+        // Config changes are user-editable and apply to hook decisions without
+        // a daemon restart. Watch them for trust loss and widening evidence;
+        // the watcher persists its baseline so an offline change is reported
+        // at the next startup as well (itr#96).
+        let _config_watch_handle = crate::config_watch::spawn_config_watcher(
+            self.config.config_json_path(),
+            self.state_db.clone(),
+            self.tui_tx.clone(),
+            self.config.notifications_enabled,
+        );
+
         let mut reap_interval = tokio::time::interval(Duration::from_secs(5));
         reap_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 

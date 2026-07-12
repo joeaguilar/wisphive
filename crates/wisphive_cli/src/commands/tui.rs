@@ -486,6 +486,9 @@ async fn run_loop(
                     Some(ServerMessage::DiskAlert { kind, active, message, .. }) => {
                         app.apply_disk_alert(kind, active, message);
                     }
+                    Some(ServerMessage::ConfigAlert { kind, active, message, .. }) => {
+                        app.apply_config_alert(kind, active, message);
+                    }
                     Some(ServerMessage::Error { message }) => {
                         tracing::warn!(%message, "daemon error");
                         app.set_status_error(message);

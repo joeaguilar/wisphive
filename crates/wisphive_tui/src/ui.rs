@@ -24,20 +24,20 @@ pub fn draw(frame: &mut Frame, app: &App) {
         ViewMode::TerminalReplay => draw_terminal_replay_view(frame, app),
         ViewMode::Dashboard => draw_dashboard(frame, app),
     }
-    // Rendered last so it overlays the active view: a resource alert is
-    // important enough to sit on top of whatever panel is focused.
-    draw_disk_alert_banner(frame, app);
+    // Rendered last so alerts overlay the active view: resource, config trust,
+    // and policy-widening signals are important enough to sit above any panel.
+    draw_alert_banner(frame, app);
 }
 
-/// Overlay a banner for active daemon resource alerts (audit archive size, low
-/// disk). Wisphive never deletes audit data; the daemon raises these instead
-/// (itr#340). One row per alert, pinned to the top of the frame.
-fn draw_disk_alert_banner(frame: &mut Frame, app: &App) {
-    if app.disk_alerts.is_empty() {
+/// Overlay a shared banner strip for daemon resource and configuration alerts.
+/// One row per active kind is pinned to the top of the frame.
+fn draw_alert_banner(frame: &mut Frame, app: &App) {
+    if app.disk_alerts.is_empty() && app.config_alerts.is_empty() {
         return;
     }
     let area = frame.area();
-    let height = (app.disk_alerts.len() as u16).min(2);
+    let count = app.disk_alerts.len() + app.config_alerts.len();
+    let height = (count as u16).min(4);
     if area.height <= height {
         return; // too small to overlay without hiding everything
     }
@@ -48,30 +48,41 @@ fn draw_disk_alert_banner(frame: &mut Frame, app: &App) {
         height,
     };
 
-    let lines: Vec<Line> = app
+    let mut lines: Vec<Line> = app
         .disk_alerts
         .iter()
-        .take(height as usize)
-        .map(|a| {
-            let (label, color) = match a.kind {
+        .map(|alert| {
+            let (label, color) = match alert.kind {
                 wisphive_protocol::DiskAlertKind::ArchiveSize => ("ARCHIVE", Color::Yellow),
                 wisphive_protocol::DiskAlertKind::LowDiskSpace => ("LOW DISK", Color::Red),
             };
-            Line::from(vec![
-                Span::styled(
-                    format!(" ⚠ {label}: "),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(a.message.clone()),
-            ])
+            alert_line(label, color, &alert.message)
         })
         .collect();
+    lines.extend(app.config_alerts.iter().map(|alert| {
+        let (label, color) = match alert.kind {
+            wisphive_protocol::ConfigAlertKind::PolicyWidened => ("POLICY WIDENED", Color::Yellow),
+            wisphive_protocol::ConfigAlertKind::UntrustedConfig => ("CONFIG UNTRUSTED", Color::Red),
+        };
+        alert_line(label, color, &alert.message)
+    }));
+    lines.truncate(height as usize);
 
     let para = Paragraph::new(lines)
         .style(Style::default().bg(Color::Rgb(40, 30, 0)))
         .wrap(Wrap { trim: true });
     frame.render_widget(Clear, banner);
     frame.render_widget(para, banner);
+}
+
+fn alert_line(label: &str, color: Color, message: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!(" ⚠ {label}: "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(message.to_owned()),
+    ])
 }
 
 fn draw_terminal_list_view(frame: &mut Frame, app: &App) {

@@ -304,6 +304,26 @@ fn dashboard_queue_with_pending_decisions() {
     assert_frame_snapshot("dashboard_queue_pending", render_app(&app, 100, 24));
 }
 
+#[test]
+fn dashboard_config_alert_banner() {
+    let mut app = dashboard_app();
+    app.apply_config_alert(
+        wisphive_protocol::ConfigAlertKind::UntrustedConfig,
+        true,
+        "config.json is group writable; using the safe read-tier policy.".into(),
+    );
+    app.apply_config_alert(
+        wisphive_protocol::ConfigAlertKind::PolicyWidened,
+        true,
+        "auto_approve_level increased from read to all".into(),
+    );
+
+    let frame = render_app(&app, 100, 24);
+    assert!(frame.contains("CONFIG UNTRUSTED"));
+    assert!(frame.contains("POLICY WIDENED"));
+    assert_frame_snapshot("dashboard_config_alert_banner", frame);
+}
+
 /// Approval-safety regression: a selected request below the fold must be
 /// rendered, otherwise `y` would approve an invisible queue entry.
 #[test]

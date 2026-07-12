@@ -217,11 +217,15 @@ export type ServerMessage =
   | { type: "term_error"; id?: string; message: string }
   | { type: "web_reauth_required"; device_id: string; request_id: string; tool_name: string; at: string }
   | { type: "mark_device_fresh_ack"; device_id: string }
-  | { type: "disk_alert"; kind: DiskAlertKind; active: boolean; message: string; at: string };
+  | { type: "disk_alert"; kind: DiskAlertKind; active: boolean; message: string; at: string }
+  | { type: "config_alert"; kind: ConfigAlertKind; active: boolean; message: string; at: string };
 
 /** Which resource condition a `disk_alert` describes. Wisphive never deletes
  * audit data; these are non-destructive warnings (itr#340). */
 export type DiskAlertKind = "archive_size" | "low_disk_space";
+
+/** A configuration trust or effective-policy alert from the daemon. */
+export type ConfigAlertKind = "policy_widened" | "untrusted_config";
 
 export interface ProjectSummary {
   project: string;
@@ -498,6 +502,14 @@ export function parseServerMessage(data: string): ServerMessage {
       return {
         type,
         kind: readField(message, "kind", readDiskAlertKind, "message"),
+        active: readField(message, "active", readBoolean, "message"),
+        message: readField(message, "message", readString, "message"),
+        at: readField(message, "at", readRfc3339, "message"),
+      };
+    case "config_alert":
+      return {
+        type,
+        kind: readField(message, "kind", readConfigAlertKind, "message"),
         active: readField(message, "active", readBoolean, "message"),
         message: readField(message, "message", readString, "message"),
         at: readField(message, "at", readRfc3339, "message"),
@@ -922,6 +934,13 @@ function readTerminalDirection(value: unknown, path: string): TerminalDirection 
 function readDiskAlertKind(value: unknown, path: string): DiskAlertKind {
   if (value !== "archive_size" && value !== "low_disk_space") {
     return invalid(path, '"archive_size" or "low_disk_space"');
+  }
+  return value;
+}
+
+function readConfigAlertKind(value: unknown, path: string): ConfigAlertKind {
+  if (value !== "policy_widened" && value !== "untrusted_config") {
+    return invalid(path, '"policy_widened" or "untrusted_config"');
   }
   return value;
 }
