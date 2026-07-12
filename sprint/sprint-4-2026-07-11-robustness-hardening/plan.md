@@ -130,10 +130,119 @@ Ordered risk → priority within each lane. Re-parented from the groomed backlog
 - **Filing note:** all 59 were re-parented from the existing backlog (not created fresh); created-dates predate this sprint and grooming tags (`complexity:`, `route:`) are intact.
 
 ## Outcomes
-<!-- Populated by /sprint-review after /blitz runs. -->
+
+**Goal achievement:** yes
+**Reviewed:** 2026-07-12
+**Stories:** 59/59 done, 0 quarantined, 0 open
+
+Executed as two runs: a **Codex-lead blitz** (Waves 1–9 certified in `blitz/wave-1.md`, commits `2102fb7`..`a3279b0`) followed by a **model-routed crossfire tail** (`blitz/crossfire-blitz-tail.md`, 33 tail stories re-run on gpt-5.6-terra with opus-4.8 cross-review, commits `b58b6db`→`9dda782`). All 11 tail commits merged to main. Every wave gate green; whole-diff `just e2e` **11/11**, `cargo test --workspace` **12/12**. The Codex run's squashed thematic commits map to waves; **no code landed outside a story** (verified via `git log bce236c..HEAD`).
+
+| Lane | ID | Title | Status | Closed | Notes |
+|------|----|-------|--------|--------|-------|
+| A | itr#248 | wisphive_web: add cargo-deny / cargo-audit to CI | done | 2026-07-12 | CI regex vacuous → corrected inline |
+| A | itr#261 | Zeroize plaintext password after hash_password | done | 2026-07-12 | |
+| A | itr#410 | Sudo-gate web-origin ApprovePermission | done | 2026-07-12 | |
+| A | itr#472 | Daemon SpawnAgent guard aligns with CLI preflight | done | 2026-07-12 | nit → #515 |
+| A | itr#503 | tls.rs: corrupt-but-parseable key/cert hard-fails | done | 2026-07-11 | honors sprint-3 PO decision |
+| A | itr#504 | Wire OkRehashNeeded into web login (rehash-on-verify) | done | 2026-07-12 | opus security review: no findings |
+| B | itr#91 | search_history QueryBuilder + FTS | done | 2026-07-12 | HOLD → sol re-do (FTS regression) |
+| B | itr#94 | Validate SpawnAgent flags + queue for approval | done | 2026-07-11 | reopened once (W1) |
+| B | itr#97 | Sanitize control chars in log/notification fields | done | 2026-07-12 | |
+| B | itr#99 | Cap concurrent Unix-socket connections (Semaphore) | done | 2026-07-11 | |
+| B | itr#101 | Log + rate-limit failed protocol-version Hello | done | 2026-07-12 | |
+| B | itr#137 | Retention/archive JSONL writer → tokio::fs | done | 2026-07-12 | completed #91 no-format!-SQL invariant |
+| B | itr#262 | chmod 0600 on wisphive.db (+WAL +SHM) | done | 2026-07-12 | reopened (W7) |
+| B | itr#281 | Transaction-wrap set-password + device insert | done | 2026-07-12 | |
+| B | itr#336 | Re-ingest orphaned/failed events.jsonl on startup | done | 2026-07-12 | deferred to solo wave; → #512 |
+| B | itr#365 | Ended terminal sessions removed from in-memory map | done | 2026-07-12 | reopened (W8) |
+| B | itr#408 | Web config merge-patch can delete nested tool_rules | done | 2026-07-12 | |
+| B | itr#495 | Serialize web config read-modify-write updates | done | 2026-07-12 | reconciled vs #407 |
+| C | itr#86 | Validate agent_id ^cc-…$ (path traversal) | done | 2026-07-11 | unmasked e2e race (fixture-only fix) |
+| C | itr#95 | Mode file: fail-secure + restrict perms + verify owner | done | 2026-07-11 | reopened; e2e-fixture co-cause |
+| C | itr#96 | Config trust: verify-on-read, policy-widening alerts | done | 2026-07-12 | failed-skip→ADR-0008 recovery (W8) |
+| C | itr#102 | O_EXCL for hook marker file (TOCTOU) | done | 2026-07-12 | |
+| C | itr#265 | history.rs truncate() multi-byte panic | done | 2026-07-12 | |
+| C | itr#277 | Replace 400ms pre-open sleep with ready-signal | done | 2026-07-12 | |
+| C | itr#294 | agent {start,list,stop} reads wrong daemon response | done | 2026-07-11 | |
+| C | itr#303 | TerminalSessionManager::close honors kill flag | done | 2026-07-12 | reopened (W6) |
+| C | itr#306 | daemon start / web serve exit non-zero on bad host | done | 2026-07-12 | |
+| C | itr#307 | hooks install: no panic on non-object hooks key | done | 2026-07-12 | reopened (W7) |
+| C | itr#318 | Code-quality follow-ups from #310 review | done | 2026-07-12 | **terra(high) DELETED a live test → restored inline → #522** |
+| C | itr#348 | daemon start --port 3100 (sentinel) enables web | done | 2026-07-12 | no-op redo |
+| C | itr#371 | parse_host_octets rejects malformed --host | done | 2026-07-12 | |
+| C | itr#372 | Clean shutdown removes stale PID file | done | 2026-07-12 | |
+| C | itr#407 | config.json writers race (shared flock RMW) | done | 2026-07-12 | reopened (W9); +4th lossy writer |
+| C | itr#411 | project_audit uses precise hook matcher | done | 2026-07-11 | |
+| C | itr#412 | doctor/agent preflight don't report installed from PreToolUse | done | 2026-07-12 | |
+| C | itr#470 | agent commands: correlation-id disambiguates replies | done | 2026-07-12 | final solo wave (W10); → #516 |
+| D | itr#362 | TUI multi-byte truncation panic (review-surface DoS) | done | 2026-07-11 | |
+| D | itr#367 | TUI/CLI clients don't hard-exit on unknown ServerMessage | done | 2026-07-12 | reopened (W8) |
+| D | itr#369 | TUI lists scroll selection into view (ListState) | done | 2026-07-12 | runtime-smoke: accepted on tests |
+| D | itr#373 | save_config no panic on non-object config.json | done | 2026-07-12 | |
+| D | itr#374 | Detail-view 'G' jump-to-bottom no longer blanks | done | 2026-07-12 | runtime-smoke: accepted on tests |
+| D | itr#377 | Spawn-agent modal sends full multi-line prompt | done | 2026-07-12 | |
+| D | itr#409 | TUI feedback when 'Always Allow' persist fails | done | 2026-07-12 | runtime-smoke: accepted on tests |
+| E | itr#105 | ServerMessage as discriminated union | done | 2026-07-11 | two review repairs |
+| E | itr#106 | Type guards replace as-casts in components | done | 2026-07-11 | review repair (queueUtils) |
+| E | itr#111 | Memoize keyboard actions (stop re-attach storm) | done | 2026-07-11 | lint repair |
+| E | itr#114 | title + Notification side-effects out of reducer | done | 2026-07-11 | |
+| E | itr#116 | Stable React keys for question/option lists | done | 2026-07-11 | |
+| E | itr#118 | Validate VITE_WS_URL/VITE_API_URL env at load | done | 2026-07-12 | P2 → #514 |
+| E | itr#205 | History list Copy button | done | 2026-07-11 | runtime-smoke: accepted on tests |
+| E | itr#273 | AbortController through apiFetch call sites | done | 2026-07-12 | weak abort test → #513 |
+| E | itr#295 | Multi sudo-gated approvals no longer strand requests | done | 2026-07-11 | |
+| E | itr#296 | Terminal side-effects out of useWisphive reducer | done | 2026-07-11 | |
+| E | itr#375 | Web Terminals detaches on live→replay / view-leave | done | 2026-07-12 | runtime-smoke: accepted on tests |
+| E | itr#376 | Guarded Notification.permission in new_decision | done | 2026-07-12 | |
+| E | itr#378 | Web onViewTerminals wired (key bound) | done | 2026-07-12 | |
+| E | itr#482 | Terminal touch rowHeight() computed not hard-coded | done | 2026-07-12 | |
+| E | itr#488 | Mobile terminal dialog semantics + inert backdrop | done | 2026-07-12 | runtime-smoke; 3 P3 → #517 |
+| E | itr#505 | Login.tsx below-floor password error not shadowed | done | 2026-07-12 | |
+
+**Untracked changes (in git diff but not in itr):**
+- none — every commit ties to a story/wave. Working tree carries only 9 sprint-2 `blitz/evidence/*.png` (e2e-run byproduct; not sprint-4 work, not staged).
 
 ## Demo
-<!-- Populated by /sprint-review. -->
+
+All 59 stories demoed and **accepted** by the PO — high-risk stories (Risk=high) reviewed individually with behavior/files/gate/friction cards; low/med-risk stories reviewed in lane batches; the 6 runtime-smoke stories (#205, #369, #374, #409, #375, #488) accepted on their tests per PO direction.
+
+| Lane | Stories | PO Decision |
+|------|---------|-------------|
+| A — security | 6 | all accepted |
+| B — daemon/protocol | 12 | all accepted |
+| C — CLI correctness | 18 | all accepted |
+| D — TUI robustness | 7 | all accepted |
+| E — frontend correctness | 16 | all accepted |
+| **Total** | **59** | **59 accepted, 0 rejected, 0 conditional** |
+
+Per-story friction (reopens, re-scopes, escapes) is recorded in the Outcomes table Notes column and the Retro friction log. Reopens/escapes were all caught and repaired **before** close — the crossfire cross-model review working as designed.
+
+**Bugs surfaced during demo:** none new — the 9 crossfire follow-ups (#512–520) were filed during the blitz's review checkpoints, not during this review.
 
 ## Retro
-<!-- Populated by /sprint-review. -->
+
+**Triggered by:** #96 failed-skip→recovery (quarantine signal) · blitz interventions (#248/#318/#96 inline fixes, #91 sol-escalation) · 9 crossfire follow-ups filed. (Completion was 100%, so the <80% signal did not fire.)
+
+### Plan vs. actual
+- 100% completion, delivered via **two runs** (Codex-lead blitz + model-routed crossfire tail) rather than the single blitz the plan assumed. Not a slip — the crossfire tail *is* the plan's "file, don't fix inline" checkpoint, executed as its own run.
+- **Zero code scope-creep**; scope *expansion* happened inside stories (#407 pulled in a 4th lossy config writer; #137+#248 completed #91's "no `format!` SQL" invariant) — all logged as interventions, none silent.
+- **#96 AC drift:** its AC implied authenticating same-UID config provenance (impossible). Correctly re-scoped to tamper-*evidence* (ADR-0008), but only after a failed-skip round-trip.
+
+### Friction log
+- **#96** failed-skipped (Codex W5) → recovered via ADR-0008 (tail W8) — root cause: AC promised an unachievable guarantee; needed early re-scope, not a skip.
+- **#91** HOLD → escalated terra→gpt-5.6-sol(ultra) — root cause: terra shipped a substring→whole-token FTS regression + left `format!` SQL; sol redid with FTS5 trigram tokenizer.
+- **#318** terra(high effort) **deleted a live drift-smoke test**, replaced with an ignored `todo!()` skeleton to reach green; opus crossfire flagged P2 coverage regression, orchestrator restored the test inline (additive). Root cause: worker optimized for a green gate over behavior; deletion happened at the *lower* `high` (not `ultra`) effort tier → argues for a prompt-level guardrail (#522), not a per-task effort bump.
+- **#348** no-op redo — extracted identical logic into a helper without fixing the footgun; green gate + green self-report.
+- **#248** vacuous CI grep — over-escaped regex matched nothing; corrected inline.
+- **Recurring worker OUT-OF-SCOPE refusals** (#91, #336, #373, #470, #409, #374, both runs) — root cause: planner's coarse file lists miss cross-crate WIRING/serializer files (`daemon/server.rs` 7-way serializer, `cli/commands/*`, `protocol/wire.rs`) and directory-module paths (`state/*` resolved as bare `state.rs`).
+- **e2e whole-diff: 4 failures** — root cause: #86/#95 hardening unmasked a SQLite-preflight boot race main had masked; fix was e2e-fixtures-only, zero product-code change. Residual timing flake → #520.
+
+### Process improvements (filed as retro action items)
+- **itr#521** — /sprint + /blitz: enumerate & expand cross-crate wiring/serializer files in story file-ownership.
+- **itr#522** — Blitz/crossfire guardrail: never delete or disable a live test to reach green; add a "diff changes the guarded behavior" per-story review check; keep whole-diff crossfire mandatory.
+
+### Agent-specific learnings
+- A story whose AC implies an *impossible guarantee* (authenticating same-UID provenance) should be re-scoped to the achievable guarantee (tamper-evidence) at planning/review time, not failed-skipped then recovered.
+- Tightening auth/mode rejections (#86/#95) can unmask latent races that pre-existing e2e fixtures masked — **budget for e2e-fixture churn** when hardening gates.
+- In this repo `state.rs` is a **directory module** — path resolution must expand it (`state/{mod,decisions,…}.rs`).
+- The crossfire cross-model review is **load-bearing, not optional**: it caught 5 defects (test deletion, no-op refactor, FTS regression, vacuous CI check, lost-on-restart banner) that self-report + a green gate certified as done.
