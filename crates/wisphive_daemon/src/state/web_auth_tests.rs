@@ -42,6 +42,59 @@ async fn web_password_set_get_and_reset() {
 }
 
 #[tokio::test]
+async fn initial_web_password_and_device_rolls_back_when_device_insert_fails() {
+    let db = test_db().await;
+    db.insert_web_device("existing-device", "phone", "existing-token")
+        .await
+        .unwrap();
+
+    let err = db
+        .try_set_initial_web_password_and_device(
+            "$argon2id$hash",
+            "new-device",
+            "laptop",
+            "existing-token",
+        )
+        .await
+        .expect_err("duplicate device token must fail the initial provisioning transaction");
+    assert!(
+        matches!(err, WebAuthError::Duplicate),
+        "expected Duplicate, got {err:?}"
+    );
+    assert!(
+        db.get_web_password_hash().await.unwrap().is_none(),
+        "failed initial device insertion must roll back the password"
+    );
+    assert_eq!(
+        db.list_web_devices().await.unwrap().len(),
+        1,
+        "the failed transaction must not add another device"
+    );
+
+    // The rollback must leave the pooled connection usable for a later,
+    // legitimate first-run provisioning attempt.
+    assert!(
+        db.try_set_initial_web_password_and_device(
+            "$argon2id$hash",
+            "new-device",
+            "laptop",
+            "new-token",
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(
+        db.get_web_password_hash().await.unwrap().as_deref(),
+        Some("$argon2id$hash")
+    );
+    assert_eq!(
+        db.list_web_devices().await.unwrap().len(),
+        2,
+        "the retry must persist its initial device binding"
+    );
+}
+
+#[tokio::test]
 async fn web_device_insert_find_revoke_list() {
     let db = test_db().await;
     db.insert_web_device("dev-1", "phone", "hash-1")

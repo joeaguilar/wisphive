@@ -15,8 +15,11 @@
 //! v1 is atomic-profile only — no per-knob env overrides. Add profiles
 //! sparingly when a real new posture emerges; avoid knob-by-knob configs.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::time::Duration;
+
+#[cfg(test)]
+use std::net::Ipv4Addr;
 
 use serde::{Deserialize, Serialize};
 use webauthn_rs::prelude::Url;
@@ -38,11 +41,21 @@ pub enum UvRequirement {
 /// where a real RP ID is required — both would silently fail at the
 /// browser's RP ID check, costing a debugging round.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-pub struct RpId(pub String);
+pub struct RpId(
+    /// Canonical registrable-domain representation used as the WebAuthn RP ID.
+    pub String,
+);
 
 impl RpId {
+    /// Borrow this RP ID as its canonical domain string.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl AsRef<str> for RpId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
     }
 }
 
@@ -202,7 +215,7 @@ impl AuthPolicy {
 fn loopback_rp_id_from_origin(origin: &Url) -> Option<RpId> {
     let host = origin.host()?;
     match host {
-        url::Host::Domain(d) if d.eq_ignore_ascii_case("localhost") => {
+        url::Host::Domain(d) if d.trim_end_matches('.').eq_ignore_ascii_case("localhost") => {
             Some(RpId("localhost".to_string()))
         }
         // IP literals (including loopback `127.0.0.1` / `[::1]`) are forbidden
@@ -225,6 +238,13 @@ fn loopback_rp_id_from_origin(origin: &Url) -> Option<RpId> {
         // (`security::loopback_ip_redirect`) catches browser navigation
         // to `127.0.0.1` / `[::1]` and 301s to `localhost`, so most users
         // never even land on an IP-literal origin in practice.
+        // `Ipv4Addr::is_loopback()` covers the full 127.0.0.0/8 range, even
+        // though the Host allowlist currently seeds only `127.0.0.1:<port>`
+        // and `localhost:<port>`. Thus `127.0.0.2` is normally rejected at
+        // the host gate before reaching this policy. Keep the policy's full
+        // loopback classification intact if this branch gains distinct
+        // behavior; the narrower allowlist is a separate concern.
+        url::Host::Ipv4(ip) if ip.is_loopback() => None,
         url::Host::Ipv4(_) | url::Host::Ipv6(_) => None,
         _ => None,
     }
@@ -285,7 +305,8 @@ pub fn validate_enterprise_config(
 /// char DNS-legal. Not a full RFC 1035 validator — the real cert SAN
 /// suffix check belongs in #270's cert-loading path. This just rejects
 /// the obvious garbage (`""`, `".."`, `"foo bar"`, IP literals already
-/// handled upstream).
+/// handled upstream). A label made only of digits is rejected too: a value
+/// such as `123.456` is structurally DNS-like but not a registrable domain.
 fn is_plausible_dns_name(s: &str) -> bool {
     if s.is_empty() || s.len() > 253 {
         return false;
@@ -298,14 +319,14 @@ fn is_plausible_dns_name(s: &str) -> bool {
         !label.is_empty()
             && label.len() <= 63
             && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            && !label.chars().all(|c| c.is_ascii_digit())
             && !label.starts_with('-')
             && !label.ends_with('-')
     })
 }
 
-/// Whether `ip` is in an RFC 1918 private-use range. Used by the unit
-/// tests for `rp_id_for_origin` and reusable by future LAN-handling code.
-#[allow(dead_code)]
+/// Whether `ip` is in an RFC 1918 private-use range. Used only by unit tests.
+#[cfg(test)]
 pub(crate) fn is_rfc1918(ip: Ipv4Addr) -> bool {
     let [a, b, _, _] = ip.octets();
     a == 10 || (a == 172 && (16..=31).contains(&b)) || (a == 192 && b == 168)
@@ -464,6 +485,21 @@ mod tests {
             p.rp_id_for_origin(&url("https://localhost")),
             Some(RpId("localhost".to_string()))
         );
+        // Authority userinfo and the default HTTP port do not change the
+        // origin host used for RP ID derivation.
+        assert_eq!(
+            p.rp_id_for_origin(&url("http://user:pass@localhost/")),
+            Some(RpId("localhost".to_string()))
+        );
+        assert_eq!(
+            p.rp_id_for_origin(&url("http://localhost/")),
+            Some(RpId("localhost".to_string()))
+        );
+        // A DNS trailing root label names the same loopback host.
+        assert_eq!(
+            p.rp_id_for_origin(&url("http://localhost./")),
+            Some(RpId("localhost".to_string()))
+        );
     }
 
     #[test]
@@ -592,12 +628,19 @@ mod tests {
             validate_enterprise_config(Some(".com"), true, true).unwrap_err(),
             EnterpriseValidationError::RpIdNotDomain(_)
         ));
+        // Numeric-only labels look like a dotted-quad but are neither an
+        // IP literal accepted by `IpAddr` nor a registrable DNS name.
+        assert!(matches!(
+            validate_enterprise_config(Some("123.456"), true, true).unwrap_err(),
+            EnterpriseValidationError::RpIdNotDomain(_)
+        ));
     }
 
     #[test]
     fn enterprise_validation_accepts_real_domain() {
         let rp = validate_enterprise_config(Some("wisphive.example.com"), true, true).unwrap();
         assert_eq!(rp.as_str(), "wisphive.example.com");
+        assert_eq!(rp.as_ref(), "wisphive.example.com");
         // Multi-label, hyphens in middle, etc.
         let rp = validate_enterprise_config(Some("auth-srv.corp.example.net"), true, true).unwrap();
         assert_eq!(rp.as_str(), "auth-srv.corp.example.net");
@@ -682,13 +725,28 @@ mod tests {
         scan_passkey_rp_id_drift(&db, &policy).await;
     }
 
-    /// Positive path: a row whose `rp_id` doesn't match the active
-    /// profile must trigger the warn-log. We can't easily assert on the
-    /// tracing output without pulling in a subscriber harness, so this
-    /// test instead asserts the function runs to completion under a
-    /// realistic mismatch scenario (the warn-log itself is the
-    /// load-bearing side effect; this test guards the query path that
-    /// produces it).
+    /// Positive-path logging skeleton. itr#311 will add a tracing capture
+    /// harness and un-ignore this test once the passkey migration is
+    /// available everywhere the suite runs.
+    #[tokio::test]
+    #[ignore = "itr#311: add a tracing WARN capture harness for drift logging"]
+    async fn scan_passkey_rp_id_drift_logs_warn_skeleton() {
+        let capture_warns = || -> Vec<String> {
+            todo!(
+                "seed a mismatched web_passkeys.rp_id row, call the scan, and capture tracing WARNs"
+            )
+        };
+        assert!(capture_warns().iter().any(|message| {
+            message.contains("passkey RP ID does not match active profile")
+                && message.contains("stored_rp_id=wisphive.example.com")
+        }));
+    }
+
+    /// Restored positive smoke (crossfire wave-3 review; "additive, not
+    /// destructive"): itr#311 already landed the `web_passkeys.rp_id` column,
+    /// so this row-seeding scan executes for real and guards the drift query
+    /// path that produces the WARN. Kept alongside the ignored tracing-capture
+    /// skeleton above rather than replaced by it.
     #[tokio::test]
     async fn scan_passkey_rp_id_drift_warns_on_mismatched_rows() {
         let tmp = tempfile::tempdir().unwrap();

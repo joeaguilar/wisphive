@@ -15,6 +15,7 @@ use wisphive_protocol::{
 };
 
 use crate::config::{DaemonConfig, require_active_mode};
+use crate::notify::sanitize_for_log;
 
 /// Capacity of the per-TUI-connection worker channel (itr#82). Bounds memory
 /// when a fast producer (terminal forwarder, `TermReplay`) outruns a slow TUI
@@ -372,7 +373,7 @@ impl Server {
                         } else {
                             warn!(
                                 security_event = "invalid_agent_marker_rejected",
-                                %agent_id,
+                                agent_id = %sanitize_for_log(&agent_id),
                                 "refusing to remove a marker for an invalid agent id"
                             );
                         }
@@ -700,7 +701,7 @@ async fn handle_hook(
         warn!(
             security_event = "invalid_agent_identity_rejected",
             ?decision_id,
-            %agent_id,
+            agent_id = %sanitize_for_log(agent_id),
             "hook payload attempted to use an invalid identity"
         );
         if let Some(id) = decision_id {
@@ -945,7 +946,12 @@ async fn handle_hook(
                 match attach_tool_result_with_retry(&state_db, &result, ATTACH_RETRY_DELAYS).await {
                     Ok(Some(attached)) => {
                         let matched_id = attached.id;
-                        info!(id = %matched_id, tool = %result.tool_name, agent = %result.agent_id, "tool result attached");
+                        info!(
+                            id = %matched_id,
+                            tool = %sanitize_for_log(&result.tool_name),
+                            agent = %sanitize_for_log(&result.agent_id),
+                            "tool result attached"
+                        );
                         // A DEFERRED native prompt just got answered in the terminal —
                         // tell clients so the inbox clears its "waiting in your terminal"
                         // row (itr#461). Requires a tool_use_id to key the clear on; the
@@ -966,8 +972,11 @@ async fn handle_hook(
                         }
                     }
                     Ok(None) => {
-                        warn!(tool = %result.tool_name, agent = %result.agent_id,
-                              "tool result dropped: no matching decision appeared within the retry window");
+                        warn!(
+                            tool = %sanitize_for_log(&result.tool_name),
+                            agent = %sanitize_for_log(&result.agent_id),
+                            "tool result dropped: no matching decision appeared within the retry window"
+                        );
                     }
                     Err(e) => {
                         warn!("failed to store tool result: {e}");
@@ -1347,7 +1356,7 @@ async fn dispatch_command(
             handle_terminal_command(writer, ctx, device_id, msg, term_attachments, conn_tx).await?;
         }
         _ => {
-            warn!("unexpected message from TUI: {:?}", msg);
+            warn!("unexpected message from TUI");
         }
     }
     Ok(ControlFlow::Continue(()))
@@ -1396,7 +1405,12 @@ async fn handle_decision_command(
                     at: chrono::Utc::now(),
                 };
                 write_msg(writer, &reauth_msg).await?;
-                debug!(%id, tool = %tool_name, device_id = %dev.0, "sudo gate: reauth required");
+                debug!(
+                    %id,
+                    tool = %sanitize_for_log(&tool_name),
+                    device_id = %dev.0,
+                    "sudo gate: reauth required"
+                );
                 return Ok(());
             }
 
@@ -1608,7 +1622,12 @@ async fn handle_decision_command(
                         at: chrono::Utc::now(),
                     };
                     write_msg(writer, &reauth_msg).await?;
-                    debug!(%id, tool = %tool_name, device_id = %dev.0, "sudo gate: reauth required (approve_all)");
+                    debug!(
+                        %id,
+                        tool = %sanitize_for_log(&tool_name),
+                        device_id = %dev.0,
+                        "sudo gate: reauth required (approve_all)"
+                    );
                 }
             } else {
                 let ids = {
@@ -1695,7 +1714,7 @@ async fn handle_decision_command(
                 write_msg(writer, &reauth_msg).await?;
                 debug!(
                     %id,
-                    tool = %tool_name,
+                    tool = %sanitize_for_log(&tool_name),
                     device_id = %dev.0,
                     "sudo gate: reauth required (approve_permission)"
                 );
@@ -1745,7 +1764,11 @@ async fn handle_decision_command(
             .await;
         }
         ClientMessage::InstallHooks { project } => {
-            info!(?device_id, project = %project.display(), "install_hooks");
+            info!(
+                ?device_id,
+                project = %sanitize_for_log(&project.to_string_lossy()),
+                "install_hooks"
+            );
 
             // Sudo gate (itr#460): installing hooks writes into the project's
             // `.claude/settings.json` / `.codex/hooks.json` — a filesystem
@@ -1765,7 +1788,11 @@ async fn handle_decision_command(
                     at: chrono::Utc::now(),
                 };
                 write_msg(writer, &reauth_msg).await?;
-                debug!(project = %project.display(), device_id = %dev.0, "sudo gate: reauth required (install_hooks)");
+                debug!(
+                    project = %sanitize_for_log(&project.to_string_lossy()),
+                    device_id = %dev.0,
+                    "sudo gate: reauth required (install_hooks)"
+                );
                 return Ok(());
             }
 
@@ -1779,7 +1806,11 @@ async fn handle_decision_command(
                     }
                 }
                 Err(e) => {
-                    warn!(project = %project.display(), error = %e, "install_hooks failed");
+                    warn!(
+                        project = %sanitize_for_log(&project.to_string_lossy()),
+                        error = %e,
+                        "install_hooks failed"
+                    );
                     ServerMessage::InstallHooksResult {
                         project: project.clone(),
                         status: None,
@@ -1790,7 +1821,7 @@ async fn handle_decision_command(
             write_msg(writer, &result).await?;
         }
         _ => {
-            warn!("unexpected message from TUI: {:?}", msg);
+            warn!("unexpected message from TUI");
         }
     }
     Ok(())
@@ -2266,7 +2297,7 @@ async fn handle_agent_command(
             if let Err(e) = validate_spawn_request(&mut req) {
                 warn!(
                     security_event = "managed_agent_spawn_rejected",
-                    project = %req.project.display(),
+                    project = %sanitize_for_log(&req.project.to_string_lossy()),
                     reason = %e,
                     "rejected managed-agent spawn request"
                 );
@@ -2304,7 +2335,7 @@ async fn handle_agent_command(
                 security_event = "managed_agent_spawn_queued",
                 %decision_id,
                 agent_type = %req.agent_type,
-                project = %req.project.display(),
+                project = %sanitize_for_log(&req.project.to_string_lossy()),
                 "managed-agent spawn awaiting explicit human approval"
             );
 
@@ -2438,7 +2469,7 @@ async fn handle_agent_command(
             }
         }
         _ => {
-            warn!("unexpected message from TUI: {:?}", msg);
+            warn!("unexpected message from TUI");
         }
     }
     Ok(())
@@ -2665,7 +2696,7 @@ async fn handle_query_command(
             .await?;
         }
         _ => {
-            warn!("unexpected message from TUI: {:?}", msg);
+            warn!("unexpected message from TUI");
         }
     }
     Ok(())
@@ -2951,14 +2982,24 @@ async fn handle_terminal_command(
             }
 
             if access.session_known && access.non_authored() {
-                info!(%id, %requester, author = ?access.author, authorization = access.authorization(), "non-authored terminal replay request");
+                info!(
+                    %id,
+                    requester = %sanitize_for_log(&requester),
+                    author = ?access.author.as_deref().map(sanitize_for_log),
+                    authorization = access.authorization(),
+                    "non-authored terminal replay request"
+                );
                 if ctx.notifications_enabled {
                     crate::notify::notify_terminal_replay(&requester, access.author.as_deref(), id);
                 }
             }
 
             if !rate_allowed {
-                warn!(%id, %requester, "terminal replay rate limit exceeded");
+                warn!(
+                    %id,
+                    requester = %sanitize_for_log(&requester),
+                    "terminal replay rate limit exceeded"
+                );
                 write_msg(
                     writer,
                     &ServerMessage::TermError {
@@ -2971,7 +3012,12 @@ async fn handle_terminal_command(
             }
 
             if !access.allowed() {
-                warn!(%id, %requester, authorization = access.authorization(), "terminal replay denied");
+                warn!(
+                    %id,
+                    requester = %sanitize_for_log(&requester),
+                    authorization = access.authorization(),
+                    "terminal replay denied"
+                );
                 write_msg(
                     writer,
                     &ServerMessage::TermError {
@@ -3056,7 +3102,7 @@ async fn handle_terminal_command(
             });
         }
         _ => {
-            warn!("unexpected message from TUI: {:?}", msg);
+            warn!("unexpected message from TUI");
         }
     }
     Ok(())
@@ -3191,7 +3237,10 @@ fn persist_auto_approve_with_observer(
                     Ok(())
                 })
                 .map_err(|e| anyhow::anyhow!("config.json: {e}"))?;
-            info!(tool = tool_name, "added to auto_approve_add in config.json");
+            info!(
+                tool = %sanitize_for_log(tool_name),
+                "added to auto_approve_add in config.json"
+            );
             return Ok(());
         }
 
@@ -3222,7 +3271,10 @@ fn persist_auto_approve_with_observer(
 
         if !arr.iter().any(|v| v.as_str() == Some(tool_name)) {
             arr.push(serde_json::Value::String(tool_name.to_string()));
-            info!(tool = tool_name, "added to legacy auto-approve list");
+            info!(
+                tool = %sanitize_for_log(tool_name),
+                "added to legacy auto-approve list"
+            );
         }
 
         crate::config::write_config_atomic(&path, &serde_json::to_string_pretty(&config)?)?;

@@ -8,6 +8,16 @@ afterEach(() => {
 });
 
 describe("useKeyboard", () => {
+  it("invokes onViewTerminals when 7 is pressed", () => {
+    const onViewTerminals = vi.fn();
+
+    renderHook(() => useKeyboard({ onViewTerminals }));
+
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "7" }));
+
+    expect(onViewTerminals).toHaveBeenCalledOnce();
+  });
+
   it("keeps one listener across action changes and calls the latest action", () => {
     const addListener = vi.spyOn(window, "addEventListener");
     const removeListener = vi.spyOn(window, "removeEventListener");

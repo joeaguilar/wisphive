@@ -5,6 +5,8 @@ use tracing::{info, warn};
 use uuid::Uuid;
 use wisphive_protocol::{Decision, DecisionFilter, DecisionRequest, RichDecision, ServerMessage};
 
+use crate::notify::sanitize_for_log;
+
 /// The decision queue: holds pending tool-call decisions awaiting human response.
 ///
 /// When a hook submits a DecisionRequest, it gets a oneshot receiver to block on.
@@ -81,8 +83,8 @@ impl DecisionQueue {
         {
             warn!(
                 id = %req.id,
-                agent = %req.agent_id,
-                tool = %req.tool_name,
+                agent = %sanitize_for_log(&req.agent_id),
+                tool = %sanitize_for_log(&req.tool_name),
                 "rejected duplicate decision id (itr#370)"
             );
             return None;
@@ -92,9 +94,9 @@ impl DecisionQueue {
 
         info!(
             id = %req.id,
-            agent = %req.agent_id,
-            tool = %req.tool_name,
-            project = %req.project.display(),
+            agent = %sanitize_for_log(&req.agent_id),
+            tool = %sanitize_for_log(&req.tool_name),
+            project = %sanitize_for_log(&req.project.to_string_lossy()),
             "decision queued"
         );
 
@@ -140,7 +142,11 @@ impl DecisionQueue {
         let sender = self.pending_senders.remove(&id)?;
         let request = self.pending_items.remove(position);
         self.claimed_items.insert(id, request.clone());
-        info!(%id, tool = %request.tool_name, "decision claimed for durable resolution");
+        info!(
+            %id,
+            tool = %sanitize_for_log(&request.tool_name),
+            "decision claimed for durable resolution"
+        );
         Some(ClaimedDecision { request, sender })
     }
 

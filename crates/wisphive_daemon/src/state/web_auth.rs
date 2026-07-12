@@ -117,6 +117,63 @@ impl StateDb {
         Ok(result.rows_affected() == 1)
     }
 
+    /// Atomically create the first web password and its initial device
+    /// token binding. Returns `true` iff no password existed before this
+    /// call; a race-loser returns `false` without creating a device.
+    ///
+    /// If the device insert fails, this explicitly rolls back the password
+    /// insert before returning the error, so an operator is never left with
+    /// a password-only onboarding state.
+    pub async fn try_set_initial_web_password_and_device(
+        &self,
+        argon2_hash: &str,
+        id: &str,
+        name: &str,
+        token_hash: &str,
+    ) -> WebAuthResult<bool> {
+        let mut tx = self.pool.begin().await.map_err(WebAuthError::from_sqlx)?;
+        let result: WebAuthResult<bool> = async {
+            let password_insert = sqlx::query(
+                "INSERT OR IGNORE INTO web_password (id, argon2_hash, updated_at) VALUES (1, ?, ?)",
+            )
+            .bind(argon2_hash)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&mut *tx)
+            .await
+            .map_err(WebAuthError::from_sqlx)?;
+
+            if password_insert.rows_affected() == 0 {
+                return Ok(false);
+            }
+
+            sqlx::query(
+                "INSERT INTO web_devices (id, name, token_hash, created_at)
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(name)
+            .bind(token_hash)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&mut *tx)
+            .await
+            .map_err(WebAuthError::from_sqlx)?;
+
+            Ok(true)
+        }
+        .await;
+
+        match result {
+            Ok(created) => {
+                tx.commit().await.map_err(WebAuthError::from_sqlx)?;
+                Ok(created)
+            }
+            Err(error) => {
+                tx.rollback().await.map_err(WebAuthError::from_sqlx)?;
+                Err(error)
+            }
+        }
+    }
+
     /// Fetch the stored web password hash, if one has been set.
     pub async fn get_web_password_hash(&self) -> WebAuthResult<Option<String>> {
         let row: Option<(String,)> =

@@ -68,6 +68,7 @@ tower-http = { version = "0.6", features = ["fs", "cors"] }
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 mime_guess = "2"
 futures-util = "0.3"
+url = "2"
 
 # Error handling
 thiserror = "2"

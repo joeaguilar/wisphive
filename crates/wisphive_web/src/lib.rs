@@ -992,9 +992,9 @@ const AUTH_BODY_LIMIT: usize = 16 * 1024;
 /// exempted from the setup-required gate in
 /// [`crate::security::path_bypasses_setup_gate`]. Protection surfaces are:
 /// (1) the [`LoginThrottle`] per-IP rate-limit, (2) atomic
-/// `try_set_initial_web_password` that returns `false` if a row already
-/// exists — serializing the race between two concurrent first-run attempts,
-/// (3) Origin/Host allowlist enforced upstream in `security.rs`.
+/// `try_set_initial_web_password_and_device` that returns `false` if a row
+/// already exists — serializing the race between two concurrent first-run
+/// attempts, (3) Origin/Host allowlist enforced upstream in `security.rs`.
 ///
 /// Once a password exists the endpoint returns 409 permanently; changing or
 /// resetting goes through the CLI (`wisphive web reset-password`), which
@@ -1095,12 +1095,26 @@ async fn post_auth_set_password(
         }
     };
 
-    match db.try_set_initial_web_password(&phc).await {
+    // Generate the full credential bundle before the transaction so the
+    // password and its first device binding either persist together or not
+    // at all. The raw token is returned only after a successful commit.
+    let id = uuid::Uuid::new_v4().to_string();
+    let name = body.device_name.clone().unwrap_or_else(|| {
+        let short = id.get(..8).unwrap_or("unknown");
+        format!("device-{short}")
+    });
+    let token = auth::generate_device_token();
+
+    match db
+        .try_set_initial_web_password_and_device(&phc, &id, &name, &token.hash_hex)
+        .await
+    {
         Ok(true) => {
             // itr#256: latch the process-local cache immediately so the
             // very next request (from this client or any other) skips the
             // SQLite round-trip `SecurityConfig::password_set` would
-            // otherwise still need on a cache miss.
+            // otherwise still need on a cache miss. The transactional
+            // password/device write has committed at this point.
             security.mark_password_set();
         }
         Ok(false) => {
@@ -1125,7 +1139,7 @@ async fn post_auth_set_password(
                 .into_response();
         }
         Err(e) => {
-            tracing::warn!(error = %e, "try_set_initial_web_password failed");
+            tracing::warn!(error = %e, "initial password/device provisioning failed");
             guard.record_failure().await;
             let _ = db
                 .append_web_audit(
@@ -1141,27 +1155,6 @@ async fn post_auth_set_password(
             )
                 .into_response();
         }
-    }
-
-    // Atomically mint the first device token so the onboarding UI lands
-    // in the authenticated shell without a second round-trip. Same shape
-    // as LoginResponse so the frontend can reuse the login handler.
-    let id = uuid::Uuid::new_v4().to_string();
-    let name = body.device_name.clone().unwrap_or_else(|| {
-        let short = id.get(..8).unwrap_or("unknown");
-        format!("device-{short}")
-    });
-    let token = auth::generate_device_token();
-    if let Err(e) = db.insert_web_device(&id, &name, &token.hash_hex).await {
-        tracing::warn!(error = %e, "set-password: failed to persist device token");
-        guard.record_failure().await;
-        // The password IS set at this point — leave it; the operator can
-        // just hit /api/auth/login with the new password to recover.
-        return (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "password stored but could not record device; retry login",
-        )
-            .into_response();
     }
 
     let _ = db

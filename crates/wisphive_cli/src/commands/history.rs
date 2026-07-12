@@ -237,9 +237,27 @@ fn extract_detail(entry: &wisphive_protocol::HistoryEntry) -> String {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() > max {
-        format!("{}...", &s[..max.saturating_sub(3)])
+    if s.chars().count() > max {
+        format!(
+            "{}...",
+            s.chars().take(max.saturating_sub(3)).collect::<String>()
+        )
     } else {
         s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate;
+
+    #[test]
+    fn truncate_handles_multibyte_utf8_at_byte_boundary() {
+        let input = format!("{}界😀{}", "a".repeat(40), "b".repeat(7));
+
+        assert_eq!(
+            truncate(&input, 48),
+            format!("{}界😀bbb...", "a".repeat(40))
+        );
     }
 }

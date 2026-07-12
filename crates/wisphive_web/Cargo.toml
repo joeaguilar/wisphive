@@ -41,9 +41,8 @@ subtle.workspace = true
 thiserror.workspace = true
 # itr#310: url is used by `auth_profile::rp_id_for_origin` to decompose
 # the request `Origin` header into a `Host` variant (Domain / Ipv4 / Ipv6)
-# before mapping to an RP ID. We pin to the same version `webauthn-rs`
-# already pulls in transitively so the dep graph stays single-versioned.
-url = "2"
+# before mapping to an RP ID.
+url.workspace = true
 # itr#310: sqlx is used by the profile-switch detection stub to probe
 # `web_passkeys.rp_id` and tolerate the "no such column" error until
 # itr#311 adds the column. We pin to the workspace's existing sqlx

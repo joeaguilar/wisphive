@@ -621,10 +621,7 @@ fn main() -> anyhow::Result<()> {
                             let profile =
                                 match resolve_auth_profile(auth_profile, auth_rp_id.as_deref()) {
                                     Ok(p) => p,
-                                    Err(e) => {
-                                        eprintln!("{e}");
-                                        return Ok(());
-                                    }
+                                    Err(error) => exit_auth_profile_error(error),
                                 };
                             // Dev mode stays http (Vite serves the UI over
                             // http and dragging the user through self-signed
@@ -727,12 +724,48 @@ fn main() -> anyhow::Result<()> {
 /// `--tls-key` flags, Enterprise selection always fails with a clear
 /// error pointing operators at the missing prerequisite.
 ///
-/// Returns the error message ready to print to stderr — callers just need
-/// to exit cleanly without running the daemon.
+/// Validation failures identify incorrect CLI input and exit with the usual
+/// usage-error status; internal construction failures exit as runtime errors.
+#[derive(Debug)]
+enum ResolveAuthProfileError {
+    Validation(wisphive_web::EnterpriseValidationError),
+    InternalRpOrigin(String),
+}
+
+impl std::fmt::Display for ResolveAuthProfileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Validation(error) => error.fmt(f),
+            Self::InternalRpOrigin(error) => write!(
+                f,
+                "internal: failed to derive rp_origin from --auth-rp-id: {error}"
+            ),
+        }
+    }
+}
+
+impl ResolveAuthProfileError {
+    fn exit_code(&self) -> i32 {
+        match self {
+            Self::Validation(_) => 2,
+            Self::InternalRpOrigin(_) => 1,
+        }
+    }
+}
+
+/// Print a profile-resolution error and terminate before any daemon state is
+/// created. Invalid operator input gets Clap's conventional status 2; an
+/// impossible derived-origin failure remains a status-1 runtime error.
+fn exit_auth_profile_error(error: ResolveAuthProfileError) -> ! {
+    let exit_code = error.exit_code();
+    eprintln!("{error}");
+    std::process::exit(exit_code);
+}
+
 fn resolve_auth_profile(
     arg: AuthProfileArg,
     auth_rp_id: Option<&str>,
-) -> Result<wisphive_web::AuthProfile, String> {
+) -> Result<wisphive_web::AuthProfile, ResolveAuthProfileError> {
     match arg {
         AuthProfileArg::LocalLan => {
             if auth_rp_id.is_some() {
@@ -759,15 +792,13 @@ fn resolve_auth_profile(
                 tls_cert_provided,
                 tls_key_provided,
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(ResolveAuthProfileError::Validation)?;
             // RP origin is derived from the RP ID + https scheme — a
             // conservative default that matches the "user brings a real
             // domain" Enterprise contract. #270 will refine this once
             // the cert's primary SAN is known.
-            let rp_origin = wisphive_web::Url::parse(&format!("https://{}", rp_id.as_str()))
-                .map_err(|e| {
-                    format!("internal: failed to derive rp_origin from --auth-rp-id: {e}")
-                })?;
+            let rp_origin = wisphive_web::Url::parse(&format!("https://{rp_id}"))
+                .map_err(|error| ResolveAuthProfileError::InternalRpOrigin(error.to_string()))?;
             Ok(wisphive_web::AuthProfile::Enterprise { rp_id, rp_origin })
         }
     }
@@ -833,10 +864,7 @@ async fn serve_web(
     // fails before we start the listener.
     let profile = match resolve_auth_profile(auth_profile, auth_rp_id.as_deref()) {
         Ok(p) => p,
-        Err(e) => {
-            eprintln!("{e}");
-            return Ok(());
-        }
+        Err(error) => exit_auth_profile_error(error),
     };
 
     print_startup_banner(&home, host_octets, port, dev);
@@ -1068,5 +1096,22 @@ mod cli_tests {
         assert!(
             Cli::try_parse_from(["wisphive", "term", "close", "session-id", "--kill"]).is_err()
         );
+    }
+
+    #[test]
+    fn resolve_auth_profile_preserves_error_class_and_exit_status() {
+        let validation =
+            resolve_auth_profile(AuthProfileArg::Enterprise, Some("wisphive.example.com"))
+                .expect_err("enterprise without TLS flags must reject operator input");
+        assert_eq!(validation.exit_code(), 2);
+        assert!(matches!(
+            validation,
+            ResolveAuthProfileError::Validation(
+                wisphive_web::EnterpriseValidationError::MissingTlsFlags
+            )
+        ));
+
+        let internal = ResolveAuthProfileError::InternalRpOrigin("test parse failure".to_string());
+        assert_eq!(internal.exit_code(), 1);
     }
 }

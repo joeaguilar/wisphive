@@ -10,13 +10,7 @@ use wisphive_protocol::DecisionRequest;
 /// The notification body includes all tool input details so the user
 /// has full context when they switch to the TUI to respond.
 pub fn notify_decision(req: &DecisionRequest) {
-    let project_name = req
-        .project
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "unknown".into());
-
-    let title = match req.hook_event_name {
+    let title = sanitize_for_log(&match req.hook_event_name {
         wisphive_protocol::HookEventType::PermissionRequest => {
             format!("Wisphive: {} permission request", req.tool_name)
         }
@@ -29,15 +23,8 @@ pub fn notify_decision(req: &DecisionRequest) {
         wisphive_protocol::HookEventType::TeammateIdle => "Wisphive: teammate idle".into(),
         wisphive_protocol::HookEventType::TaskCompleted => "Wisphive: task completed".into(),
         _ => format!("Wisphive: {} needs approval", req.tool_name),
-    };
-    // Notifications render on the lock screen — never show a live secret
-    // there (itr#89).
-    let body = format!(
-        "{}\n\nProject: {} ({})",
-        wisphive_protocol::redact::redact_text(&tool_input_summary(req)),
-        project_name,
-        req.agent_id
-    );
+    });
+    let body = decision_notification_body(req);
 
     tokio::spawn(async move {
         if let Err(e) = send_passive_notification(&title, &body).await {
@@ -46,6 +33,40 @@ pub fn notify_decision(req: &DecisionRequest) {
             info!("sent passive notification: {title}");
         }
     });
+}
+
+/// Remove control characters before untrusted text reaches a human-readable
+/// sink such as tracing or a passive notification.
+///
+/// Control bytes can forge log lines or execute terminal escape sequences. A
+/// space preserves word boundaries without letting C0, DEL, or C1 characters
+/// affect the receiving renderer.
+pub(crate) fn sanitize_for_log(text: &str) -> String {
+    text.chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect()
+}
+
+/// Build the decision notification body from redacted, display-safe fields.
+///
+/// Notifications render on the lock screen — never show a live secret there
+/// (itr#89), and never pass agent-provided control characters to the platform
+/// notification renderer (itr#97).
+fn decision_notification_body(req: &DecisionRequest) -> String {
+    let project_name = req
+        .project
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".into());
+
+    format!(
+        "{}\n\nProject: {} ({})",
+        sanitize_for_log(&wisphive_protocol::redact::redact_text(
+            &tool_input_summary(req)
+        )),
+        sanitize_for_log(&project_name),
+        sanitize_for_log(&req.agent_id)
+    )
 }
 
 /// Send a passive notification when a client requests replay for a terminal
@@ -59,8 +80,11 @@ pub fn notify_decision(req: &DecisionRequest) {
 pub fn notify_terminal_replay(requester: &str, author: Option<&str>, session_id: uuid::Uuid) {
     let title = "Wisphive: terminal replay".to_string();
     let body = format!(
-        "{requester} requested replay for terminal session {session_id}\nCreated by: {}",
-        author.unwrap_or("unknown (pre-audit session)")
+        "{} requested replay for terminal session {session_id}\nCreated by: {}",
+        sanitize_for_log(requester),
+        author
+            .map(sanitize_for_log)
+            .unwrap_or_else(|| "unknown (pre-audit session)".into())
     );
 
     tokio::spawn(async move {
@@ -257,6 +281,51 @@ fn build_osascript_command(body: &str, title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_for_log_removes_ansi_and_embedded_newlines() {
+        let payload = "before\x1b[2Jclear\nnext\r\u{009b}after";
+        let sanitized = sanitize_for_log(payload);
+
+        assert_eq!(sanitized, "before [2Jclear next  after");
+        assert!(
+            !sanitized.chars().any(char::is_control),
+            "sanitized value retained a control character: {sanitized:?}"
+        );
+    }
+
+    #[test]
+    fn decision_notification_sanitizes_untrusted_field_controls() {
+        let payload = "evil\x1b[2J\nnext\r\u{009b}";
+        let req = DecisionRequest {
+            id: uuid::Uuid::new_v4(),
+            agent_id: format!("cc-{payload}"),
+            agent_type: wisphive_protocol::AgentType::Codex,
+            project: std::path::PathBuf::from(format!("/tmp/{payload}")),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({ "command": payload }),
+            timestamp: chrono::Utc::now(),
+            hook_event_name: Default::default(),
+            tool_use_id: None,
+            permission_suggestions: None,
+            event_data: None,
+            terminal_session_id: None,
+        };
+
+        let body = decision_notification_body(&req);
+        assert_eq!(
+            body.lines().count(),
+            3,
+            "agent newlines forged notification lines"
+        );
+        assert!(
+            body.split('\n')
+                .all(|line| !line.chars().any(char::is_control)),
+            "notification field retained a control character: {body:?}"
+        );
+        assert!(!body.contains('\x1b'));
+        assert!(!body.contains('\r'));
+    }
 
     /// The exploit payload from itr#85: a raw newline followed by AppleScript
     /// statements that would run a shell command if the literal weren't sealed.

@@ -324,6 +324,7 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
               <div className="help-row"><kbd>4</kbd> Projects</div>
               <div className="help-row"><kbd>5</kbd> Agents</div>
               <div className="help-row"><kbd>6</kbd> Config</div>
+              <div className="help-row"><kbd>7</kbd> Terminals</div>
               <div className="help-row"><kbd>?</kbd> This help</div>
             </div>
           </div>
