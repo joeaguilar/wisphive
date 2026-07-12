@@ -292,6 +292,83 @@ pub async fn reimport_all(
     Ok(count)
 }
 
+/// Re-import rotated event segments left behind by an interrupted prior run.
+///
+/// The startup caller runs this before log retention. Normal rotated segments
+/// are usually already in `decision_log`, but a crash between rotation and its
+/// re-import leaves them orphaned. Failed segments are explicitly retried; a
+/// successful retry removes the `.failed.jsonl` recovery marker. Re-importing
+/// is idempotent through `ingest_line`'s database-level deduplication.
+///
+/// If a normal segment cannot be imported, rename it to `.failed.jsonl` before
+/// returning so retention cannot discard its only copy. A failed segment that
+/// still cannot be imported is already protected from retention and remains in
+/// place for the next startup attempt.
+pub async fn reimport_rotated_segments(
+    log_dir: &std::path::Path,
+    state_db: &StateDb,
+) -> anyhow::Result<u64> {
+    let mut segments = Vec::new();
+    for entry in std::fs::read_dir(log_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_failed = name.starts_with("events-") && name.ends_with(".failed.jsonl");
+        let is_normal = name.starts_with("events-") && name.ends_with(".jsonl") && !is_failed;
+        if is_normal || is_failed {
+            segments.push((entry.path(), is_failed));
+        }
+    }
+    segments.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+    let mut imported = 0;
+    for (segment, was_failed) in segments {
+        match reimport_all(&segment, state_db).await {
+            Ok(count) => {
+                imported += count;
+                if was_failed {
+                    if let Err(e) = tokio::fs::remove_file(&segment).await {
+                        warn!(
+                            segment = %segment.display(),
+                            "re-ingested failed events segment but could not reap it: {e}"
+                        );
+                    } else {
+                        info!(segment = %segment.display(), count, "re-ingested and reaped failed events segment");
+                    }
+                } else if count > 0 {
+                    info!(segment = %segment.display(), count, "re-imported rotated events segment");
+                }
+            }
+            Err(e) if was_failed => {
+                warn!(
+                    segment = %segment.display(),
+                    "failed events segment remains for a future startup re-import: {e}"
+                );
+            }
+            Err(e) => {
+                let failed = segment.with_extension("failed.jsonl");
+                tokio::fs::rename(&segment, &failed).await.map_err(|rename_err| {
+                    anyhow::anyhow!(
+                        "failed to re-import {} ({e}) and could not preserve it as {}: {rename_err}",
+                        segment.display(),
+                        failed.display()
+                    )
+                })?;
+                warn!(
+                    segment = %failed.display(),
+                    "failed to re-import rotated events segment; retained for a future startup re-import: {e}"
+                );
+            }
+        }
+    }
+
+    Ok(imported)
+}
+
 /// Parse a single JSONL line and insert into decision_log.
 ///
 /// Handles the hook's non-human decision records (itr#397): `auto_approved`
@@ -619,6 +696,39 @@ mod tests {
             1,
             "reimport should be idempotent for events without tool_use_id"
         );
+    }
+
+    #[tokio::test]
+    async fn reimport_rotated_segments_dedups_and_reaps_recovered_failed_segment() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let log_dir = tmp.path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+
+        let duplicate = auto_approved_event("Bash", "cc-1", Some("segment-1"));
+        let recovered = auto_approved_event("Edit", "cc-1", Some("segment-2"));
+        std::fs::write(
+            log_dir.join("events-20260101-000000.jsonl"),
+            format!("{duplicate}\n"),
+        )
+        .unwrap();
+        let failed = log_dir.join("events-20260101-000001.failed.jsonl");
+        std::fs::write(&failed, format!("{duplicate}\n{recovered}\n")).unwrap();
+
+        let count = reimport_rotated_segments(&log_dir, &db).await.unwrap();
+        assert_eq!(count, 2, "only new decision_log rows are counted");
+        assert_eq!(db.query_history(None, 10).await.unwrap().len(), 2);
+        assert!(
+            !failed.exists(),
+            "a successfully re-ingested failed segment is reaped"
+        );
+
+        assert_eq!(
+            reimport_rotated_segments(&log_dir, &db).await.unwrap(),
+            0,
+            "a subsequent startup must not double-insert the normal segment"
+        );
+        assert_eq!(db.query_history(None, 10).await.unwrap().len(), 2);
     }
 
     // ════════════════════════════════════════════════════════════

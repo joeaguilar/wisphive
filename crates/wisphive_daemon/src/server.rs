@@ -192,6 +192,16 @@ impl Server {
         let db_path = config.db_path.to_string_lossy().to_string();
         let state_db = Arc::new(StateDb::open(&db_path).await?);
 
+        // Recover rotated event segments before the CLI startup pruner runs.
+        // A process crash after rotation can leave a normal segment unimported;
+        // a prior failed import leaves a `.failed.jsonl` recovery segment. Both
+        // are idempotently ingested here before either can be age-reaped.
+        let recovered =
+            crate::event_ingest::reimport_rotated_segments(&config.log_dir, &state_db).await?;
+        if recovered > 0 {
+            info!(recovered, "startup re-imported rotated event segments");
+        }
+
         // Crash recovery (itr#299/#94): hook rows already fail-open-approved
         // when the old socket died; synthetic SpawnAgent rows never launched
         // and therefore fail closed. Record each truthful outcome and clear the
@@ -3986,6 +3996,49 @@ mod tests {
         assert_eq!(
             history[0].decided_by.as_deref(),
             Some("daemon_restart:failopen")
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_reimports_rotated_event_segments_before_log_pruning() {
+        use crate::DaemonConfig;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let config = DaemonConfig::new(home.clone());
+        config.ensure_dirs().unwrap();
+
+        let duplicate = r#"{"event":"auto_approved","agent_id":"cc-1","tool_name":"Bash","tool_input":{},"timestamp":"2024-01-01T00:00:00Z","tool_use_id":"rotated-1"}"#;
+        let recovered = r#"{"event":"auto_approved","agent_id":"cc-1","tool_name":"Edit","tool_input":{},"timestamp":"2024-01-01T00:00:00Z","tool_use_id":"rotated-2"}"#;
+        std::fs::write(
+            config.log_dir.join("events-20260101-000000.jsonl"),
+            format!("{duplicate}\n"),
+        )
+        .unwrap();
+        let failed = config.log_dir.join("events-20260101-000001.failed.jsonl");
+        std::fs::write(&failed, format!("{duplicate}\n{recovered}\n")).unwrap();
+
+        let server = super::Server::new(config).await.unwrap();
+        assert_eq!(
+            server.state_db.query_history(None, 10).await.unwrap().len(),
+            2
+        );
+        assert!(
+            !failed.exists(),
+            "successful startup recovery reaps the failed segment before pruning"
+        );
+
+        drop(server);
+        let restarted = super::Server::new(DaemonConfig::new(home)).await.unwrap();
+        assert_eq!(
+            restarted
+                .state_db
+                .query_history(None, 10)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "the next startup must dedupe the retained normal segment"
         );
     }
 

@@ -35,14 +35,6 @@ pub async fn start(web: Option<WebOptions>) -> Result<()> {
     // follow-up issue that threads live logs into the embedded web server.
     let log_store = LogStore::new(4096);
     let log_guards = logging::init(&config.log_dir, log_store.clone(), Level::WARN)?;
-    if let Err(e) = logging::prune_old_files(&config.log_dir, config.log_retention_days) {
-        // The subscriber is already installed, so this `warn!` reaches
-        // the file/store sinks; surface it instead of swallowing because
-        // anything other than NotFound (which the pruner already absorbs)
-        // means the operator has a broken `~/.wisphive/logs` they should
-        // see — e.g. EACCES on a hand-edited dir.
-        warn!(error = %e, "log pruning failed at startup");
-    }
 
     // Check for existing daemon
     shutdown::check_existing_daemon(&config.pid_path)?;
@@ -51,6 +43,23 @@ pub async fn start(web: Option<WebOptions>) -> Result<()> {
     let pid_guard = shutdown::write_pid_file(&config.pid_path)?;
 
     info!("starting wisphive daemon");
+
+    // Constructing the server synchronously re-imports leftover rotated event
+    // segments. This must precede log retention so an old segment is never
+    // pruned before its decision_log rows are recovered.
+    let log_dir = config.log_dir.clone();
+    let log_retention_days = config.log_retention_days;
+    let socket_path = config.socket_path.clone();
+    let db_path = config.db_path.clone();
+    let server = Server::new(config).await?;
+    if let Err(e) = logging::prune_old_files(&log_dir, log_retention_days) {
+        // The subscriber is already installed, so this `warn!` reaches
+        // the file/store sinks; surface it instead of swallowing because
+        // anything other than NotFound (which the pruner already absorbs)
+        // means the operator has a broken `~/.wisphive/logs` they should
+        // see — e.g. EACCES on a hand-edited dir.
+        warn!(error = %e, "log pruning failed at startup");
+    }
 
     let (shutdown_tx, shutdown_rx) = shutdown::shutdown_channel();
 
@@ -64,7 +73,7 @@ pub async fn start(web: Option<WebOptions>) -> Result<()> {
     // connect on each upgrade) handles that gracefully since each WebSocket
     // client opens a fresh connection per upgrade.
     let (web_handle, browser_handle) = if let Some(opts) = web {
-        let socket_path = config.socket_path.clone();
+        let socket_path = socket_path.clone();
         let addr = std::net::SocketAddr::from((opts.host, opts.port));
         info!(%addr, dev = opts.dev, "starting embedded web server");
         if opts.host == [0, 0, 0, 0] {
@@ -78,7 +87,7 @@ pub async fn start(web: Option<WebOptions>) -> Result<()> {
         let browser = if opts.no_open {
             None
         } else {
-            let db_path = config.db_path.clone();
+            let db_path = db_path.clone();
             Some(tokio::spawn(crate::maybe_open_browser(
                 db_path, opts.host, opts.port, opts.dev, ready_rx,
             )))
@@ -110,7 +119,6 @@ pub async fn start(web: Option<WebOptions>) -> Result<()> {
     };
 
     // Run the server (blocks until shutdown)
-    let server = Server::new(config).await?;
     server.run(shutdown_rx).await?;
 
     // Stop the web task if it's still running.
