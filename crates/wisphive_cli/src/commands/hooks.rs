@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use wisphive_daemon::config::{ModeFileState, read_mode_file, write_mode_file_atomic};
 use wisphive_daemon::hook_install;
 use wisphive_daemon::project_audit::{AgentHookAudit, HookMode, audit_project};
 
@@ -24,9 +25,9 @@ pub fn emergency_off() -> Result<()> {
 
 /// Set the mode file to the given value.
 pub fn set_mode(mode: &str) -> Result<()> {
-    let home = wisphive_home();
-    std::fs::create_dir_all(&home)?;
-    std::fs::write(mode_path(), mode)?;
+    let path = mode_path();
+    write_mode_file_atomic(&path, mode)
+        .with_context(|| format!("securely writing {}", path.display()))?;
     eprintln!("Wisphive hooks mode: {mode}");
     Ok(())
 }
@@ -75,8 +76,12 @@ pub fn uninstall(project: Option<PathBuf>, _all: bool) -> Result<()> {
 /// Show current hook status.
 pub fn status() -> Result<()> {
     // Mode
-    let mode = std::fs::read_to_string(mode_path()).unwrap_or_else(|_| "off (not set)".into());
-    eprintln!("Mode: {}", mode.trim());
+    let path = mode_path();
+    match read_mode_file(&path) {
+        Ok(ModeFileState::Active) => eprintln!("Mode: active"),
+        Ok(ModeFileState::Off) => eprintln!("Mode: off"),
+        Err(error) => eprintln!("Mode: unsafe or unavailable ({error})"),
+    }
 
     // Daemon
     let pid_path = wisphive_home().join("wisphive.pid");

@@ -63,11 +63,11 @@
 ### Wave 6
 
 - **#95 — Make mode-file reads fail secure and verify permissions**
-  - Files: `crates/wisphive_hook/src/main.rs`, `crates/wisphive_cli/src/commands/hooks.rs`, `crates/wisphive_daemon/src/config.rs`, `crates/wisphive_daemon/src/server.rs`, `AGENTS.md`
+  - Files: `crates/wisphive_hook/src/main.rs`, `crates/wisphive_hook/Cargo.toml`, `crates/wisphive_hook/tests/mode_failclosed.rs`, `crates/wisphive_cli/src/commands/hooks.rs`, `crates/wisphive_daemon/src/config.rs`, `crates/wisphive_daemon/src/server.rs`, `crates/wisphive_daemon/tests/server_integration.rs`, `AGENTS.md`
 - **#205 — Add Copy controls to History details**
-  - Files: `crates/wisphive_web/frontend/src/components/DetailView.tsx`, `crates/wisphive_web/frontend/src/components/ToolContent.tsx`, `crates/wisphive_web/frontend/src/components/CopyButton.tsx`
-- **#303 — Honor the terminal-close kill flag**
-  - Files: `crates/wisphive_daemon/src/terminal.rs`, `crates/wisphive_protocol/src/wire.rs`, `crates/wisphive_cli/src/commands/term.rs`
+  - Files: `crates/wisphive_web/frontend/src/components/DetailView.tsx`, `crates/wisphive_web/frontend/src/components/ToolContent.tsx`, `crates/wisphive_web/frontend/src/components/CopyButton.tsx`, `crates/wisphive_web/frontend/src/components/HistoryEntryItem.tsx`, `crates/wisphive_web/frontend/src/components/HistoryEntryItem.test.tsx`
+- **#303 — Remove the unsupported terminal-close kill distinction**
+  - Files: `crates/wisphive_daemon/src/terminal.rs`, `crates/wisphive_daemon/src/server.rs`, `crates/wisphive_protocol/src/wire.rs`, `crates/wisphive_cli/src/commands/term.rs`, `crates/wisphive_cli/src/commands/tui.rs`, `crates/wisphive_cli/src/main.rs`, `crates/wisphive_web/frontend/src/hooks/useWisphive.ts`, `crates/wisphive_web/frontend/src/types/protocol.ts`, `docs/ROADMAP.md`
 
 ### Wave 7
 
@@ -195,10 +195,11 @@
 
 ## File conflicts
 
-- `crates/wisphive_daemon/src/server.rs`: #94 → #294 → #86 → #99 → #95 → #407 → #97 → #101 → #102 → #336 → #409 → #410.
-- `crates/wisphive_web/frontend/src/hooks/useWisphive.ts`: #105 → #295 → #296 → #114 → #375 → #376 → #118.
+- `crates/wisphive_daemon/src/server.rs`: #94 → #294 → #86 → #99 → #95 → #303 → #407 → #97 → #101 → #102 → #336 → #409 → #410.
+- `crates/wisphive_web/frontend/src/hooks/useWisphive.ts`: #105 → #295 → #296 → #114 → #303 → #375 → #376 → #118.
+- `crates/wisphive_web/frontend/src/types/protocol.ts`: #105 → #303.
 - `crates/wisphive_web/src/lib.rs`: #407 → #504 → #495 → #408 → #277 → #281.
-- `crates/wisphive_cli/src/main.rs`: #306 → #348 → #371 → #277 → #318.
+- `crates/wisphive_cli/src/main.rs`: #303 → #306 → #348 → #371 → #277 → #318.
 - `crates/wisphive_hook/src/main.rs`: #86 → #95 → #102.
 - `crates/wisphive_cli/src/commands/agent.rs`: #94 → #294 → #412 → #470.
 - `crates/wisphive_cli/src/commands/hooks.rs`: #411 → #95 → #307.
@@ -209,6 +210,7 @@
 - `crates/wisphive_daemon/src/process_registry.rs`: #94 → #472.
 - `crates/wisphive_daemon/src/terminal.rs`: #303 → #365.
 - `crates/wisphive_protocol/src/wire.rs`: #303 → #367.
+- `crates/wisphive_cli/src/commands/tui.rs`: #303 → #367.
 - `crates/wisphive_tui/src/input.rs`: #374 → #377.
 - `crates/wisphive_web/frontend/src/App.tsx` and `useKeyboard.ts`: #111 → #378.
 - `crates/wisphive_web/frontend/src/components/Terminals.tsx`: #375 → #488.
@@ -227,7 +229,7 @@ No wave contains a shared owned file. Co-located tests inherit the same ownershi
 - **#114 / #376 are one side-effect seam:** #114 performs the extraction first; #376 must harden the extracted notification path rather than recreating reducer-side behavior.
 - **#294 / #470 share response selection:** #294 fixes startup snapshots; #470 later proves unrelated live broadcasts cannot satisfy a command reply.
 - **#306 / #371 share host parsing:** #306 establishes non-zero error propagation; #371 replaces permissive parsing without weakening that behavior.
-- **#303 preserves the public wire shape:** honor `kill=false` rather than deleting the protocol flag unless implementation evidence makes that impossible.
+- **#303 used its documented safe alternative:** nested review proved a truthful force/graceful distinction unsafe with the current PTY ownership model, so the unsupported flag was removed end-to-end while legacy payloads remain decodable.
 - **#472 contains a policy branch:** prefer the existing CLI-safe refusal semantics so daemon and CLI behavior align; stop for PO input if the current architecture makes the alternative materially safer.
 - **Stale `state.rs` ownership normalized:** #91 maps to `state/decisions.rs`, tests, and migration code; #137 maps to `state/retention.rs`; #281 maps to web-auth state and HTTP tests. This removes a false conflict introduced by the pre-split tracker paths.
 - **Directory ownership normalized:** #248 owns only `.github/workflows/ci.yml`, not the whole workflow directory.
@@ -254,6 +256,14 @@ No wave contains a shared owned file. Co-located tests inherit the same ownershi
 - **Wave 5 / #96 hard quarantine:** exact same-UID provenance cannot be authenticated by owner/mode checks or a file-backed key readable by that UID. The worker made no edits. PO directed that #96 remain open for Fable review and be removed from this blitz; tracker tags `needs-fable-review` and `blitz-skipped` plus note #181 preserve the full required design expansion. Outcome: `failed-skipped`.
 - **Wave 5 sandbox gate retry:** #114's first Rust run hit the existing fake-daemon Unix-socket sandbox restriction; its authorized rerun and the orchestrator gate passed without a product-code intervention.
 - **Wave 5 gate:** orchestrator reran both repository gates after workers settled: `GATR exit=0 dur=24.6s errors=0 warnings=0 adapter=generic tag=blitz-wave5-final-rust` and `GATR exit=0 dur=5.8s errors=0 warnings=0 adapter=generic tag=blitz-wave5-final-frontend` (14 files, 124 tests).
+- **Pre-Wave 6 test ownership:** #205's actual History render path is `HistoryEntryItem` → `ToolContent`, not only the stale tracker file list. Added `HistoryEntryItem.tsx` and a focused colocated test path; no Wave 6 conflict was introduced.
+- **Wave 6 / #95 ownership grant:** added `crates/wisphive_hook/Cargo.toml` so descriptor-level `O_NOFOLLOW` and effective-UID checks can use the workspace `libc` dependency; no neighboring worker owns the manifest.
+- **Wave 6 / #95 integration-fixture grant:** daemon integration fixtures must now create an active mode file before sending hook requests through the new daemon-side gate. Added `crates/wisphive_daemon/tests/server_integration.rs`; no other blitz issue owns that path.
+- **Wave 6 adversarial review repair:** reopened all three stories before commit. #95's pre-stdin failure path emitted a hard-coded PreToolUse response for other hook events; it must fail closed generically with exit 2. #205's initial regression proved only two named blocks rather than the invariant that every History code block has an exact-copy control. #303 marked undelivered signals as killed, exposed a waiter/raw-PID reuse race, and lacked the required manager-level lifecycle test. Original owners received narrow repair tasks and must rerun their full gates.
+- **Wave 6 / #95 process-test grant:** added `crates/wisphive_hook/tests/mode_failclosed.rs` to prove a missing-mode PermissionRequest exits 2 with stderr and no mismatched PreToolUse stdout; no neighboring worker owns the path.
+- **Wave 6 / #303 safe-alternative pivot:** nested signal-race review demonstrated that raw-PID SIGKILL cannot be made truthful and reuse-safe with the current `portable-pty` ownership model, including zombie and inherited `SIGCHLD=SIG_IGN` cases. Directed the story to its explicit alternate acceptance: remove the unsupported kill distinction and expose one honest close behavior. Added the CLI parser plus all Rust/TypeScript TermClose senders and protocol types; every later owner was inactive, and #95 had already settled its shared server edits.
+- **Wave 6 / #303 documentation re-review:** final review found the blitz warning and roadmap still described terminal-close work as pending. Updated both to the accepted single-close outcome and added `docs/ROADMAP.md` to ownership.
+- **Wave 6 gate:** after all adversarial repairs and documentation reconciliation, the orchestrator reran both repository gates: `GATR exit=0 dur=25.8s errors=0 warnings=0 adapter=generic tag=blitz-wave6-repair-final-rust` and `GATR exit=0 dur=6.7s errors=0 warnings=0 adapter=generic tag=blitz-wave6-repair-final-frontend` (15 files, 125 tests). Final re-review: PASS.
 - **Wave 4 / #111 lint repair:** its first frontend pass caught a React hooks rule violation from assigning the actions ref during render. The worker moved the ref refresh into `useLayoutEffect`; both required gates then passed.
 - **Wave 4 gate:** orchestrator reran both repository gates after all workers settled: `GATR exit=0 dur=23.5s errors=0 warnings=0 adapter=generic tag=blitz-wave4-final-rust` and `GATR exit=0 dur=5.8s errors=0 warnings=0 adapter=generic tag=blitz-wave4-final-frontend` (14 files, 122 tests).
 
@@ -284,6 +294,11 @@ No wave contains a shared owned file. Co-located tests inherit the same ownershi
   - **#114 closed:** title updates run in an effect, one validated decision frame creates one notification outside state updaters, permission prompting waits for a real click, and redundant socket error closing is removed. StrictMode/gesture tests pass.
   - **#503 closed:** readable-but-unparseable TLS cert/key material remains fail-closed with actionable path-specific remediation; tests prove no regeneration and no file mutation.
   - **#96 failed-skipped:** no edits; remains open with Fable-review tags and the PO-approved design diagnostic.
+  - **Commit:** `9886856` — `fix(web): isolate notifications and TLS corruption`.
+- **Wave 6 — 2026-07-11T23:27Z–2026-07-12T00:10Z — 3 workers + adversarial repair reviews.**
+  - **#95 closed:** mode reads now use descriptor-based no-follow validation of the effective owner, exact `0700` state directory, exact `0600` regular file, and bounded contents; writes are atomic and owner-only; the daemon independently requires secure active mode before hook decisions or managed spawns. Missing/unsafe pre-parse state emits stderr and exits 2 without fabricating an event response. Real-binary PermissionRequest and daemon-boundary regressions pass.
+  - **#205 closed:** the existing shared History renderer already supplied Copy controls; focused runtime coverage now proves every rendered History code block has a colocated control and copies exact Command/Tool Result content, including stdout, stderr, and raw output.
+  - **#303 closed:** after adversarial review rejected an unsafe raw-PID force/graceful implementation, the accepted alternate removed the unsupported `kill` distinction across Rust/TypeScript protocol, CLI, TUI, web, and daemon. Legacy payloads with the retired field still decode, and a real PTY manager test proves the single close behavior.
   - **Commit:** pending immediately after this log update.
 
 ## Quarantine triage notes

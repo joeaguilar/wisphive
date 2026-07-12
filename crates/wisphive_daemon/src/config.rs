@@ -1,5 +1,27 @@
 use std::path::{Path, PathBuf};
 
+/// Parsed value of the security-sensitive `~/.wisphive/mode` file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeFileState {
+    Active,
+    Off,
+}
+
+impl ModeFileState {
+    fn parse(value: &str) -> std::io::Result<Self> {
+        match value.trim() {
+            "active" => Ok(Self::Active),
+            "off" => Ok(Self::Off),
+            value => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("mode file contains invalid value {value:?}"),
+            )),
+        }
+    }
+}
+
+const MODE_FILE_MAX_BYTES: u64 = 64;
+
 /// Daemon configuration — paths and tuning parameters.
 pub struct DaemonConfig {
     /// Root directory for all Wisphive state: ~/.wisphive
@@ -290,6 +312,275 @@ impl DaemonConfig {
     }
 }
 
+#[cfg(unix)]
+fn validate_owned_metadata(
+    metadata: &std::fs::Metadata,
+    expected_permissions: u32,
+    expected_kind: &str,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let kind_matches = match expected_kind {
+        "directory" => metadata.file_type().is_dir(),
+        "regular file" => metadata.file_type().is_file(),
+        _ => false,
+    };
+    if !kind_matches {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("mode state path is not a {expected_kind}"),
+        ));
+    }
+
+    // SAFETY: `geteuid` takes no arguments and has no preconditions.
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != effective_uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "mode state path is owned by uid {}, expected effective uid {effective_uid}",
+                metadata.uid()
+            ),
+        ));
+    }
+
+    let actual_permissions = metadata.mode() & 0o7777;
+    if actual_permissions != expected_permissions {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "mode state path permissions are {actual_permissions:#06o}, expected {expected_permissions:#06o}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_mode_parent(parent: &Path, repair_permissions: bool) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    if repair_permissions {
+        std::fs::create_dir_all(parent)?;
+    }
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(parent)?;
+    let metadata = directory.metadata()?;
+
+    // Check ownership before repairing legacy permissions. Never chmod a
+    // directory owned by another local account.
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: `geteuid` takes no arguments and has no preconditions.
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != effective_uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "mode state directory is owned by uid {}, expected effective uid {effective_uid}",
+                metadata.uid()
+            ),
+        ));
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "mode state parent is not a directory",
+        ));
+    }
+    if repair_permissions && metadata.mode() & 0o7777 != 0o700 {
+        directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    }
+    validate_owned_metadata(&directory.metadata()?, 0o700, "directory")?;
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn mode_file_name(path: &Path) -> std::io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "mode path has no file name",
+        )
+    })?;
+    std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "mode path contains a NUL byte",
+        )
+    })
+}
+
+#[cfg(unix)]
+fn open_mode_at(
+    directory: &std::fs::File,
+    name: &std::ffi::CStr,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    // O_NONBLOCK prevents a malicious FIFO from hanging the hook before its
+    // descriptor metadata can be rejected as non-regular.
+    // SAFETY: both descriptors and the NUL-terminated name are valid for the
+    // duration of this call. A successful fd is transferred exactly once to
+    // `File`, which owns and closes it.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `openat` returned a fresh owned descriptor above.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn read_mode_at(
+    directory: &std::fs::File,
+    name: &std::ffi::CStr,
+) -> std::io::Result<ModeFileState> {
+    use std::io::Read;
+
+    let file = open_mode_at(directory, name)?;
+    validate_owned_metadata(&file.metadata()?, 0o600, "regular file")?;
+
+    let mut bytes = Vec::new();
+    file.take(MODE_FILE_MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MODE_FILE_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("mode file exceeds {MODE_FILE_MAX_BYTES} bytes"),
+        ));
+    }
+    let contents = std::str::from_utf8(&bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("mode file is not UTF-8: {error}"),
+        )
+    })?;
+    ModeFileState::parse(contents)
+}
+
+/// Read and validate the mode file without following the state directory or
+/// final file through a symlink. Metadata and contents come from the same open
+/// descriptor, eliminating check-then-open replacement races.
+#[cfg(unix)]
+pub fn read_mode_file(path: &Path) -> std::io::Result<ModeFileState> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let directory = open_mode_parent(parent, false)?;
+    let name = mode_file_name(path)?;
+    read_mode_at(&directory, &name)
+}
+
+/// Non-Unix builds do not have the descriptor/ownership primitives required
+/// by the Wisphive mode-file contract, so they fail closed explicitly.
+#[cfg(not(unix))]
+pub fn read_mode_file(_path: &Path) -> std::io::Result<ModeFileState> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "secure mode files require Unix descriptor semantics",
+    ))
+}
+
+/// Require an active, secure mode file.
+pub fn require_active_mode(path: &Path) -> std::io::Result<()> {
+    match read_mode_file(path)? {
+        ModeFileState::Active => Ok(()),
+        ModeFileState::Off => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "mode is off",
+        )),
+    }
+}
+
+/// Atomically replace a mode file using an owner-only state directory and a
+/// descriptor-created 0600 temporary file. `renameat` replaces an attacker
+/// supplied final symlink rather than following it.
+#[cfg(unix)]
+pub fn write_mode_file_atomic(path: &Path, mode: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::PermissionsExt;
+
+    let expected = ModeFileState::parse(mode)?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let directory = open_mode_parent(parent, true)?;
+    let final_name = mode_file_name(path)?;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp_name = std::ffi::CString::new(format!(".mode.{}.{seq}.tmp", std::process::id()))
+        .expect("generated mode temp name contains no NUL");
+
+    // SAFETY: the directory fd and NUL-terminated name are valid. The fresh
+    // descriptor is transferred exactly once to `File` on success.
+    let temp_fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            temp_name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if temp_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `openat` returned a fresh owned descriptor above.
+    let mut temp = unsafe { std::fs::File::from_raw_fd(temp_fd) };
+
+    let result = (|| {
+        temp.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        validate_owned_metadata(&temp.metadata()?, 0o600, "regular file")?;
+        temp.write_all(mode.as_bytes())?;
+        temp.sync_all()?;
+
+        // SAFETY: both names are valid NUL-terminated strings relative to the
+        // same live directory descriptor.
+        let renamed = unsafe {
+            libc::renameat(
+                directory.as_raw_fd(),
+                temp_name.as_ptr(),
+                directory.as_raw_fd(),
+                final_name.as_ptr(),
+            )
+        };
+        if renamed != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        directory.sync_all()?;
+        let actual = read_mode_at(&directory, &final_name)?;
+        if actual != expected {
+            return Err(std::io::Error::other(
+                "mode file verification returned a different value",
+            ));
+        }
+        Ok(())
+    })();
+
+    if result.is_err() {
+        // SAFETY: the name is relative to the validated directory. ENOENT is
+        // expected when rename already succeeded; cleanup is best-effort.
+        unsafe {
+            libc::unlinkat(directory.as_raw_fd(), temp_name.as_ptr(), 0);
+        }
+    }
+    result
+}
+
+#[cfg(not(unix))]
+pub fn write_mode_file_atomic(_path: &Path, _mode: &str) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "secure mode files require Unix descriptor semantics",
+    ))
+}
+
 /// Atomically replace `path` with `body`: write to a same-directory temp file
 /// (0600), fsync, then rename over the target. A crash mid-write can never
 /// leave a truncated config behind (itr#92).
@@ -524,5 +815,67 @@ mod tests {
         write_config_atomic(&path, "{}").unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn mode_writer_is_atomic_owner_only_and_round_trips() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mode");
+        write_mode_file_atomic(&path, "active").unwrap();
+
+        assert_eq!(read_mode_file(&path).unwrap(), ModeFileState::Active);
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+        // SAFETY: `geteuid` takes no arguments and has no preconditions.
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+
+        write_mode_file_atomic(&path, "off").unwrap();
+        assert_eq!(read_mode_file(&path).unwrap(), ModeFileState::Off);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn mode_reader_rejects_missing_unreadable_and_symlink_files() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mode");
+        assert!(read_mode_file(&path).is_err());
+
+        write_mode_file_atomic(&path, "active").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(read_mode_file(&path).is_err());
+
+        std::fs::remove_file(&path).unwrap();
+        let target = dir.path().join("attacker-active");
+        std::fs::write(&target, "active").unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(read_mode_file(&path).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn mode_writer_replaces_final_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mode");
+        let target = dir.path().join("attacker-target");
+        std::fs::write(&target, "do-not-touch").unwrap();
+        symlink(&target, &path).unwrap();
+
+        write_mode_file_atomic(&path, "off").unwrap();
+
+        assert_eq!(read_mode_file(&path).unwrap(), ModeFileState::Off);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "do-not-touch");
+        assert!(
+            !std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 }

@@ -994,7 +994,7 @@ export type ClientMessage =
   | { type: "term_detach"; id: string }
   | { type: "term_input"; id: string; data: string }
   | { type: "term_resize"; id: string; cols: number; rows: number }
-  | { type: "term_close"; id: string; kill?: boolean }
+  | { type: "term_close"; id: string }
   | { type: "term_list" }
   | { type: "term_replay"; id: string; from_seq?: number; speed?: number }
   | { type: "term_set_group"; id: string; group?: string }

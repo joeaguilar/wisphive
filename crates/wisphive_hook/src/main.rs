@@ -13,6 +13,7 @@ use wisphive_protocol::{
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_STDIN_BYTES: usize = 8 * 1024 * 1024;
 const MAX_AGENT_ID_SUFFIX_BYTES: usize = 64;
+const MODE_FILE_MAX_BYTES: u64 = 64;
 
 /// Maximum bytes a single newline-delimited response line from the daemon may
 /// occupy before the hook rejects it (itr#83). Without a cap, a misbehaving or
@@ -245,10 +246,6 @@ fn format_byte_limit(max_bytes: usize) -> String {
 }
 
 impl HookResponse {
-    fn simple(decision: Decision) -> Self {
-        Self::new(decision, HookEventType::PreToolUse, AgentType::ClaudeCode)
-    }
-
     fn new(decision: Decision, event_type: HookEventType, agent_type: AgentType) -> Self {
         Self {
             decision,
@@ -381,17 +378,127 @@ fn agent_project_env(agent_type: &AgentType) -> Option<&'static str> {
 }
 
 fn main() {
-    let code = format_and_exit(&run());
+    let code = match run() {
+        Ok(response) => format_and_exit(&response),
+        Err(failure) => format_pre_parse_deny(&failure, &mut std::io::stderr().lock()),
+    };
     process::exit(code);
 }
 
-fn mode_is_active(contents: Option<&str>) -> bool {
-    contents.is_some_and(|mode| mode.trim() == "active")
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreParseDeny {
+    message: String,
 }
 
-fn is_active(wisphive_dir: &Path) -> bool {
-    let mode_path = wisphive_dir.join("mode");
-    mode_is_active(std::fs::read_to_string(&mode_path).ok().as_deref())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModeFileState {
+    Active,
+    Off,
+}
+
+fn mode_from_contents(contents: &str) -> std::io::Result<ModeFileState> {
+    match contents.trim() {
+        "active" => Ok(ModeFileState::Active),
+        "off" => Ok(ModeFileState::Off),
+        value => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("mode file contains invalid value {value:?}"),
+        )),
+    }
+}
+
+/// Securely read `~/.wisphive/mode` through descriptors. `O_NOFOLLOW` covers
+/// both the state directory and final file; metadata and bytes are checked on
+/// the same fd so a rename/symlink swap cannot create a check-open gap.
+#[cfg(unix)]
+fn read_mode_file(wisphive_dir: &Path) -> std::io::Result<ModeFileState> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(wisphive_dir)?;
+    let directory_metadata = directory.metadata()?;
+    // SAFETY: `geteuid` takes no arguments and has no preconditions.
+    let effective_uid = unsafe { libc::geteuid() };
+    if !directory_metadata.file_type().is_dir()
+        || directory_metadata.uid() != effective_uid
+        || directory_metadata.mode() & 0o7777 != 0o700
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Wisphive state directory must be a non-symlink directory owned by the effective user with mode 0700",
+        ));
+    }
+
+    let mode_name = c"mode";
+    // O_NONBLOCK prevents a hostile FIFO from hanging before the descriptor's
+    // file type can be rejected.
+    // SAFETY: the directory descriptor and static C string are valid. A
+    // successful descriptor is transferred exactly once to `File`.
+    let mode_fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            mode_name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if mode_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `openat` returned a fresh owned descriptor above.
+    let file = unsafe { std::fs::File::from_raw_fd(mode_fd) };
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != effective_uid
+        || metadata.mode() & 0o7777 != 0o600
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "mode must be a non-symlink regular file owned by the effective user with mode 0600",
+        ));
+    }
+
+    let mut bytes = Vec::new();
+    file.take(MODE_FILE_MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MODE_FILE_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("mode file exceeds {MODE_FILE_MAX_BYTES} bytes"),
+        ));
+    }
+    let contents = std::str::from_utf8(&bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("mode file is not UTF-8: {error}"),
+        )
+    })?;
+    mode_from_contents(contents)
+}
+
+#[cfg(not(unix))]
+fn read_mode_file(_wisphive_dir: &Path) -> std::io::Result<ModeFileState> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "secure mode files require Unix descriptor semantics",
+    ))
+}
+
+fn mode_failure(error: &std::io::Error) -> PreParseDeny {
+    PreParseDeny {
+        message: format!(
+            "Wisphive denied this hook because the mode file is missing, unreadable, or unsafe: {error}"
+        ),
+    }
+}
+
+/// A mode failure happens before stdin is parsed, so no event-specific JSON
+/// shape is safe to emit. Exit 2 with stderr feedback is understood by both
+/// Claude Code and Codex and cannot be mistaken for another hook event.
+fn format_pre_parse_deny<W: Write>(failure: &PreParseDeny, stderr: &mut W) -> i32 {
+    let _ = writeln!(stderr, "{}", failure.message);
+    2
 }
 
 fn fail_mode_from_contents(contents: Option<&str>) -> FailMode {
@@ -796,19 +903,27 @@ fn format_task_completed_response(resp: &HookResponse) -> i32 {
     }
 }
 
-fn run() -> HookResponse {
+fn run() -> Result<HookResponse, PreParseDeny> {
     let home = home_dir();
     let wisphive_dir = home.join(".wisphive");
 
-    if !is_active(&wisphive_dir) {
-        return HookResponse::simple(Decision::Approve);
+    match read_mode_file(&wisphive_dir) {
+        Ok(ModeFileState::Active) => {}
+        Ok(ModeFileState::Off) => {
+            return Ok(HookResponse::new(
+                Decision::Approve,
+                HookEventType::PreToolUse,
+                detect_agent_type(&serde_json::Value::Null),
+            ));
+        }
+        Err(error) => return Err(mode_failure(&error)),
     }
 
     let fail_mode = read_fail_mode(&wisphive_dir);
-    match run_active(&wisphive_dir) {
+    Ok(match run_active(&wisphive_dir) {
         Ok(response) => response,
         Err(failure) => response_for_failure(&failure, fail_mode),
-    }
+    })
 }
 
 /// Classify a payload as PostToolUse telemetry (auto-approved, result
@@ -2439,11 +2554,101 @@ mod tests {
         assert_eq!(response.decision, Decision::Deny);
     }
 
+    #[cfg(unix)]
+    fn write_test_mode(directory: &Path, value: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("mode");
+        std::fs::write(&path, value).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
     #[test]
-    fn missing_or_inactive_mode_is_not_active() {
-        assert!(!mode_is_active(None));
-        assert!(!mode_is_active(Some("off")));
-        assert!(mode_is_active(Some("active\n")));
+    #[cfg(unix)]
+    fn secure_mode_reader_accepts_only_active_or_off() {
+        let directory = tempfile::tempdir().unwrap();
+        write_test_mode(directory.path(), "active\n");
+        assert_eq!(
+            read_mode_file(directory.path()).unwrap(),
+            ModeFileState::Active
+        );
+
+        write_test_mode(directory.path(), "off");
+        assert_eq!(
+            read_mode_file(directory.path()).unwrap(),
+            ModeFileState::Off
+        );
+
+        write_test_mode(directory.path(), "maybe");
+        assert_eq!(
+            read_mode_file(directory.path()).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn missing_mode_produces_a_generic_pre_parse_deny() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = read_mode_file(directory.path()).expect_err("missing mode must fail closed");
+        let failure = mode_failure(&error);
+        let mut stderr = Vec::new();
+
+        assert_eq!(format_pre_parse_deny(&failure, &mut stderr), 2);
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.contains("missing, unreadable, or unsafe"));
+        assert!(!stderr.contains("PreToolUse"));
+        assert!(!stderr.contains("hookSpecificOutput"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unreadable_or_overpermissive_mode_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        write_test_mode(directory.path(), "active");
+        let path = directory.path().join("mode");
+
+        for permissions in [0o000, 0o400, 0o644, 0o700] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(permissions)).unwrap();
+            assert!(
+                read_mode_file(directory.path()).is_err(),
+                "mode {permissions:#06o} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlink_and_swap_attempts_never_activate_mode() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mode = directory.path().join("mode");
+        let attacker_target = directory.path().join("attacker-active");
+        std::fs::write(&attacker_target, "active").unwrap();
+
+        for _ in 0..100 {
+            let _ = std::fs::remove_file(&mode);
+            symlink(&attacker_target, &mode).unwrap();
+            assert!(
+                read_mode_file(directory.path()).is_err(),
+                "O_NOFOLLOW must reject a swapped-in symlink"
+            );
+
+            std::fs::remove_file(&mode).unwrap();
+            write_test_mode(directory.path(), "off");
+            assert_eq!(
+                read_mode_file(directory.path()).unwrap(),
+                ModeFileState::Off
+            );
+        }
     }
 
     #[test]

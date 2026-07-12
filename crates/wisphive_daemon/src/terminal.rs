@@ -369,19 +369,19 @@ impl TerminalSessionManager {
         Ok(())
     }
 
-    /// Close a session. If `kill` is true, forcibly terminate the child.
-    /// Otherwise attempt a graceful close by sending HUP via `child.kill()`
-    /// (portable-pty only exposes kill — a hangup equivalent would need raw
-    /// libc). Either way the session is removed from the live map.
-    pub async fn close(&self, id: Uuid, _kill: bool) -> Result<()> {
+    /// Request that portable-pty terminate a session's child process.
+    ///
+    /// The public API intentionally exposes one close operation rather than
+    /// promising platform-specific graceful/force signal semantics.
+    pub async fn close(&self, id: Uuid) -> Result<()> {
         let session = self
             .get(id)
             .await
             .ok_or_else(|| anyhow!("terminal session {id} not found"))?;
-        // Kill via the clone-killer so this works even if the waiter task
-        // has already taken ownership of the Child for wait().
+        // Use the clone-killer because the waiter task owns the Child handle.
         if let Some(mut k) = session.killer.lock().expect("killer poisoned").take() {
-            let _ = k.kill();
+            k.kill()
+                .with_context(|| format!("failed to close terminal session {id}"))?;
         }
         Ok(())
     }
@@ -674,4 +674,75 @@ pub fn catchup_message(session: &TerminalSession, next_seq: u64) -> ServerMessag
 /// Decode a base64 `data` field into raw bytes.
 pub fn decode_b64(data: &str) -> Result<Vec<u8>> {
     B64.decode(data).map_err(|e| anyhow!("invalid base64: {e}"))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    async fn wait_for_ready(manager: &TerminalSessionManager, id: Uuid) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(session) = manager.get(id).await
+                    && session
+                        .catchup_snapshot()
+                        .windows(b"READY".len())
+                        .any(|window| window == b"READY")
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shell did not report ready");
+    }
+
+    async fn wait_for_persisted_exit(state_db: &StateDb, id: Uuid) -> TerminalSessionMeta {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let meta = state_db
+                    .get_terminal_session(id)
+                    .await
+                    .expect("read terminal session")
+                    .expect("terminal session exists");
+                if meta.status != TerminalStatus::Running {
+                    return meta;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("terminal exit was not persisted")
+    }
+
+    #[tokio::test]
+    async fn manager_close_terminates_real_pty_with_single_close_behavior() {
+        let state_db = Arc::new(StateDb::open(":memory:").await.expect("open test db"));
+        let (tui_tx, _) = broadcast::channel(16);
+        let manager = Arc::new(TerminalSessionManager::new(state_db.clone(), tui_tx));
+        let meta = manager
+            .create(
+                Some("close-test".into()),
+                Some("/bin/sh".into()),
+                Some(vec![
+                    "-c".into(),
+                    "trap 'exit 0' HUP; printf READY; read line".into(),
+                ]),
+                None,
+                80,
+                24,
+                None,
+                Some("test".into()),
+            )
+            .await
+            .expect("create real PTY session");
+        wait_for_ready(&manager, meta.id).await;
+
+        manager.close(meta.id).await.expect("close terminal");
+
+        let ended = wait_for_persisted_exit(&state_db, meta.id).await;
+        assert_eq!(ended.status, TerminalStatus::Exited);
+        assert_eq!(ended.exit_code, Some(0));
+    }
 }

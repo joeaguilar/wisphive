@@ -280,7 +280,7 @@ async fn run_loop(
                         }
                         InputAction::TermClose { id } => {
                             tracing::info!(%id, "closing terminal session");
-                            conn.send(&ClientMessage::TermClose { id, kill: true }).await?;
+                            conn.send(&ClientMessage::TermClose { id }).await?;
                         }
                         InputAction::TermInput { id, bytes } => {
                             use base64::Engine as _;

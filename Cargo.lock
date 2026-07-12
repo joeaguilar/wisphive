@@ -4139,6 +4139,7 @@ name = "wisphive_hook"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "libc",
  "serde_json",
  "sha2",
  "tempfile",

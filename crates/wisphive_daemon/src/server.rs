@@ -13,7 +13,7 @@ use wisphive_protocol::{
     ServerMessage, SpawnAgentRequest, TerminalSessionMeta, encode,
 };
 
-use crate::config::DaemonConfig;
+use crate::config::{DaemonConfig, require_active_mode};
 
 /// Capacity of the per-TUI-connection worker channel (itr#82). Bounds memory
 /// when a fast producer (terminal forwarder, `TermReplay`) outruns a slow TUI
@@ -81,6 +81,14 @@ fn hook_message_agent_id(msg: &ClientMessage) -> Option<&str> {
         ClientMessage::AgentRegister { agent_id, .. } => Some(agent_id),
         _ => None,
     }
+}
+
+fn hook_decision_mode_denial(home_dir: &std::path::Path) -> Option<String> {
+    require_active_mode(&home_dir.join("mode"))
+        .err()
+        .map(|error| {
+            format!("Wisphive rejected this request because secure mode is not active: {error}")
+        })
 }
 use crate::process_registry::{ProcessRegistry, validate_spawn_request};
 use crate::queue::DecisionQueue;
@@ -630,6 +638,33 @@ async fn handle_hook(
     match msg {
         ClientMessage::DecisionRequest(req) => {
             let id = req.id;
+
+            // Re-check the descriptor-validated mode at the daemon boundary.
+            // A hook can race with emergency-off after its own check, and a
+            // hand-written socket client can bypass the hook entirely. Neither
+            // may enqueue a decision while the effective mode is non-active.
+            if let Some(reason) = hook_decision_mode_denial(&ctx.home_dir) {
+                warn!(
+                    security_event = "inactive_mode_decision_rejected",
+                    %id,
+                    %reason,
+                    "hook DecisionRequest rejected before registry or database work"
+                );
+                write_msg(
+                    &mut writer,
+                    &ServerMessage::DecisionResponse {
+                        id,
+                        decision: Decision::Deny,
+                        message: Some(reason),
+                        updated_input: None,
+                        additional_context: None,
+                        selected_permission: None,
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+
             let agent_id = req.agent_id.clone();
             let req_tool_name = req.tool_name.clone();
 
@@ -1746,14 +1781,8 @@ fn decode_complete_spawn_input(input: serde_json::Value) -> Result<SpawnAgentReq
 }
 
 fn ensure_spawn_mode_active(home_dir: &std::path::Path) -> Result<()> {
-    let mode = std::fs::read_to_string(home_dir.join("mode")).unwrap_or_else(|_| "off".to_string());
-    if mode.trim() != "active" {
-        anyhow::bail!(
-            "Wisphive hooks are not active (mode: {}); refusing managed spawn",
-            mode.trim()
-        );
-    }
-    Ok(())
+    require_active_mode(&home_dir.join("mode"))
+        .context("Wisphive hooks do not have a secure active mode; refusing managed spawn")
 }
 
 async fn enqueue_spawn_for_approval(
@@ -2686,11 +2715,11 @@ async fn handle_terminal_command(
                 .await?;
             }
         }
-        ClientMessage::TermClose { id, kill } => {
+        ClientMessage::TermClose { id } => {
             if let Some(handle) = term_attachments.remove(&id) {
                 handle.abort();
             }
-            if let Err(e) = ctx.terminal_manager.close(id, kill).await {
+            if let Err(e) = ctx.terminal_manager.close(id).await {
                 write_msg(
                     writer,
                     &ServerMessage::TermError {
@@ -3122,10 +3151,10 @@ mod tests {
         CONN_CHANNEL_CAPACITY, CONNECTION_LIMIT_ERROR, MAX_CONCURRENT_CONNECTIONS, MAX_LINE_BYTES,
         MAX_PENDING_SPAWNS, SpawnRunError, attach_tool_result_with_retry,
         enqueue_spawn_for_approval, ensure_spawn_mode_active, finalize_spawn_abandonment,
-        finalize_spawn_decision, hook_message_agent_id, is_reserved_internal_agent_id,
-        is_valid_hook_agent_id, partition_sudo_gated, peer_uid_allowed, persist_auto_approve,
-        read_capped_line, reject_connection_at_capacity, resolve_bulk_deny,
-        run_after_spawn_approval, set_socket_permissions, settle_spawn_expiry,
+        finalize_spawn_decision, hook_decision_mode_denial, hook_message_agent_id,
+        is_reserved_internal_agent_id, is_valid_hook_agent_id, partition_sudo_gated,
+        peer_uid_allowed, persist_auto_approve, read_capped_line, reject_connection_at_capacity,
+        resolve_bulk_deny, run_after_spawn_approval, set_socket_permissions, settle_spawn_expiry,
         spawn_approval_request, sweep_stale_session_markers, try_acquire_connection_permit,
     };
     use std::sync::Arc;
@@ -3910,9 +3939,9 @@ mod tests {
     fn managed_spawn_requires_active_mode_and_reserves_internal_ids() {
         let home = tempfile::tempdir().unwrap();
         assert!(ensure_spawn_mode_active(home.path()).is_err());
-        std::fs::write(home.path().join("mode"), "off\n").unwrap();
+        crate::config::write_mode_file_atomic(&home.path().join("mode"), "off").unwrap();
         assert!(ensure_spawn_mode_active(home.path()).is_err());
-        std::fs::write(home.path().join("mode"), "active\n").unwrap();
+        crate::config::write_mode_file_atomic(&home.path().join("mode"), "active").unwrap();
         ensure_spawn_mode_active(home.path()).unwrap();
 
         assert!(is_reserved_internal_agent_id("wisphive-daemon:spawn"));
@@ -3960,6 +3989,24 @@ mod tests {
             hook_message_agent_id(&register),
             Some("wisphive-daemon:spawn")
         );
+    }
+
+    #[test]
+    fn hook_decisions_require_secure_active_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("mode");
+        assert!(hook_decision_mode_denial(home.path()).is_some());
+
+        crate::config::write_mode_file_atomic(&path, "off").unwrap();
+        assert!(hook_decision_mode_denial(home.path()).is_some());
+
+        crate::config::write_mode_file_atomic(&path, "active").unwrap();
+        assert!(hook_decision_mode_denial(home.path()).is_none());
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(hook_decision_mode_denial(home.path()).is_some());
     }
 
     #[test]

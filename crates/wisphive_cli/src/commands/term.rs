@@ -308,12 +308,13 @@ pub async fn replay(id_str: String, speed: f32) -> Result<()> {
     Ok(())
 }
 
-/// `wisphive term close <id> [--kill]`
-pub async fn close(id_str: String, kill: bool) -> Result<()> {
+/// `wisphive term close <id>` requests the daemon's single platform-defined
+/// terminal termination behavior.
+pub async fn close(id_str: String) -> Result<()> {
     let id = Uuid::parse_str(&id_str).context("invalid session id")?;
     let (mut _lines, mut writer) = connect().await?;
     writer
-        .write_all(encode(&ClientMessage::TermClose { id, kill })?.as_bytes())
+        .write_all(encode(&ClientMessage::TermClose { id })?.as_bytes())
         .await?;
     println!("close request sent");
     Ok(())

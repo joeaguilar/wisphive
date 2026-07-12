@@ -12,12 +12,14 @@ use wisphive_daemon::shutdown;
 /// Create a daemon config rooted in a temp directory.
 fn temp_config() -> (tempfile::TempDir, DaemonConfig) {
     let tmp = tempfile::tempdir().unwrap();
+    wisphive_daemon::config::write_mode_file_atomic(&tmp.path().join("mode"), "active").unwrap();
     let config = DaemonConfig::new(tmp.path().to_path_buf());
     (tmp, config)
 }
 
 fn temp_config_without_notifications() -> (tempfile::TempDir, DaemonConfig) {
     let tmp = tempfile::tempdir().unwrap();
+    wisphive_daemon::config::write_mode_file_atomic(&tmp.path().join("mode"), "active").unwrap();
     std::fs::write(tmp.path().join("config.json"), r#"{"notifications":false}"#).unwrap();
     let config = DaemonConfig::new(tmp.path().to_path_buf());
     (tmp, config)
@@ -299,6 +301,47 @@ async fn non_hello_first_message_gets_error() {
 // ════════════════════════════════════════════════════════════
 // Hook → Daemon → TUI flow
 // ════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn daemon_denies_hook_decision_when_mode_disappears() {
+    let (tmp, config) = temp_config();
+    let socket_path = config.socket_path.clone();
+    let shutdown_tx = start_server(config).await;
+    let (mut hook_lines, mut hook_writer) = connect_as_hook(&socket_path).await;
+
+    std::fs::remove_file(tmp.path().join("mode")).unwrap();
+    let req = make_decision_request("Bash");
+    let req_id = req.id;
+    hook_writer
+        .write_all(
+            encode(&ClientMessage::DecisionRequest(req))
+                .unwrap()
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let line = tokio::time::timeout(Duration::from_secs(2), hook_lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    match decode::<ServerMessage>(&line).unwrap() {
+        ServerMessage::DecisionResponse {
+            id,
+            decision,
+            message,
+            ..
+        } => {
+            assert_eq!(id, req_id);
+            assert_eq!(decision, Decision::Deny);
+            assert!(message.unwrap().contains("secure mode is not active"));
+        }
+        other => panic!("expected fail-closed DecisionResponse, got: {other:?}"),
+    }
+
+    let _ = shutdown_tx.send(true);
+}
 
 #[tokio::test]
 async fn hook_sends_request_tui_approves_hook_gets_response() {

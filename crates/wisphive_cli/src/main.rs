@@ -196,13 +196,10 @@ enum TermAction {
         #[arg(long, default_value = "1.0")]
         speed: f32,
     },
-    /// Close (kill) a running terminal session
+    /// Close a running terminal session
     Close {
         /// Session UUID
         id: String,
-        /// Force kill the child process
-        #[arg(long)]
-        kill: bool,
     },
 }
 
@@ -659,7 +656,7 @@ fn main() -> anyhow::Result<()> {
                     TermAction::List => commands::term::list().await,
                     TermAction::Attach { id } => commands::term::attach(id).await,
                     TermAction::Replay { id, speed } => commands::term::replay(id, speed).await,
-                    TermAction::Close { id, kill } => commands::term::close(id, kill).await,
+                    TermAction::Close { id } => commands::term::close(id).await,
                 }
             })
         }
@@ -943,5 +940,26 @@ fn print_startup_banner(home: &std::path::Path, host_octets: [u8; 4], port: u16,
         Ok(Some(fp)) => eprintln!("  fingerprint: {fp}"),
         Ok(None) => eprintln!("  fingerprint: (cert will be minted on first request)"),
         Err(e) => eprintln!("  fingerprint: (read error: {e})"),
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn term_close_exposes_one_behavior_without_kill_flag() {
+        let cli = Cli::try_parse_from(["wisphive", "term", "close", "session-id"])
+            .expect("term close should parse");
+        match cli.command {
+            Command::Term {
+                action: TermAction::Close { id },
+            } => assert_eq!(id, "session-id"),
+            _ => panic!("unexpected command"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["wisphive", "term", "close", "session-id", "--kill"]).is_err()
+        );
     }
 }

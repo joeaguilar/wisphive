@@ -226,13 +226,10 @@ pub enum ClientMessage {
     #[serde(rename = "term_resize")]
     TermResize { id: Uuid, cols: u16, rows: u16 },
 
-    /// Close a terminal session. If `kill` is true, send SIGKILL to the child.
+    /// Close a terminal session using the daemon's single platform-defined
+    /// termination behavior.
     #[serde(rename = "term_close")]
-    TermClose {
-        id: Uuid,
-        #[serde(default)]
-        kill: bool,
-    },
+    TermClose { id: Uuid },
 
     /// List all terminal sessions (running + historical).
     #[serde(rename = "term_list")]
@@ -1355,7 +1352,7 @@ mod tests {
         for msg in [
             ClientMessage::TermAttach { id },
             ClientMessage::TermDetach { id },
-            ClientMessage::TermClose { id, kill: true },
+            ClientMessage::TermClose { id },
             ClientMessage::TermList,
             ClientMessage::TermReplay {
                 id,
@@ -1371,6 +1368,17 @@ mod tests {
             let encoded = encode(&msg).unwrap();
             let _: ClientMessage = decode(&encoded).unwrap();
         }
+
+        let encoded = encode(&ClientMessage::TermClose { id }).unwrap();
+        assert!(!encoded.contains("kill"));
+
+        // Older clients may still send the retired field. Serde ignores it,
+        // preserving wire compatibility while the daemon exposes one behavior.
+        let legacy = format!(r#"{{"type":"term_close","id":"{id}","kill":true}}"#);
+        assert!(matches!(
+            decode::<ClientMessage>(&legacy).unwrap(),
+            ClientMessage::TermClose { id: decoded } if decoded == id
+        ));
     }
 
     #[test]

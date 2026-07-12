@@ -739,8 +739,8 @@ export function useWisphive() {
   );
 
   const termClose = useCallback(
-    (id: string, kill = true) => {
-      send({ type: "term_close", id, kill });
+    (id: string) => {
+      send({ type: "term_close", id });
     },
     [send],
   );

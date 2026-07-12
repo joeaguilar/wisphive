@@ -93,7 +93,7 @@ Continuous (not phased): sprint-process improvements #324–#329 — apply at ea
 
 | Section | Status | Size | Linked itr | Notes |
 |---------|--------|------|------------|-------|
-| §C.1 Agent spawning and terminal sessions | 🟡 <!-- auto --> | M <!-- auto --> | itr#15, itr#22, itr#84, itr#303, itr#305 <!-- auto --> | Agent spawn and terminal basics exist; output streaming, terminal close semantics, and replay direction handling remain. <!-- auto --> |
+| §C.1 Agent spawning and terminal sessions | 🟡 <!-- auto --> | M <!-- auto --> | itr#15, itr#22, itr#84, itr#303, itr#305 <!-- auto --> | Agent spawn and terminal basics exist; terminal close now exposes one honest platform-defined behavior, while output streaming and replay direction handling remain. <!-- auto --> |
 | §C.2 Server-authoritative terminal scrollback | ❌ <!-- auto --> | L <!-- auto --> | itr#284, itr#285, itr#286, itr#287, itr#288, itr#289 <!-- auto --> | Epic is defined; protocol field, daemon bounded-tail replay, frontend seq tracking, and privacy copy remain. <!-- auto --> |
 | §C.3 Project discovery, AI-config audit, seeding, and config sharing | ❌ <!-- auto --> | XL <!-- auto --> | itr#349, itr#350, itr#351, itr#352, itr#353, itr#354, itr#355 <!-- auto --> | New product direction is filed; discovery core is the first unblocked child. <!-- auto --> |
 
