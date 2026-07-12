@@ -101,9 +101,9 @@
 - **#470 — Ignore interleaved broadcasts in CLI agent commands**
   - Files: `crates/wisphive_cli/src/commands/agent.rs`
 - **#488 — Add dialog semantics/inert background to mobile terminals**
-  - Files: `crates/wisphive_web/frontend/src/components/Terminals.tsx`
+  - Files: `crates/wisphive_web/frontend/src/components/Terminals.tsx`, `crates/wisphive_web/frontend/src/components/Terminals.test.tsx`
 - **#504 — Persist upgraded Argon2 hashes after successful login**
-  - Files: `crates/wisphive_web/src/lib.rs`, `crates/wisphive_web/src/auth.rs`
+  - Files: `crates/wisphive_web/src/lib.rs`, `crates/wisphive_web/src/auth.rs`, `crates/wisphive_web/src/http_tests.rs`, `crates/wisphive_daemon/src/state/web_auth.rs`, `crates/wisphive_daemon/src/state/web_auth_tests.rs`
 
 ### Wave 11
 
@@ -199,7 +199,9 @@
 - `crates/wisphive_web/frontend/src/hooks/useWisphive.ts`: #105 → #295 → #296 → #114 → #303 → #375 → #376 → #118.
 - `crates/wisphive_web/frontend/src/types/protocol.ts`: #105 → #303.
 - `crates/wisphive_web/src/lib.rs`: #407 → #504 → #495 → #408 → #277 → #281.
-- `crates/wisphive_web/src/http_tests.rs`: #407 → #281.
+- `crates/wisphive_web/src/http_tests.rs`: #407 → #504 → #281.
+- `crates/wisphive_web/frontend/src/components/Terminals.test.tsx`: #375 → #488.
+- `crates/wisphive_daemon/src/state/web_auth.rs`: #504 → #281.
 - `crates/wisphive_cli/src/main.rs`: #303 → #306 → #348 → #371 → #277 → #318.
 - `crates/wisphive_hook/src/main.rs`: #86 → #95 → #102.
 - `crates/wisphive_cli/src/commands/agent.rs`: #94 → #294 → #412 → #470.
@@ -283,6 +285,7 @@ No wave contains a shared owned file. Co-located tests inherit the same ownershi
 - **Wave 9 / #407 async TUI routing grant:** direct flock I/O in the TUI select loop would block the runtime. Added `wisphive_tui/src/input.rs` to emit a save action and CLI `commands/tui.rs` to execute the shared mutation in `spawn_blocking` with visible failure handling; later #374/#377 are inactive.
 - **Wave 9 / #407 authority-branch repair:** adversarial cross-review found `persist_auto_approve` checked for `config.json` before locking, so two legacy writers could still lose updates and a concurrent config creator could make the daemon write the now-nonauthoritative legacy file. Reopened #407 to take the same config lock before selecting config versus legacy, hold it through the chosen RMW without recursive locking, and add deterministic dual-legacy/config-creation plus concurrent same-tool TUI pattern tests.
 - **Wave 9 gate:** after the #407 authority repair, the orchestrator reran both repository gates: `GATR exit=0 dur=43.5s errors=0 warnings=0 adapter=generic tag=blitz-wave9-final-rust` and `GATR exit=0 dur=6.0s errors=0 warnings=0 adapter=generic tag=blitz-wave9-final-frontend` (15 files, 130 tests). Final cross-reviews for #376, #407, and #412: PASS.
+- **Pre-Wave 10 test/storage ownership:** added `Terminals.test.tsx` to #488. Expanded #504 to the HTTP regression surface plus web-auth state implementation/tests because compare-and-swap persistence belongs at the database boundary; all later web-auth owners are inactive.
 - **Wave 4 / #111 lint repair:** its first frontend pass caught a React hooks rule violation from assigning the actions ref during render. The worker moved the ref refresh into `useLayoutEffect`; both required gates then passed.
 - **Wave 4 gate:** orchestrator reran both repository gates after all workers settled: `GATR exit=0 dur=23.5s errors=0 warnings=0 adapter=generic tag=blitz-wave4-final-rust` and `GATR exit=0 dur=5.8s errors=0 warnings=0 adapter=generic tag=blitz-wave4-final-frontend` (14 files, 122 tests).
 
@@ -333,7 +336,7 @@ No wave contains a shared owned file. Co-located tests inherit the same ownershi
   - **#376 closed:** every Notification API access is guarded at use time, including the deferred click callback. A hidden-document test deletes the API, processes a new decision without crashing or notifying, then proves a later resolution frame still clears state on the same socket.
   - **#407 closed:** every daemon, web, CLI, and TUI config mutation now uses one owner-only persistent `config.json.lock` transaction covering authority selection, raw-JSON read, precise mutation, and atomic rename. TUI saves execute off-runtime as per-setting/per-pattern mutations; typed CLI updates preserve future nested fields. Deterministic tests cover 16 concurrent tools, HTTP-vs-daemon, dual legacy writers, concurrent config creation/recheck, same-tool allow/deny patterns, corrupt inputs, symlinked locks, and panic release.
   - **#412 closed:** doctor reuses the exact hook audit to distinguish full installation from PreToolUse-only gating and names every missing Claude/Codex event. Agent preflight stays fail-closed when the minimum gate is absent, warns on partial coverage, and remains silent for full installs; both-agent absent/malformed/partial/full fixtures pass.
-  - **Commit:** pending immediately after this log update.
+  - **Commit:** `a3279b0` — `fix(runtime): serialize config and audit hook coverage`.
 
 ## Quarantine triage notes
 
