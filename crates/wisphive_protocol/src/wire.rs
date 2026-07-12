@@ -297,6 +297,10 @@ pub struct ClientCommand {
     /// trusted) and for non-decision variants that have no actor attribution.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub device_id: Option<DeviceId>,
+    /// Opaque correlation ID for a one-shot command response.  It is optional
+    /// so existing clients and daemons continue to decode bare commands.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub correlation_id: Option<String>,
 }
 
 impl ClientCommand {
@@ -304,11 +308,17 @@ impl ClientCommand {
         Self {
             body,
             device_id: None,
+            correlation_id: None,
         }
     }
 
     pub fn with_device_id(mut self, device_id: DeviceId) -> Self {
         self.device_id = Some(device_id);
+        self
+    }
+
+    pub fn with_correlation_id(mut self, correlation_id: String) -> Self {
+        self.correlation_id = Some(correlation_id);
         self
     }
 }
@@ -400,7 +410,32 @@ pub enum ServerMessage {
 
     /// Response to ListAgents request.
     #[serde(rename = "agent_list")]
-    AgentList { agents: Vec<ManagedAgent> },
+    AgentList {
+        agents: Vec<ManagedAgent>,
+        /// Echoed correlation ID from the request. Broadcast agent lists omit
+        /// this, so one-shot CLI callers can distinguish their direct reply.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        correlation_id: Option<String>,
+    },
+
+    /// Correlated direct acknowledgement that a managed-agent spawn was queued.
+    /// The legacy `NewDecision` broadcast remains unchanged for TUI clients.
+    #[serde(rename = "agent_spawn_queued")]
+    AgentSpawnQueued {
+        decision: DecisionRequest,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        correlation_id: Option<String>,
+    },
+
+    /// Correlated direct response to StopAgent. The legacy `AgentExited`
+    /// broadcast remains unchanged for TUI clients.
+    #[serde(rename = "agent_stop_response")]
+    AgentStopResponse {
+        agent_id: String,
+        exit_code: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        correlation_id: Option<String>,
+    },
 
     /// Response to QueryHistory request.
     #[serde(rename = "history_response")]
@@ -1727,9 +1762,23 @@ mod tests {
             _ => panic!("unexpected variant"),
         }
         assert!(decoded.device_id.is_none());
+        assert!(decoded.correlation_id.is_none());
     }
 
-    /// The envelope must elide `device_id` when None so encoding a
+    #[test]
+    fn decode_uncorrelated_agent_list_is_backward_compatible() {
+        let legacy = r#"{"type":"agent_list","agents":[]}"#;
+        let decoded: ServerMessage = decode(legacy).unwrap();
+        assert!(matches!(
+            decoded,
+            ServerMessage::AgentList {
+                agents,
+                correlation_id: None,
+            } if agents.is_empty()
+        ));
+    }
+
+    /// The envelope must elide `device_id` and `correlation_id` when None so encoding a
     /// plain [`ClientMessage`] stays byte-equivalent to a
     /// `ClientCommand { body, device_id: None }` — critical for existing
     /// callers (TUI, tests) that keep emitting bare ClientMessages.
@@ -1741,6 +1790,10 @@ mod tests {
         assert!(
             !encoded.contains("device_id"),
             "wire output should omit device_id when None: {encoded}"
+        );
+        assert!(
+            !encoded.contains("correlation_id"),
+            "wire output should omit correlation_id when None: {encoded}"
         );
 
         // And the bare ClientMessage encoding must match the envelope's.

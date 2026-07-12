@@ -6,8 +6,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use wisphive_daemon::project_audit::{AgentHookAudit, audit_project};
 use wisphive_protocol::{
-    AgentType, ClientMessage, ClientType, ManagedAgent, PROTOCOL_VERSION, ServerMessage,
-    SpawnAgentRequest,
+    AgentType, ClientCommand, ClientMessage, ClientType, ManagedAgent, PROTOCOL_VERSION,
+    ServerMessage, SpawnAgentRequest,
 };
 
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
@@ -60,28 +60,18 @@ fn is_connect_snapshot(msg: &ServerMessage) -> bool {
     )
 }
 
-/// Match the daemon's synthetic queue event for this spawn content. This
-/// rejects hook-forged SpawnAgent events and other clients' different requests;
-/// identical concurrent submissions still need protocol correlation (itr#470).
-fn is_matching_spawn_queue_ack(sent: &SpawnAgentRequest, msg: &ServerMessage) -> bool {
-    let ServerMessage::NewDecision(decision) = msg else {
-        return false;
-    };
-    decision.agent_id == "wisphive-daemon:spawn"
-        && decision.tool_name == "SpawnAgent"
-        && serde_json::to_value(sent).is_ok_and(|value| value == decision.tool_input)
-}
-
 /// Send a message and read one response.
 fn send_and_recv(msg: &ClientMessage) -> Result<ServerMessage> {
-    send_and_recv_on(msg, connect_to_daemon()?)
+    send_and_recv_on(msg, uuid::Uuid::new_v4().to_string(), connect_to_daemon()?)
 }
 
 fn send_and_recv_on(
     msg: &ClientMessage,
+    correlation_id: String,
     (mut reader, mut writer): (BufReader<UnixStream>, UnixStream),
 ) -> Result<ServerMessage> {
-    let encoded = wisphive_protocol::encode(msg)?;
+    let command = ClientCommand::from(msg.clone()).with_correlation_id(correlation_id.clone());
+    let encoded = wisphive_protocol::encode(&command)?;
     writer.write_all(encoded.as_bytes())?;
 
     // handle_tui pushes a burst of snapshot messages on connect (AgentsSnapshot,
@@ -90,11 +80,10 @@ fn send_and_recv_on(
     // 3 when AuditSnapshot was added and made every agent command misread the
     // AuditSnapshot as its response (itr#468).
     //
-    // Caveat (itr#470): this connects as a Tui client, so the daemon may also
-    // interleave *broadcast* events on this socket. Those are not skipped here, so
-    // a concurrent event of the same variant as the reply can still be misread.
-    // The real fix is request/response correlation or a non-subscribed CLI client
-    // type; tracked separately.
+    // This connects as a Tui client, so the daemon may also interleave broadcast
+    // events on this socket. Only accept a reply whose daemon-echoed correlation
+    // ID matches this command; skip every other event, including a same-variant
+    // broadcast from another client.
     loop {
         let mut line = String::new();
         let n = reader.read_line(&mut line)?;
@@ -105,16 +94,31 @@ fn send_and_recv_on(
         if is_connect_snapshot(&response) {
             continue;
         }
-        if let ClientMessage::SpawnAgent(sent) = msg
-            && matches!(response, ServerMessage::NewDecision(_))
-        {
-            if is_matching_spawn_queue_ack(sent, &response) {
-                return Ok(response);
-            }
-            // Another client's concurrent spawn queue event is not our reply.
-            continue;
+        if is_matching_agent_reply(&response, &correlation_id) {
+            return Ok(response);
         }
-        return Ok(response);
+        if matches!(response, ServerMessage::Error { .. }) {
+            // Errors are written directly to this connection, never broadcast.
+            return Ok(response);
+        }
+    }
+}
+
+fn is_matching_agent_reply(msg: &ServerMessage, correlation_id: &str) -> bool {
+    match msg {
+        ServerMessage::AgentSpawnQueued {
+            correlation_id: Some(id),
+            ..
+        }
+        | ServerMessage::AgentList {
+            correlation_id: Some(id),
+            ..
+        }
+        | ServerMessage::AgentStopResponse {
+            correlation_id: Some(id),
+            ..
+        } => id == correlation_id,
+        _ => false,
     }
 }
 
@@ -136,7 +140,7 @@ pub async fn start(req: SpawnAgentRequest) -> Result<()> {
         ServerMessage::Error { message } => {
             anyhow::bail!("failed to start agent: {message}");
         }
-        ServerMessage::NewDecision(decision) if decision.tool_name == "SpawnAgent" => {
+        ServerMessage::AgentSpawnQueued { decision, .. } => {
             eprintln!(
                 "Agent spawn queued for human approval (decision {}, project {}).",
                 decision.id,
@@ -156,7 +160,7 @@ pub async fn list() -> Result<()> {
     let response = send_and_recv(&ClientMessage::ListAgents)?;
 
     match response {
-        ServerMessage::AgentList { agents } => {
+        ServerMessage::AgentList { agents, .. } => {
             if agents.is_empty() {
                 eprintln!("No managed agents running.");
             } else {
@@ -184,9 +188,10 @@ pub async fn stop(agent_id: String) -> Result<()> {
     })?;
 
     match response {
-        ServerMessage::AgentExited {
+        ServerMessage::AgentStopResponse {
             agent_id,
             exit_code,
+            ..
         } => {
             eprintln!(
                 "Agent {} stopped (exit code: {})",
@@ -376,55 +381,6 @@ mod tests {
         .unwrap();
     }
 
-    fn spawn(prompt: &str) -> SpawnAgentRequest {
-        serde_json::from_value(serde_json::json!({
-            "agent_type": "claude_code",
-            "project": "/tmp/project",
-            "prompt": prompt,
-        }))
-        .unwrap()
-    }
-
-    fn queued(req: &SpawnAgentRequest) -> ServerMessage {
-        ServerMessage::NewDecision(wisphive_protocol::DecisionRequest {
-            id: uuid::Uuid::new_v4(),
-            agent_id: "wisphive-daemon:spawn".into(),
-            agent_type: req.agent_type.clone(),
-            project: req.project.clone(),
-            tool_name: "SpawnAgent".into(),
-            tool_input: serde_json::to_value(req).unwrap(),
-            timestamp: chrono::Utc::now(),
-            hook_event_name: Default::default(),
-            tool_use_id: None,
-            permission_suggestions: None,
-            event_data: None,
-            terminal_session_id: None,
-        })
-    }
-
-    #[test]
-    fn matching_spawn_queue_event_is_acknowledgment() {
-        let sent = spawn("review this repo");
-        assert!(is_matching_spawn_queue_ack(&sent, &queued(&sent)));
-    }
-
-    #[test]
-    fn concurrent_spawn_queue_event_is_not_our_acknowledgment() {
-        let sent = spawn("review this repo");
-        let other = spawn("unrelated request");
-        assert!(!is_matching_spawn_queue_ack(&sent, &queued(&other)));
-    }
-
-    #[test]
-    fn ordinary_queue_event_is_not_spawn_acknowledgment() {
-        let sent = spawn("review this repo");
-        let mut ordinary = queued(&sent);
-        if let ServerMessage::NewDecision(ref mut decision) = ordinary {
-            decision.tool_name = "Bash".into();
-        }
-        assert!(!is_matching_spawn_queue_ack(&sent, &ordinary));
-    }
-
     #[test]
     fn pretool_only_configs_warn_with_every_missing_event_for_both_agents() {
         let project = tempfile::tempdir().unwrap();
@@ -498,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn list_agents_skips_startup_snapshots_before_response() {
+    fn list_agents_skips_snapshots_and_interleaved_broadcast_before_own_reply() {
         let temp = tempfile::tempdir().unwrap();
         let socket_path = temp.path().join("fake-daemon.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
@@ -532,22 +488,59 @@ mod tests {
 
             let mut request_line = String::new();
             reader.read_line(&mut request_line).unwrap();
-            let request: ClientMessage = wisphive_protocol::decode(&request_line).unwrap();
-            assert!(matches!(request, ClientMessage::ListAgents));
+            let request: ClientCommand = wisphive_protocol::decode(&request_line).unwrap();
+            assert!(matches!(request.body, ClientMessage::ListAgents));
+            let correlation_id = request
+                .correlation_id
+                .expect("CLI request must be correlated");
+
+            // Simulate a same-variant AgentList fan-out from another client's
+            // action arriving before our direct response.
+            stream
+                .write_all(
+                    wisphive_protocol::encode(&ServerMessage::AgentList {
+                        agents: vec![ManagedAgent {
+                            agent_id: "broadcast-agent".into(),
+                            agent_type: AgentType::Codex,
+                            pid: 123,
+                            project: PathBuf::from("/tmp/other-project"),
+                            model: None,
+                            name: None,
+                            started_at: chrono::Utc::now(),
+                            reasoning: None,
+                            max_turns: None,
+                            permission_mode: None,
+                        }],
+                        correlation_id: None,
+                    })
+                    .unwrap()
+                    .as_bytes(),
+                )
+                .unwrap();
 
             stream
                 .write_all(
-                    wisphive_protocol::encode(&ServerMessage::AgentList { agents: Vec::new() })
-                        .unwrap()
-                        .as_bytes(),
+                    wisphive_protocol::encode(&ServerMessage::AgentList {
+                        agents: Vec::new(),
+                        correlation_id: Some(correlation_id),
+                    })
+                    .unwrap()
+                    .as_bytes(),
                 )
                 .unwrap();
         });
 
         let connection = connect_to_socket(&socket_path).unwrap();
-        let response = send_and_recv_on(&ClientMessage::ListAgents, connection).unwrap();
+        let response = send_and_recv_on(
+            &ClientMessage::ListAgents,
+            "our-list-request".into(),
+            connection,
+        )
+        .unwrap();
 
-        assert!(matches!(response, ServerMessage::AgentList { agents } if agents.is_empty()));
+        assert!(
+            matches!(response, ServerMessage::AgentList { agents, correlation_id: Some(id) } if agents.is_empty() && id == "our-list-request")
+        );
         fake_daemon.join().unwrap();
     }
 }

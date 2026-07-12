@@ -1280,11 +1280,13 @@ async fn handle_tui(
                         // honouring web-origin approvals of sudo-class tools
                         // (itr#218, itr#410).
                         let device_id = command.device_id.clone();
+                        let correlation_id = command.correlation_id.clone();
                         let msg = command.body;
                         if dispatch_command(
                             &mut writer,
                             ctx,
                             device_id,
+                            correlation_id,
                             msg,
                             &mut term_attachments,
                             &conn_tx,
@@ -1325,6 +1327,7 @@ async fn dispatch_command(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     ctx: &ConnectionContext,
     device_id: Option<wisphive_protocol::DeviceId>,
+    correlation_id: Option<String>,
     msg: ClientMessage,
     term_attachments: &mut std::collections::HashMap<uuid::Uuid, tokio::task::JoinHandle<()>>,
     conn_tx: &tokio::sync::mpsc::Sender<ServerMessage>,
@@ -1345,7 +1348,7 @@ async fn dispatch_command(
         | ClientMessage::ListAgents
         | ClientMessage::StopAgent { .. }
         | ClientMessage::ReimportEvents => {
-            handle_agent_command(writer, ctx, msg, conn_tx).await?;
+            handle_agent_command(writer, ctx, correlation_id, msg, conn_tx).await?;
         }
         ClientMessage::QueryHistory { .. }
         | ClientMessage::SearchHistory(_)
@@ -2325,6 +2328,7 @@ async fn settle_spawn_expiry(expiry: tokio::task::JoinHandle<()>, started: &Atom
 async fn handle_agent_command(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     ctx: &ConnectionContext,
+    correlation_id: Option<String>,
     msg: ClientMessage,
     conn_tx: &tokio::sync::mpsc::Sender<ServerMessage>,
 ) -> Result<()> {
@@ -2379,6 +2383,21 @@ async fn handle_agent_command(
                     }
                 };
             let decision_id = decision_req.id;
+
+            // The queue broadcasts `NewDecision` to every subscribed TUI. A
+            // one-shot caller that supplied a correlation ID also receives a
+            // direct acknowledgement so it need not mistake an interleaved
+            // broadcast (including another spawn) for its own reply.
+            if correlation_id.is_some() {
+                write_msg(
+                    writer,
+                    &ServerMessage::AgentSpawnQueued {
+                        decision: decision_req.clone(),
+                        correlation_id: correlation_id.clone(),
+                    },
+                )
+                .await?;
+            }
 
             if ctx.notifications_enabled {
                 crate::notify::notify_decision(&decision_req);
@@ -2478,7 +2497,14 @@ async fn handle_agent_command(
         ClientMessage::ListAgents => {
             let pr = ctx.process_registry.lock().await;
             let agents = pr.list();
-            write_msg(writer, &ServerMessage::AgentList { agents }).await?;
+            write_msg(
+                writer,
+                &ServerMessage::AgentList {
+                    agents,
+                    correlation_id,
+                },
+            )
+            .await?;
         }
         ClientMessage::ReimportEvents => {
             let events_path = ctx.home_dir.join("events.jsonl");
@@ -2501,14 +2527,18 @@ async fn handle_agent_command(
             let mut pr = ctx.process_registry.lock().await;
             match pr.stop_agent(agent_id).await {
                 Ok(exit_code) => {
-                    write_msg(
-                        writer,
-                        &ServerMessage::AgentExited {
+                    let response = match correlation_id {
+                        Some(correlation_id) => ServerMessage::AgentStopResponse {
+                            agent_id: agent_id.clone(),
+                            exit_code,
+                            correlation_id: Some(correlation_id),
+                        },
+                        None => ServerMessage::AgentExited {
                             agent_id: agent_id.clone(),
                             exit_code,
                         },
-                    )
-                    .await?;
+                    };
+                    write_msg(writer, &response).await?;
                 }
                 Err(e) => {
                     write_msg(
@@ -4404,6 +4434,7 @@ mod tests {
             &mut writer,
             &ctx,
             None,
+            None,
             ClientMessage::Approve {
                 id: request_id,
                 message: None,
@@ -4518,6 +4549,7 @@ mod tests {
             &mut writer,
             &ctx,
             command.device_id,
+            command.correlation_id,
             command.body,
             &mut attachments,
             &conn_tx,
