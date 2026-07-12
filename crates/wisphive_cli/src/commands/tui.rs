@@ -1,3 +1,4 @@
+use std::fmt::Display;
 use std::path::Path;
 use std::time::Duration;
 
@@ -21,6 +22,10 @@ fn persist_tui_config(
     mutation: ConfigMutation,
 ) -> Result<(), wisphive_daemon::ConfigUpdateError> {
     wisphive_daemon::update_config_json(path, |obj| mutation.apply_to(obj))
+}
+
+fn report_tui_config_save_error(app: &mut App, error: impl Display) {
+    app.set_status_error(format!("Config save failed: {error}"));
 }
 
 /// Run the TUI client.
@@ -199,20 +204,29 @@ async fn run_loop(
                             })
                             .await
                             {
-                                Ok(Ok(())) => tracing::info!(
-                                    path = %display_path.display(),
-                                    "saved TUI config"
-                                ),
-                                Ok(Err(error)) => tracing::error!(
-                                    path = %display_path.display(),
-                                    %error,
-                                    "failed to save TUI config; fix the on-disk config and retry"
-                                ),
-                                Err(error) => tracing::error!(
-                                    path = %display_path.display(),
-                                    %error,
-                                    "TUI config save worker failed; retry the change"
-                                ),
+                                Ok(Ok(())) => {
+                                    app.clear_status_error();
+                                    tracing::info!(
+                                        path = %display_path.display(),
+                                        "saved TUI config"
+                                    );
+                                }
+                                Ok(Err(error)) => {
+                                    tracing::error!(
+                                        path = %display_path.display(),
+                                        %error,
+                                        "failed to save TUI config; fix the on-disk config and retry"
+                                    );
+                                    report_tui_config_save_error(app, error);
+                                }
+                                Err(error) => {
+                                    tracing::error!(
+                                        path = %display_path.display(),
+                                        %error,
+                                        "TUI config save worker failed; retry the change"
+                                    );
+                                    report_tui_config_save_error(app, error);
+                                }
                             }
                         }
                         InputAction::QuerySessionTimeline { agent_id } => {
@@ -493,7 +507,51 @@ async fn run_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn non_object_config_save_sets_status_error_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "[]").unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            persist_tui_config(
+                &path,
+                ConfigMutation::AutoApproveLevel(wisphive_protocol::AutoApproveLevel::Execute),
+            )
+        }));
+        let error = result
+            .expect("a non-object config must not panic")
+            .expect_err("a non-object config must be refused");
+        assert!(matches!(
+            error,
+            wisphive_daemon::ConfigUpdateError::NotAnObject
+        ));
+
+        let mut app = App::new();
+        report_tui_config_save_error(&mut app, error);
+        assert_eq!(
+            app.status_error.as_deref(),
+            Some("Config save failed: config file top level is not a JSON object")
+        );
+
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).expect("test backend is valid");
+        terminal
+            .draw(|frame| wisphive_tui::ui::draw(frame, &app))
+            .expect("status error must render without panicking");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("ERROR: Config save failed"));
+    }
 
     #[test]
     fn concurrent_tui_rule_transactions_preserve_same_tool_allow_and_deny() {

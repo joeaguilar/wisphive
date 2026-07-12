@@ -246,6 +246,8 @@ pub struct App {
     pub filter_input_mode: bool,
     /// Buffer for filter input.
     pub filter_buffer: String,
+    /// Most recent non-fatal operation error, displayed in the status bar.
+    pub status_error: Option<String>,
     /// Current view mode (dashboard, detail, or history).
     pub view_mode: ViewMode,
     /// Scroll offset for the detail view content area.
@@ -419,6 +421,7 @@ impl App {
             connected: false,
             filter_input_mode: false,
             filter_buffer: String::new(),
+            status_error: None,
             view_mode: ViewMode::Dashboard,
             detail_scroll: 0,
             detail_request_id: None,
@@ -474,6 +477,16 @@ impl App {
         if active {
             self.disk_alerts.push(DiskAlertNotice { kind, message });
         }
+    }
+
+    /// Show a non-fatal operation error in the status bar until it is cleared.
+    pub fn set_status_error(&mut self, message: impl Into<String>) {
+        self.status_error = Some(message.into());
+    }
+
+    /// Clear the transient status-bar operation error.
+    pub fn clear_status_error(&mut self) {
+        self.status_error = None;
     }
 
     /// Get the currently selected decision request, if any.

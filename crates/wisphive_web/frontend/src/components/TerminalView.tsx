@@ -124,16 +124,6 @@ export function TerminalView({ session, replayMode, onInput, onResize, registerH
     let scrolling = false;
     let appliedOffset = 0; // rows already applied this gesture (vs anchor)
 
-    // Height of one terminal row in CSS px. The viewport is exactly rows tall,
-    // so its clientHeight / rows is the cell height; fall back to a font-size
-    // estimate if layout hasn't settled (clientHeight can be 0 pre-paint).
-    const rowHeight = () => {
-      const h = viewport?.clientHeight ?? 0;
-      const rows = term.rows || 1;
-      const px = h > 0 ? h / rows : 0;
-      return px > 0 ? px : 17; // ~fontSize(13) * lineHeight
-    };
-
     const onTouchStart = (e: TouchEvent) => {
       if (e.touches.length !== 1) return;
       const t = e.touches[0];
@@ -147,12 +137,17 @@ export function TerminalView({ session, replayMode, onInput, onResize, registerH
       if (activeTouchId === null) return;
       const t = Array.from(e.touches).find((x) => x.identifier === activeTouchId);
       if (!t) return;
+      // Before xterm has painted, its viewport has no measurable height. Do
+      // not guess a row height here: a drag should remain native until a later
+      // move can use the actual rendered cell height.
+      const viewportHeight = viewport?.clientHeight ?? 0;
+      if (viewportHeight === 0) return;
       const dy = t.clientY - startY;
       if (!scrolling && Math.abs(dy) < SCROLL_LOCK_PX) return;
       // Drag down (dy>0) → reveal earlier scrollback (a smaller line index).
-      const offsetRows = Math.round(-dy / rowHeight());
+      const offsetRows = Math.round(-dy / (viewportHeight / term.rows));
       // Only intercept once the gesture actually moves the viewport by a row.
-      // A 6-8px finger jitter rounds to zero rows with a ~17px row height, so
+      // A 6-8px finger jitter rounds to zero rows with a typical cell height, so
       // preventDefault-ing there would swallow a tap without scrolling (itr#480).
       // Once a non-zero delta has been applied we keep tracking the finger —
       // including back through the anchor — so a reversal still follows (itr#477).

@@ -1193,12 +1193,57 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         )
     };
 
-    let bar = Paragraph::new(Line::from(Span::styled(
-        status,
-        Style::default().fg(Color::White).bg(Color::DarkGray),
-    )));
+    let spans = if let Some(error) = &app.status_error {
+        vec![
+            Span::styled(format!("ERROR: {error}"), Style::default().fg(Color::Red)),
+            Span::raw(format!(" | {status}")),
+        ]
+    } else {
+        vec![Span::raw(status)]
+    };
+
+    let bar = Paragraph::new(Line::from(spans))
+        .style(Style::default().fg(Color::White).bg(Color::DarkGray));
 
     frame.render_widget(bar, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use super::*;
+
+    #[test]
+    fn status_bar_renders_status_error_in_red() {
+        let mut app = App::new();
+        app.filter_input_mode = true;
+        app.set_status_error("ERR42: config file top level is not a JSON object");
+
+        let backend = TestBackend::new(120, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_status_bar(frame, &app, frame.area()))
+            .unwrap();
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("ERROR: ERR42"));
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| cell.symbol() == "4" && cell.fg == Color::Red)
+        );
+    }
 }
 
 fn draw_picker_modal(frame: &mut Frame, app: &App) {

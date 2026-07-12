@@ -2437,3 +2437,108 @@ pub async fn serve(
 
 #[cfg(test)]
 mod http_tests;
+
+#[cfg(test)]
+mod config_concurrency_tests {
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    use super::*;
+
+    const WRITERS: usize = 8;
+    const HOST: &str = "localhost:3100";
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn api_config_put_concurrent_requests_preserve_all_patches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("wisphive.db");
+        let db = StateDb::open(db_path.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        let token = auth::generate_device_token();
+        db.insert_web_device("concurrent-config-put", "test", &token.hash_hex)
+            .await
+            .unwrap();
+
+        let security = SecurityConfig::for_test(Vec::new(), vec![HOST.to_string()], db);
+        security.mark_password_set();
+        let config_path = tmp.path().join("config.json");
+        std::fs::write(
+            &config_path,
+            serde_json::json!({"unrelated_future_field": {"keep": true}}).to_string(),
+        )
+        .unwrap();
+        let app = build_router(
+            AppState {
+                socket_path: tmp.path().join("wisphive.sock"),
+                config_path: config_path.clone(),
+                security,
+                auth_policy: AuthProfile::LocalLAN.policy(),
+                passkey_challenges: passkey::ChallengeStore::new(),
+                log_store: None,
+                revoke_limiter: DeviceRevokeLimiter::default(),
+            },
+            false,
+        );
+
+        // Release every independent settings update at once. Before itr#407
+        // moved the handler through `update_config_json`, each request could
+        // read the same document and the final atomic rename would discard
+        // the other seven merge patches.
+        let patches = vec![
+            serde_json::json!({"notifications": true}),
+            serde_json::json!({"auto_approve_stop": true}),
+            serde_json::json!({"auto_approve_user_prompt": true}),
+            serde_json::json!({"auto_approve_config_change": true}),
+            serde_json::json!({"auto_approve_lifecycle": false}),
+            serde_json::json!({"auto_approve_dangerous": true}),
+            serde_json::json!({"hook_timeout_secs": 600}),
+            serde_json::json!({"agent_timeout_secs": 900}),
+        ];
+        assert_eq!(patches.len(), WRITERS);
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(WRITERS));
+        let writers: Vec<_> = patches
+            .into_iter()
+            .map(|patch| {
+                let app = app.clone();
+                let barrier = barrier.clone();
+                let token = token.raw.clone();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    app.oneshot(
+                        Request::builder()
+                            .method("PUT")
+                            .uri("/api/config")
+                            .header("host", HOST)
+                            .header("authorization", format!("Bearer {token}"))
+                            .header("content-type", "application/json")
+                            .body(Body::from(patch.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .status()
+                })
+            })
+            .collect();
+        for writer in writers {
+            assert_eq!(writer.await.unwrap(), StatusCode::OK);
+        }
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
+        assert_eq!(after["unrelated_future_field"]["keep"], true);
+        assert_eq!(after["notifications"], true);
+        assert_eq!(after["auto_approve_stop"], true);
+        assert_eq!(after["auto_approve_user_prompt"], true);
+        assert_eq!(after["auto_approve_config_change"], true);
+        assert_eq!(after["auto_approve_lifecycle"], false);
+        assert_eq!(after["auto_approve_dangerous"], true);
+        assert_eq!(after["hook_timeout_secs"], 600);
+        assert_eq!(after["agent_timeout_secs"], 900);
+    }
+}

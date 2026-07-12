@@ -55,12 +55,22 @@ pub fn check_existing_daemon(path: &std::path::Path) -> Result<()> {
     }
 
     let contents = std::fs::read_to_string(path)?;
-    let pid: u32 = contents.trim().parse()?;
+    let pid: i32 = match contents.trim().parse() {
+        Ok(pid) if pid > 0 => pid,
+        _ => {
+            info!(
+                "removing stale PID file with invalid contents: {}",
+                path.display()
+            );
+            std::fs::remove_file(path)?;
+            return Ok(());
+        }
+    };
 
     // Check if process is alive
     #[cfg(unix)]
     {
-        if process_exists(pid as i32) {
+        if process_exists(pid) {
             anyhow::bail!(
                 "another daemon is already running (pid: {}). \
                  If this is stale, remove {}",
@@ -95,5 +105,37 @@ impl Drop for PidGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
         // Can't use tracing here (may be shut down), so best-effort silent cleanup.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_existing_daemon, write_pid_file};
+
+    #[test]
+    fn pid_guard_removes_pid_file_on_clean_shutdown() {
+        let dir = tempfile::tempdir().expect("create temporary state directory");
+        let pid_path = dir.path().join("wisphive.pid");
+
+        let pid_guard = write_pid_file(&pid_path).expect("write PID file");
+        assert!(pid_path.exists());
+
+        drop(pid_guard);
+
+        assert!(
+            !pid_path.exists(),
+            "clean shutdown must remove the PID file"
+        );
+    }
+
+    #[test]
+    fn check_existing_daemon_removes_unparseable_pid_file() {
+        let dir = tempfile::tempdir().expect("create temporary state directory");
+        let pid_path = dir.path().join("wisphive.pid");
+        std::fs::write(&pid_path, "not a PID").expect("write malformed PID file");
+
+        check_existing_daemon(&pid_path).expect("malformed PID must not block startup");
+
+        assert!(!pid_path.exists(), "malformed PID file must be removed");
     }
 }

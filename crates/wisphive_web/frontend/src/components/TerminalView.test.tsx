@@ -168,6 +168,23 @@ describe("TerminalView touch-to-scroll (itr#445)", () => {
     mount.dispatchEvent(touch("touchend", 508)); // lift → still a focusing tap
   });
 
+  it("ignores a pre-paint move instead of using a guessed row height (itr#482)", () => {
+    const { container } = mountView();
+    const viewport = container.querySelector<HTMLElement>(".xterm-viewport")!;
+    Object.defineProperty(viewport, "clientHeight", { value: 0, configurable: true });
+
+    const mount = container.querySelector<HTMLElement>("div[style*='touch-action']")!;
+    mount.dispatchEvent(touch("touchstart", 500));
+    // The former 17px fallback turned this 340px pre-paint drag into a
+    // 20-row scroll. Until the rendered cell height is known, leave it native.
+    const move = touch("touchmove", 840);
+    mount.dispatchEvent(move);
+
+    expect(scrollToLine).not.toHaveBeenCalled();
+    expect(move.defaultPrevented).toBe(false);
+    mount.dispatchEvent(touch("touchend", 840));
+  });
+
   it("sets touch-action:pinch-zoom on the mount so pinch-zoom stays available (itr#478)", () => {
     const { container } = mountView();
     const mount = container.querySelector<HTMLElement>("div[style*='touch-action']");

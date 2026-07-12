@@ -48,7 +48,7 @@ pub async fn start(web: Option<WebOptions>) -> Result<()> {
     shutdown::check_existing_daemon(&config.pid_path)?;
 
     // Write PID file (guard removes it on drop)
-    let _pid_guard = shutdown::write_pid_file(&config.pid_path)?;
+    let pid_guard = shutdown::write_pid_file(&config.pid_path)?;
 
     info!("starting wisphive daemon");
 
@@ -116,6 +116,10 @@ pub async fn start(web: Option<WebOptions>) -> Result<()> {
     }
 
     info!("wisphive daemon stopped cleanly");
+
+    // `process::exit` below skips Rust destructors, so remove the PID file
+    // explicitly while this clean shutdown path still owns the guard.
+    drop(pid_guard);
 
     // Flush any buffered tracing output before force-exiting so the last
     // log line actually reaches the terminal.
