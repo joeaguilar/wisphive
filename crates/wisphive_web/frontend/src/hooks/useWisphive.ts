@@ -106,6 +106,7 @@ const CHANNEL_SESSION = "session";
 
 export function useWisphive() {
   const wsRef = useRef<WebSocket | null>(null);
+  const authProbeAbortRef = useRef<AbortController | null>(null);
   const wsEverOpenedRef = useRef<boolean>(false);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const terminalHandlersRef = useRef<Map<string, TerminalHandlerRegistration>>(new Map());
@@ -506,17 +507,23 @@ export function useWisphive() {
       // the server rejects us. If /api/me is fine, fall through to the
       // normal reconnect path.
       if (ev.code === 1006 && !wsEverOpenedRef.current && getWebToken()) {
+        authProbeAbortRef.current?.abort();
+        const controller = new AbortController();
+        authProbeAbortRef.current = controller;
         void (async () => {
           try {
             // apiFetch clears the token on 401/403 via its side effect,
             // which fires the auth-change listener and tears us down.
-            await apiFetch("/api/me");
+            await apiFetch("/api/me", { signal: controller.signal });
           } catch {
             // Network error; leave it to the normal reconnect timer.
+          } finally {
+            if (authProbeAbortRef.current === controller) {
+              authProbeAbortRef.current = null;
+            }
           }
         })();
       }
-      // eslint-disable-next-line react-hooks/immutability
       reconnectTimer.current = setTimeout(connect, 2000);
     };
 
@@ -526,7 +533,12 @@ export function useWisphive() {
     connect();
     return () => {
       clearTimeout(reconnectTimer.current);
-      wsRef.current?.close();
+      authProbeAbortRef.current?.abort();
+      authProbeAbortRef.current = null;
+      if (wsRef.current) {
+        wsRef.current.onclose = null;
+        wsRef.current.close();
+      }
     };
   }, [connect]);
 
@@ -547,6 +559,8 @@ export function useWisphive() {
         void connect();
       } else if (!hasToken) {
         clearTimeout(reconnectTimer.current);
+        authProbeAbortRef.current?.abort();
+        authProbeAbortRef.current = null;
         // Null the close handler before tearing down: otherwise the
         // existing onclose will fire async after logout, see a stale
         // wsRef, and schedule a reconnect we don't want.

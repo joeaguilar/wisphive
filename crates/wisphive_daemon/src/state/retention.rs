@@ -1,4 +1,6 @@
 use anyhow::Result;
+use sqlx::QueryBuilder;
+use tokio::io::AsyncWriteExt;
 
 use super::{ARCHIVE_SINK_MAX_BYTES, DecisionLogRow, StateDb, rotate_if_large};
 
@@ -168,35 +170,38 @@ impl StateDb {
         ids: &[(String,)],
         archive_path: &std::path::Path,
     ) -> Result<u64> {
-        use std::io::Write;
-
         // Cap the archive sink: it lives in log_dir alongside the daemon logs,
         // so a rotated segment is reaped by `logging::prune_old_files`. Without
         // this the sink grows without bound (observed at 150MB+).
-        rotate_if_large(archive_path, ARCHIVE_SINK_MAX_BYTES);
+        let rotation_path = archive_path.to_owned();
+        tokio::task::spawn_blocking(move || {
+            rotate_if_large(&rotation_path, ARCHIVE_SINK_MAX_BYTES);
+        })
+        .await?;
 
         let mut archived = 0u64;
-        let mut file = std::fs::OpenOptions::new()
+        let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(archive_path)?;
+            .open(archive_path)
+            .await?;
 
         for chunk in ids.chunks(500) {
-            // Build placeholders for batch SELECT
-            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
-            let select_sql = format!(
+            let mut query = QueryBuilder::<sqlx::Sqlite>::new(
                 "SELECT id, agent_id, agent_type, project, tool_name, tool_input, decision, \
                  requested_at, resolved_at, tool_result, tool_use_id, hook_event_name, terminal_session_id, \
                  decided_by, config_hash \
-                 FROM decision_log WHERE id IN ({})",
-                placeholders.join(",")
+                 FROM decision_log WHERE id IN (",
             );
-
-            let mut query = sqlx::query_as::<_, DecisionLogRow>(&select_sql);
+            let mut separated = query.separated(", ");
             for (id,) in chunk {
-                query = query.bind(id);
+                separated.push_bind(id);
             }
-            let rows = query.fetch_all(&self.pool).await?;
+            separated.push_unseparated(")");
+            let rows = query
+                .build_query_as::<DecisionLogRow>()
+                .fetch_all(&self.pool)
+                .await?;
 
             // Write all rows to archive file
             for (
@@ -235,7 +240,7 @@ impl StateDb {
                 });
                 let mut line = serde_json::to_string(&entry).unwrap_or_default();
                 line.push('\n');
-                file.write_all(line.as_bytes())?;
+                file.write_all(line.as_bytes()).await?;
                 archived += 1;
             }
             // fsync before the DELETE commits (itr#368): `flush()` on a raw
@@ -243,18 +248,17 @@ impl StateDb {
             // cache while SQLite durably deletes them — a power loss in that
             // window would lose audit rows from BOTH the DB and the archive,
             // violating the "audit data is never deleted" invariant (itr#340).
-            file.sync_data()?;
+            file.sync_data().await?;
 
             // Batch delete after archive is durably on disk
-            let delete_sql = format!(
-                "DELETE FROM decision_log WHERE id IN ({})",
-                placeholders.join(",")
-            );
-            let mut delete_query = sqlx::query(&delete_sql);
+            let mut delete_query =
+                QueryBuilder::<sqlx::Sqlite>::new("DELETE FROM decision_log WHERE id IN (");
+            let mut separated = delete_query.separated(", ");
             for (id,) in chunk {
-                delete_query = delete_query.bind(id);
+                separated.push_bind(id);
             }
-            delete_query.execute(&self.pool).await?;
+            separated.push_unseparated(")");
+            delete_query.build().execute(&self.pool).await?;
         }
 
         Ok(archived)
@@ -328,6 +332,49 @@ mod tests {
         let archived = db.archive_and_prune(&archive_path, 100, 365).await.unwrap();
         assert_eq!(archived, 0);
         assert!(!archive_path.exists());
+    }
+
+    #[tokio::test]
+    async fn archive_rows_by_ids_archives_and_deletes_only_requested_ids() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let archive_path = tmp.path().join("archive.jsonl");
+        let requests: Vec<_> = (0..3)
+            .map(|i| make_request(&format!("Tool{i}"), "cc-1", "/muse"))
+            .collect();
+
+        for request in &requests {
+            db.persist_pending(request).await.unwrap();
+            db.resolve_pending(request.id, wisphive_protocol::Decision::Approve)
+                .await
+                .unwrap();
+        }
+
+        let ids = vec![(requests[0].id.to_string(),), (requests[2].id.to_string(),)];
+        assert_eq!(
+            db.archive_rows_by_ids(&ids, &archive_path).await.unwrap(),
+            2
+        );
+
+        let archived_ids: std::collections::BTreeSet<String> =
+            std::fs::read_to_string(&archive_path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .map(|entry| entry["id"].as_str().unwrap().to_owned())
+                .collect();
+        let expected_ids: std::collections::BTreeSet<String> =
+            ids.iter().map(|(id,)| id.clone()).collect();
+        assert_eq!(archived_ids, expected_ids);
+
+        let remaining_ids: std::collections::BTreeSet<String> = db
+            .query_history(None, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.id.to_string())
+            .collect();
+        assert_eq!(remaining_ids, [requests[1].id.to_string()].into());
     }
 
     #[tokio::test]

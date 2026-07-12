@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -28,6 +29,13 @@ const CONN_CHANNEL_CAPACITY: usize = 1024;
 const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 const CONNECTION_LIMIT_ERROR: &str = "daemon connection capacity reached; retry later";
 
+/// A mismatched client is normally a stale local binary, but a tight retry
+/// loop (or a malicious local peer) must not turn those errors into an
+/// unbounded response and task churn. The limit is shared across reconnects
+/// for each operating-system user identity.
+const BAD_HELLO_WINDOW: Duration = Duration::from_secs(60);
+const BAD_HELLO_MAX_PER_WINDOW: usize = 10;
+
 /// Maximum bytes a single newline-delimited line may occupy on a daemon socket
 /// reader before the connection is rejected (itr#83). Without a cap a peer that
 /// streams bytes with no newline grows the line buffer until OOM. Aligned with
@@ -42,6 +50,49 @@ const MAX_PENDING_SPAWNS: usize = 8;
 const SPAWN_DECISION_AGENT_ID: &str = "wisphive-daemon:spawn";
 const SPAWN_DECISION_TOOL: &str = "SpawnAgent";
 const MAX_AGENT_ID_SUFFIX_BYTES: usize = 64;
+
+/// Sliding-window limiter for failed protocol-version handshakes.
+///
+/// The daemon already authenticates Unix peers by effective UID, so that UID
+/// is the stable per-peer identity available across reconnects. Rejected hits
+/// are not recorded: a peer cannot prolong its own cooldown by continuing to
+/// flood the socket.
+#[derive(Clone)]
+struct BadHelloRateLimiter {
+    inner: Arc<Mutex<HashMap<u32, Vec<Instant>>>>,
+    window: Duration,
+    max_per_window: usize,
+}
+
+impl BadHelloRateLimiter {
+    fn new() -> Self {
+        Self::with_limits(BAD_HELLO_WINDOW, BAD_HELLO_MAX_PER_WINDOW)
+    }
+
+    fn with_limits(window: Duration, max_per_window: usize) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            window,
+            max_per_window,
+        }
+    }
+
+    async fn try_acquire(&self, peer_uid: u32) -> bool {
+        let mut peers = self.inner.lock().await;
+        let now = Instant::now();
+        peers.retain(|_, hits| {
+            hits.retain(|hit| now.duration_since(*hit) < self.window);
+            !hits.is_empty()
+        });
+
+        let hits = peers.entry(peer_uid).or_default();
+        if hits.len() >= self.max_per_window {
+            return false;
+        }
+        hits.push(now);
+        true
+    }
+}
 
 fn is_reserved_internal_agent_id(agent_id: &str) -> bool {
     agent_id.starts_with("wisphive-daemon:")
@@ -108,6 +159,7 @@ struct ConnectionContext {
     terminal_manager: Arc<TerminalSessionManager>,
     reauth: ReauthRegistry,
     replay_gate: ReplayRateLimiter,
+    bad_hello_gate: BadHelloRateLimiter,
     hook_timeout_secs: u64,
     notifications_enabled: bool,
     home_dir: PathBuf,
@@ -126,6 +178,7 @@ pub struct Server {
     terminal_manager: Arc<TerminalSessionManager>,
     reauth: ReauthRegistry,
     replay_gate: ReplayRateLimiter,
+    bad_hello_gate: BadHelloRateLimiter,
 }
 
 impl Server {
@@ -170,6 +223,7 @@ impl Server {
             terminal_manager,
             reauth: ReauthRegistry::new(),
             replay_gate: ReplayRateLimiter::new(),
+            bad_hello_gate: BadHelloRateLimiter::new(),
         })
     }
 
@@ -362,7 +416,7 @@ impl Server {
                             // crashing the accept loop. The 0600 socket perms make
                             // this rare; the check is the second layer (itr#81).
                             let daemon_uid = current_uid();
-                            match stream.peer_cred() {
+                            let peer_cred = match stream.peer_cred() {
                                 Ok(cred) => {
                                     if !peer_uid_allowed(cred.uid(), daemon_uid) {
                                         warn!(
@@ -373,6 +427,7 @@ impl Server {
                                         // Drop the stream — the connection is closed.
                                         continue;
                                     }
+                                    cred
                                 }
                                 Err(e) => {
                                     // Can't establish the peer's identity; fail
@@ -381,7 +436,7 @@ impl Server {
                                     warn!("rejecting connection: peer_cred lookup failed: {e}");
                                     continue;
                                 }
-                            }
+                            };
 
                             let Some(permit) =
                                 try_acquire_connection_permit(&connection_permits)
@@ -405,6 +460,7 @@ impl Server {
                                 terminal_manager: self.terminal_manager.clone(),
                                 reauth: self.reauth.clone(),
                                 replay_gate: self.replay_gate.clone(),
+                                bad_hello_gate: self.bad_hello_gate.clone(),
                                 hook_timeout_secs: self.config.hook_timeout_secs,
                                 notifications_enabled: self.config.notifications_enabled,
                                 home_dir: self.config.home_dir.clone(),
@@ -412,7 +468,7 @@ impl Server {
                             });
                             tokio::spawn(async move {
                                 let _permit = permit;
-                                if let Err(e) = handle_connection(stream, &ctx).await {
+                                if let Err(e) = handle_connection(stream, &ctx, peer_cred).await {
                                     warn!("connection error: {e}");
                                 }
                             });
@@ -531,7 +587,11 @@ async fn read_capped_line<R: tokio::io::AsyncBufRead + Unpin>(
 
 /// Handle a single client connection. Dispatches based on the Hello handshake.
 #[allow(clippy::too_many_arguments)]
-async fn handle_connection(stream: UnixStream, ctx: &ConnectionContext) -> Result<()> {
+async fn handle_connection(
+    stream: UnixStream,
+    ctx: &ConnectionContext,
+    peer_cred: tokio::net::unix::UCred,
+) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader);
     let mut line_buf = Vec::new();
@@ -546,6 +606,31 @@ async fn handle_connection(stream: UnixStream, ctx: &ConnectionContext) -> Resul
     match hello {
         ClientMessage::Hello { client, version } => {
             if version != PROTOCOL_VERSION {
+                let peer_uid = peer_cred.uid();
+                let peer_gid = peer_cred.gid();
+                let peer_pid = peer_cred.pid();
+                if !ctx.bad_hello_gate.try_acquire(peer_uid).await {
+                    warn!(
+                        peer_uid,
+                        peer_gid,
+                        ?peer_pid,
+                        supplied_version = version,
+                        expected_version = PROTOCOL_VERSION,
+                        limit = BAD_HELLO_MAX_PER_WINDOW,
+                        window_secs = BAD_HELLO_WINDOW.as_secs(),
+                        "throttling unsupported protocol-version Hello"
+                    );
+                    return Ok(());
+                }
+
+                warn!(
+                    peer_uid,
+                    peer_gid,
+                    ?peer_pid,
+                    supplied_version = version,
+                    expected_version = PROTOCOL_VERSION,
+                    "rejecting unsupported protocol-version Hello"
+                );
                 write_msg(
                     &mut writer,
                     &ServerMessage::Error {
@@ -3203,14 +3288,14 @@ fn peer_uid_allowed(peer_uid: u32, daemon_uid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONN_CHANNEL_CAPACITY, CONNECTION_LIMIT_ERROR, MAX_CONCURRENT_CONNECTIONS, MAX_LINE_BYTES,
-        MAX_PENDING_SPAWNS, SpawnRunError, attach_tool_result_with_retry,
-        enqueue_spawn_for_approval, ensure_spawn_mode_active, finalize_spawn_abandonment,
-        finalize_spawn_decision, hook_decision_mode_denial, hook_message_agent_id,
-        is_reserved_internal_agent_id, is_valid_hook_agent_id, partition_sudo_gated,
-        peer_uid_allowed, persist_auto_approve, persist_auto_approve_with_observer,
-        read_capped_line, reject_connection_at_capacity, resolve_bulk_deny,
-        run_after_spawn_approval, set_socket_permissions, settle_spawn_expiry,
+        BAD_HELLO_MAX_PER_WINDOW, BadHelloRateLimiter, CONN_CHANNEL_CAPACITY,
+        CONNECTION_LIMIT_ERROR, MAX_CONCURRENT_CONNECTIONS, MAX_LINE_BYTES, MAX_PENDING_SPAWNS,
+        SpawnRunError, attach_tool_result_with_retry, enqueue_spawn_for_approval,
+        ensure_spawn_mode_active, finalize_spawn_abandonment, finalize_spawn_decision,
+        hook_decision_mode_denial, hook_message_agent_id, is_reserved_internal_agent_id,
+        is_valid_hook_agent_id, partition_sudo_gated, peer_uid_allowed, persist_auto_approve,
+        persist_auto_approve_with_observer, read_capped_line, reject_connection_at_capacity,
+        resolve_bulk_deny, run_after_spawn_approval, set_socket_permissions, settle_spawn_expiry,
         spawn_approval_request, sweep_stale_session_markers, try_acquire_connection_permit,
     };
     use std::sync::Arc;
@@ -4134,6 +4219,7 @@ mod tests {
             terminal_manager: server.terminal_manager.clone(),
             reauth: server.reauth.clone(),
             replay_gate: server.replay_gate.clone(),
+            bad_hello_gate: server.bad_hello_gate.clone(),
             hook_timeout_secs: server.config.hook_timeout_secs,
             notifications_enabled: server.config.notifications_enabled,
             home_dir: server.config.home_dir.clone(),
@@ -4513,5 +4599,29 @@ mod tests {
         assert!(!peer_uid_allowed(0, 1000));
         assert!(!peer_uid_allowed(1000, 0));
         assert!(!peer_uid_allowed(65534, 1000)); // nobody
+    }
+
+    #[tokio::test]
+    async fn bad_protocol_hello_is_throttled_after_limit() {
+        let gate = BadHelloRateLimiter::with_limits(
+            std::time::Duration::from_secs(60),
+            BAD_HELLO_MAX_PER_WINDOW,
+        );
+        let peer_uid = 1000;
+
+        for _ in 0..BAD_HELLO_MAX_PER_WINDOW {
+            assert!(
+                gate.try_acquire(peer_uid).await,
+                "each Hello inside the per-peer budget must receive its version error"
+            );
+        }
+        assert!(
+            !gate.try_acquire(peer_uid).await,
+            "the first over-budget bad Hello must be throttled"
+        );
+        assert!(
+            gate.try_acquire(peer_uid + 1).await,
+            "one peer's mismatches must not throttle another peer"
+        );
     }
 }

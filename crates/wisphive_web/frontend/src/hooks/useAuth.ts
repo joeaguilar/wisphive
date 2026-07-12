@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   apiFetch,
   clearWebToken,
@@ -78,6 +78,15 @@ interface AuthStatus {
   setup_required: boolean;
 }
 
+function isAbortError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "name" in error &&
+    error.name === "AbortError"
+  );
+}
+
 /**
  * useAuth — single source of truth for web-UI login state.
  *
@@ -97,6 +106,32 @@ export function useAuth(): UseAuth {
     getWebToken() ? "authed" : "loading",
   );
   const [error, setError] = useState<AuthError | null>(null);
+  const requestsRef = useRef<Set<AbortController>>(new Set());
+
+  const fetchWithAbort = useCallback(
+    async (path: string, init: RequestInit = {}): Promise<Response> => {
+      const controller = new AbortController();
+      requestsRef.current.add(controller);
+      try {
+        return await apiFetch(path, { ...init, signal: controller.signal });
+      } finally {
+        requestsRef.current.delete(controller);
+      }
+    },
+    [],
+  );
+
+  // Requests issued by this hook only matter while its consumer is mounted.
+  // Abort them during teardown so their callbacks cannot publish stale state.
+  useEffect(() => {
+    const requests = requestsRef.current;
+    return () => {
+      for (const controller of requests) {
+        controller.abort();
+      }
+      requests.clear();
+    };
+  }, []);
 
   const probeStatus = useCallback(async () => {
     try {
@@ -104,20 +139,21 @@ export function useAuth(): UseAuth {
       // unauthenticated endpoint: keeps the "all fetch sites share the
       // same auth-failure side effects" invariant documented in api.ts
       // intact if this endpoint ever gains auth semantics.
-      const res = await apiFetch("/api/auth/status");
+      const res = await fetchWithAbort("/api/auth/status");
       if (!res.ok) {
         setPhase("unauthed");
         return;
       }
       const body = (await res.json()) as AuthStatus;
       setPhase(body.setup_required ? "setup" : "unauthed");
-    } catch {
+    } catch (e) {
+      if (isAbortError(e)) return;
       // Network error during status probe → assume unauthed so the user
       // at least sees the login form and can retry. Setup detection will
       // correct itself on the next successful probe.
       setPhase("unauthed");
     }
-  }, []);
+  }, [fetchWithAbort]);
 
   // On mount: if we don't already hold a token, figure out if setup is
   // needed. This is an external-system probe (GET /api/auth/status), so
@@ -125,7 +161,6 @@ export function useAuth(): UseAuth {
   // branch of the react-hooks/set-state-in-effect rule.
   useEffect(() => {
     if (!token) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       void probeStatus();
     }
   }, [token, probeStatus]);
@@ -172,7 +207,7 @@ export function useAuth(): UseAuth {
     async (password: string, deviceName?: string): Promise<boolean> => {
       setError(null);
       try {
-        const res = await apiFetch("/api/auth/login", {
+        const res = await fetchWithAbort("/api/auth/login", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
@@ -218,6 +253,7 @@ export function useAuth(): UseAuth {
         });
         return false;
       } catch (e) {
+        if (isAbortError(e)) return false;
         setError({
           kind: "network",
           message: `Could not reach daemon: ${e instanceof Error ? e.message : String(e)}`,
@@ -225,14 +261,14 @@ export function useAuth(): UseAuth {
         return false;
       }
     },
-    [],
+    [fetchWithAbort],
   );
 
   const setPassword = useCallback(
     async (password: string, deviceName?: string): Promise<boolean> => {
       setError(null);
       try {
-        const res = await apiFetch("/api/auth/set-password", {
+        const res = await fetchWithAbort("/api/auth/set-password", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
@@ -314,6 +350,7 @@ export function useAuth(): UseAuth {
         });
         return false;
       } catch (e) {
+        if (isAbortError(e)) return false;
         setError({
           kind: "network",
           message: `Could not reach daemon: ${e instanceof Error ? e.message : String(e)}`,
@@ -327,7 +364,7 @@ export function useAuth(): UseAuth {
     // so the callback identity doesn't need to churn on profile
     // changes and the dep array stays empty. The async barrier handles
     // the timing.
-    [],
+    [fetchWithAbort],
   );
 
   const completeEnrollGate = useCallback(() => {
@@ -341,12 +378,12 @@ export function useAuth(): UseAuth {
   const logout = useCallback(async () => {
     // Best-effort server-side revoke; local state is authoritative for UX.
     try {
-      await apiFetch("/api/auth/logout", { method: "POST" });
+      await fetchWithAbort("/api/auth/logout", { method: "POST" });
     } catch {
       // Offline logout still clears the local token below.
     }
     clearWebToken();
-  }, []);
+  }, [fetchWithAbort]);
 
   const clearError = useCallback(() => setError(null), []);
 

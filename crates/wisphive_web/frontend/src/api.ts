@@ -19,7 +19,9 @@
  *   gets the same behaviour without each caller re-implementing it.
  */
 
-const API_BASE = import.meta.env.VITE_API_URL || "";
+import { environment } from "./env";
+
+const API_BASE = environment.apiUrl || "";
 const TOKEN_STORAGE_KEY = "wisphive-web-token";
 
 /** Returns the currently-stored device token, or null if none is set. */

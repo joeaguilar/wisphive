@@ -1041,6 +1041,20 @@ mod cli_tests {
     }
 
     #[test]
+    fn web_serve_rejects_malformed_host_without_silently_binding_loopback() {
+        // The former filter-based parser discarded the invalid suffix and
+        // accepted this as 127.0.0.1.
+        let error = parse_error(&["wisphive", "web", "serve", "--host", "127.0.0.1.invalid"]);
+
+        assert_eq!(error.exit_code(), 2);
+        assert!(
+            error
+                .to_string()
+                .contains("invalid host address '127.0.0.1.invalid'")
+        );
+    }
+
+    #[test]
     fn term_close_exposes_one_behavior_without_kill_flag() {
         let cli = Cli::try_parse_from(["wisphive", "term", "close", "session-id"])
             .expect("term close should parse");
