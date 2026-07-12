@@ -133,7 +133,7 @@ Unix socket at `~/.wisphive/wisphive.sock`. Newline-delimited JSON. Two client t
 All under `~/.wisphive/`:
 - `wisphive.sock` — Unix domain socket
 - `wisphive.pid` — Daemon PID file
-- `wisphive.db` — SQLite state/audit database
+- `wisphive.db` — SQLite state/audit database. The main file and live `wisphive.db-wal` / `wisphive.db-shm` companions are effective-user-owned regular files at exact mode `0600`. The shared daemon/CLI open path holds a no-follow descriptor for an effective-user-owned, non-group/world-writable parent; it validates/repairs existing artifacts before SQLite connects, securely pre-creates a missing main file, and validates/repairs newly-created sidecars after WAL activation. This prevents substitution by other local accounts; another process already running as the same UID remains inside Wisphive's local trust boundary.
 - `mode` — "active" or "off" (global kill switch), atomically written at `0600`; secure reads require effective-user ownership and a non-symlink `0700` state directory
 - `fail-mode` — "closed" or "open" for active-mode hook failures. Missing/invalid means "closed"; "open" restores availability-first approval on runtime failures. A daemon-unreachable (refused/absent socket) failure always fails open regardless. Oversized hook stdin is denied regardless.
 - `config.json` — User-editable daemon/hook configuration. `audit_snapshot_limit` caps the recent audit rows sent to TUI/web clients on connect (default 500, clamped 10–10000).

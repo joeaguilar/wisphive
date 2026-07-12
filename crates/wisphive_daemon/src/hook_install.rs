@@ -17,7 +17,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tracing::info;
 
 use crate::project_audit::{CLAUDE_HOOK_EVENTS, CODEX_HOOK_EVENTS};
@@ -41,8 +41,13 @@ project trust alone is not enough for Codex to run them.";
 /// Performs surgical JSON editing — only adds Wisphive entries, preserves
 /// everything else. Idempotent: re-installing does not duplicate entries.
 pub fn install_hooks(project: &Path) -> Result<()> {
-    install_claude(project)?;
-    install_codex(project)?;
+    // Prepare and validate both user-owned files before writing either one.
+    // A malformed Codex config must not leave Claude hooks half-installed (or
+    // vice versa) merely because it was discovered second.
+    let claude = prepare_claude_install(project)?;
+    let codex = prepare_codex_install(project)?;
+    write_prepared_install(claude)?;
+    write_prepared_install(codex)?;
     Ok(())
 }
 
@@ -50,15 +55,21 @@ pub fn install_hooks(project: &Path) -> Result<()> {
 ///
 /// Returns the path written. Silent — logs via `tracing::info!`.
 pub fn install_claude(project: &Path) -> Result<PathBuf> {
+    write_prepared_install(prepare_claude_install(project)?)
+}
+
+struct PreparedInstall {
+    path: PathBuf,
+    contents: String,
+    agent_name: &'static str,
+}
+
+fn prepare_claude_install(project: &Path) -> Result<PreparedInstall> {
     let settings_path = project.join(".claude").join("settings.json");
 
-    // Read existing settings or start fresh
-    let mut settings: serde_json::Value = if settings_path.exists() {
-        let content = std::fs::read_to_string(&settings_path)?;
-        serde_json::from_str(&content)?
-    } else {
-        serde_json::json!({})
-    };
+    // Read existing settings or start fresh.
+    let mut settings = read_hook_settings(&settings_path)?;
+    ensure_hooks_object(&mut settings, &settings_path)?;
 
     // Hook commands run via `sh -c`, so a binary path with special characters
     // must be quoted — both for correct execution and so the itr#359 matcher
@@ -66,52 +77,36 @@ pub fn install_claude(project: &Path) -> Result<PathBuf> {
     // through unquoted (no churn in existing settings files).
     let hook_command = shell_quote_command(&hook_binary_path());
 
-    // Ensure hooks object exists
-    if settings.get("hooks").is_none() {
-        settings["hooks"] = serde_json::json!({});
-    }
-
     for event in CLAUDE_HOOK_EVENTS {
-        add_hook_entry(&mut settings, event, &hook_command);
+        add_hook_entry(&mut settings, event, &hook_command)?;
     }
 
     // Add permissions so Claude Code auto-allows tools wisphive gates
     // (eliminates double-prompt — wisphive becomes the sole gatekeeper)
     add_wisphive_permissions(&mut settings);
 
-    // Write back
-    let dir = settings_path.parent().ok_or_else(|| {
-        anyhow::anyhow!(
-            "settings path has no parent directory: {}",
-            settings_path.display()
-        )
-    })?;
-    std::fs::create_dir_all(dir)?;
     let formatted = serde_json::to_string_pretty(&settings)?;
-    std::fs::write(&settings_path, formatted)?;
-
-    info!(path = %settings_path.display(), "Wisphive Claude hooks installed");
-    Ok(settings_path)
+    Ok(PreparedInstall {
+        path: settings_path,
+        contents: formatted,
+        agent_name: "Claude",
+    })
 }
 
 /// Install Wisphive hooks into `<project>/.codex/hooks.json`.
 ///
 /// Returns the path written. Silent — logs via `tracing::info!`.
 pub fn install_codex(project: &Path) -> Result<PathBuf> {
+    write_prepared_install(prepare_codex_install(project)?)
+}
+
+fn prepare_codex_install(project: &Path) -> Result<PreparedInstall> {
     let hooks_path = project.join(".codex").join("hooks.json");
 
-    let mut settings: serde_json::Value = if hooks_path.exists() {
-        let content = std::fs::read_to_string(&hooks_path)?;
-        serde_json::from_str(&content)?
-    } else {
-        serde_json::json!({})
-    };
+    let mut settings = read_hook_settings(&hooks_path)?;
+    ensure_hooks_object(&mut settings, &hooks_path)?;
 
     let hook_command = codex_hook_command(&hook_binary_path());
-
-    if settings.get("hooks").is_none() {
-        settings["hooks"] = serde_json::json!({});
-    }
 
     for event in CODEX_HOOK_EVENTS {
         add_hook_entry_with_timeout(
@@ -119,21 +114,60 @@ pub fn install_codex(project: &Path) -> Result<PathBuf> {
             event,
             &hook_command,
             Some(CODEX_HOOK_TIMEOUT_SECS),
+        )?;
+    }
+
+    let formatted = serde_json::to_string_pretty(&settings)?;
+    Ok(PreparedInstall {
+        path: hooks_path,
+        contents: formatted,
+        agent_name: "Codex",
+    })
+}
+
+fn read_hook_settings(path: &Path) -> Result<serde_json::Value> {
+    if !path.exists() {
+        return Ok(serde_json::json!({}));
+    }
+
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("reading hook settings {}", path.display()))?;
+    serde_json::from_str(&content)
+        .with_context(|| format!("parsing hook settings {}", path.display()))
+}
+
+fn ensure_hooks_object(settings: &mut serde_json::Value, path: &Path) -> Result<()> {
+    let root = settings.as_object_mut().with_context(|| {
+        format!(
+            "{} must contain a JSON object at the document root",
+            path.display()
+        )
+    })?;
+    let hooks = root.entry("hooks").or_insert_with(|| serde_json::json!({}));
+    if !hooks.is_object() {
+        anyhow::bail!(
+            "{} has an invalid `hooks` value: `hooks` must be a JSON object; \
+             replace it with `\"hooks\": {{}}` or remove the key, then retry \
+             hook installation",
+            path.display()
         );
     }
 
-    let dir = hooks_path.parent().ok_or_else(|| {
+    Ok(())
+}
+
+fn write_prepared_install(prepared: PreparedInstall) -> Result<PathBuf> {
+    let dir = prepared.path.parent().ok_or_else(|| {
         anyhow::anyhow!(
-            "hooks path has no parent directory: {}",
-            hooks_path.display()
+            "hook settings path has no parent directory: {}",
+            prepared.path.display()
         )
     })?;
     std::fs::create_dir_all(dir)?;
-    let formatted = serde_json::to_string_pretty(&settings)?;
-    std::fs::write(&hooks_path, formatted)?;
+    std::fs::write(&prepared.path, prepared.contents)?;
 
-    info!(path = %hooks_path.display(), "Wisphive Codex hooks installed");
-    Ok(hooks_path)
+    info!(path = %prepared.path.display(), agent = prepared.agent_name, "Wisphive hooks installed");
+    Ok(prepared.path)
 }
 
 /// Remove Wisphive hooks from `<project>/.claude/settings.json`.
@@ -263,8 +297,8 @@ fn remove_wisphive_permissions(settings: &mut serde_json::Value) {
 ///   }
 /// }
 /// ```
-fn add_hook_entry(settings: &mut serde_json::Value, hook_type: &str, command: &str) {
-    add_hook_entry_with_timeout(settings, hook_type, command, None);
+fn add_hook_entry(settings: &mut serde_json::Value, hook_type: &str, command: &str) -> Result<()> {
+    add_hook_entry_with_timeout(settings, hook_type, command, None)
 }
 
 fn add_hook_entry_with_timeout(
@@ -272,10 +306,12 @@ fn add_hook_entry_with_timeout(
     hook_type: &str,
     command: &str,
     timeout: Option<u64>,
-) {
-    let hooks = settings["hooks"]
+) -> Result<()> {
+    let hooks = settings
+        .get_mut("hooks")
+        .context("hook settings are missing the required `hooks` object")?
         .as_object_mut()
-        .expect("hooks should be an object");
+        .context("hook settings `hooks` must be a JSON object")?;
 
     let entries = hooks
         .entry(hook_type)
@@ -284,7 +320,7 @@ fn add_hook_entry_with_timeout(
     if let Some(arr) = entries.as_array_mut() {
         let already_present = update_existing_wisphive_hooks(arr, command, timeout);
         if already_present {
-            return;
+            return Ok(());
         }
     }
 
@@ -306,6 +342,8 @@ fn add_hook_entry_with_timeout(
             ]
         }));
     }
+
+    Ok(())
 }
 
 fn codex_hook_command(command: &str) -> String {
@@ -657,6 +695,95 @@ mod tests {
         json!({"matcher": "", "hooks": [{"type": "command", "command": command}]})
     }
 
+    fn assert_install_hooks_rejects_hooks_value(hooks: serde_json::Value) {
+        let tmp = temp_project();
+        let original = json!({"hooks": hooks, "theme": "dark"});
+        write_settings(tmp.path(), &original);
+
+        let error = install_hooks(tmp.path())
+            .expect_err("malformed shared hook settings must fail without panicking");
+        let message = error.to_string();
+        assert!(
+            message.contains("`hooks` must be a JSON object"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("replace it with `\"hooks\": {}`"),
+            "error should explain how to repair the config: {message}"
+        );
+        assert_eq!(
+            read_settings(tmp.path()),
+            original,
+            "a rejected config must remain unchanged"
+        );
+        assert!(
+            !tmp.path().join(".codex/hooks.json").exists(),
+            "a rejected Claude config must not partially install Codex hooks"
+        );
+    }
+
+    // ══ Shared install validation ══
+
+    #[test]
+    fn shared_install_rejects_array_hooks_value() {
+        assert_install_hooks_rejects_hooks_value(json!([]));
+    }
+
+    #[test]
+    fn shared_install_rejects_string_hooks_value() {
+        assert_install_hooks_rejects_hooks_value(json!("not hooks"));
+    }
+
+    #[test]
+    fn shared_install_rejects_number_hooks_value() {
+        assert_install_hooks_rejects_hooks_value(json!(42));
+    }
+
+    #[test]
+    fn shared_install_rejects_boolean_hooks_value() {
+        assert_install_hooks_rejects_hooks_value(json!(true));
+    }
+
+    #[test]
+    fn shared_install_rejects_non_object_document_root_without_writes() {
+        let tmp = temp_project();
+        write_settings(tmp.path(), &json!(["not", "an", "object"]));
+        let settings_path = tmp.path().join(".claude/settings.json");
+        let original = fs::read(&settings_path).unwrap();
+
+        let error = install_hooks(tmp.path())
+            .expect_err("a non-object settings document must fail without panicking");
+        assert!(
+            error
+                .to_string()
+                .contains("must contain a JSON object at the document root")
+        );
+        assert_eq!(
+            fs::read(&settings_path).unwrap(),
+            original,
+            "a rejected document must remain byte-for-byte unchanged"
+        );
+        assert!(
+            !tmp.path().join(".codex/hooks.json").exists(),
+            "a rejected Claude document must not partially install Codex hooks"
+        );
+    }
+
+    #[test]
+    fn shared_install_validates_codex_before_mutating_claude() {
+        let tmp = temp_project();
+        let claude_original = json!({"theme": "dark"});
+        let codex_original = json!({"hooks": false, "custom": "keep"});
+        write_settings(tmp.path(), &claude_original);
+        write_codex_hooks(tmp.path(), &codex_original);
+
+        let error = install_hooks(tmp.path())
+            .expect_err("malformed Codex hooks must reject the combined install");
+        assert!(error.to_string().contains("`hooks` must be a JSON object"));
+        assert_eq!(read_settings(tmp.path()), claude_original);
+        assert_eq!(read_codex_hooks(tmp.path()), codex_original);
+    }
+
     // ══ codex_pretooluse_hook_installed — security gate (itr#467) ══
 
     #[test]
@@ -756,7 +883,7 @@ mod tests {
     #[test]
     fn add_to_empty_creates_nested_format() {
         let mut s = json!({"hooks": {}});
-        add_hook_entry(&mut s, "PreToolUse", "wisphive-hook");
+        add_hook_entry(&mut s, "PreToolUse", "wisphive-hook").unwrap();
         let rule = &s["hooks"]["PreToolUse"][0];
         assert_eq!(rule["matcher"], "");
         assert_eq!(rule["hooks"][0]["type"], "command");
@@ -766,7 +893,7 @@ mod tests {
     #[test]
     fn add_preserves_existing_rules() {
         let mut s = json!({"hooks": {"PreToolUse": [cc_rule("other-hook")]}});
-        add_hook_entry(&mut s, "PreToolUse", "wisphive-hook");
+        add_hook_entry(&mut s, "PreToolUse", "wisphive-hook").unwrap();
         let arr = s["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["hooks"][0]["command"], "other-hook");
@@ -776,17 +903,17 @@ mod tests {
     #[test]
     fn add_is_idempotent() {
         let mut s = json!({"hooks": {}});
-        add_hook_entry(&mut s, "PreToolUse", "wisphive-hook");
-        add_hook_entry(&mut s, "PreToolUse", "wisphive-hook");
-        add_hook_entry(&mut s, "PreToolUse", "/usr/bin/wisphive-hook");
+        add_hook_entry(&mut s, "PreToolUse", "wisphive-hook").unwrap();
+        add_hook_entry(&mut s, "PreToolUse", "wisphive-hook").unwrap();
+        add_hook_entry(&mut s, "PreToolUse", "/usr/bin/wisphive-hook").unwrap();
         assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
     }
 
     #[test]
     fn add_different_hook_types_independent() {
         let mut s = json!({"hooks": {}});
-        add_hook_entry(&mut s, "PreToolUse", "wisphive-hook");
-        add_hook_entry(&mut s, "PostToolUse", "wisphive-hook");
+        add_hook_entry(&mut s, "PreToolUse", "wisphive-hook").unwrap();
+        add_hook_entry(&mut s, "PostToolUse", "wisphive-hook").unwrap();
         assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
         assert_eq!(s["hooks"]["PostToolUse"].as_array().unwrap().len(), 1);
     }
@@ -794,7 +921,7 @@ mod tests {
     #[test]
     fn add_with_full_path() {
         let mut s = json!({"hooks": {}});
-        add_hook_entry(&mut s, "PreToolUse", "/home/user/.cargo/bin/wisphive-hook");
+        add_hook_entry(&mut s, "PreToolUse", "/home/user/.cargo/bin/wisphive-hook").unwrap();
         assert_eq!(
             s["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
             "/home/user/.cargo/bin/wisphive-hook"
@@ -804,7 +931,7 @@ mod tests {
     #[test]
     fn add_with_timeout_sets_command_timeout() {
         let mut s = json!({"hooks": {}});
-        add_hook_entry_with_timeout(&mut s, "PreToolUse", "wisphive-hook", Some(42));
+        add_hook_entry_with_timeout(&mut s, "PreToolUse", "wisphive-hook", Some(42)).unwrap();
         assert_eq!(s["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"], 42);
     }
 
@@ -832,7 +959,8 @@ mod tests {
             "PreToolUse",
             "env WISPHIVE_AGENT_TYPE=codex wisphive-hook",
             Some(CODEX_HOOK_TIMEOUT_SECS),
-        );
+        )
+        .unwrap();
         let arr = s["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(

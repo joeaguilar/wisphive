@@ -116,7 +116,11 @@ enum WebAction {
         #[arg(short, long, default_value = "3100")]
         port: u16,
         /// Bind address (default: 127.0.0.1, use 0.0.0.0 for LAN access)
-        #[arg(long, default_value = "127.0.0.1")]
+        #[arg(
+            long,
+            default_value = "127.0.0.1",
+            value_parser = parse_host_arg
+        )]
         host: String,
         /// Dev mode: only serve WebSocket, expect Vite dev server for frontend
         #[arg(long)]
@@ -276,7 +280,11 @@ enum DaemonAction {
         #[arg(long)]
         web: bool,
         /// Web UI bind address (implies --web). Use 0.0.0.0 for LAN access.
-        #[arg(long, default_value = "127.0.0.1")]
+        #[arg(
+            long,
+            default_value = "127.0.0.1",
+            value_parser = parse_host_arg
+        )]
         host: String,
         /// Web UI HTTP port (implies --web).
         #[arg(long, default_value = "3100")]
@@ -597,9 +605,7 @@ fn main() -> anyhow::Result<()> {
                             // --host 0.0.0.0 while `web serve` warned, a
                             // behavioral regression flagged in the itr#215
                             // efficiency review (eff#1).
-                            let Some(host_octets) = parse_host_octets(&host) else {
-                                return Ok(());
-                            };
+                            let host_octets = parse_host_octets(&host)?;
                             // itr#310: resolve the auth profile *before*
                             // launching the daemon. Enterprise fail-fast
                             // exits here with a clean stderr message so
@@ -763,28 +769,41 @@ fn resolve_auth_profile(
 /// Parse a dotted-quad IPv4 string into a `[u8; 4]` octet array. Shared by
 /// `wisphive web serve` and `wisphive daemon start --web`.
 ///
-/// Returns `None` on invalid input — the error is already printed to
-/// stderr, so callers just need to exit cleanly. Prints a WARNING on
-/// `0.0.0.0` so operators notice the LAN exposure.
-fn parse_host_octets(host: &str) -> Option<[u8; 4]> {
+/// Clap value parser for web bind hosts. Validating at the command boundary
+/// gives invalid hosts Clap's non-zero usage-error exit code before any
+/// startup side effects occur.
+fn parse_host_arg(host: &str) -> Result<String, String> {
+    parse_ipv4_host(host).map(|_| host.to_owned())
+}
+
+/// Parse supported web bind hosts without producing output. Keeping the
+/// parser pure lets Clap validate arguments without duplicating the LAN
+/// exposure warning emitted during actual startup.
+fn parse_ipv4_host(host: &str) -> Result<[u8; 4], String> {
     match host {
-        "0.0.0.0" => {
-            eprintln!(
-                "WARNING: Web UI is exposed on all network interfaces. Ensure this is intentional."
-            );
-            Some([0, 0, 0, 0])
-        }
-        "127.0.0.1" | "localhost" => Some([127, 0, 0, 1]),
-        other => {
-            let parts: Vec<u8> = other.split('.').filter_map(|s| s.parse().ok()).collect();
-            if parts.len() == 4 {
-                Some([parts[0], parts[1], parts[2], parts[3]])
-            } else {
-                eprintln!("Invalid host address: {other}");
-                None
-            }
-        }
+        "localhost" => Ok([127, 0, 0, 1]),
+        other => other
+            .parse::<std::net::Ipv4Addr>()
+            .map(|address| address.octets())
+            .map_err(|_| {
+                format!(
+                    "invalid host address '{other}': expected 'localhost' or a dotted-quad IPv4 address"
+                )
+            }),
     }
+}
+
+/// Parse a web bind host for startup. Invalid input remains an error even if
+/// a future internal caller bypasses Clap validation. Prints a WARNING on
+/// `0.0.0.0` so operators notice the LAN exposure.
+fn parse_host_octets(host: &str) -> anyhow::Result<[u8; 4]> {
+    let octets = parse_ipv4_host(host).map_err(anyhow::Error::msg)?;
+    if octets == [0, 0, 0, 0] {
+        eprintln!(
+            "WARNING: Web UI is exposed on all network interfaces. Ensure this is intentional."
+        );
+    }
+    Ok(octets)
 }
 
 async fn serve_web(
@@ -801,9 +820,7 @@ async fn serve_web(
         .join(".wisphive");
     let socket_path = home.join("wisphive.sock");
 
-    let Some(host_octets) = parse_host_octets(&host) else {
-        return Ok(());
-    };
+    let host_octets = parse_host_octets(&host)?;
 
     // itr#310: resolve the auth profile up front so an Enterprise misconfig
     // fails before we start the listener.
@@ -946,6 +963,29 @@ fn print_startup_banner(home: &std::path::Path, host_octets: [u8; 4], port: u16,
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    fn parse_error(args: &[&str]) -> clap::Error {
+        match Cli::try_parse_from(args) {
+            Ok(_) => panic!("command unexpectedly accepted invalid arguments"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn daemon_start_invalid_host_exits_nonzero() {
+        let error = parse_error(&["wisphive", "daemon", "start", "--web", "--host", "bogus"]);
+
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("invalid host address 'bogus'"));
+    }
+
+    #[test]
+    fn web_serve_invalid_host_exits_nonzero() {
+        let error = parse_error(&["wisphive", "web", "serve", "--host", "bogus"]);
+
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("invalid host address 'bogus'"));
+    }
 
     #[test]
     fn term_close_exposes_one_behavior_without_kill_flag() {

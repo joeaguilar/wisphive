@@ -74,7 +74,7 @@
 - **#306 — Reject invalid daemon/web host values**
   - Files: `crates/wisphive_cli/src/main.rs`
 - **#307 — Handle non-object Claude hook settings without panic**
-  - Files: `crates/wisphive_cli/src/commands/hooks.rs`
+  - Files: `crates/wisphive_cli/src/commands/hooks.rs`, `crates/wisphive_daemon/src/hook_install.rs`
 - **#262 — Enforce mode 0600 on SQLite database sidecars**
   - Files: `crates/wisphive_daemon/src/state/mod.rs`, `AGENTS.md`
 
@@ -264,6 +264,9 @@ No wave contains a shared owned file. Co-located tests inherit the same ownershi
 - **Wave 6 / #303 safe-alternative pivot:** nested signal-race review demonstrated that raw-PID SIGKILL cannot be made truthful and reuse-safe with the current `portable-pty` ownership model, including zombie and inherited `SIGCHLD=SIG_IGN` cases. Directed the story to its explicit alternate acceptance: remove the unsupported kill distinction and expose one honest close behavior. Added the CLI parser plus all Rust/TypeScript TermClose senders and protocol types; every later owner was inactive, and #95 had already settled its shared server edits.
 - **Wave 6 / #303 documentation re-review:** final review found the blitz warning and roadmap still described terminal-close work as pending. Updated both to the accepted single-close outcome and added `docs/ROADMAP.md` to ownership.
 - **Wave 6 gate:** after all adversarial repairs and documentation reconciliation, the orchestrator reran both repository gates: `GATR exit=0 dur=25.8s errors=0 warnings=0 adapter=generic tag=blitz-wave6-repair-final-rust` and `GATR exit=0 dur=6.7s errors=0 warnings=0 adapter=generic tag=blitz-wave6-repair-final-frontend` (15 files, 125 tests). Final re-review: PASS.
+- **Wave 7 / #307 shared-boundary repair:** independent review found the CLI-only prevalidation left the daemon/web `InstallHooks` path able to reach the same `hooks`-object `expect`. Reopened #307 and added `crates/wisphive_daemon/src/hook_install.rs`; malformed shapes must return `Result` from the shared library before either caller mutates files.
+- **Wave 7 / #262 pre-existing-file repair:** independent security review found the fresh-file permission pass happened too late for existing WAL/SHM files and did not validate parent ownership/writeability or descriptor file type/effective UID. Reopened #262 for secure-parent validation, descriptor preflight of main/WAL/SHM before SQLite consumes them, postflight of newly-created sidecars, and loose-mode/symlink/nonregular regressions.
+- **Wave 7 gate:** after both review repairs, the orchestrator reran both repository gates: `GATR exit=0 dur=34.0s errors=0 warnings=0 adapter=generic tag=blitz-wave7-final-rust` and `GATR exit=0 dur=6.6s errors=0 warnings=0 adapter=generic tag=blitz-wave7-final-frontend` (15 files, 125 tests). Final re-reviews for #262 and #307: PASS; #306 review: PASS.
 - **Wave 4 / #111 lint repair:** its first frontend pass caught a React hooks rule violation from assigning the actions ref during render. The worker moved the ref refresh into `useLayoutEffect`; both required gates then passed.
 - **Wave 4 gate:** orchestrator reran both repository gates after all workers settled: `GATR exit=0 dur=23.5s errors=0 warnings=0 adapter=generic tag=blitz-wave4-final-rust` and `GATR exit=0 dur=5.8s errors=0 warnings=0 adapter=generic tag=blitz-wave4-final-frontend` (14 files, 122 tests).
 
@@ -299,6 +302,11 @@ No wave contains a shared owned file. Co-located tests inherit the same ownershi
   - **#95 closed:** mode reads now use descriptor-based no-follow validation of the effective owner, exact `0700` state directory, exact `0600` regular file, and bounded contents; writes are atomic and owner-only; the daemon independently requires secure active mode before hook decisions or managed spawns. Missing/unsafe pre-parse state emits stderr and exits 2 without fabricating an event response. Real-binary PermissionRequest and daemon-boundary regressions pass.
   - **#205 closed:** the existing shared History renderer already supplied Copy controls; focused runtime coverage now proves every rendered History code block has a colocated control and copies exact Command/Tool Result content, including stdout, stderr, and raw output.
   - **#303 closed:** after adversarial review rejected an unsafe raw-PID force/graceful implementation, the accepted alternate removed the unsupported `kill` distinction across Rust/TypeScript protocol, CLI, TUI, web, and daemon. Legacy payloads with the retired field still decode, and a real PTY manager test proves the single close behavior.
+  - **Commit:** `b6a1551` — `fix(runtime): secure mode and simplify terminal close`.
+- **Wave 7 — 2026-07-12T00:11Z–2026-07-12T00:38Z — 3 workers + adversarial repair reviews.**
+  - **#306 closed:** both daemon-web start and standalone web-serve hosts are validated by Clap before side effects and invalid input exits 2 with an actionable error; runtime parsing also propagates errors if called outside Clap. Regression tests cover both affected commands and valid IPv4/localhost behavior remains.
+  - **#307 closed:** the shared Claude/Codex installer now parses and validates both user configs before writing either one, returns contextual errors for malformed roots or non-object hooks, and is used by CLI plus daemon/web paths. Tests cover array/string/number/bool hooks, malformed document roots, unchanged rejected files, and cross-agent no-partial-mutation behavior.
+  - **#262 closed:** daemon and CLI database opens hold a no-follow, effective-user-owned, non-group/world-writable parent descriptor; preflight existing main/WAL/SHM entries by descriptor, securely create a missing main file, enforce exact `0600`, and postflight parent identity plus newly-created sidecars. Six adversarial tests cover fresh and `06777` files, symlinks, nonregular entries, and unsafe parents.
   - **Commit:** pending immediately after this log update.
 
 ## Quarantine triage notes

@@ -43,10 +43,12 @@ pub fn install(project: Option<PathBuf>, _all: bool) -> Result<()> {
         .or_else(|| std::env::current_dir().ok())
         .context("could not determine project directory")?;
 
-    let claude_path = hook_install::install_claude(&project)?;
+    hook_install::install_hooks(&project)?;
+
+    let claude_path = project.join(".claude").join("settings.json");
     eprintln!("Wisphive hooks installed in {}", claude_path.display());
 
-    let codex_path = hook_install::install_codex(&project)?;
+    let codex_path = project.join(".codex").join("hooks.json");
     eprintln!("Wisphive hooks installed in {}", codex_path.display());
     eprintln!("{}", hook_install::CODEX_HOOK_REVIEW_NOTE);
 
@@ -188,6 +190,88 @@ fn process_exists(pid: i32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::install;
+
+    fn write_claude_settings(project: &std::path::Path, settings: serde_json::Value) {
+        let claude_dir = project.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_vec(&settings).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn assert_install_rejects_hooks_value(hooks: serde_json::Value) {
+        let tmp = tempfile::tempdir().unwrap();
+        write_claude_settings(tmp.path(), serde_json::json!({ "hooks": hooks }));
+
+        let error = install(Some(tmp.path().to_path_buf()), false)
+            .expect_err("malformed Claude hooks must fail without panicking");
+        let message = error.to_string();
+        assert!(
+            message.contains("`hooks` must be a JSON object"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("replace it with `\"hooks\": {}`"),
+            "error should tell the user how to repair the config: {message}"
+        );
+        assert!(
+            !tmp.path().join(".codex/hooks.json").exists(),
+            "a rejected Claude config must not partially install Codex hooks"
+        );
+    }
+
+    #[test]
+    fn install_rejects_array_hooks_value() {
+        assert_install_rejects_hooks_value(serde_json::json!([]));
+    }
+
+    #[test]
+    fn install_rejects_string_hooks_value() {
+        assert_install_rejects_hooks_value(serde_json::json!("not hooks"));
+    }
+
+    #[test]
+    fn install_rejects_number_hooks_value() {
+        assert_install_rejects_hooks_value(serde_json::json!(42));
+    }
+
+    #[test]
+    fn install_rejects_boolean_hooks_value() {
+        assert_install_rejects_hooks_value(serde_json::json!(true));
+    }
+
+    #[test]
+    fn install_accepts_object_hooks_and_preserves_other_settings() {
+        let valid = tempfile::tempdir().unwrap();
+        write_claude_settings(
+            valid.path(),
+            serde_json::json!({ "hooks": {}, "theme": "dark" }),
+        );
+        install(Some(valid.path().to_path_buf()), false).unwrap();
+
+        let installed: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(valid.path().join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(installed["theme"], "dark");
+        assert!(installed["hooks"].is_object());
+    }
+
+    #[test]
+    fn install_accepts_missing_hooks_key_and_missing_settings_file() {
+        let missing_key = tempfile::tempdir().unwrap();
+        write_claude_settings(missing_key.path(), serde_json::json!({ "theme": "dark" }));
+        install(Some(missing_key.path().to_path_buf()), false).unwrap();
+
+        let missing = tempfile::tempdir().unwrap();
+        install(Some(missing.path().to_path_buf()), false).unwrap();
+        assert!(missing.path().join(".claude/settings.json").is_file());
+        assert!(missing.path().join(".codex/hooks.json").is_file());
+    }
+
     // ══ Mode file ══
 
     #[test]
