@@ -215,8 +215,12 @@ impl Server {
             ),
             Err(e) => warn!("failed to drain orphaned pending decisions: {e}"),
         }
+        // itr#510: thread the daemon's own effective hook-approval timeout
+        // into the spawn-time gate — the registry must not re-derive it from
+        // the default home, which can diverge from this daemon's `home_dir`.
         let process_registry = Arc::new(Mutex::new(ProcessRegistry::new(
             config.codex_allow_foreign_hooks,
+            config.hook_timeout_secs,
         )));
         let agent_registry = Arc::new(Mutex::new(AgentRegistry::new()));
         let terminal_manager = Arc::new(TerminalSessionManager::new(
@@ -1852,7 +1856,7 @@ async fn handle_decision_command(
                 return Ok(());
             }
 
-            let result = match crate::hook_install::install_hooks(&project) {
+            let result = match crate::hook_install::install_hooks_in_home(&project, &ctx.home_dir) {
                 Ok(()) => {
                     let audit = crate::project_audit::audit_project(&project);
                     ServerMessage::InstallHooksResult {
@@ -4373,6 +4377,134 @@ mod tests {
         let (gated, allowed) = partition_sudo_gated(true, vec![spawn.clone()]);
         assert!(gated.is_empty());
         assert_eq!(ids(&allowed), vec![spawn.0]);
+    }
+
+    /// itr#510 review fix: the live-daemon InstallHooks handler must derive
+    /// both agents' installed hook timeout from that daemon's configured home,
+    /// not from the standalone CLI's default `~/.wisphive` home.
+    #[tokio::test]
+    async fn install_hooks_handler_uses_running_daemon_home_timeout() {
+        use std::time::Duration;
+
+        use tokio::net::UnixStream;
+        use wisphive_protocol::{ClientMessage, ServerMessage};
+
+        // Deliberately diverge from the process's real default-home config so
+        // this test reliably fails if the handler calls default-home install.
+        let default_home_timeout = crate::config::effective_hook_timeout_secs_default_home();
+        let daemon_timeout = if default_home_timeout == 7_200 {
+            86_400
+        } else {
+            7_200
+        };
+        assert_ne!(daemon_timeout, default_home_timeout);
+
+        let home = tempfile::tempdir().unwrap();
+        crate::config::write_config_atomic(
+            &home.path().join("config.json"),
+            &format!(r#"{{"hook_timeout_secs": {daemon_timeout}}}"#),
+        )
+        .unwrap();
+        let config = crate::DaemonConfig::new(home.path().to_path_buf());
+        assert_eq!(config.home_dir, home.path());
+        assert_eq!(config.hook_timeout_secs, daemon_timeout);
+
+        let server = super::Server::new(config).await.unwrap();
+        let ctx = super::ConnectionContext {
+            queue: server.queue.clone(),
+            process_registry: server.process_registry.clone(),
+            agent_registry: server.agent_registry.clone(),
+            tui_tx: server.tui_tx.clone(),
+            state_db: server.state_db.clone(),
+            terminal_manager: server.terminal_manager.clone(),
+            reauth: server.reauth.clone(),
+            replay_gate: server.replay_gate.clone(),
+            bad_hello_gate: server.bad_hello_gate.clone(),
+            hook_timeout_secs: server.config.hook_timeout_secs,
+            notifications_enabled: server.config.notifications_enabled,
+            home_dir: server.config.home_dir.clone(),
+            audit_snapshot_limit: server.config.audit_snapshot_limit,
+        };
+        assert_eq!(ctx.home_dir, home.path());
+
+        let project = tempfile::tempdir().unwrap();
+        let project_path = project.path().to_path_buf();
+        let (server_stream, client_stream) = UnixStream::pair().unwrap();
+        let (_, mut writer) = server_stream.into_split();
+        let mut responses = BufReader::new(client_stream).lines();
+        let mut attachments = std::collections::HashMap::new();
+        let (conn_tx, _conn_rx) = tokio::sync::mpsc::channel(1);
+
+        let flow = super::dispatch_command(
+            &mut writer,
+            &ctx,
+            None,
+            None,
+            ClientMessage::InstallHooks {
+                project: project_path.clone(),
+            },
+            &mut attachments,
+            &conn_tx,
+        )
+        .await
+        .unwrap();
+        assert!(flow.is_continue());
+
+        let line = tokio::time::timeout(Duration::from_secs(2), responses.next_line())
+            .await
+            .expect("install result should be sent to the requesting TUI")
+            .unwrap()
+            .unwrap();
+        let response: ServerMessage = wisphive_protocol::decode(&line).unwrap();
+        match response {
+            ServerMessage::InstallHooksResult {
+                project,
+                status,
+                error,
+            } => {
+                assert_eq!(project, project_path);
+                assert!(
+                    status.is_some(),
+                    "successful install should return fresh status"
+                );
+                assert!(
+                    error.is_none(),
+                    "successful install should not return an error"
+                );
+            }
+            other => panic!("expected install-hooks result, got {other:?}"),
+        }
+
+        let expected_timeout = crate::hook_install::installed_hook_timeout_secs(daemon_timeout);
+        let default_home_installed_timeout =
+            crate::hook_install::installed_hook_timeout_secs(default_home_timeout);
+        assert_ne!(expected_timeout, default_home_installed_timeout);
+        for (agent, path, events) in [
+            (
+                "Claude",
+                project_path.join(".claude/settings.json"),
+                crate::project_audit::CLAUDE_HOOK_EVENTS,
+            ),
+            (
+                "Codex",
+                project_path.join(".codex/hooks.json"),
+                crate::project_audit::CODEX_HOOK_EVENTS,
+            ),
+        ] {
+            let contents = std::fs::read_to_string(path).unwrap();
+            let settings: serde_json::Value = serde_json::from_str(&contents).unwrap();
+            for &event in events {
+                assert_eq!(
+                    settings["hooks"][event][0]["hooks"][0]["timeout"], expected_timeout,
+                    "{agent} {event} must use the running daemon home's timeout"
+                );
+                assert_ne!(
+                    settings["hooks"][event][0]["hooks"][0]["timeout"],
+                    default_home_installed_timeout,
+                    "{agent} {event} must not use the default-home timeout"
+                );
+            }
+        }
     }
 
     #[tokio::test]

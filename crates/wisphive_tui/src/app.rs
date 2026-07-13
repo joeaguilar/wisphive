@@ -689,6 +689,56 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// Select the previous item while keeping the current detail view open.
+    pub fn select_prev_item_in_detail(&mut self) {
+        match self.view_mode {
+            ViewMode::Detail => {
+                let previous_index = self.queue_index;
+                self.queue_up();
+                if self.queue_index != previous_index {
+                    self.detail_request_id = self.selected_request().map(|request| request.id);
+                    self.detail_scroll = 0;
+                }
+            }
+            ViewMode::HistoryDetail => {
+                let previous_index = self.history_index;
+                self.history_up();
+                if self.history_index != previous_index {
+                    if self.view_back_stack.last() == Some(&ViewMode::SessionTimeline) {
+                        self.session_timeline_index = self.history_index;
+                    }
+                    self.detail_scroll = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Select the next item while keeping the current detail view open.
+    pub fn select_next_item_in_detail(&mut self) {
+        match self.view_mode {
+            ViewMode::Detail => {
+                let previous_index = self.queue_index;
+                self.queue_down();
+                if self.queue_index != previous_index {
+                    self.detail_request_id = self.selected_request().map(|request| request.id);
+                    self.detail_scroll = 0;
+                }
+            }
+            ViewMode::HistoryDetail => {
+                let previous_index = self.history_index;
+                self.history_down();
+                if self.history_index != previous_index {
+                    if self.view_back_stack.last() == Some(&ViewMode::SessionTimeline) {
+                        self.session_timeline_index = self.history_index;
+                    }
+                    self.detail_scroll = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Enter the history view.
     pub fn enter_history_view(&mut self, agent_id: Option<String>) {
         self.history_agent_filter = agent_id;

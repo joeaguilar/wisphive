@@ -112,6 +112,7 @@ const UNLOADED_SNAPSHOT: UseAuthProfile = {
  * round-trip happens regardless of mount order or remount churn. */
 let cachedSnapshot: UseAuthProfile | null = null;
 let inflight: Promise<UseAuthProfile> | null = null;
+let profileAbortController: AbortController | null = null;
 const subscribers = new Set<() => void>();
 
 function notifySubscribers(): void {
@@ -126,9 +127,9 @@ function notifySubscribers(): void {
   }
 }
 
-async function fetchProfile(): Promise<UseAuthProfile> {
+async function fetchProfile(signal: AbortSignal): Promise<UseAuthProfile> {
   try {
-    const res = await apiFetch("/api/auth/profile");
+    const res = await apiFetch("/api/auth/profile", { signal });
     if (!res.ok) {
       // Non-2xx — the endpoint is unauthenticated so 401/403 here would
       // be a daemon bug. Surface as "fail closed, but loaded" and don't
@@ -183,9 +184,18 @@ export async function waitForAuthProfile(): Promise<UseAuthProfile> {
   // success or fail-closed, lands in the cache so hook consumers can
   // render a stable `loaded=true` UI. A subsequent `waitForAuthProfile()`
   // caller will re-kick if this attempt also failed.
-  const promise = fetchProfile().then((snapshot) => {
+  const controller = new AbortController();
+  profileAbortController = controller;
+  const promise = fetchProfile(controller.signal).then((snapshot) => {
+    // A final-subscriber cleanup may abort this probe immediately before a
+    // StrictMode remount starts a replacement. Do not let the cancelled
+    // probe overwrite that replacement's state when its rejection settles.
+    if (controller.signal.aborted) return snapshot;
     cachedSnapshot = snapshot;
     inflight = null;
+    if (profileAbortController === controller) {
+      profileAbortController = null;
+    }
     notifySubscribers();
     return snapshot;
   });
@@ -198,9 +208,9 @@ export async function waitForAuthProfile(): Promise<UseAuthProfile> {
  * posture. Multiple `useAuthProfile()` callers share the same probe
  * and the same snapshot — see module docstring.
  *
- * Cleanup is per-component (each hook instance unsubscribes on
- * unmount); the underlying probe runs to completion regardless because
- * other consumers may still be mounted.
+ * Cleanup is per-component. The shared probe stays alive while at least
+ * one consumer remains mounted, then aborts when the final consumer
+ * unsubscribes.
  */
 export function useAuthProfile(): UseAuthProfile {
   // Render-time snapshot is the singleton if cached, else the unloaded
@@ -220,6 +230,14 @@ export function useAuthProfile(): UseAuthProfile {
     void waitForAuthProfile();
     return () => {
       subscribers.delete(cb);
+      if (subscribers.size === 0 && profileAbortController) {
+        profileAbortController.abort();
+        profileAbortController = null;
+        // React StrictMode immediately re-runs setup after cleanup. Make the
+        // cancelled promise unavailable synchronously so that setup starts a
+        // fresh probe instead of sharing the already-aborted one.
+        inflight = null;
+      }
     };
   }, []);
 
@@ -242,7 +260,9 @@ export function useAuthProfile(): UseAuthProfile {
  * subscriber tick) rather than overloading this test hook.
  */
 export function __resetAuthProfileForTesting(): void {
+  profileAbortController?.abort();
   cachedSnapshot = null;
   inflight = null;
+  profileAbortController = null;
   subscribers.clear();
 }

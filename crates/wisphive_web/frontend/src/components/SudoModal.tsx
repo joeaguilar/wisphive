@@ -19,6 +19,15 @@ interface Props {
   onSuccess: () => void;
 }
 
+function isAbortError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "name" in error &&
+    error.name === "AbortError"
+  );
+}
+
 /**
  * SudoModal — re-prompts for the account password when the daemon rejects a
  * sudo-class approve with `web_reauth_required`. Mirrors Login.tsx's error
@@ -30,6 +39,31 @@ export const SudoModal = memo(function SudoModal({ toolName, onCancel, onSuccess
   const [error, setError] = useState<SudoModalError | null>(null);
   const [countdown, setCountdown] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
+  const requestsRef = useRef<Set<AbortController>>(new Set());
+
+  const fetchWithAbort = useCallback(
+    async (path: string, init: RequestInit = {}): Promise<Response> => {
+      const controller = new AbortController();
+      requestsRef.current.add(controller);
+      try {
+        return await apiFetch(path, { ...init, signal: controller.signal });
+      } finally {
+        requestsRef.current.delete(controller);
+      }
+    },
+    [],
+  );
+
+  // Requests issued by this modal only matter while it remains open.
+  useEffect(() => {
+    const requests = requestsRef.current;
+    return () => {
+      for (const controller of requests) {
+        controller.abort();
+      }
+      requests.clear();
+    };
+  }, []);
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -65,8 +99,9 @@ export const SudoModal = memo(function SudoModal({ toolName, onCancel, onSuccess
       if (disabled || !password) return;
       setSubmitting(true);
       setError(null);
+      let aborted = false;
       try {
-        const res = await apiFetch("/api/auth/reauth", {
+        const res = await fetchWithAbort("/api/auth/reauth", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ password }),
@@ -99,15 +134,19 @@ export const SudoModal = memo(function SudoModal({ toolName, onCancel, onSuccess
         }
         setError({ kind: "server", message: `Reauth failed (${res.status}).` });
       } catch (err) {
+        if (isAbortError(err)) {
+          aborted = true;
+          return;
+        }
         setError({
           kind: "network",
           message: `Could not reach daemon: ${err instanceof Error ? err.message : String(err)}`,
         });
       } finally {
-        setSubmitting(false);
+        if (!aborted) setSubmitting(false);
       }
     },
-    [disabled, password, onSuccess],
+    [disabled, password, onSuccess, fetchWithAbort],
   );
 
   return (

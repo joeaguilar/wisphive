@@ -1,3 +1,5 @@
+#![allow(unexpected_cfgs)]
+
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
@@ -187,6 +189,160 @@ pub struct DecisionRequest {
     /// daemon-managed PTY down through the shell to the hook.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_session_id: Option<Uuid>,
+}
+
+mod fixture_impl {
+    use super::{AgentType, DecisionRequest, HookEventType, PermissionSuggestion};
+    use chrono::{DateTime, Utc};
+    use std::path::PathBuf;
+    use uuid::Uuid;
+
+    /// Builder for the complete `DecisionRequest` shape used by test fixtures.
+    #[derive(Debug)]
+    pub struct DecisionRequestBuilder {
+        id: Uuid,
+        agent_id: String,
+        agent_type: AgentType,
+        project: PathBuf,
+        tool_name: String,
+        tool_input: serde_json::Value,
+        timestamp: DateTime<Utc>,
+        hook_event_name: HookEventType,
+        tool_use_id: Option<String>,
+        permission_suggestions: Option<Vec<PermissionSuggestion>>,
+        event_data: Option<serde_json::Value>,
+        terminal_session_id: Option<Uuid>,
+    }
+
+    impl DecisionRequestBuilder {
+        pub fn new(
+            tool_name: impl Into<String>,
+            agent_id: impl Into<String>,
+            project: impl Into<PathBuf>,
+        ) -> Self {
+            Self {
+                id: Uuid::new_v4(),
+                agent_id: agent_id.into(),
+                agent_type: AgentType::ClaudeCode,
+                project: project.into(),
+                tool_name: tool_name.into(),
+                tool_input: serde_json::Value::Null,
+                timestamp: Utc::now(),
+                hook_event_name: HookEventType::default(),
+                tool_use_id: None,
+                permission_suggestions: None,
+                event_data: None,
+                terminal_session_id: None,
+            }
+        }
+
+        pub fn agent_type(mut self, agent_type: AgentType) -> Self {
+            self.agent_type = agent_type;
+            self
+        }
+
+        pub fn tool_input(mut self, tool_input: serde_json::Value) -> Self {
+            self.tool_input = tool_input;
+            self
+        }
+
+        pub fn timestamp(mut self, timestamp: DateTime<Utc>) -> Self {
+            self.timestamp = timestamp;
+            self
+        }
+
+        pub fn hook_event_name(mut self, hook_event_name: HookEventType) -> Self {
+            self.hook_event_name = hook_event_name;
+            self
+        }
+
+        pub fn tool_use_id(mut self, tool_use_id: Option<String>) -> Self {
+            self.tool_use_id = tool_use_id;
+            self
+        }
+
+        pub fn permission_suggestions(
+            mut self,
+            permission_suggestions: Option<Vec<PermissionSuggestion>>,
+        ) -> Self {
+            self.permission_suggestions = permission_suggestions;
+            self
+        }
+
+        pub fn event_data(mut self, event_data: Option<serde_json::Value>) -> Self {
+            self.event_data = event_data;
+            self
+        }
+
+        pub fn terminal_session_id(mut self, terminal_session_id: Option<Uuid>) -> Self {
+            self.terminal_session_id = terminal_session_id;
+            self
+        }
+
+        pub fn build(self) -> DecisionRequest {
+            DecisionRequest {
+                id: self.id,
+                agent_id: self.agent_id,
+                agent_type: self.agent_type,
+                project: self.project,
+                tool_name: self.tool_name,
+                tool_input: self.tool_input,
+                timestamp: self.timestamp,
+                hook_event_name: self.hook_event_name,
+                tool_use_id: self.tool_use_id,
+                permission_suggestions: self.permission_suggestions,
+                event_data: self.event_data,
+                terminal_session_id: self.terminal_session_id,
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn make_request(
+        tool: &str,
+        agent_id: &str,
+        project: &str,
+        agent_type: AgentType,
+    ) -> DecisionRequest {
+        DecisionRequestBuilder::new(tool, agent_id, project)
+            .agent_type(agent_type)
+            .build()
+    }
+
+    pub const QUEUE_MAKE_REQUEST: fn(&str, &str, &str) -> DecisionRequest =
+        |tool, agent_id, project| {
+            DecisionRequestBuilder::new(tool, agent_id, project)
+                .tool_input(serde_json::json!({}))
+                .build()
+        };
+
+    pub const STATE_MAKE_REQUEST: fn(&str, &str, &str) -> DecisionRequest =
+        |tool, agent_id, project| {
+            DecisionRequestBuilder::new(tool, agent_id, project)
+                .tool_input(serde_json::json!({"command": "test"}))
+                .hook_event_name(HookEventType::PreToolUse)
+                .build()
+        };
+
+    pub const STATE_MAKE_REQUEST_WITH_TOOL_USE_ID: fn(&str, &str, &str) -> DecisionRequest =
+        |tool, agent_id, tool_use_id| {
+            DecisionRequestBuilder::new(tool, agent_id, "/test")
+                .tool_input(serde_json::json!({"command": "test"}))
+                .hook_event_name(HookEventType::PreToolUse)
+                .tool_use_id(Some(tool_use_id.into()))
+                .build()
+        };
+}
+
+pub use fixture_impl::{
+    DecisionRequestBuilder, QUEUE_MAKE_REQUEST, STATE_MAKE_REQUEST,
+    STATE_MAKE_REQUEST_WITH_TOOL_USE_ID,
+};
+
+#[allow(unexpected_cfgs)]
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod fixtures {
+    pub use super::fixture_impl::{DecisionRequestBuilder, make_request};
 }
 
 /// The human's decision on a tool call.
@@ -860,30 +1016,9 @@ pub struct ProjectHookStatus {
 
 #[cfg(test)]
 mod tests {
+    use super::fixtures::make_request;
     use super::*;
     use std::path::PathBuf;
-
-    fn make_request(
-        tool: &str,
-        agent_id: &str,
-        project: &str,
-        agent_type: AgentType,
-    ) -> DecisionRequest {
-        DecisionRequest {
-            id: uuid::Uuid::new_v4(),
-            agent_id: agent_id.into(),
-            agent_type,
-            project: PathBuf::from(project),
-            tool_name: tool.into(),
-            tool_input: serde_json::Value::Null,
-            timestamp: chrono::Utc::now(),
-            hook_event_name: Default::default(),
-            tool_use_id: None,
-            permission_suggestions: None,
-            event_data: None,
-            terminal_session_id: None,
-        }
-    }
 
     // ── AgentType ──────────────────────────────────────────────────────
 

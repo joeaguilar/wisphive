@@ -32,4 +32,58 @@ describe("useAuth", () => {
     });
     expect(result.current.error).toBeNull();
   });
+
+  it("keeps login error null for AbortError on unmount, but surfaces other failures", async () => {
+    let loginSignal: AbortSignal | undefined;
+    const fetchMock = vi.fn((path: string, init?: RequestInit) => {
+      if (path === "/api/auth/status") {
+        return Promise.resolve(
+          new Response(JSON.stringify({ password_set: true, setup_required: false }), {
+            headers: { "content-type": "application/json" },
+          }),
+        );
+      }
+      return new Promise<Response>((_resolve, reject) => {
+        loginSignal = init?.signal ?? undefined;
+        loginSignal?.addEventListener("abort", () => {
+          reject(new DOMException("The operation was aborted.", "AbortError"));
+        });
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(() => useAuth());
+    await waitFor(() => expect(result.current.phase).toBe("unauthed"));
+
+    let login: Promise<boolean>;
+    act(() => {
+      login = result.current.login("password");
+    });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    unmount();
+    expect(loginSignal?.aborted).toBe(true);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    await expect(login!).resolves.toBe(false);
+    expect(result.current.error).toBeNull();
+
+    const networkFetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ password_set: true, setup_required: false }), {
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockRejectedValueOnce(new TypeError("network down"));
+    vi.stubGlobal("fetch", networkFetchMock);
+
+    const network = renderHook(() => useAuth());
+    await waitFor(() => expect(network.result.current.phase).toBe("unauthed"));
+    await act(async () => {
+      await expect(network.result.current.login("password")).resolves.toBe(false);
+    });
+    expect(network.result.current.error).toMatchObject({ kind: "network" });
+  });
 });

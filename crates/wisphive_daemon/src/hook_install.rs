@@ -27,7 +27,43 @@ use crate::project_audit::{CLAUDE_HOOK_EVENTS, CODEX_HOOK_EVENTS};
 /// This eliminates the double-prompt — wisphive becomes the sole gatekeeper.
 const WISPHIVE_PERMISSIONS: &[&str] = &["Bash(*)", "Edit(*)", "Write(*)", "NotebookEdit(*)"];
 
-const CODEX_HOOK_TIMEOUT_SECS: u64 = 3_700;
+/// Safety margin (seconds) added on top of the effective daemon hook-approval
+/// timeout when writing the synchronous `timeout` field of an installed
+/// Wisphive hook entry.
+///
+/// INVARIANT (itr#510): every installed synchronous Wisphive hook entry must
+/// carry a `timeout` that strictly exceeds the daemon's effective
+/// `hook_timeout_secs` (default 3600, configurable up to 86400). Claude Code
+/// cancels a command hook after its `timeout` — **600 s when the field is
+/// omitted** — so an absent or short timeout lets Claude Code kill the
+/// blocking `wisphive-hook` and abandon the pending approval before the
+/// daemon's own timeout resolves it: the human approves in the TUI, but the
+/// agent has already given up and moved on. The same invariant is re-checked
+/// at managed-spawn time (`process_registry::inspect_hook_settings`), so a
+/// daemon timeout raised *after* install refuses spawns until
+/// `wisphive hooks install` rewrites the entries.
+pub(crate) const HOOK_TIMEOUT_MARGIN_SECS: u64 = 100;
+
+/// The hook `timeout` value the installer writes for a daemon approval
+/// timeout of `daemon_hook_timeout_secs`. See [`HOOK_TIMEOUT_MARGIN_SECS`]
+/// for the invariant this maintains.
+pub(crate) fn installed_hook_timeout_secs(daemon_hook_timeout_secs: u64) -> u64 {
+    daemon_hook_timeout_secs.saturating_add(HOOK_TIMEOUT_MARGIN_SECS)
+}
+
+/// The timeout to install right now: the effective daemon hook-approval
+/// timeout from `~/.wisphive/config.json` (defaulted + clamped exactly as the
+/// daemon does) plus the safety margin.
+fn effective_installed_hook_timeout_secs() -> u64 {
+    installed_hook_timeout_secs(crate::config::effective_hook_timeout_secs_default_home())
+}
+
+/// [`effective_installed_hook_timeout_secs`] for an explicit Wisphive home:
+/// the daemon-aligned timeout derived from `<wisphive_home>/config.json`
+/// (defaulted + clamped exactly as `DaemonConfig::new` does) plus the margin.
+fn effective_installed_hook_timeout_secs_in(wisphive_home: &Path) -> u64 {
+    installed_hook_timeout_secs(crate::config::effective_hook_timeout_secs(wisphive_home))
+}
 
 /// Reminder shown after installing Codex hooks: Codex requires the user to
 /// trust the hook command in `/hooks`, not just the project.
@@ -35,17 +71,34 @@ pub const CODEX_HOOK_REVIEW_NOTE: &str = "Codex project hooks are non-managed ho
 After installing or changing them, open /hooks in Codex and trust the Wisphive hook command; \
 project trust alone is not enough for Codex to run them.";
 
-/// Install Wisphive hooks (Claude Code + Codex) for `project`.
+/// Install Wisphive hooks (Claude Code + Codex) for `project`, deriving the
+/// installed timeout from the default `~/.wisphive` home.
 ///
-/// Silent library entry point used by the daemon's web-driven install path.
-/// Performs surgical JSON editing — only adds Wisphive entries, preserves
-/// everything else. Idempotent: re-installing does not duplicate entries.
+/// Silent library entry point used by standalone CLI processes. Performs
+/// surgical JSON editing — only adds Wisphive entries, preserves everything
+/// else. Idempotent: re-installing does not duplicate entries.
 pub fn install_hooks(project: &Path) -> Result<()> {
     // Prepare and validate both user-owned files before writing either one.
     // A malformed Codex config must not leave Claude hooks half-installed (or
     // vice versa) merely because it was discovered second.
-    let claude = prepare_claude_install(project)?;
-    let codex = prepare_codex_install(project)?;
+    let hook_timeout_secs = effective_installed_hook_timeout_secs();
+    let claude = prepare_claude_install(project, hook_timeout_secs)?;
+    let codex = prepare_codex_install(project, hook_timeout_secs)?;
+    write_prepared_install(claude)?;
+    write_prepared_install(codex)?;
+    Ok(())
+}
+
+/// [`install_hooks`], but with the daemon-aligned hook timeout derived from
+/// the explicit Wisphive home at `wisphive_home` instead of the default
+/// `~/.wisphive`. Use this from a live daemon, whose configured home may
+/// differ from the standalone CLI default.
+pub fn install_hooks_in_home(project: &Path, wisphive_home: &Path) -> Result<()> {
+    // As in `install_hooks`, validate both files before atomically replacing
+    // either one so a malformed second config cannot cause a partial install.
+    let hook_timeout_secs = effective_installed_hook_timeout_secs_in(wisphive_home);
+    let claude = prepare_claude_install(project, hook_timeout_secs)?;
+    let codex = prepare_codex_install(project, hook_timeout_secs)?;
     write_prepared_install(claude)?;
     write_prepared_install(codex)?;
     Ok(())
@@ -53,9 +106,28 @@ pub fn install_hooks(project: &Path) -> Result<()> {
 
 /// Install Wisphive hooks into `<project>/.claude/settings.json`.
 ///
+/// Every entry is written with a synchronous `timeout` that exceeds the
+/// effective daemon hook-approval timeout (see [`HOOK_TIMEOUT_MARGIN_SECS`],
+/// itr#510); reinstalling upgrades legacy timeout-less entries in place.
+///
 /// Returns the path written. Silent — logs via `tracing::info!`.
 pub fn install_claude(project: &Path) -> Result<PathBuf> {
-    write_prepared_install(prepare_claude_install(project)?)
+    write_prepared_install(prepare_claude_install(
+        project,
+        effective_installed_hook_timeout_secs(),
+    )?)
+}
+
+/// [`install_claude`], but with the daemon-aligned hook timeout derived from
+/// the Wisphive home at `wisphive_home` instead of the default `~/.wisphive`.
+/// Same end-to-end path (config load → clamp → margin → prepare → atomic
+/// write); use it when the target daemon runs with a non-default state dir,
+/// and in hermetic tests.
+pub fn install_claude_in_home(project: &Path, wisphive_home: &Path) -> Result<PathBuf> {
+    write_prepared_install(prepare_claude_install(
+        project,
+        effective_installed_hook_timeout_secs_in(wisphive_home),
+    )?)
 }
 
 struct PreparedInstall {
@@ -64,7 +136,7 @@ struct PreparedInstall {
     agent_name: &'static str,
 }
 
-fn prepare_claude_install(project: &Path) -> Result<PreparedInstall> {
+fn prepare_claude_install(project: &Path, hook_timeout_secs: u64) -> Result<PreparedInstall> {
     let settings_path = project.join(".claude").join("settings.json");
 
     // Read existing settings or start fresh.
@@ -77,8 +149,14 @@ fn prepare_claude_install(project: &Path) -> Result<PreparedInstall> {
     // through unquoted (no churn in existing settings files).
     let hook_command = shell_quote_command(&hook_binary_path());
 
+    // Write an explicit synchronous timeout on every entry (itr#510): a
+    // PreToolUse hook blocks for up to the daemon's approval timeout, and
+    // Claude Code's implicit 600 s hook timeout would cancel it first. Other
+    // events (Stop, UserPromptSubmit, ...) can also route to the daemon queue
+    // when their auto-approve toggles are off, so all entries get the aligned
+    // value. This also upgrades legacy entries written without a timeout.
     for event in CLAUDE_HOOK_EVENTS {
-        add_hook_entry(&mut settings, event, &hook_command)?;
+        add_hook_entry_with_timeout(&mut settings, event, &hook_command, Some(hook_timeout_secs))?;
     }
 
     // Add permissions so Claude Code auto-allows tools wisphive gates
@@ -97,10 +175,13 @@ fn prepare_claude_install(project: &Path) -> Result<PreparedInstall> {
 ///
 /// Returns the path written. Silent — logs via `tracing::info!`.
 pub fn install_codex(project: &Path) -> Result<PathBuf> {
-    write_prepared_install(prepare_codex_install(project)?)
+    write_prepared_install(prepare_codex_install(
+        project,
+        effective_installed_hook_timeout_secs(),
+    )?)
 }
 
-fn prepare_codex_install(project: &Path) -> Result<PreparedInstall> {
+fn prepare_codex_install(project: &Path, hook_timeout_secs: u64) -> Result<PreparedInstall> {
     let hooks_path = project.join(".codex").join("hooks.json");
 
     let mut settings = read_hook_settings(&hooks_path)?;
@@ -108,13 +189,11 @@ fn prepare_codex_install(project: &Path) -> Result<PreparedInstall> {
 
     let hook_command = codex_hook_command(&hook_binary_path());
 
+    // Same daemon-aligned timeout as the Claude install (itr#510) — this was
+    // previously a fixed 3700, which only covered the default 3600 daemon
+    // timeout, not a raised one.
     for event in CODEX_HOOK_EVENTS {
-        add_hook_entry_with_timeout(
-            &mut settings,
-            event,
-            &hook_command,
-            Some(CODEX_HOOK_TIMEOUT_SECS),
-        )?;
+        add_hook_entry_with_timeout(&mut settings, event, &hook_command, Some(hook_timeout_secs))?;
     }
 
     let formatted = serde_json::to_string_pretty(&settings)?;
@@ -164,7 +243,12 @@ fn write_prepared_install(prepared: PreparedInstall) -> Result<PathBuf> {
         )
     })?;
     std::fs::create_dir_all(dir)?;
-    std::fs::write(&prepared.path, prepared.contents)?;
+    crate::config::write_config_atomic(&prepared.path, &prepared.contents).with_context(|| {
+        format!(
+            "atomically writing hook settings {}",
+            prepared.path.display()
+        )
+    })?;
 
     info!(path = %prepared.path.display(), agent = prepared.agent_name, "Wisphive hooks installed");
     Ok(prepared.path)
@@ -297,6 +381,7 @@ fn remove_wisphive_permissions(settings: &mut serde_json::Value) {
 ///   }
 /// }
 /// ```
+#[cfg(test)]
 fn add_hook_entry(settings: &mut serde_json::Value, hook_type: &str, command: &str) -> Result<()> {
     add_hook_entry_with_timeout(settings, hook_type, command, None)
 }
@@ -645,8 +730,16 @@ mod tests {
     // Shim wrappers mirroring the old CLI signatures so the migrated
     // filesystem integration tests below compile unchanged. The library API
     // splits install/uninstall per-agent; these recombine them.
+    /// Deterministic hook timeout for tests: the value a default-config
+    /// install writes (3600 daemon timeout + margin), independent of the
+    /// developer machine's real ~/.wisphive/config.json.
+    const TEST_INSTALL_TIMEOUT_SECS: u64 = 3_700;
+
     fn install(project: Option<PathBuf>, _all: bool) -> Result<()> {
-        install_hooks(&project.unwrap())
+        let p = project.unwrap();
+        write_prepared_install(prepare_claude_install(&p, TEST_INSTALL_TIMEOUT_SECS)?)?;
+        write_prepared_install(prepare_codex_install(&p, TEST_INSTALL_TIMEOUT_SECS)?)?;
+        Ok(())
     }
 
     fn uninstall(project: Option<PathBuf>, _all: bool) -> Result<()> {
@@ -782,6 +875,39 @@ mod tests {
         assert!(error.to_string().contains("`hooks` must be a JSON object"));
         assert_eq!(read_settings(tmp.path()), claude_original);
         assert_eq!(read_codex_hooks(tmp.path()), codex_original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_atomically_replaces_settings_symlink_without_following_target() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let tmp = temp_project();
+        let settings_dir = tmp.path().join(".claude");
+        fs::create_dir_all(&settings_dir).unwrap();
+        let sentinel = tmp.path().join("sentinel.json");
+        fs::write(&sentinel, "{}").unwrap();
+        let settings_path = settings_dir.join("settings.json");
+        symlink(&sentinel, &settings_path).unwrap();
+
+        write_prepared_install(
+            prepare_claude_install(tmp.path(), TEST_INSTALL_TIMEOUT_SECS).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&sentinel).unwrap(),
+            "{}",
+            "atomic rename must replace the settings symlink, not overwrite its target"
+        );
+        let metadata = fs::symlink_metadata(&settings_path).unwrap();
+        assert!(metadata.file_type().is_file());
+        assert!(!metadata.file_type().is_symlink());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            read_settings(tmp.path())["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"],
+            TEST_INSTALL_TIMEOUT_SECS
+        );
     }
 
     // ══ codex_pretooluse_hook_installed — security gate (itr#467) ══
@@ -958,7 +1084,7 @@ mod tests {
             &mut s,
             "PreToolUse",
             "env WISPHIVE_AGENT_TYPE=codex wisphive-hook",
-            Some(CODEX_HOOK_TIMEOUT_SECS),
+            Some(TEST_INSTALL_TIMEOUT_SECS),
         )
         .unwrap();
         let arr = s["hooks"]["PreToolUse"].as_array().unwrap();
@@ -967,7 +1093,7 @@ mod tests {
             arr[0]["hooks"][0]["command"],
             "env WISPHIVE_AGENT_TYPE=codex wisphive-hook"
         );
-        assert_eq!(arr[0]["hooks"][0]["timeout"], CODEX_HOOK_TIMEOUT_SECS);
+        assert_eq!(arr[0]["hooks"][0]["timeout"], TEST_INSTALL_TIMEOUT_SECS);
     }
 
     // ══ remove_hook_entries (handles nested + legacy) ══
@@ -1255,6 +1381,133 @@ mod tests {
         assert_eq!(rule["hooks"][0]["type"], "command");
     }
 
+    // ══ itr#510: installed hook timeout must exceed the daemon approval timeout ══
+
+    #[test]
+    fn installed_hook_timeout_exceeds_daemon_timeout_at_default_and_max() {
+        // Default daemon timeout (3600) → 3700, the value Codex installs
+        // already carried before itr#510.
+        assert_eq!(installed_hook_timeout_secs(3600), 3_700);
+        // Maximum configurable daemon timeout (86400) must still be exceeded.
+        assert_eq!(installed_hook_timeout_secs(86_400), 86_500);
+        assert!(installed_hook_timeout_secs(86_400) > crate::config::HOOK_TIMEOUT_MAX_SECS);
+        // Saturating: absurd inputs can't wrap into a tiny timeout.
+        assert_eq!(installed_hook_timeout_secs(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn claude_install_writes_daemon_aligned_timeout_on_every_event() {
+        let tmp = temp_project();
+        let p = tmp.path().to_path_buf();
+        install(Some(p.clone()), false).unwrap();
+        let s = read_settings(&p);
+        for event in CLAUDE_HOOK_EVENTS {
+            assert_eq!(
+                s["hooks"][event][0]["hooks"][0]["timeout"], TEST_INSTALL_TIMEOUT_SECS,
+                "{event} entry must carry the daemon-aligned timeout"
+            );
+        }
+    }
+
+    /// A hook entry written by a pre-itr#510 wisphive version has no `timeout`
+    /// field, so Claude Code's implicit 600 s cancels the blocking hook long
+    /// before the daemon's 3600 s approval timeout. Reinstalling must upgrade
+    /// the legacy entry in place — same rule, no duplicate — with the timeout.
+    #[test]
+    fn reinstall_upgrades_legacy_claude_entry_without_timeout() {
+        let tmp = temp_project();
+        let p = tmp.path().to_path_buf();
+        // Legacy install: wisphive PreToolUse entry with no timeout field.
+        write_settings(
+            tmp.path(),
+            &json!({"hooks": {"PreToolUse": [cc_rule("/usr/local/bin/wisphive-hook")]}}),
+        );
+
+        install(Some(p.clone()), false).unwrap();
+
+        let s = read_settings(&p);
+        let rules = s["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(rules.len(), 1, "reinstall must not duplicate the entry");
+        let hook = &rules[0]["hooks"][0];
+        assert_eq!(hook["timeout"], TEST_INSTALL_TIMEOUT_SECS);
+        assert!(is_wisphive_hook_command(hook["command"].as_str().unwrap()));
+    }
+
+    /// The public entry points must derive the written timeout from the same
+    /// effective daemon config the daemon itself loads (default + clamp).
+    #[test]
+    fn public_install_uses_effective_daemon_timeout() {
+        let tmp = temp_project();
+        install_claude(tmp.path()).unwrap();
+        let s = read_settings(tmp.path());
+        let expected =
+            installed_hook_timeout_secs(crate::config::effective_hook_timeout_secs_default_home());
+        assert_eq!(s["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"], expected);
+        assert!(
+            expected > crate::config::effective_hook_timeout_secs_default_home(),
+            "installed timeout must strictly exceed the daemon approval timeout"
+        );
+    }
+
+    /// itr#510 end-to-end at the MAXIMUM configurable daemon timeout: a real
+    /// `config.json` with `hook_timeout_secs: 86400` in a fixture Wisphive
+    /// home drives the actual public install path (config load → clamp →
+    /// margin → prepare → atomic write) — not the arithmetic helper in
+    /// isolation — and every resulting Claude hook entry, including a legacy
+    /// pre-itr#510 timeout-less entry being upgraded in place, ends up with
+    /// the derived 86_500 (86400 + margin).
+    #[test]
+    fn install_with_max_configured_timeout_end_to_end() {
+        let home = tempfile::tempdir().unwrap();
+        crate::config::write_config_atomic(
+            &home.path().join("config.json"),
+            r#"{"hook_timeout_secs": 86400}"#,
+        )
+        .unwrap();
+
+        let tmp = temp_project();
+        // Legacy install (pre-itr#510): a Wisphive PreToolUse entry with no
+        // timeout field, so Claude Code's implicit 600 s would apply.
+        write_settings(
+            tmp.path(),
+            &json!({"hooks": {"PreToolUse": [cc_rule("/usr/local/bin/wisphive-hook")]}}),
+        );
+
+        install_claude_in_home(tmp.path(), home.path()).unwrap();
+
+        let expected = installed_hook_timeout_secs(crate::config::HOOK_TIMEOUT_MAX_SECS);
+        assert_eq!(expected, 86_500, "max daemon timeout + margin");
+        let s = read_settings(tmp.path());
+        for event in CLAUDE_HOOK_EVENTS {
+            let rules = s["hooks"][event].as_array().unwrap_or_else(|| {
+                panic!("{event} must have an installed rule array");
+            });
+            assert_eq!(
+                rules.len(),
+                1,
+                "{event}: reinstall must not duplicate entries"
+            );
+            for hook in rules[0]["hooks"].as_array().unwrap() {
+                assert!(
+                    is_wisphive_hook_command(hook["command"].as_str().unwrap()),
+                    "{event} entry must be the Wisphive hook"
+                );
+                assert_eq!(
+                    hook["timeout"], 86_500,
+                    "{event} entry must carry the config-derived max timeout"
+                );
+            }
+        }
+        // The upgraded legacy entry specifically: same single rule slot
+        // (upgraded in place, not appended), still the Wisphive hook, and the
+        // previously-absent timeout is now the config-derived value.
+        let pretool = &s["hooks"]["PreToolUse"][0]["hooks"][0];
+        assert!(is_wisphive_hook_command(
+            pretool["command"].as_str().unwrap()
+        ));
+        assert_eq!(pretool["timeout"], 86_500);
+    }
+
     #[test]
     fn install_creates_codex_hooks_with_timeout() {
         let tmp = temp_project();
@@ -1269,7 +1522,7 @@ mod tests {
                 .contains("wisphive")
         );
         assert_eq!(rule["hooks"][0]["type"], "command");
-        assert_eq!(rule["hooks"][0]["timeout"], CODEX_HOOK_TIMEOUT_SECS);
+        assert_eq!(rule["hooks"][0]["timeout"], TEST_INSTALL_TIMEOUT_SECS);
         assert!(
             rule["hooks"][0]["command"]
                 .as_str()

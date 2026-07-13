@@ -22,7 +22,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { renderHook } from "@testing-library/react";
+import { renderHook, waitFor } from "@testing-library/react";
 
 import {
   base64UrlDecode,
@@ -679,5 +679,30 @@ describe("usePasskey.loginWithPasskey", () => {
     }
     // Token MUST NOT be stashed.
     expect(localStorage.getItem("wisphive-web-token")).toBeNull();
+  });
+
+  it("aborts an in-flight fetch when the consumer unmounts", async () => {
+    let signal: AbortSignal | undefined;
+    const fetchMock = vi.fn(
+      (_path: string, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          signal = init?.signal ?? undefined;
+          signal?.addEventListener("abort", () => {
+            reject(new DOMException("The operation was aborted.", "AbortError"));
+          });
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(() => usePasskey());
+    const login = result.current.loginWithPasskey();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    unmount();
+    expect(signal?.aborted).toBe(true);
+
+    await expect(login).resolves.toMatchObject({
+      ok: false,
+      error: { kind: "network" },
+    });
   });
 });

@@ -23,6 +23,14 @@ impl ModeFileState {
 
 const MODE_FILE_MAX_BYTES: u64 = 64;
 
+/// Default daemon hook-approval timeout (seconds) when `config.json` does not
+/// set `hook_timeout_secs`.
+pub const HOOK_TIMEOUT_DEFAULT_SECS: u64 = 3600;
+/// Lower clamp bound for `hook_timeout_secs`.
+pub const HOOK_TIMEOUT_MIN_SECS: u64 = 10;
+/// Upper clamp bound for `hook_timeout_secs`.
+pub const HOOK_TIMEOUT_MAX_SECS: u64 = 86_400;
+
 /// Daemon configuration — paths and tuning parameters.
 pub struct DaemonConfig {
     /// Root directory for all Wisphive state: ~/.wisphive
@@ -177,12 +185,7 @@ impl DaemonConfig {
     pub fn new(home_dir: PathBuf) -> Self {
         let user = Self::load_user_config(&home_dir);
 
-        let hook_timeout_secs = clamp_config(
-            "hook_timeout_secs",
-            user.hook_timeout_secs.unwrap_or(3600),
-            10,
-            86_400,
-        );
+        let hook_timeout_secs = effective_hook_timeout_from(&user);
         let agent_timeout_secs = clamp_config(
             "agent_timeout_secs",
             user.agent_timeout_secs.unwrap_or(300),
@@ -330,6 +333,39 @@ impl DaemonConfig {
             }
         }
     }
+}
+
+/// The clamped hook-approval timeout `DaemonConfig::new` derives from a loaded
+/// user config.
+fn effective_hook_timeout_from(user: &UserConfig) -> u64 {
+    clamp_config(
+        "hook_timeout_secs",
+        user.hook_timeout_secs.unwrap_or(HOOK_TIMEOUT_DEFAULT_SECS),
+        HOOK_TIMEOUT_MIN_SECS,
+        HOOK_TIMEOUT_MAX_SECS,
+    )
+}
+
+/// The effective daemon hook-approval timeout (seconds) for the Wisphive home
+/// at `home_dir` — exactly the value `DaemonConfig::new(home_dir)` would use:
+/// `hook_timeout_secs` from a *trusted* `config.json`, defaulted to
+/// [`HOOK_TIMEOUT_DEFAULT_SECS`] and clamped to
+/// [`HOOK_TIMEOUT_MIN_SECS`]..=[`HOOK_TIMEOUT_MAX_SECS`].
+///
+/// INVARIANT (itr#510): any synchronous agent-side hook `timeout` that
+/// Wisphive installs (`hook_install`) or accepts at managed-spawn time
+/// (`process_registry::inspect_hook_settings`) must strictly exceed this
+/// value. Claude Code cancels a command hook after its own `timeout` — 600 s
+/// when the field is omitted — so a shorter (or absent) hook timeout lets the
+/// agent kill the blocking `wisphive-hook`, abandoning the pending approval
+/// before the daemon's timeout resolves it.
+pub fn effective_hook_timeout_secs(home_dir: &Path) -> u64 {
+    effective_hook_timeout_from(&DaemonConfig::load_user_config(home_dir))
+}
+
+/// [`effective_hook_timeout_secs`] for the default `~/.wisphive` home.
+pub fn effective_hook_timeout_secs_default_home() -> u64 {
+    effective_hook_timeout_secs(&dirs_home().join(".wisphive"))
 }
 
 #[cfg(unix)]
@@ -1157,6 +1193,42 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "definitely not json"
         );
+    }
+
+    #[test]
+    fn effective_hook_timeout_defaults_and_clamps() {
+        // Missing config.json → built-in default.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            effective_hook_timeout_secs(dir.path()),
+            HOOK_TIMEOUT_DEFAULT_SECS
+        );
+
+        // Explicit maximum is honoured as-is.
+        let path = dir.path().join("config.json");
+        write_config_atomic(&path, r#"{"hook_timeout_secs": 86400}"#).unwrap();
+        assert_eq!(
+            effective_hook_timeout_secs(dir.path()),
+            HOOK_TIMEOUT_MAX_SECS
+        );
+
+        // Out-of-range values clamp exactly like DaemonConfig::new.
+        write_config_atomic(&path, r#"{"hook_timeout_secs": 999999}"#).unwrap();
+        assert_eq!(
+            effective_hook_timeout_secs(dir.path()),
+            HOOK_TIMEOUT_MAX_SECS
+        );
+        write_config_atomic(&path, r#"{"hook_timeout_secs": 1}"#).unwrap();
+        assert_eq!(
+            effective_hook_timeout_secs(dir.path()),
+            HOOK_TIMEOUT_MIN_SECS
+        );
+
+        // And it must agree with the value the daemon itself would run with.
+        write_config_atomic(&path, r#"{"hook_timeout_secs": 7200}"#).unwrap();
+        let daemon = DaemonConfig::new(dir.path().to_path_buf());
+        assert_eq!(effective_hook_timeout_secs(dir.path()), 7200);
+        assert_eq!(daemon.hook_timeout_secs, 7200);
     }
 
     #[test]

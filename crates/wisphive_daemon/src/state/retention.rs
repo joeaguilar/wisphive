@@ -34,13 +34,12 @@ impl StateDb {
         &self,
         archive_path: &std::path::Path,
         max_rows: u64,
-        max_age_days: u64,
+        cutoff: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64> {
         let mut total_archived = 0u64;
 
-        // Phase 1: Archive entries older than max_age_days
-        let cutoff =
-            (chrono::Utc::now() - chrono::Duration::days(max_age_days as i64)).to_rfc3339();
+        // Phase 1: Archive entries older than the cutoff
+        let cutoff = cutoff.to_rfc3339();
         let old_rows: Vec<(String,)> = sqlx::query_as(
             "SELECT id FROM decision_log WHERE resolved_at < ? ORDER BY resolved_at ASC, id ASC",
         )
@@ -88,11 +87,11 @@ impl StateDb {
         max_age_days: u64,
         vacuum_max_bytes: u64,
     ) -> Result<RetentionOutcome> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(max_age_days as i64);
         let archived = self
-            .archive_and_prune(archive_path, max_rows, max_age_days)
+            .archive_and_prune(archive_path, max_rows, cutoff)
             .await?;
 
-        let cutoff = chrono::Utc::now() - chrono::Duration::days(max_age_days as i64);
         let terminal_events_pruned = self.prune_terminal_events(cutoff).await?;
 
         // Always bound the WAL, even when nothing was reclaimed: a large WAL is
@@ -311,7 +310,11 @@ mod tests {
         }
 
         // Prune to max 3 rows
-        let archived = db.archive_and_prune(&archive_path, 3, 365).await.unwrap();
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(365);
+        let archived = db
+            .archive_and_prune(&archive_path, 3, cutoff)
+            .await
+            .unwrap();
         assert_eq!(archived, 2, "should archive 2 oldest entries");
 
         let remaining = db.query_history(None, 100).await.unwrap();
@@ -329,7 +332,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let archive_path = tmp.path().join("archive.jsonl");
 
-        let archived = db.archive_and_prune(&archive_path, 100, 365).await.unwrap();
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(365);
+        let archived = db
+            .archive_and_prune(&archive_path, 100, cutoff)
+            .await
+            .unwrap();
         assert_eq!(archived, 0);
         assert!(!archive_path.exists());
     }

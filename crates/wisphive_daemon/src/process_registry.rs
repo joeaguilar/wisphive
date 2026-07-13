@@ -18,7 +18,12 @@ const MAX_PROMPT_BYTES: usize = 1024 * 1024;
 const MAX_SYSTEM_PROMPT_BYTES: usize = 16 * 1024;
 const MAX_SHORT_FLAG_BYTES: usize = 256;
 const MAX_TOOL_FILTERS: usize = 128;
-const MIN_BLOCKING_HOOK_TIMEOUT_SECS: u64 = 600;
+/// Claude Code's implicit command-hook timeout when the hook entry omits the
+/// `timeout` field. A legacy Wisphive install (pre-itr#510) wrote no timeout,
+/// so its effective hook lifetime is this — far below the daemon's default
+/// 3600 s approval timeout, meaning Claude Code would cancel the blocking hook
+/// (and abandon the pending approval) before the daemon resolves it.
+const CLAUDE_DEFAULT_HOOK_TIMEOUT_SECS: u64 = 600;
 
 const SYSTEM_PROMPT_DENY_PATTERNS: &[&str] = &[
     "ignore previous instructions",
@@ -378,7 +383,21 @@ fn optional_condition<'a>(
 /// only the installer-generated command string: the looser install/uninstall
 /// matcher intentionally accepts extra argv and is unsafe at an execution
 /// boundary (`wisphive-hook ; evil` must never pass here).
-fn inspect_hook_settings(project: &Path, kind: HookSettingsKind) -> Result<HookSettingsSecurity> {
+///
+/// `daemon_hook_timeout_secs` is the daemon's *effective* hook-approval
+/// timeout. INVARIANT (itr#510): a Claude gate only counts as blocking when
+/// its installed `timeout` (or Claude Code's implicit
+/// [`CLAUDE_DEFAULT_HOOK_TIMEOUT_SECS`] when the field is omitted) strictly
+/// exceeds this value — otherwise Claude Code cancels the hook subprocess
+/// before the daemon's timeout resolves the pending approval, and the human's
+/// TUI decision lands after the agent already moved on. The check runs at
+/// spawn time, not just install time, so a daemon timeout raised after
+/// install is caught here and refused until hooks are reinstalled.
+fn inspect_hook_settings(
+    project: &Path,
+    kind: HookSettingsKind,
+    daemon_hook_timeout_secs: u64,
+) -> Result<HookSettingsSecurity> {
     let label = kind.label();
     let path = kind.settings_path(project);
     let content = std::fs::read_to_string(&path)
@@ -462,17 +481,41 @@ fn inspect_hook_settings(project: &Path, kind: HookSettingsKind) -> Result<HookS
                 let exact_wisphive = hook_type == "command" && command == Some(expected.as_str());
                 if enabled && event == "PreToolUse" && exact_wisphive {
                     let timeout = hook_timeout.or(rule_timeout);
-                    let adequate_timeout = !matches!(kind, HookSettingsKind::Claude)
-                        || timeout.is_none_or(|seconds| seconds >= MIN_BLOCKING_HOOK_TIMEOUT_SECS);
-                    let valid_gate = matcher == Some("")
+                    let valid_shape = matcher == Some("")
                         && !rule_async
                         && !hook_async
                         && !rule_async_rewake
                         && !hook_async_rewake
                         && rule_condition.is_none()
-                        && hook_condition.is_none()
-                        && adequate_timeout;
-                    if !valid_gate {
+                        && hook_condition.is_none();
+                    // itr#510: a missing timeout is NOT adequate for Claude —
+                    // Claude Code then cancels the hook after its implicit
+                    // 600 s, well before the daemon's approval timeout. Codex
+                    // installs carry the same aligned value, but its implicit
+                    // timeout semantics are unverified, so only Claude is
+                    // gated on it here.
+                    let adequate_timeout = !matches!(kind, HookSettingsKind::Claude) || {
+                        let effective = timeout.unwrap_or(CLAUDE_DEFAULT_HOOK_TIMEOUT_SECS);
+                        effective > daemon_hook_timeout_secs
+                    };
+                    if valid_shape && !adequate_timeout {
+                        let effective = timeout.unwrap_or(CLAUDE_DEFAULT_HOOK_TIMEOUT_SECS);
+                        let detail = if timeout.is_none() {
+                            format!(
+                                "no timeout field (Claude Code's implicit {CLAUDE_DEFAULT_HOOK_TIMEOUT_SECS}s applies)"
+                            )
+                        } else {
+                            format!("timeout {effective}s")
+                        };
+                        bail!(
+                            "{label} Wisphive PreToolUse hook has {detail}, which does not exceed \
+                             the daemon hook approval timeout ({daemon_hook_timeout_secs}s); the \
+                             agent would cancel the blocking hook and abandon a pending approval \
+                             before the daemon resolves it (itr#510) — reinstall the hooks to \
+                             write an aligned timeout"
+                        );
+                    }
+                    if !valid_shape {
                         bail!(
                             "{label} has an active but non-blocking/conditional Wisphive PreToolUse variant"
                         );
@@ -496,14 +539,20 @@ fn inspect_hook_settings(project: &Path, kind: HookSettingsKind) -> Result<HookS
 }
 
 #[cfg(test)]
-fn claude_pretooluse_hook_installed(project: &Path) -> bool {
-    inspect_hook_settings(project, HookSettingsKind::Claude)
+fn claude_pretooluse_hook_installed(project: &Path, daemon_hook_timeout_secs: u64) -> bool {
+    inspect_hook_settings(project, HookSettingsKind::Claude, daemon_hook_timeout_secs)
         .is_ok_and(|security| security.has_blocking_pretool_gate)
 }
 
 #[cfg(test)]
-fn claude_foreign_hook_commands(project: &Path) -> Result<Vec<String>> {
-    Ok(inspect_hook_settings(project, HookSettingsKind::Claude)?.foreign_hooks)
+fn claude_foreign_hook_commands(
+    project: &Path,
+    daemon_hook_timeout_secs: u64,
+) -> Result<Vec<String>> {
+    Ok(
+        inspect_hook_settings(project, HookSettingsKind::Claude, daemon_hook_timeout_secs)?
+            .foreign_hooks,
+    )
 }
 
 fn build_agent_command(
@@ -621,6 +670,14 @@ pub struct ProcessRegistry {
     /// The local kill switch that makes the managed agent's bypassed native
     /// permission prompts safe to use.
     mode_path: PathBuf,
+    /// itr#510: the daemon's effective hook-approval timeout (seconds),
+    /// threaded in from the running daemon's `DaemonConfig` at registry
+    /// construction (i.e. daemon start, like `codex_allow_foreign_hooks`) —
+    /// never re-derived from the default `~/.wisphive` home, which can diverge
+    /// from the daemon's actual home dir. Managed Claude spawns refuse
+    /// projects whose installed hook `timeout` does not exceed this — see
+    /// `inspect_hook_settings`.
+    hook_timeout_secs: u64,
 }
 
 struct ManagedProcess {
@@ -629,15 +686,32 @@ struct ManagedProcess {
 }
 
 impl ProcessRegistry {
-    pub fn new(codex_allow_foreign_hooks: bool) -> Self {
-        Self::with_mode_path(codex_allow_foreign_hooks, default_mode_path())
+    /// `hook_timeout_secs` must be the *running daemon's* effective
+    /// hook-approval timeout — `DaemonConfig::hook_timeout_secs`, computed
+    /// from the daemon's actual home dir. It is deliberately a parameter, not
+    /// re-derived here from the default `~/.wisphive` home: a daemon started
+    /// with a non-default home (custom state dir) would otherwise gate spawns
+    /// against a *different* config's timeout, accepting installs whose hook
+    /// `timeout` the real daemon outlives — reintroducing the itr#510
+    /// cancel-before-resolve bug.
+    pub fn new(codex_allow_foreign_hooks: bool, hook_timeout_secs: u64) -> Self {
+        Self::with_mode_path(
+            codex_allow_foreign_hooks,
+            default_mode_path(),
+            hook_timeout_secs,
+        )
     }
 
-    fn with_mode_path(codex_allow_foreign_hooks: bool, mode_path: PathBuf) -> Self {
+    fn with_mode_path(
+        codex_allow_foreign_hooks: bool,
+        mode_path: PathBuf,
+        hook_timeout_secs: u64,
+    ) -> Self {
         Self {
             processes: HashMap::new(),
             codex_allow_foreign_hooks,
             mode_path,
+            hook_timeout_secs,
         }
     }
 
@@ -661,8 +735,12 @@ impl ProcessRegistry {
         // is reachable from web/TUI clients that do not run the CLI preflight;
         // enforce hook presence again at the process boundary.
         if matches!(agent_type, AgentType::ClaudeCode) {
-            let security = inspect_hook_settings(&req.project, HookSettingsKind::Claude)
-                .map_err(|error| {
+            let security = inspect_hook_settings(
+                &req.project,
+                HookSettingsKind::Claude,
+                self.hook_timeout_secs,
+            )
+            .map_err(|error| {
                     anyhow::anyhow!(
                         "refusing to spawn Claude Code into {}: project hook validation failed ({error:#}). Run `wisphive hooks install --project {}` first.",
                         req.project.display(),
@@ -696,8 +774,12 @@ impl ProcessRegistry {
         // completely UNGATED while appearing "managed". Fail closed rather than
         // present an ungated agent as controlled.
         if matches!(agent_type, AgentType::Codex) {
-            let security = inspect_hook_settings(&req.project, HookSettingsKind::Codex)
-                .map_err(|error| {
+            let security = inspect_hook_settings(
+                &req.project,
+                HookSettingsKind::Codex,
+                self.hook_timeout_secs,
+            )
+            .map_err(|error| {
                     anyhow::anyhow!(
                         "refusing to spawn Codex into {}: project hook validation failed ({error:#}). Run `wisphive hooks install --project {}` first.",
                         req.project.display(),
@@ -864,12 +946,11 @@ impl ProcessRegistry {
     }
 }
 
-impl Default for ProcessRegistry {
-    fn default() -> Self {
-        // Fail-safe: refuse foreign Codex hooks unless explicitly opted in.
-        Self::new(false)
-    }
-}
+// NOTE: deliberately no `Default` impl (itr#510 review): there is no safe
+// default `hook_timeout_secs` — the running daemon's `DaemonConfig` value must
+// be threaded in explicitly, and a silent default would re-create the
+// gate-against-the-wrong-config bug this constructor signature exists to
+// prevent.
 
 #[cfg(test)]
 mod tests {
@@ -913,15 +994,31 @@ mod tests {
         .unwrap();
     }
 
+    /// Deterministic daemon approval timeout for tests (the built-in default),
+    /// independent of the developer machine's real ~/.wisphive/config.json.
+    const TEST_DAEMON_TIMEOUT_SECS: u64 = 3_600;
+    /// The hook timeout a default-config install writes (daemon + margin).
+    const TEST_HOOK_TIMEOUT_SECS: u64 = 3_700;
+
     fn rule(command: &str) -> serde_json::Value {
         serde_json::json!({"matcher": "", "hooks": [{"type": "command", "command": command}]})
+    }
+
+    /// A Claude gate entry as the itr#510 installer writes it: catch-all,
+    /// synchronous, with a timeout exceeding the daemon approval timeout.
+    fn timed_rule(command: &str) -> serde_json::Value {
+        serde_json::json!({"matcher": "", "hooks": [{
+            "type": "command",
+            "command": command,
+            "timeout": TEST_HOOK_TIMEOUT_SECS,
+        }]})
     }
 
     fn registry_with_active_mode(project: &std::path::Path) -> ProcessRegistry {
         let mode_path = project.join(".wisphive").join("mode");
         crate::config::write_mode_file_atomic(&mode_path, "active")
             .expect("test mode should be written securely");
-        ProcessRegistry::with_mode_path(false, mode_path)
+        ProcessRegistry::with_mode_path(false, mode_path, TEST_DAEMON_TIMEOUT_SECS)
     }
 
     fn argv_strings(cmd: &Command) -> Vec<String> {
@@ -939,7 +1036,8 @@ mod tests {
         let mode_path = proj.path().join(".wisphive").join("mode");
         crate::config::write_mode_file_atomic(&mode_path, "off")
             .expect("test mode should be written securely");
-        let mut registry = ProcessRegistry::with_mode_path(false, mode_path);
+        let mut registry =
+            ProcessRegistry::with_mode_path(false, mode_path, TEST_DAEMON_TIMEOUT_SECS);
 
         let err = registry
             .spawn_agent(codex_req(proj.path()))
@@ -1057,10 +1155,17 @@ mod tests {
             })
         };
         let expected = expected_hook_command(HookSettingsKind::Claude);
-        let valid = serde_json::json!({"type": "command", "command": expected});
+        let valid = serde_json::json!({
+            "type": "command",
+            "command": expected,
+            "timeout": TEST_HOOK_TIMEOUT_SECS,
+        });
 
         write_claude_settings(proj.path(), settings("Read", valid.clone()));
-        assert!(!claude_pretooluse_hook_installed(proj.path()));
+        assert!(!claude_pretooluse_hook_installed(
+            proj.path(),
+            TEST_DAEMON_TIMEOUT_SECS
+        ));
 
         write_claude_settings(
             proj.path(),
@@ -1072,7 +1177,10 @@ mod tests {
                 }),
             ),
         );
-        assert!(!claude_pretooluse_hook_installed(proj.path()));
+        assert!(!claude_pretooluse_hook_installed(
+            proj.path(),
+            TEST_DAEMON_TIMEOUT_SECS
+        ));
 
         write_claude_settings(
             proj.path(),
@@ -1085,10 +1193,16 @@ mod tests {
                 }),
             ),
         );
-        assert!(!claude_pretooluse_hook_installed(proj.path()));
+        assert!(!claude_pretooluse_hook_installed(
+            proj.path(),
+            TEST_DAEMON_TIMEOUT_SECS
+        ));
 
         write_claude_settings(proj.path(), settings("", valid));
-        assert!(claude_pretooluse_hook_installed(proj.path()));
+        assert!(claude_pretooluse_hook_installed(
+            proj.path(),
+            TEST_DAEMON_TIMEOUT_SECS
+        ));
 
         write_claude_settings(
             proj.path(),
@@ -1099,11 +1213,15 @@ mod tests {
                     "hooks": [{
                         "type": "command",
                         "command": expected_hook_command(HookSettingsKind::Claude),
+                        "timeout": TEST_HOOK_TIMEOUT_SECS,
                     }],
                 }]},
             }),
         );
-        assert!(!claude_pretooluse_hook_installed(proj.path()));
+        assert!(!claude_pretooluse_hook_installed(
+            proj.path(),
+            TEST_DAEMON_TIMEOUT_SECS
+        ));
     }
 
     #[test]
@@ -1123,7 +1241,14 @@ mod tests {
                 }]},
             }),
         );
-        assert!(inspect_hook_settings(claude.path(), HookSettingsKind::Claude).is_err());
+        assert!(
+            inspect_hook_settings(
+                claude.path(),
+                HookSettingsKind::Claude,
+                TEST_DAEMON_TIMEOUT_SECS
+            )
+            .is_err()
+        );
 
         for (field, value) in [
             ("asyncRewake", serde_json::json!(true)),
@@ -1144,7 +1269,12 @@ mod tests {
                 }),
             );
             assert!(
-                inspect_hook_settings(claude.path(), HookSettingsKind::Claude).is_err(),
+                inspect_hook_settings(
+                    claude.path(),
+                    HookSettingsKind::Claude,
+                    TEST_DAEMON_TIMEOUT_SECS
+                )
+                .is_err(),
                 "{field} must not create a blocking gate"
             );
         }
@@ -1161,7 +1291,12 @@ mod tests {
                 }]},
             }),
         );
-        let security = inspect_hook_settings(claude.path(), HookSettingsKind::Claude).unwrap();
+        let security = inspect_hook_settings(
+            claude.path(),
+            HookSettingsKind::Claude,
+            TEST_DAEMON_TIMEOUT_SECS,
+        )
+        .unwrap();
         assert!(!security.has_blocking_pretool_gate);
         assert_eq!(security.foreign_hooks.len(), 1);
 
@@ -1178,7 +1313,169 @@ mod tests {
                 }]},
             }),
         );
-        assert!(inspect_hook_settings(codex.path(), HookSettingsKind::Codex).is_err());
+        assert!(
+            inspect_hook_settings(
+                codex.path(),
+                HookSettingsKind::Codex,
+                TEST_DAEMON_TIMEOUT_SECS
+            )
+            .is_err()
+        );
+    }
+
+    /// itr#510: the Claude gate only counts as blocking when its installed
+    /// `timeout` strictly exceeds the daemon's effective approval timeout —
+    /// checked at spawn time against the configured value, not install time.
+    #[test]
+    fn claude_gate_requires_timeout_exceeding_daemon_timeout() {
+        let proj = tempfile::tempdir().unwrap();
+        let expected = expected_hook_command(HookSettingsKind::Claude);
+        let with_timeout = |timeout: Option<u64>| {
+            let mut hook = serde_json::json!({"type": "command", "command": expected.clone()});
+            if let Some(t) = timeout {
+                hook.as_object_mut()
+                    .unwrap()
+                    .insert("timeout".into(), t.into());
+            }
+            serde_json::json!({"hooks": {"PreToolUse": [{"matcher": "", "hooks": [hook]}]}})
+        };
+
+        // Default install (3600 daemon + 100 margin) passes the default gate.
+        write_claude_settings(proj.path(), with_timeout(Some(3_700)));
+        assert!(claude_pretooluse_hook_installed(proj.path(), 3_600));
+
+        // Maximum configurable daemon timeout (86400): the matching install
+        // value passes, but an install from before the config was raised is
+        // stale and must be refused.
+        write_claude_settings(proj.path(), with_timeout(Some(86_500)));
+        assert!(claude_pretooluse_hook_installed(proj.path(), 86_400));
+        write_claude_settings(proj.path(), with_timeout(Some(3_700)));
+        assert!(!claude_pretooluse_hook_installed(proj.path(), 86_400));
+
+        // Legacy entry (pre-itr#510, no timeout field): Claude Code's implicit
+        // 600 s applies and must be refused against the default 3600 s daemon
+        // timeout, with both numbers named in the error.
+        write_claude_settings(proj.path(), with_timeout(None));
+        let err = inspect_hook_settings(proj.path(), HookSettingsKind::Claude, 3_600)
+            .expect_err("legacy timeout-less entry must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("600") && msg.contains("3600") && msg.contains("does not exceed"),
+            "refusal should name both timeouts, got: {msg}"
+        );
+        // ...but the implicit 600 s IS adequate for a daemon timeout below it.
+        assert!(claude_pretooluse_hook_installed(proj.path(), 500));
+
+        // Equal is not enough — the hook must strictly outlive the daemon wait.
+        write_claude_settings(proj.path(), with_timeout(Some(3_600)));
+        assert!(!claude_pretooluse_hook_installed(proj.path(), 3_600));
+    }
+
+    /// itr#510 end-to-end: a managed Claude spawn into a project whose hook
+    /// timeout cannot outlive the daemon approval wait is refused with an
+    /// actionable message, before any process launches.
+    #[test]
+    fn claude_spawn_refuses_short_hook_timeout() {
+        let proj = tempfile::tempdir().unwrap();
+        write_claude_settings(
+            proj.path(),
+            serde_json::json!({"hooks": {"PreToolUse": [{
+                "matcher": "",
+                "hooks": [{
+                    "type": "command",
+                    "command": expected_hook_command(HookSettingsKind::Claude),
+                    "timeout": 600,
+                }],
+            }]}}),
+        );
+
+        let mut registry = registry_with_active_mode(proj.path());
+        let err = registry
+            .spawn_agent(claude_req(proj.path()))
+            .expect_err("a hook timeout below the daemon approval timeout must refuse spawn");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does not exceed") && msg.contains("hooks install"),
+            "refusal should explain the timeout mismatch and the fix, got: {msg}"
+        );
+        assert!(registry.is_empty());
+    }
+
+    /// itr#510 review fix: the registry gates on the timeout it was GIVEN —
+    /// the running daemon's `DaemonConfig::hook_timeout_secs`, computed from
+    /// that daemon's actual home dir — never a value re-derived from the
+    /// default `~/.wisphive` home. Two homes with divergent real `config.json`
+    /// values prove the threaded value is the one that gates: if the registry
+    /// silently recomputed against a default home (no config → 3600), the
+    /// stale 3700 install below would be accepted even though the real daemon
+    /// waits 86400 s — Claude would cancel the hook ~23 hours early.
+    #[test]
+    fn registry_gates_on_threaded_daemon_timeout_not_default_home() {
+        let home_short = tempfile::tempdir().unwrap();
+        let home_long = tempfile::tempdir().unwrap();
+        crate::config::write_config_atomic(
+            &home_short.path().join("config.json"),
+            r#"{"hook_timeout_secs": 3600}"#,
+        )
+        .unwrap();
+        crate::config::write_config_atomic(
+            &home_long.path().join("config.json"),
+            r#"{"hook_timeout_secs": 86400}"#,
+        )
+        .unwrap();
+        let cfg_short = crate::config::DaemonConfig::new(home_short.path().to_path_buf());
+        let cfg_long = crate::config::DaemonConfig::new(home_long.path().to_path_buf());
+        assert_eq!(cfg_short.hook_timeout_secs, 3_600);
+        assert_eq!(cfg_long.hook_timeout_secs, 86_400);
+
+        // The constructor stores exactly the value it was handed — no
+        // recomputation against a default home.
+        assert_eq!(
+            ProcessRegistry::new(false, cfg_short.hook_timeout_secs).hook_timeout_secs,
+            3_600
+        );
+        assert_eq!(
+            ProcessRegistry::new(false, cfg_long.hook_timeout_secs).hook_timeout_secs,
+            86_400
+        );
+
+        // A project whose hooks were installed for the short daemon
+        // (3600 + margin = 3700):
+        let proj = tempfile::tempdir().unwrap();
+        write_claude_settings(
+            proj.path(),
+            serde_json::json!({"hooks": {"PreToolUse": [{
+                "matcher": "",
+                "hooks": [{
+                    "type": "command",
+                    "command": expected_hook_command(HookSettingsKind::Claude),
+                    "timeout": 3_700,
+                }],
+            }]}}),
+        );
+
+        // ...is a valid blocking gate at the short daemon's threaded value...
+        assert!(claude_pretooluse_hook_installed(
+            proj.path(),
+            cfg_short.hook_timeout_secs
+        ));
+        // ...but a registry threaded the long daemon's value refuses the
+        // spawn, citing the long daemon's timeout.
+        let mode_path = proj.path().join(".wisphive").join("mode");
+        crate::config::write_mode_file_atomic(&mode_path, "active")
+            .expect("test mode should be written securely");
+        let mut registry =
+            ProcessRegistry::with_mode_path(false, mode_path, cfg_long.hook_timeout_secs);
+        let err = registry
+            .spawn_agent(claude_req(proj.path()))
+            .expect_err("an install aligned to a shorter timeout must refuse spawn at 86400");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does not exceed") && msg.contains("86400"),
+            "refusal should cite the running daemon's own timeout, got: {msg}"
+        );
+        assert!(registry.is_empty());
     }
 
     #[test]
@@ -1188,13 +1485,9 @@ mod tests {
             proj.path(),
             serde_json::json!({
                 "hooks": {
-                    "PreToolUse": [{
-                        "matcher": "",
-                        "hooks": [{
-                            "type": "command",
-                            "command": expected_hook_command(HookSettingsKind::Claude),
-                        }],
-                    }],
+                    "PreToolUse": [
+                        timed_rule(&expected_hook_command(HookSettingsKind::Claude)),
+                    ],
                     "PostToolUse": [{
                         "matcher": "",
                         "hooks": [{"type": "command", "command": "/tmp/unreviewed-hook"}],
@@ -1203,7 +1496,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            claude_foreign_hook_commands(proj.path()).unwrap(),
+            claude_foreign_hook_commands(proj.path(), TEST_DAEMON_TIMEOUT_SECS).unwrap(),
             vec!["<command hook: /tmp/unreviewed-hook>"]
         );
 
@@ -1228,6 +1521,7 @@ mod tests {
                         {
                             "type": "command",
                             "command": expected_hook_command(HookSettingsKind::Claude),
+                            "timeout": TEST_HOOK_TIMEOUT_SECS,
                         },
                         {
                             "type": "http",
@@ -1239,7 +1533,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            claude_foreign_hook_commands(proj.path()).unwrap(),
+            claude_foreign_hook_commands(proj.path(), TEST_DAEMON_TIMEOUT_SECS).unwrap(),
             vec![format!(
                 "<http hook: {}>",
                 expected_hook_command(HookSettingsKind::Claude)
@@ -1250,18 +1544,14 @@ mod tests {
             proj.path(),
             serde_json::json!({
                 "hooks": {
-                    "PreToolUse": [{
-                        "matcher": "",
-                        "hooks": [{
-                            "type": "command",
-                            "command": expected_hook_command(HookSettingsKind::Claude),
-                        }],
-                    }],
+                    "PreToolUse": [
+                        timed_rule(&expected_hook_command(HookSettingsKind::Claude)),
+                    ],
                     "PostToolUse": {"not": "an array"},
                 },
             }),
         );
-        assert!(claude_foreign_hook_commands(proj.path()).is_err());
+        assert!(claude_foreign_hook_commands(proj.path(), TEST_DAEMON_TIMEOUT_SECS).is_err());
     }
 
     #[test]

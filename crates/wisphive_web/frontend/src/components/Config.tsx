@@ -55,26 +55,31 @@ export function ConfigView() {
   const [levelTools, setLevelTools] = useState<Record<string, string[]>>({ read: [], write: [], execute: [] });
   const [loading, setLoading] = useState(true);
 
-  const loadConfig = useCallback(async () => {
+  const loadConfig = useCallback(async (signal: AbortSignal) => {
     try {
       const [cfgRes, tiersRes] = await Promise.all([
-        apiFetch(`/api/config`),
-        apiFetch(`/api/tool-tiers`),
+        apiFetch(`/api/config`, { signal }),
+        apiFetch(`/api/tool-tiers`, { signal }),
       ]);
       const data: Config = await cfgRes.json();
       const tiers: ToolTiers = await tiersRes.json();
+      if (signal.aborted) return;
       setLevel(data.auto_approve_level || "read");
       setAdd(data.auto_approve_add || []);
       setRemove(data.auto_approve_remove || []);
       setLevelTools({ read: tiers.read, write: tiers.write, execute: tiers.execute });
     } catch (e) {
-      console.warn("Failed to load config:", e);
+      if (!signal.aborted) console.warn("Failed to load config:", e);
+    } finally {
+      if (!signal.aborted) setLoading(false);
     }
-    setLoading(false);
   }, []);
 
-  // eslint-disable-next-line react-hooks/set-state-in-effect
-  useEffect(() => { loadConfig(); }, [loadConfig]);
+  useEffect(() => {
+    const controller = new AbortController();
+    void loadConfig(controller.signal);
+    return () => controller.abort();
+  }, [loadConfig]);
 
   const saveConfig = useCallback(async (newLevel: Level, newAdd: string[], newRemove: string[]) => {
     const patch: ConfigPatch = {

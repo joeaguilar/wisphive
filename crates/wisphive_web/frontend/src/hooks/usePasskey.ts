@@ -66,7 +66,7 @@
  * only in tests; production browsers take the fast native path.
  */
 
-import { useMemo } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import { apiFetch, setWebToken } from "../api";
 
 // ---------------------------------------------------------------------------
@@ -369,16 +369,42 @@ export interface UsePasskey {
   loginWithPasskey: () => Promise<PasskeyLoginResult>;
 }
 
+type FetchWithAbort = (path: string, init?: RequestInit) => Promise<Response>;
+
 export function usePasskey(): UsePasskey {
+  const requestsRef = useRef<Set<AbortController>>(new Set());
+
+  const fetchWithAbort = useCallback<FetchWithAbort>(async (path, init = {}) => {
+    const controller = new AbortController();
+    requestsRef.current.add(controller);
+    try {
+      return await apiFetch(path, { ...init, signal: controller.signal });
+    } finally {
+      requestsRef.current.delete(controller);
+    }
+  }, []);
+
+  // Requests issued by this hook only matter while its consumer is mounted.
+  // Abort them during teardown so their callbacks cannot publish stale state.
+  useEffect(() => {
+    const requests = requestsRef.current;
+    return () => {
+      for (const controller of requests) {
+        controller.abort();
+      }
+      requests.clear();
+    };
+  }, []);
+
   // The hook is stateless — every call is one-shot. `useMemo` just
   // stabilises the returned object identity so consumers passing it
   // through `useCallback` deps don't churn.
   return useMemo<UsePasskey>(
     () => ({
-      enroll: enrollImpl,
-      loginWithPasskey: loginWithPasskeyImpl,
+      enroll: () => enrollImpl(fetchWithAbort),
+      loginWithPasskey: () => loginWithPasskeyImpl(fetchWithAbort),
     }),
-    [],
+    [fetchWithAbort],
   );
 }
 
@@ -394,7 +420,7 @@ function hasWebAuthn(): boolean {
   );
 }
 
-async function enrollImpl(): Promise<PasskeyEnrollResult> {
+async function enrollImpl(fetchWithAbort: FetchWithAbort): Promise<PasskeyEnrollResult> {
   if (!hasWebAuthn()) {
     return {
       ok: false,
@@ -405,7 +431,7 @@ async function enrollImpl(): Promise<PasskeyEnrollResult> {
   // (1) Server-side ceremony start.
   let startRes: Response;
   try {
-    startRes = await apiFetch("/api/auth/passkey/register/start", { method: "POST" });
+    startRes = await fetchWithAbort("/api/auth/passkey/register/start", { method: "POST" });
   } catch (e) {
     return {
       ok: false,
@@ -517,7 +543,7 @@ async function enrollImpl(): Promise<PasskeyEnrollResult> {
 
   let finishRes: Response;
   try {
-    finishRes = await apiFetch("/api/auth/passkey/register/finish", {
+    finishRes = await fetchWithAbort("/api/auth/passkey/register/finish", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(finishBody),
@@ -538,7 +564,7 @@ async function enrollImpl(): Promise<PasskeyEnrollResult> {
   return { ok: true, credentialId: finishBodyJson.credential_id };
 }
 
-async function loginWithPasskeyImpl(): Promise<PasskeyLoginResult> {
+async function loginWithPasskeyImpl(fetchWithAbort: FetchWithAbort): Promise<PasskeyLoginResult> {
   if (!hasWebAuthn()) {
     return {
       ok: false,
@@ -551,7 +577,7 @@ async function loginWithPasskeyImpl(): Promise<PasskeyLoginResult> {
   // explicit user action; see module docstring.
   let startRes: Response;
   try {
-    startRes = await apiFetch("/api/auth/passkey/login/start", { method: "POST" });
+    startRes = await fetchWithAbort("/api/auth/passkey/login/start", { method: "POST" });
   } catch (e) {
     return {
       ok: false,
@@ -642,7 +668,7 @@ async function loginWithPasskeyImpl(): Promise<PasskeyLoginResult> {
 
   let finishRes: Response;
   try {
-    finishRes = await apiFetch("/api/auth/passkey/login/finish", {
+    finishRes = await fetchWithAbort("/api/auth/passkey/login/finish", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(finishBody),

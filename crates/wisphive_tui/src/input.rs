@@ -364,6 +364,14 @@ fn handle_detail_input(app: &mut App, key: KeyEvent) -> InputAction {
             app.detail_scroll = usize::from(app.detail_max_scroll.get());
             return InputAction::None;
         }
+        KeyCode::Char('[') => {
+            app.select_prev_item_in_detail();
+            return InputAction::None;
+        }
+        KeyCode::Char(']') => {
+            app.select_next_item_in_detail();
+            return InputAction::None;
+        }
         KeyCode::Char('p') | KeyCode::Char('P') => {
             app.markdown_preview = !app.markdown_preview;
             return InputAction::None;
@@ -1079,6 +1087,14 @@ fn handle_history_detail_input(app: &mut App, key: KeyEvent) -> InputAction {
             app.detail_scroll = app.detail_scroll.saturating_sub(20);
             InputAction::None
         }
+        KeyCode::Char('[') => {
+            app.select_prev_item_in_detail();
+            InputAction::None
+        }
+        KeyCode::Char(']') => {
+            app.select_next_item_in_detail();
+            InputAction::None
+        }
         KeyCode::Char('q') => {
             app.exit_history_detail_view();
             InputAction::None
@@ -1529,6 +1545,87 @@ fn handle_spawn_modal_input(app: &mut App, mut modal: Modal, key: KeyEvent) -> I
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn decision_request(tool_name: &str) -> wisphive_protocol::DecisionRequest {
+        wisphive_protocol::DecisionRequest {
+            id: uuid::Uuid::new_v4(),
+            agent_id: "agent-1".into(),
+            agent_type: wisphive_protocol::AgentType::Codex,
+            project: "/tmp/project".into(),
+            tool_name: tool_name.into(),
+            tool_input: serde_json::Value::Null,
+            timestamp: chrono::Utc::now(),
+            hook_event_name: Default::default(),
+            tool_use_id: None,
+            permission_suggestions: None,
+            event_data: None,
+            terminal_session_id: None,
+        }
+    }
+
+    fn history_entry(tool_name: &str) -> wisphive_protocol::HistoryEntry {
+        wisphive_protocol::HistoryEntry {
+            id: uuid::Uuid::new_v4(),
+            agent_id: "agent-1".into(),
+            agent_type: wisphive_protocol::AgentType::Codex,
+            project: "/tmp/project".into(),
+            tool_name: tool_name.into(),
+            tool_input: serde_json::Value::Null,
+            decision: wisphive_protocol::Decision::Approve,
+            requested_at: chrono::Utc::now(),
+            resolved_at: chrono::Utc::now(),
+            tool_result: None,
+            tool_use_id: None,
+            hook_event_name: None,
+            terminal_session_id: None,
+            decided_by: None,
+            config_hash: None,
+        }
+    }
+
+    #[test]
+    fn bracket_keys_navigate_pending_decision_details() {
+        let mut app = App::new();
+        app.queue = vec![decision_request("first"), decision_request("second")];
+        let first_id = app.queue[0].id;
+        let second_id = app.queue[1].id;
+        app.enter_detail_view();
+        app.detail_scroll = 4;
+
+        handle_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE)),
+        );
+        assert_eq!(app.detail_request_id, Some(second_id));
+        assert_eq!(app.detail_scroll, 0);
+
+        handle_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE)),
+        );
+        assert_eq!(app.detail_request_id, Some(first_id));
+    }
+
+    #[test]
+    fn bracket_keys_navigate_history_details() {
+        let mut app = App::new();
+        app.history = vec![history_entry("first"), history_entry("second")];
+        app.enter_history_detail_view();
+        app.detail_scroll = 4;
+
+        handle_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE)),
+        );
+        assert_eq!(app.history_index, 1);
+        assert_eq!(app.detail_scroll, 0);
+
+        handle_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE)),
+        );
+        assert_eq!(app.history_index, 0);
+    }
 
     #[test]
     fn spawn_agent_sends_full_multiline_prompt() {

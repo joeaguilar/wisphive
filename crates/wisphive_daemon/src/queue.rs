@@ -274,24 +274,7 @@ impl DecisionQueue {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use wisphive_protocol::AgentType;
-
-    fn make_request(tool_name: &str, agent_id: &str, project: &str) -> DecisionRequest {
-        DecisionRequest {
-            id: Uuid::new_v4(),
-            agent_id: agent_id.into(),
-            agent_type: AgentType::ClaudeCode,
-            project: PathBuf::from(project),
-            tool_name: tool_name.into(),
-            tool_input: serde_json::json!({}),
-            timestamp: chrono::Utc::now(),
-            hook_event_name: Default::default(),
-            tool_use_id: None,
-            permission_suggestions: None,
-            event_data: None,
-            terminal_session_id: None,
-        }
-    }
+    use wisphive_protocol::QUEUE_MAKE_REQUEST as make_request;
 
     fn make_queue() -> DecisionQueue {
         let (tx, _) = broadcast::channel(64);

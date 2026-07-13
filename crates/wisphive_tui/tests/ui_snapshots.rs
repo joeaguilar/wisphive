@@ -504,7 +504,7 @@ fn status_bar_detail_pre_tool_use() {
         &bar,
         &[
             "[Y]", "[N]", "[M]", "[!]", "[E]", "[C]", "[?]", "[j/k]", "[Spc]", "[g/G]", "[q/Esc]",
-            "[Q]", "[P]",
+            "[Q]", "[P]", "[[]prev", "[]]next",
         ],
     );
 }
@@ -525,6 +525,8 @@ fn status_bar_detail_exit_plan_mode() {
             "[q/Esc]",
             "[Q]",
             "[P]",
+            "[[]prev",
+            "[]]next",
         ],
     );
 }
@@ -537,8 +539,47 @@ fn status_bar_detail_ask_user_question() {
         &bar,
         &[
             "[1-2]", "[O]", "[D]", "[M]", "[j/k]", "[Spc]", "[g/G]", "[q/Esc]", "[Q]", "[P]",
+            "[[]prev", "[]]next",
         ],
     );
+}
+
+#[test]
+fn status_bar_detail_prev_next_visible_at_snapshot_width_for_every_action_branch() {
+    use wisphive_protocol::HookEventType;
+
+    let request_for = |event| {
+        let mut req = request(20, "Event", serde_json::Value::Null);
+        req.hook_event_name = event;
+        req
+    };
+
+    let mut permission_suggestions = request_for(HookEventType::PermissionRequest);
+    permission_suggestions.permission_suggestions = Some(Vec::new());
+
+    let cases = [
+        ("PreToolUse/default", bash_request()),
+        ("PermissionRequest suggestions", permission_suggestions),
+        ("PermissionRequest question", ask_user_question_request()),
+        ("PermissionRequest generic", exit_plan_mode_request()),
+        ("Stop/SubagentStop", request_for(HookEventType::Stop)),
+        (
+            "UserPromptSubmit/ConfigChange",
+            request_for(HookEventType::UserPromptSubmit),
+        ),
+        ("Elicitation", request_for(HookEventType::Elicitation)),
+        ("TeammateIdle", request_for(HookEventType::TeammateIdle)),
+        ("TaskCompleted", request_for(HookEventType::TaskCompleted)),
+    ];
+
+    for (branch, req) in cases {
+        let bar = bottom_row(&render_app(&detail_app(req), 100, 30));
+        expect_bar_tokens(
+            &format!("detail ({branch}) at 100 columns"),
+            &bar,
+            &["[[]prev", "[]]next"],
+        );
+    }
 }
 
 #[test]
@@ -563,7 +604,7 @@ fn status_bar_history_detail() {
     expect_bar_tokens(
         "history detail",
         &bar,
-        &["[j/k]", "[Spc]", "[q/Esc]", "[Q]"],
+        &["[j/k]", "[Spc]", "[[]prev", "[]]next", "[q/Esc]", "[Q]"],
     );
 }
 

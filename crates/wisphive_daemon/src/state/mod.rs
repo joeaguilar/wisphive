@@ -479,49 +479,14 @@ impl SecureDatabaseLocation {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::StateDb;
-    use wisphive_protocol::{AgentType, DecisionRequest, HookEventType};
+    pub(crate) use wisphive_protocol::{
+        STATE_MAKE_REQUEST as make_request,
+        STATE_MAKE_REQUEST_WITH_TOOL_USE_ID as make_request_with_tool_use_id,
+    };
 
     /// Create an in-memory StateDb for testing.
     pub(crate) async fn test_db() -> StateDb {
         StateDb::open(":memory:").await.unwrap()
-    }
-
-    pub(crate) fn make_request(tool: &str, agent_id: &str, project: &str) -> DecisionRequest {
-        DecisionRequest {
-            id: uuid::Uuid::new_v4(),
-            agent_id: agent_id.into(),
-            agent_type: AgentType::ClaudeCode,
-            project: std::path::PathBuf::from(project),
-            tool_name: tool.into(),
-            tool_input: serde_json::json!({"command": "test"}),
-            timestamp: chrono::Utc::now(),
-            hook_event_name: HookEventType::PreToolUse,
-            tool_use_id: None,
-            permission_suggestions: None,
-            event_data: None,
-            terminal_session_id: None,
-        }
-    }
-
-    pub(crate) fn make_request_with_tool_use_id(
-        tool: &str,
-        agent_id: &str,
-        tool_use_id: &str,
-    ) -> DecisionRequest {
-        DecisionRequest {
-            id: uuid::Uuid::new_v4(),
-            agent_id: agent_id.into(),
-            agent_type: AgentType::ClaudeCode,
-            project: std::path::PathBuf::from("/test"),
-            tool_name: tool.into(),
-            tool_input: serde_json::json!({"command": "test"}),
-            timestamp: chrono::Utc::now(),
-            hook_event_name: HookEventType::PreToolUse,
-            tool_use_id: Some(tool_use_id.into()),
-            permission_suggestions: None,
-            event_data: None,
-            terminal_session_id: None,
-        }
     }
 }
 

@@ -171,6 +171,95 @@ describe("useAuthProfile", () => {
     expect(result.current.canEnrollPasskeyOnThisOrigin).toBe(false);
   });
 
+  it("aborts the shared probe when its last consumer unmounts", async () => {
+    let signal: AbortSignal | undefined;
+    const fetchMock = vi.fn(
+      (_path: string, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          signal = init?.signal ?? undefined;
+          signal?.addEventListener("abort", () => {
+            reject(new DOMException("The operation was aborted.", "AbortError"));
+          });
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { unmount } = renderHook(() => useAuthProfile());
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    unmount();
+    expect(signal?.aborted).toBe(true);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+  });
+
+  it("keeps the shared probe alive until all consumers unmount", async () => {
+    let signal: AbortSignal | undefined;
+    const fetchMock = vi.fn(
+      (_path: string, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          signal = init?.signal ?? undefined;
+          signal?.addEventListener("abort", () => {
+            reject(new DOMException("The operation was aborted.", "AbortError"));
+          });
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const first = renderHook(() => useAuthProfile());
+    const second = renderHook(() => useAuthProfile());
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    first.unmount();
+    expect(signal?.aborted).toBe(false);
+
+    second.unmount();
+    expect(signal?.aborted).toBe(true);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+  });
+
+  it("starts a fresh probe after synchronous unmount and remount", async () => {
+    let firstSignal: AbortSignal | undefined;
+    const fetchMock = vi
+      .fn()
+      .mockImplementationOnce(
+        (_path: string, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            firstSignal = init?.signal ?? undefined;
+            firstSignal?.addEventListener("abort", () => {
+              reject(new DOMException("The operation was aborted.", "AbortError"));
+            });
+          }),
+      )
+      .mockResolvedValueOnce(
+        makeJsonResponse({
+          profile: "local-lan",
+          can_enroll_passkey_on_this_origin: true,
+          passkey_required: false,
+          allow_ephemeral_listener: true,
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const first = renderHook(() => useAuthProfile());
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    first.unmount();
+    expect(firstSignal?.aborted).toBe(true);
+
+    // Mirrors StrictMode's setup -> cleanup -> setup sequence: the cancelled
+    // promise has not settled yet, but the new setup must still start probe 2.
+    const second = renderHook(() => useAuthProfile());
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(second.result.current.loaded).toBe(true));
+
+    expect(second.result.current.profile).toBe("local-lan");
+    expect(second.result.current.canEnrollPasskeyOnThisOrigin).toBe(true);
+  });
+
   it("singleton: two consumers share one probe (no duplicate fetches)", async () => {
     // Sprint-1 wave-4 review item #1 regression: pre-singleton, both
     // useAuth and Login.tsx called useAuthProfile() independently — each

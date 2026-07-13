@@ -346,7 +346,7 @@ fn draw_detail_view(frame: &mut Frame, app: &App) {
             _ => "[Y]approve [N]deny [M]deny+msg [!]always [E]edit [C]context [?]defer".to_string(),
         };
         let bar_text = format!(
-            " {actions} [j/k]scroll [Spc]page [g/G]top/end [q/Esc]back [Q]uit{scroll_info}"
+            " {actions} [[]prev []]next [j/k]scroll [Spc]page [g/G]top/end [q/Esc]back [Q]uit{scroll_info}"
         );
         let preview_indicator = if app.markdown_preview {
             " [P]raw"
@@ -523,7 +523,7 @@ fn draw_history_detail_view(frame: &mut Frame, app: &App) {
     }
 
     let bar = Paragraph::new(Line::from(Span::styled(
-        " [j/k]scroll [Spc]page [q/Esc]back [Q]uit ",
+        " [j/k]scroll [Spc]page [[]prev []]next [q/Esc]back [Q]uit ",
         Style::default().fg(Color::White).bg(Color::DarkGray),
     )));
     frame.render_widget(bar, chunks[1]);
