@@ -747,6 +747,11 @@ mod tests {
         assert_eq!(db.query_history(None, 10).await.unwrap().len(), 2);
     }
 
+    /// Covers only the `!file_type.is_file()` skip path: on Unix a dangling
+    /// symlink's `file_type()` returns `Ok(is_symlink)`, not `Err`, so this
+    /// entry never reaches the `#512` readdir-`Err` / `file_type()`-`Err`
+    /// log-and-skip arms — those aren't portably forceable and remain uncovered
+    /// (itr follow-up). Do **not** treat this as the #512 regression guard.
     #[tokio::test]
     async fn reimport_rotated_segments_skips_dangling_symlink() {
         let db = test_db().await;
