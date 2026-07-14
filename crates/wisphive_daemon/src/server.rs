@@ -2324,6 +2324,40 @@ async fn settle_spawn_expiry(expiry: tokio::task::JoinHandle<()>, started: &Atom
     }
 }
 
+/// Build the reply for a `StopAgent` command from the registry's stop result
+/// and the caller's echoed correlation id (itr#526).
+///
+/// The `Some`/`None` branch is load-bearing for the CLI: `wisphive agent stop`
+/// filters its socket reads through a correlation skip-loop
+/// (`crates/wisphive_cli/src/commands/agent.rs`) that accepts only an
+/// `AgentStopResponse` echoing its own correlation id. If a correlated stop
+/// were answered with `AgentExited` (which carries no correlation id on the
+/// wire), the skip-loop would discard it forever and the CLI would hang until
+/// its read timeout. Uncorrelated (legacy/broadcast-style) callers keep the
+/// `AgentExited` event shape they have always received.
+fn stop_agent_reply(
+    agent_id: &str,
+    result: Result<Option<i32>>,
+    correlation_id: Option<String>,
+) -> ServerMessage {
+    match result {
+        Ok(exit_code) => match correlation_id {
+            Some(correlation_id) => ServerMessage::AgentStopResponse {
+                agent_id: agent_id.to_string(),
+                exit_code,
+                correlation_id: Some(correlation_id),
+            },
+            None => ServerMessage::AgentExited {
+                agent_id: agent_id.to_string(),
+                exit_code,
+            },
+        },
+        Err(e) => ServerMessage::Error {
+            message: format!("{e}"),
+        },
+    }
+}
+
 /// Dispatch agent-process commands: spawn, list, stop, and event re-import.
 ///
 /// A spawn is deliberately asynchronous relative to this connection: the
@@ -2527,32 +2561,11 @@ async fn handle_agent_command(
             }
         }
         ClientMessage::StopAgent { ref agent_id } => {
-            let mut pr = ctx.process_registry.lock().await;
-            match pr.stop_agent(agent_id).await {
-                Ok(exit_code) => {
-                    let response = match correlation_id {
-                        Some(correlation_id) => ServerMessage::AgentStopResponse {
-                            agent_id: agent_id.clone(),
-                            exit_code,
-                            correlation_id: Some(correlation_id),
-                        },
-                        None => ServerMessage::AgentExited {
-                            agent_id: agent_id.clone(),
-                            exit_code,
-                        },
-                    };
-                    write_msg(writer, &response).await?;
-                }
-                Err(e) => {
-                    write_msg(
-                        writer,
-                        &ServerMessage::Error {
-                            message: format!("{e}"),
-                        },
-                    )
-                    .await?;
-                }
-            }
+            let result = {
+                let mut pr = ctx.process_registry.lock().await;
+                pr.stop_agent(agent_id).await
+            };
+            write_msg(writer, &stop_agent_reply(agent_id, result, correlation_id)).await?;
         }
         _ => {
             warn!("unexpected message from TUI");
@@ -5038,5 +5051,232 @@ mod tests {
             gate.try_acquire(peer_uid + 1).await,
             "one peer's mismatches must not throttle another peer"
         );
+    }
+
+    /// itr#526: the StopAgent success reply must stamp the caller's echoed
+    /// correlation id per the Some/None branch. The CLI's `agent stop`
+    /// skip-loop (crates/wisphive_cli/src/commands/agent.rs) accepts only an
+    /// `AgentStopResponse` carrying its own correlation id, so inverting this
+    /// branch (Some → AgentExited / None → AgentStopResponse) would hang every
+    /// correlated CLI stop. Both arms below fail under that inversion: the
+    /// correlated arm would see AgentExited and the uncorrelated arm would see
+    /// AgentStopResponse.
+    ///
+    /// This exercises `stop_agent_reply`, the sole reply constructor of
+    /// `dispatch_command`'s StopAgent arm (routing proven by
+    /// `dispatch_stop_agent_replies_through_stop_agent_reply`). The registry
+    /// Ok-arm cannot be reached end-to-end here: `ProcessRegistry.processes`
+    /// is only populated by `spawn_agent`, which launches a real agent binary,
+    /// and its test-only child-env seam is private to `process_registry.rs`.
+    #[test]
+    fn stop_agent_reply_stamps_correlation_id_per_caller() {
+        use wisphive_protocol::ServerMessage;
+
+        // Correlated one-shot caller (CLI `agent stop`) → AgentStopResponse
+        // with its correlation id stamped back.
+        match super::stop_agent_reply("agent-1", Ok(Some(0)), Some("stop-corr-1".into())) {
+            ServerMessage::AgentStopResponse {
+                agent_id,
+                exit_code,
+                correlation_id,
+            } => {
+                assert_eq!(agent_id, "agent-1");
+                assert_eq!(exit_code, Some(0));
+                assert_eq!(correlation_id.as_deref(), Some("stop-corr-1"));
+            }
+            other => panic!("correlated stop must reply AgentStopResponse, got {other:?}"),
+        }
+
+        // Uncorrelated caller → legacy AgentExited event shape, which has no
+        // correlation field on the wire.
+        match super::stop_agent_reply("agent-2", Ok(None), None) {
+            ServerMessage::AgentExited {
+                agent_id,
+                exit_code,
+            } => {
+                assert_eq!(agent_id, "agent-2");
+                assert_eq!(exit_code, None);
+            }
+            other => panic!("uncorrelated stop must reply AgentExited, got {other:?}"),
+        }
+
+        // A stop failure keeps the Error shape regardless of correlation.
+        match super::stop_agent_reply(
+            "agent-3",
+            Err(anyhow::anyhow!("no managed agent with id: agent-3")),
+            Some("stop-corr-3".into()),
+        ) {
+            ServerMessage::Error { message } => {
+                assert!(message.contains("no managed agent with id: agent-3"));
+            }
+            other => panic!("failed stop must reply Error, got {other:?}"),
+        }
+    }
+
+    /// itr#526: `dispatch_command` must route a StopAgent command's reply
+    /// through `stop_agent_reply` onto the requesting connection's writer.
+    /// (The reachable arm without a real spawned child is the registry Err
+    /// arm; the Some/None correlation stamping of the Ok arm is pinned by
+    /// `stop_agent_reply_stamps_correlation_id_per_caller`.)
+    #[tokio::test]
+    async fn dispatch_stop_agent_replies_through_stop_agent_reply() {
+        use std::time::Duration;
+
+        use tokio::net::UnixStream;
+        use wisphive_protocol::{ClientMessage, ServerMessage};
+
+        let home = tempfile::tempdir().unwrap();
+        let config = crate::DaemonConfig::new(home.path().to_path_buf());
+        let server = super::Server::new(config).await.unwrap();
+        let ctx = super::ConnectionContext {
+            queue: server.queue.clone(),
+            process_registry: server.process_registry.clone(),
+            agent_registry: server.agent_registry.clone(),
+            tui_tx: server.tui_tx.clone(),
+            state_db: server.state_db.clone(),
+            terminal_manager: server.terminal_manager.clone(),
+            reauth: server.reauth.clone(),
+            replay_gate: server.replay_gate.clone(),
+            bad_hello_gate: server.bad_hello_gate.clone(),
+            hook_timeout_secs: server.config.hook_timeout_secs,
+            notifications_enabled: false,
+            home_dir: server.config.home_dir.clone(),
+            audit_snapshot_limit: server.config.audit_snapshot_limit,
+        };
+
+        let (server_stream, client_stream) = UnixStream::pair().unwrap();
+        let (_, mut writer) = server_stream.into_split();
+        let mut responses = BufReader::new(client_stream).lines();
+        let mut attachments = std::collections::HashMap::new();
+        let (conn_tx, _conn_rx) = tokio::sync::mpsc::channel(1);
+
+        let flow = super::dispatch_command(
+            &mut writer,
+            &ctx,
+            None,
+            Some("stop-corr-err".into()),
+            ClientMessage::StopAgent {
+                agent_id: "agent-not-managed".into(),
+            },
+            &mut attachments,
+            &conn_tx,
+        )
+        .await
+        .unwrap();
+        assert!(flow.is_continue());
+
+        let line = tokio::time::timeout(Duration::from_secs(2), responses.next_line())
+            .await
+            .expect("StopAgent must reply on the requesting connection")
+            .unwrap()
+            .unwrap();
+        let response: ServerMessage = wisphive_protocol::decode(&line).unwrap();
+        match response {
+            ServerMessage::Error { message } => {
+                assert!(
+                    message.contains("no managed agent with id: agent-not-managed"),
+                    "unexpected error message: {message}"
+                );
+            }
+            other => panic!("stopping an unmanaged agent must reply Error, got {other:?}"),
+        }
+    }
+
+    /// itr#526: SpawnAgent's equivalent correlation stamping, end-to-end
+    /// through `dispatch_command`. A correlated caller must receive a direct
+    /// `AgentSpawnQueued` acknowledgement stamped with its own correlation id;
+    /// an uncorrelated caller must receive no direct acknowledgement (its
+    /// decision arrives via the broadcast queue only). The uncorrelated spawn
+    /// is dispatched FIRST on the same writer, so if the `is_some()` condition
+    /// were inverted, the first frame read below would be an AgentSpawnQueued
+    /// with `correlation_id: None` and the assertions fail.
+    #[tokio::test]
+    async fn dispatch_spawn_agent_acks_only_correlated_callers_with_stamped_id() {
+        use std::time::Duration;
+
+        use tokio::net::UnixStream;
+        use wisphive_protocol::{ClientMessage, ServerMessage};
+
+        let home = tempfile::tempdir().unwrap();
+        crate::config::write_mode_file_atomic(&home.path().join("mode"), "active").unwrap();
+        let config = crate::DaemonConfig::new(home.path().to_path_buf());
+        let server = super::Server::new(config).await.unwrap();
+        let ctx = super::ConnectionContext {
+            queue: server.queue.clone(),
+            process_registry: server.process_registry.clone(),
+            agent_registry: server.agent_registry.clone(),
+            tui_tx: server.tui_tx.clone(),
+            state_db: server.state_db.clone(),
+            terminal_manager: server.terminal_manager.clone(),
+            reauth: server.reauth.clone(),
+            replay_gate: server.replay_gate.clone(),
+            bad_hello_gate: server.bad_hello_gate.clone(),
+            hook_timeout_secs: server.config.hook_timeout_secs,
+            // A queued spawn fires a desktop notification when enabled; keep
+            // the test silent and deterministic.
+            notifications_enabled: false,
+            home_dir: server.config.home_dir.clone(),
+            audit_snapshot_limit: server.config.audit_snapshot_limit,
+        };
+
+        let project = tempfile::tempdir().unwrap();
+        let (server_stream, client_stream) = UnixStream::pair().unwrap();
+        let (_, mut writer) = server_stream.into_split();
+        let mut responses = BufReader::new(client_stream).lines();
+        let mut attachments = std::collections::HashMap::new();
+        let (conn_tx, _conn_rx) = tokio::sync::mpsc::channel(1);
+
+        // Uncorrelated spawn first: must write nothing to this connection.
+        let flow = super::dispatch_command(
+            &mut writer,
+            &ctx,
+            None,
+            None,
+            ClientMessage::SpawnAgent(spawn_req(project.path())),
+            &mut attachments,
+            &conn_tx,
+        )
+        .await
+        .unwrap();
+        assert!(flow.is_continue());
+
+        // Correlated spawn second: must be directly acknowledged.
+        let flow = super::dispatch_command(
+            &mut writer,
+            &ctx,
+            None,
+            Some("spawn-corr-1".into()),
+            ClientMessage::SpawnAgent(spawn_req(project.path())),
+            &mut attachments,
+            &conn_tx,
+        )
+        .await
+        .unwrap();
+        assert!(flow.is_continue());
+
+        // Writes on this connection are sequential, so the FIRST frame must be
+        // the correlated ack — anything earlier means the uncorrelated spawn
+        // leaked a direct acknowledgement.
+        let line = tokio::time::timeout(Duration::from_secs(2), responses.next_line())
+            .await
+            .expect("correlated spawn must be acknowledged on the requesting connection")
+            .unwrap()
+            .unwrap();
+        let response: ServerMessage = wisphive_protocol::decode(&line).unwrap();
+        match response {
+            ServerMessage::AgentSpawnQueued {
+                decision,
+                correlation_id,
+            } => {
+                assert_eq!(
+                    correlation_id.as_deref(),
+                    Some("spawn-corr-1"),
+                    "the ack must echo the caller's correlation id (and must not \
+                     belong to the earlier uncorrelated spawn)"
+                );
+                assert_eq!(decision.tool_name, super::SPAWN_DECISION_TOOL);
+            }
+            other => panic!("expected the correlated AgentSpawnQueued ack, got {other:?}"),
+        }
     }
 }
