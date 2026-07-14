@@ -208,8 +208,15 @@ test('inbox surfaces queued, deferred, and auto-answered decisions across two pr
 
   // Queue is empty and no deferred rows yet ⇒ the header is the exact #436
   // empty-state string, N = 1.
+  //
+  // The auto-answered count depends on a full ingestion hop (hook → events.jsonl
+  // → daemon tail → SQLite → snapshot broadcast → UI). Under a machine saturated
+  // by a concurrent `cargo test --workspace`, that hop has been observed to
+  // exceed 15s (itr#520). `toHaveText` already polls, so a generous timeout is
+  // the resilient fix — it waits out load without weakening the exact-string
+  // assertion.
   await expect(header).toHaveText('0 waiting · 1 auto-answered in last hour (view)', {
-    timeout: 15_000,
+    timeout: 30_000,
   })
   await shot(page, 'ac4-empty-state-count')
 
@@ -346,8 +353,26 @@ test('inbox surfaces queued, deferred, and auto-answered decisions across two pr
   expect(auditB).toContain('AskUserQuestion')
   expect(auditB).toContain('always_ask:intrinsic')
 
-  // The empty-state count N (1 auto-answered) matches the audit trail.
-  const auditAuto = await runAudit(['--decided-by', (feedRule as string).trim(), '--since', '1h'])
-  const readRows = auditAuto.split('\n').filter((l) => l.includes('Read')).length
-  expect(readRows, 'auto-answered count disagrees with audit oracle').toBe(1)
+  // The empty-state count N (1 auto-answered) matches the audit trail. `wisphive
+  // audit` is a one-shot CLI snapshot of the same ingestion pipeline as the
+  // header; under load the archive write can lag the UI, so poll the CLI until
+  // it settles rather than trusting a single read (itr#520). The exact `.toBe(1)`
+  // oracle is preserved — only the read is retried, so an over-count still fails.
+  await expect
+    .poll(
+      async () => {
+        const auditAuto = await runAudit([
+          '--decided-by',
+          (feedRule as string).trim(),
+          '--since',
+          '1h',
+        ])
+        return auditAuto.split('\n').filter((l) => l.includes('Read')).length
+      },
+      {
+        message: 'auto-answered count disagrees with audit oracle',
+        timeout: 30_000,
+      },
+    )
+    .toBe(1)
 })

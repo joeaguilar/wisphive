@@ -91,9 +91,14 @@ Copy this block into the appropriate phase section:
 
 ### Command Center inbox: real daily two-session perception (added 2026-07-04, source: itr#438/#399, Sprint-2)
 - **Steps:** Automated §10 runtime evidence already captured — `crates/wisphive_web/frontend/e2e/inbox-command-center.spec.ts`
-  drives a REAL `wisphive daemon start --web` (isolated HOME) with the REAL `wisphive-hook`
-  binary authoring deferred + auto-approved `events.jsonl` records across two projects,
-  proving all five #438 ACs + the `wisphive audit` oracle; screenshots in
+  drives a REAL `wisphive daemon start --web` (isolated HOME) across two projects, proving all
+  five #438 ACs + the `wisphive audit` oracle on live (non-fixture) daemon data. Provenance is
+  mixed by design: the deferred (AC2) and auto-approved (AC3, which drives the AC4 header count)
+  `events.jsonl` records are authored by the REAL `wisphive-hook` binary running its real
+  always-defer / auto-approve classification. AC1's gated human-review queue item comes from a
+  real-wire socket client fixture (`e2e/fixtures/hook-client.ts`), **not** the hook binary —
+  under `auto_approve_level:all` the real hook auto-approves everything and so cannot produce a
+  human-review row. Screenshots in
   `sprint/sprint-2-2026-07-03-command-center-inbox/blitz/evidence/`. This human item is the
   residual perception pass: run `wisphive daemon start --web`, open the Inbox in a real
   browser, and work with **two genuine concurrent Claude/Codex sessions** in different

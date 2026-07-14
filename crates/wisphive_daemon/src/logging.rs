@@ -557,4 +557,87 @@ mod tests {
         let missing = dir.path().join("does-not-exist");
         prune_old_files(&missing, 14).unwrap();
     }
+
+    /// An `io::Write` + `MakeWriter` that captures fmt-layer output into a shared
+    /// buffer, so a test can inspect what the stderr layer *would* have printed
+    /// without touching the process's real stderr fd.
+    #[derive(Clone)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Locks in the most error-prone bit of `init`'s composition (#292, from the
+    /// #238 review): the interaction between the registry-level [`EnvFilter`]
+    /// floor and the *per-layer* [`LevelFilter`] ceiling on the stderr sink.
+    ///
+    /// `init` installs its subscriber via `try_init`, which registers a
+    /// **process-global** default that can only be set once per process and
+    /// cannot be uninstalled or introspected — so it can't be exercised from a
+    /// test that needs to emit events and then inspect the results in isolation.
+    /// Instead we rebuild the same layer stack (EnvFilter + WARN-clamped stderr
+    /// layer + [`StoreLayer`]) under a thread-scoped `with_default` subscriber.
+    /// The file layer is omitted: it's orthogonal to the filter interaction and
+    /// only adds a temp-dir dependency.
+    #[test]
+    fn envfilter_floor_and_stderr_ceiling_are_independent() {
+        let store = LogStore::new(16);
+        let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+
+        // Registry-level floor admits DEBUG globally (mirrors `RUST_LOG=debug`).
+        let env_filter = EnvFilter::new("debug");
+        // Per-layer ceiling clamps *only* the stderr sink to WARN — exactly the
+        // `LevelFilter::from_level(stderr_level)` wiring in `init`.
+        let stderr_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer({
+                let captured = captured.clone();
+                move || CaptureWriter(captured.clone())
+            })
+            .with_filter(LevelFilter::from_level(Level::WARN));
+        let store_layer = StoreLayer::new(store.clone());
+
+        let subscriber = Registry::default()
+            .with(env_filter)
+            .with(stderr_layer)
+            .with(store_layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!(target: "clamp_test", "debug-line");
+            tracing::warn!(target: "clamp_test", "warn-line");
+        });
+
+        // (a) EnvFilter floor: BOTH records reached the (unclamped) store, so the
+        //     registry-level filter admitted DEBUG.
+        let records = store.tail(10, Level::TRACE);
+        let messages: Vec<&str> = records.iter().map(|r| r.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            vec!["debug-line", "warn-line"],
+            "EnvFilter=debug must admit both DEBUG and WARN to the store layer"
+        );
+
+        // (b) Per-layer ceiling: ONLY the WARN event reached stderr, proving the
+        //     WARN clamp held independently of the more permissive global floor.
+        let stderr = String::from_utf8(captured.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            .expect("captured stderr is valid utf-8");
+        assert!(
+            stderr.contains("warn-line"),
+            "the WARN event must reach the stderr layer, got: {stderr:?}"
+        );
+        assert!(
+            !stderr.contains("debug-line"),
+            "the DEBUG event must be clamped off stderr by the per-layer WARN ceiling, got: {stderr:?}"
+        );
+    }
 }
