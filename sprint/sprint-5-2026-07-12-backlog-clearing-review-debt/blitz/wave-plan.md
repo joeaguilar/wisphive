@@ -243,6 +243,251 @@ Ordering rationale: #510/#511/#515 (process_registry.rs 3-way clique) land in wa
   --tag verify-rust` → no error blocks). Not blocking; worth a follow-up itr issue for the test harness's
   listener-startup race, filed separately from this sprint's scope.
 
+## Wave 2 execution log
+
+- **#511 (fable-5, shared tree): PASS.** Full `just verify` green (all 5 gates). New
+  `audit_codex_effective_hooks` in process_registry.rs inspects the full effective hook inventory (user
+  hooks.json, inline `[hooks]` TOML in user+project config.toml, project file, plugin-bundled hooks,
+  managed knobs, `features.hooks`, persisted `/hooks` state, `allow_managed_hooks_only`) rather than just
+  the project file. Fails closed on any TOML layer it can't positively parse (no `toml` crate in
+  ownership, so a purpose-built line scanner errs toward over-refusing). `features.hooks≠true` and
+  persisted disablement are hard refusals the `codex_allow_foreign_hooks` opt-in cannot release. 15 new
+  tests + a genuine runtime proof (spawns a real `codex exec`, confirms the Wisphive gate's events.jsonl
+  recorded the auto-approved PreToolUse — env-gated behind `WISPHIVE_CODEX_RUNTIME_PROOF=1` to keep
+  `just verify` deterministic, but actually executed and passed during this task).
+- **#139 (terra, worktree): PASS.** useWisphive.ts's decode/encodeBase64 try native
+  `Uint8Array.fromBase64()`/`toBase64()` first (feature-detected via `typeof ctor.fromBase64 ===
+  "function"`, since TS lib target is ES2023 and jsdom/Node test env can't guarantee ES2024 methods),
+  falling back to the original atob/per-byte-loop/btoa implementation. 2 new tests: one deletes the
+  native methods and proves the fallback round-trips ASCII + arbitrary binary bytes (0x00/0xff/0x80/...);
+  one stubs native methods and asserts they're actually dispatched to when present. 146/146 vitest,
+  eslint clean.
+- **#517 (terra, worktree): PASS.** Chose ref-based fix (not integration test) — App.tsx already owns the
+  sidebar DOM node, so a `backgroundRef` prop threaded down to Terminals.tsx eliminates the
+  `.app > .sidebar` string-selector coupling entirely rather than just detecting its breakage after the
+  fact. Added a capturing Tab/Shift+Tab keydown trap on the mobile dialog (independent of native `inert`,
+  mirrors Modal.tsx's existing FOCUSABLE pattern) with a new test that bypasses jsdom's lack of `inert`
+  focus-suppression semantics to prove the trap holds focus inside the dialog in both directions. 145/145
+  vitest, eslint clean.
+- **#263 (terra, worktree): PASS on the actual change.** `revoke_web_device` now inspects
+  `rows_affected()`; on 0 rows does a follow-up `SELECT 1 FROM web_devices WHERE id = ?` to distinguish
+  already-revoked (idempotent, exit 0) from unknown id (`WebAuthError::NotFound` → CLI prints "unknown
+  device id: <id>", nonzero exit). 3 new tests cover unknown/already-revoked/fresh-revoke, all pass
+  (`3 passed; 0 failed` isolated). Codex self-reported FAIL only due to the same familiar sandbox
+  socket-permission artifact seen throughout this run (2 unrelated tests); clippy clean, 376/378
+  workspace tests pass when those 2 are skipped.
+- **#516 (terra, worktree): PASS, independently re-verified outside Codex's sandbox** (which prohibits
+  AF_UNIX binds outright — Codex's own transcript only ever saw the trivial skip-branch execute). Wrapper
+  agent rebuilt/retested itself: real `wisphive daemon start`/`stop` subprocess lifecycle test (isolated
+  temp HOME/PATH, confirmed different real PIDs across runs, confirmed `~/.wisphive/wisphive.pid`
+  untouched) + 2 new interleave tests in server.rs (stop-path, spawn-path). **Self-flagged caveat for
+  review**: the new interleave tests hand-roll a client reader at the wire-protocol level rather than
+  calling the actual production `send_and_recv_on`/`is_matching_agent_reply` skip-loop the way the
+  existing list-path interleave test (wisphive_cli/commands/agent.rs) does — proves wire round-trip
+  shape, not the same production-code guarantee for stop/spawn. Also: one flaky run (10s wait_for_path
+  timeout under concurrent build load) out of 3, consistent with this sprint's known machine-load
+  sensitivity (itr#520 precedent) — always passed standalone. 343+1+27 tests, clippy clean.
+
+## Wave 2 cross-model review
+
+- **#263 (opus-4.8 reviewing terra): CLEAN — 1 harmless nit.** TOCTOU with `reset_web_password` (the only
+  bulk-delete path): if UPDATE hits 0 rows and a concurrent password reset wipes all devices before the
+  follow-up SELECT, reports NotFound for an id that briefly existed — deemed harmless since after a full
+  reset the device really is gone, message isn't misleading. All 4 requested axes verified correct: same-id
+  race handled right (UPDATE-affects-1 short-circuits before SELECT), NotFound never conflated with other
+  DB errors (only constructed on `exists.is_none()`), exit code genuinely propagates nonzero via
+  `Termination`, SELECT uses a bound parameter (no injection risk). **Verdict: CLOSE.**
+- **#139 (opus-4.8 reviewing terra): CLEAN — 1 minor, 1 nit.** Minor: AC's "throughput bench improves"
+  claim is unverified — no bench added, and native-path coverage is stub-only in CI (Node 22.12 lacks both
+  methods, so `frontend-test` only exercises fallback + stubbed-dispatch tests; the real win only
+  materializes on browsers shipping ES2024). Nit: fallback still uses the flagged per-byte
+  `String.fromCharCode` hot path — unchanged perf on non-native environments, expected/acceptable as a
+  fallback. All 4 requested correctness axes clean: binary semantics match old atob/btoa contract exactly
+  (default alphabet/lastChunkHandling), feature detection is per-function and safe under partial
+  implementations, casts don't mask any option mismatch, dispatch test genuinely distinguishes
+  encode-vs-decode by return type + call args. **Verdict: CLOSE**, minor/nit optional follow-up.
+
+## Wave 2 escalation
+
+- **#511 (fable-5 → redo at fable-5, ceiling).** Codex cross-review found 3 BLOCKERS + 1 MAJOR — this
+  security-critical ticket's first pass does not actually close the gap:
+  1. blocker, process_registry.rs:861 — `parse_toml_key_path` doesn't decode TOML basic-string `\uXXXX`
+     escapes; `"hooks" = false` parses as `features.u0068ooks` not `features.hooks`, so a
+     legitimately-disabling TOML entry (or a foreign inline hook under an escaped key) evades detection
+     entirely — disproves the "provable superset" claim outright, a concrete bypass even without the
+     foreign-hooks opt-in.
+  2. blocker, process_registry.rs:998 — plugin enumeration only admits files literally named
+     `hooks.json`, silently skips symlinks, and has no session-source enumeration at all despite the AC
+     requiring it — a plugin manifest relocating its hook file evades the audit entirely.
+  3. blocker, process_registry.rs:1430 — TOCTOU: the audit reads config/hook files, then the spawned
+     child re-reads them later; nothing ties the audited bytes to what the child actually consumes, so a
+     swap between audit and spawn can run the child ungated.
+  4. major, process_registry.rs:2913 — the runtime-proof test is skipped unless
+     `WISPHIVE_CODEX_RUNTIME_PROOF` is set, so it provides zero evidence in normal `just verify` runs, and
+     even when run it calls `audit`/`build_agent_command` directly rather than the real
+     `ProcessRegistry::spawn_agent` path, covering only a clean happy path.
+  #511 was executed at fable-5, already the ceiling — redoing once at the same model with all 4 findings
+  spliced in, per the escalation rule for ceiling tasks.
+- **#511 redo (fable-5): PASS, exceptionally thorough.** Replaced the hand-rolled TOML scanner with the
+  real `toml` crate (checked Cargo.lock first, confirmed nothing transitively vendored a parser before
+  adding one; `cargo deny check advisories bans sources` passes) — closes finding #1 structurally, not
+  via more escape-pattern whack-a-mole. Plugin manifest resolution now follows symlinks (empirically
+  verified against this machine's real `~/.codex/plugins` tree, finding actual production symlinks) with
+  cycle-breaking + fail-closed on unresolvable paths; added `audit_codex_session_argv` for the
+  daemon-managed-spawn session source. Finding #3 (TOCTOU) honestly NOT fully closed — added
+  `AuditSnapshot` (SHA-256 hash-on-read) reverified before AND after `cmd.spawn()` (killing the child on
+  post-spawn mismatch), narrowing the window to the instants around the spawn syscall while explicitly
+  documenting the residual can't be eliminated without a Codex-side API that doesn't exist. Finding #4
+  closed with an always-on offline runtime-proof test (no env gate) exercising the real `spawn_agent`
+  path with a stand-in `codex` binary, including a negative case (foreign hook without opt-in → refused,
+  no child launches). ~25 new tests, file grew 1400→3824 lines. Full `just verify` green (370+27 daemon
+  tests). Self-filed itr#527 for a newly-discovered flake in the same test family as itr#525 — merged as
+  duplicate, root-cause hypothesis sharpened. Re-review dispatched given the scope and criticality.
+- **#511 redo re-review (gpt-5.6-terra): 2 BLOCKERS + 2 MAJORS + 2 minors — round 2 miss after the one
+  ceiling redo.**
+  1. blocker, process_registry.rs:773 — AST walk only checks `features.hooks`; Codex also accepts the
+     deprecated `features.codex_hooks` alias per its config reference. `[features]\ncodex_hooks = false`
+     disables the gate but evades this audit entirely.
+  2. blocker, process_registry.rs:1725 — the TOCTOU mitigation's own test coverage has a gap in the
+     window it disclosed: pre-spawn hash check passes, `spawn()` starts a concurrently-scheduled child,
+     and the child can read swapped config and make an ungated tool call BEFORE the post-spawn re-hash/
+     kill runs. Existing mutation tests only mutate before the pre-spawn check, not in this window.
+  3. major, process_registry.rs:950 — manifest `hooks` field parsing only accepts a bare string; Codex's
+     real manifest schema also supports an array of paths, an inline hooks object, and an array of inline
+     objects. A correctly-configured plugin using any non-string form now gets EVERY managed Codex spawn
+     refused — an availability regression, not just a security gap.
+  4. major, process_registry.rs:3556 — the always-on offline runtime-proof's stand-in `codex` script only
+     seds/evals the project hooks.json; doesn't model config-layer merging, features aliases, persisted
+     disablement, profiles, or plugin enablement — so it would pass even with blocker #1 present and
+     doesn't substantiate the claimed effective-inventory behavior.
+  5. minor, process_registry.rs:953 — `dir.join(declared)` before `canonicalize` accepts absolute paths
+     (e.g. `"hooks": "/tmp/x.json"`), letting a manifest point outside the plugin root; Codex requires
+     paths to start `./` and stay inside the plugin root.
+  6. minor, process_registry.rs:1053 — the new session-argv audit is raw substring matching (`contains
+     ("feature")`), not key-path-aware parsing — same escape-bypass class as the ORIGINAL finding #1, just
+     in new code. Not yet exploitable (today's builder doesn't emit arbitrary `-c`), but fragile.
+  Per the escalation rule: #511 already had its one ceiling redo (fable-5, this pass) — a second miss
+  means surfacing to the user rather than looping a third fable pass, same situation as #510 earlier in
+  this run. User chose: route to gpt-5.6-sol at ultra effort (same choice as #510).
+- **#511 second redo (gpt-5.6-sol, ultra): all 6 findings addressed.** Alias auditing for
+  `features.hooks`/`features.codex_hooks` sharing canonical-key precedence; full 4-shape manifest union
+  parsing (path string/array/inline object/array-of-inline) tested individually for false-refusal;
+  absolute-path + traversal + symlink-escape rejection with canonical-root confinement; structured
+  `-c`/`--config` TOML-key-path parsing replacing substring matching. Finding #2 (TOCTOU) honestly
+  narrowed further, not claimed eliminated: pre-check is now the literal last op before `spawn()`,
+  post-check the literal first op after — new test lands a mutation via a start/release rendezvous file
+  exactly after the child starts and proves the recheck detects it and force-terminates; code comment
+  states the remaining scheduler-level residual precisely rather than overclaiming. Codex self-reported
+  FAIL only because of the same `UnixListener::bind` sandbox artifact seen throughout this run (#263,
+  #516) — independently confirmed passing outside the sandbox, and I ran the FULL `just verify` myself on
+  the integrated tree: all 5 gates genuinely green (fmt, clippy, 371+ tests, frontend, e2e). 68/68 new
+  security-focused tests pass. Cumulative diff across 3 passes: +4543/-1009 in process_registry.rs.
+  Fable-5 review dispatched per user instruction (in place of the usual Codex/opus reviewer, given fable
+  is already the model that did the deepest passes on this ticket).
+- **#511 fable review (round 3): 4 findings, none proven bugs.** 3 major (contingent — genuinely
+  undecidable from outside Codex's source: `disableAllHooks` per-file vs global scope, `features.hooks`
+  vs `codex_hooks` alias precedence, persisted-disable key-format assumption) + 1 major structural
+  (~3000-line audit reimplements Codex's config-resolution internals — inherently fragile long-term
+  regardless of specific bugs; filed as ADR-track itr#528, not attempted now) + 2 concrete (unbounded
+  recursion DoS on agent-writable nested TOML; unvalidated `profile` string path-injection). Confirmed
+  what held up from rounds 1-2: TOCTOU adjacency claim accurate (verify_unchanged is the literal
+  last/first op around spawn in non-test builds), `-c`/`--config` argv parser covers every syntax variant
+  tried, 4-shape manifest parity holds, escaped-key TOML decoding genuinely closes round-1's bug. User
+  chose: fix the 2 concrete issues + resolve the 3 judgment calls toward fail-closed (not a redesign).
+- **#511 round 4 (gpt-5.6-sol, ultra): small, targeted, all 5 changes applied.** Depth cap (32) on both
+  recursive TOML scanners, fail-closed on exceeding it. `profile` string validated as a bare
+  ASCII-identifier before path join. `disableAllHooks` now refuses the ENTIRE spawn regardless of which
+  file it appeared in (not just masking that file's own hooks). Feature-alias check now ORs both disable
+  signals (`hooks`/`codex_hooks`) instead of letting canonical-key precedence override an alias-disable.
+  Persisted `hooks.state` now fails closed on an unrecognized-format key while still passing through
+  empty/absent tables normally. Wrapper independently re-ran the 8 new tests + full daemon suite
+  (394/394) + clippy, all clean. I ran the full `just verify` myself: all 5 gates genuinely green (fmt,
+  clippy, workspace tests, frontend, e2e).
+- **#511 round 4 review (opus-4.8): NO FINDINGS.** All 5 changes verified correct, complete, non-vacuous:
+  depth cap enforced at function entry in both scanners with a genuine two-part test hitting each cap
+  independently; profile validation runs before every path-join site (confirmed no second unvalidated
+  call site); `disableAllHooks` bail lives in the shared `inspect_hook_value` gated on
+  `HookSettingsKind::Codex` so it fires for every Codex source (project/user/plugin), genuinely refusing
+  the whole spawn not just masking one file; alias OR-logic confirmed via all 3 cases
+  (disagree-each-direction + neither-present-default) with no regression to round-1's escaped-key
+  parsing; unrecognized-`hooks.state`-key check confirmed to never misclassify a correctly-formatted key
+  (traced the `rsplitn` parsing against what `gate_state_keys` actually produces) while still passing
+  empty/absent tables. No regressions to any prior round's fixes. **itr#511: DONE after 4 rounds** — 2
+  concrete bugs (recursion DoS, path injection) fixed, 3 genuinely-undecidable judgment calls resolved
+  toward fail-closed per PO direction, structural redesign concern filed as ADR-track itr#528.
+
+- **#516 (terra → gpt-5.6-sol).** Opus review found a MAJOR defect, worse than the executor's own
+  self-flagged caveat: the new stop/spawn interleave tests in server.rs are tautological — the fake
+  daemon writes `[AgentExited, correlated_reply]`, the hand-rolled client reads exactly 2 lines and
+  asserts their order, but never calls the real production skip-loop (`send_and_recv_on`/
+  `is_matching_agent_reply` in wisphive_cli's agent.rs) or drives the real `handle_agent_command`'s
+  per-variant correlation stamping. These tests would still pass if the skip-loop were deleted entirely —
+  exactly the hard-coded-count anti-pattern that caused itr#468. Root cause: the tests are in the daemon
+  crate, which structurally can't reach `send_and_recv_on` (private to wisphive_cli) — that crate
+  placement is what forced the hand-rolling. Reviewer's fix: move the stop/spawn cases into wisphive_cli
+  alongside the existing list-path test, reusing the real `connect_to_socket`/`send_and_recv_on`.
+  The pidfile subprocess test itself is CONFIRMED SOLID (no finding) — traced through code to prove it
+  genuinely exercises the itr#372 drop-before-exit fix, would fail if that fix were reverted. 2 minors on
+  it, folding into the redo: bump the flaky `wait_for_path` 10s timeout to ~30s; `FrontendDistGuard`
+  mutates a shared path in the real checkout rather than an isolated dir (SIGKILL-survival / concurrent-run
+  race risk) — consider gating on pre-existing dir instead of fabricate-then-delete.
+- **#517 (terra → gpt-5.6-sol).** Opus review found a MAJOR defect: the focus-trap's "focus began outside
+  dialog" branch unconditionally pulls focus into the terminal dialog from anywhere outside it — including
+  OTHER App-level modals that legitimately stack on top. Concrete reachable path: approving a sudo-class
+  tool from the mobile terminal dock's `TerminalQueueDock` while the terminal dialog is open triggers
+  `web_reauth_required` → `SudoModal` mounts over it; now two document-level capturing Tab traps are live,
+  and the Terminals handler fires first, sees the SudoModal's password field isn't inside `.terminals-main`,
+  and yanks focus back into the occluded terminal — the keyboard user can no longer Tab within the reauth
+  modal at all. Modal.tsx (the pattern this was supposed to mirror) has no such outside-pull branch.
+  Reviewer's fix: scope the pull-in to `backgroundRef.current?.contains(active)` instead of "anything
+  outside the dialog" — still satisfies the existing test. Also minor: the new test passes through a
+  jsdom quirk (`offsetParent` always null → `focusables` always empty → falls into the zero-focusable
+  `dialog.focus()` fallback) rather than exercising the intended first/last edge logic, so it can't
+  distinguish the buggy broad trap from a correctly-scoped one. Redoing at gpt-5.6-sol with both findings
+  spliced in.
+- **#517 redo (gpt-5.6-sol): PASS.** Scoped the "focus outside dialog" recovery branch to
+  `backgroundRef.current?.contains(active)` — only pulls focus back when it escaped into the occluded
+  background, leaves it alone (no `preventDefault`) when it's in another stacked modal. New regression
+  test mounts a second stacked dialog, focuses its password field, asserts Tab doesn't steal focus.
+  Rigorously verified falsifiable: reverted to the old unconditional condition and confirmed the new test
+  actually FAILS (`1 failed`), then restored the fix and confirmed it PASSES (`1 passed`) — not just a
+  self-report. Second new test patches jsdom's `offsetParent` on real controls to exercise the actual
+  first/last Tab-wrap edge logic instead of the empty-list fallback. 147/147 vitest, eslint clean.
+  Re-review pending.
+- **#516 redo (gpt-5.6-sol): PASS.** Removed the tautological server.rs interleave tests entirely. Added
+  `stop_agent_skips_interleaved_exit_and_other_correlated_reply` /
+  `spawn_agent_skips_interleaved_exit_and_other_correlated_reply` in wisphive_cli's agent.rs, mirroring
+  the existing list-path test's pattern; extracted `connect_on_stream` from production `connect_to_socket`
+  so tests drive the real handshake over `UnixStream::pair()` and genuinely call the real
+  `send_and_recv_on` skip-loop — verified in the diff, gap #1 closed. Gap #2 (daemon-side correlation
+  stamping) honestly left open and documented in a comment: `handle_agent_command`/`ConnectionContext`
+  are private to wisphive_daemon, structurally inaccessible from the CLI test module. `wait_for_path`
+  bumped 10s→30s (real run took 25.69s — legitimate flake risk, not over-fixing). `FrontendDistGuard`
+  replaced with a skip-with-actionable-message check instead of fabricate-then-delete. Wrapper
+  independently re-ran everything outside Codex's sandbox: 341+27+1 tests pass, clippy clean. Re-review
+  pending.
+- **#517 redo re-review (opus-4.8): CLEAN — 2 nits.** Verified the null-ref case correctly does nothing
+  (no fallthrough to stealing everywhere); confirmed the original itr#488 protection is intact (narrowed
+  condition still matches the exact inert scope, no other occluded focusable region leaks through — traced
+  CSS + banner components). Nit: the stacked-modal test's mock dialog has no keydown listener, so it
+  proves "Terminals doesn't steal" but not the real two-capture-listener interaction with Modal.tsx's
+  actual trap. Nit: recommend a code comment tying the fix's correctness to "modals render as siblings
+  of, never descendants of, backgroundRef" for future-refactor robustness. Mentally re-ran the pre-fix
+  code against the new test and confirmed it would genuinely fail. **Verdict: CLOSE.**
+- **#516 redo re-review (opus-4.8): 1 minor, 1 nit, no blocker.** Traced all 3 verification points as
+  genuinely closed: real `send_and_recv_on` called (not a re-hand-rolled equivalent), `connect_on_stream`
+  extraction is a faithful refactor (production `connect_to_socket` byte-for-byte unchanged), and the new
+  tests force a genuine skip (3 snapshots + unrelated AgentExited + same-variant-wrong-correlation reply
+  before the real match — 3 distinct plausible regressions all traced to fail against these tests).
+  Confirmed tautological server.rs tests fully removed via grep. Minor: the gap-#2 "structurally
+  unreachable" framing overstates it — daemon crate already has precedent (`dispatch_command` driven over
+  `UnixStream::pair()` at server.rs:4680) for closing this cheaply in-crate; reviewer notes `StopAgent`'s
+  Some/None branch (AgentStopResponse vs AgentExited) is a real untested inversion risk. Explicitly "not a
+  blocker for a C1 ticket." Nit: new tests use `UnixStream::pair()` without the list-test's
+  `unix_sockets_are_available()` skip-guard (defensible — pair() is more permissive than bind(), not a
+  real coverage gap). **Verdict: CLOSE**, filing the daemon-side dispatch_command stamping test as a
+  fast-follow (same treatment as other minor findings this run).
+
 ## Outcomes
 
 _populated at Phase 8_

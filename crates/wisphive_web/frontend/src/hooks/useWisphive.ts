@@ -869,14 +869,30 @@ export function useWisphive() {
 
 // ── base64 helpers ─────────────────────────────────────────────────
 
-function decodeBase64(s: string): Uint8Array {
+/** Type slivers for the ES2024 base64 methods, which are newer than this
+ * frontend's ES2023 TypeScript lib target. */
+interface NativeBase64Capable {
+  fromBase64?: (s: string) => Uint8Array;
+}
+
+interface NativeBase64Instance {
+  toBase64?: () => string;
+}
+
+export function decodeBase64(s: string): Uint8Array {
+  const ctor = Uint8Array as unknown as NativeBase64Capable;
+  if (typeof ctor.fromBase64 === "function") return ctor.fromBase64(s);
+
   const binary = atob(s);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   return bytes;
 }
 
-function encodeBase64(bytes: Uint8Array): string {
+export function encodeBase64(bytes: Uint8Array): string {
+  const native = (bytes as Uint8Array & NativeBase64Instance).toBase64;
+  if (typeof native === "function") return native.call(bytes);
+
   let binary = "";
   for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary);

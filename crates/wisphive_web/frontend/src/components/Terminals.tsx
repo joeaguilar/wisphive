@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import type { DecisionRequest, ProjectSummary, TerminalSessionMeta } from "../types/protocol";
 import { TerminalView } from "./TerminalView";
 import { TerminalQueueDock } from "./TerminalQueueDock";
@@ -28,6 +28,8 @@ interface TerminalsProps {
    * CTA lands on the exact session. `onFocusHandled` clears it upstream. */
   focusSessionId?: string;
   onFocusHandled?: () => void;
+  /** The application shell hidden behind the mobile terminal dialog. */
+  backgroundRef: RefObject<HTMLElement | null>;
   registerHandler: (
     id: string,
     handler: (id: string, direction: "chunk" | "catchup" | "replay_chunk", bytes: Uint8Array) => void,
@@ -39,6 +41,8 @@ interface TerminalsProps {
 // without requiring re-normalization.
 const SORT_GAP = 1_000_000;
 const UNGROUPED_KEY = "__ungrouped__";
+const FOCUSABLE =
+  'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
 interface DragPayload {
   id: string;
@@ -49,7 +53,7 @@ export function Terminals(props: TerminalsProps) {
   const {
     terminals, queue, projects, onRefresh, onRefreshProjects, onCreate, onAttach, onDetach,
     onClose, onReplay, onInput, onResize, onSetGroup, onReorder,
-    onApprove, onDeny, onJumpToQueue, focusSessionId, onFocusHandled, registerHandler,
+    onApprove, onDeny, onJumpToQueue, focusSessionId, onFocusHandled, backgroundRef, registerHandler,
   } = props;
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [replayMode, setReplayMode] = useState(false);
@@ -65,6 +69,7 @@ export function Terminals(props: TerminalsProps) {
   const [renameDraft, setRenameDraft] = useState("");
   const [drag, setDrag] = useState<DragPayload | null>(null);
   const [dropHint, setDropHint] = useState<{ group: string; index: number } | null>(null);
+  const mobileDialogRef = useRef<HTMLDivElement>(null);
   // The daemon owns one long-lived forwarder for each live attachment. Keep
   // that imperative resource in a ref so event handlers and unmount cleanup
   // always act on the current attachment rather than a stale render snapshot.
@@ -102,19 +107,63 @@ export function Terminals(props: TerminalsProps) {
   const mobileSubwindowOpen = isMobile && selected !== null;
 
   // The fixed mobile terminal sub-window covers the app navigation, but that
-  // navigation remains in the DOM. Make it inert while the sub-window is open
-  // so keyboard focus cannot escape to the occluded shell. This component is
-  // nested inside <main>, so the sibling <nav> must be managed imperatively.
+  // navigation remains in the DOM. App owns the shell element, so it supplies
+  // a ref rather than coupling this component to App's CSS class names.
   useEffect(() => {
     if (!mobileSubwindowOpen) return;
-    const backgroundShell = document.querySelector<HTMLElement>(".app > .sidebar");
+    const backgroundShell = backgroundRef.current;
     if (!backgroundShell) return;
     const wasInert = backgroundShell.hasAttribute("inert");
     backgroundShell.setAttribute("inert", "");
     return () => {
       if (!wasInert) backgroundShell.removeAttribute("inert");
     };
-  }, [mobileSubwindowOpen]);
+  }, [backgroundRef, mobileSubwindowOpen]);
+
+  // Native inert keeps focus out of the background in current browsers, but
+  // aria-modal alone does not protect keyboard users on older browsers. Keep
+  // a small Tab trap active for the mobile dialog in every browser so it also
+  // acts as the non-native-inert fallback.
+  useEffect(() => {
+    if (!mobileSubwindowOpen) return;
+    const dialog = mobileDialogRef.current;
+    if (!dialog) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Tab") return;
+      const focusables = [...dialog.querySelectorAll<HTMLElement>(FOCUSABLE)].filter(
+        (element) => element.offsetParent !== null || element === document.activeElement,
+      );
+      const active = document.activeElement;
+
+      // If focus began in the occluded background (possible without native
+      // inert), pull it into the appropriate edge of the dialog. Leave focus
+      // alone when another App-level modal is stacked above this one.
+      if (!dialog.contains(active)) {
+        if (backgroundRef.current?.contains(active)) {
+          event.preventDefault();
+          ((event.shiftKey ? focusables.at(-1) : focusables[0]) ?? dialog).focus();
+        }
+        return;
+      }
+
+      if (focusables.length === 0) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+
+      const first = focusables[0];
+      const last = focusables.at(-1)!;
+      if (event.shiftKey ? active === first || active === dialog : active === last) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      }
+    };
+
+    document.addEventListener("keydown", handleKeyDown, true);
+    return () => document.removeEventListener("keydown", handleKeyDown, true);
+  }, [backgroundRef, mobileSubwindowOpen]);
 
   // Count pending approvals per terminal by joining the queue on terminal_session_id.
   const pendingByTerminal = useMemo(() => {
@@ -542,11 +591,13 @@ export function Terminals(props: TerminalsProps) {
 
       <div
         className="terminals-main"
+        ref={mobileDialogRef}
         {...(mobileSubwindowOpen
           ? {
               role: "dialog",
               "aria-modal": true,
               "aria-labelledby": "terminals-mobile-dialog-title",
+              tabIndex: -1,
             }
           : {})}
       >

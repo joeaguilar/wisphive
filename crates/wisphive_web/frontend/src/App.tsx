@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useWisphive } from "./hooks/useWisphive";
 import { useKeyboard } from "./hooks/useKeyboard";
 import { useAuth } from "./hooks/useAuth";
@@ -80,6 +80,7 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
   const [sessionAgent, setSessionAgent] = useState<string | null>(null);
   const [agentDrilldown, setAgentDrilldown] = useState<string | null>(null);
   const [showHelp, setShowHelp] = useState(false);
+  const sidebarRef = useRef<HTMLElement>(null);
 
   const selectedRequest = queue.find((r) => r.id === selectedId);
 
@@ -148,7 +149,7 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
 
   return (
     <div className="app">
-      <nav className="sidebar">
+      <nav ref={sidebarRef} className="sidebar">
         <div className="sidebar-header">
           <h1>wisphive</h1>
           <span
@@ -296,6 +297,7 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
             onJumpToQueue={() => setView("queue")}
             focusSessionId={focusTerminalId ?? undefined}
             onFocusHandled={() => setFocusTerminalId(null)}
+            backgroundRef={sidebarRef}
             registerHandler={registerTerminalHandler}
           />
         )}

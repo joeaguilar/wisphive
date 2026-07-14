@@ -1,4 +1,4 @@
-import { StrictMode } from "react";
+import { createRef, StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -72,6 +72,7 @@ interface MountOverrides {
   ) => () => void;
   strict?: boolean;
   shell?: boolean;
+  stackedModal?: boolean;
 }
 
 function mountTerminals(overrides: MountOverrides = {}) {
@@ -79,6 +80,7 @@ function mountTerminals(overrides: MountOverrides = {}) {
   const onDetach = overrides.onDetach ?? vi.fn();
   const onReplay = overrides.onReplay ?? vi.fn();
   const registerHandler = overrides.registerHandler ?? vi.fn(() => () => {});
+  const backgroundRef = createRef<HTMLElement>();
   const terminalsView = (
     <Terminals
       terminals={[session]}
@@ -98,15 +100,21 @@ function mountTerminals(overrides: MountOverrides = {}) {
       onApprove={() => {}}
       onDeny={() => {}}
       onJumpToQueue={() => {}}
+      backgroundRef={backgroundRef}
       registerHandler={registerHandler}
     />
   );
   const view = overrides.shell ? (
     <div className="app">
-      <nav className="sidebar">
+      <nav ref={backgroundRef} className="sidebar">
         <button type="button">Occluded navigation</button>
       </nav>
       <main className="content">{terminalsView}</main>
+      {overrides.stackedModal && (
+        <div role="dialog" aria-label="Re-authenticate">
+          <input aria-label="Password" type="password" />
+        </div>
+      )}
     </div>
   ) : terminalsView;
   const utils = render(overrides.strict ? <StrictMode>{view}</StrictMode> : view);
@@ -177,11 +185,86 @@ describe("Terminals mobile dialog accessibility (itr#488)", () => {
     expect(dialog).toHaveAttribute("aria-modal", "true");
     expect(occludedNavigation).toHaveAttribute("inert");
 
-    // Browser focus navigation skips an inert subtree. jsdom does not model
-    // that native behavior, so assert the platform-recognized inert boundary
-    // rather than emulating a second tab-order algorithm in the test.
+    // The ref connects the actual background shell to the inert boundary.
     expect(occludedNavigation.contains(document.activeElement)).toBe(false);
     expect(container.querySelector(".terminals-main")).toBe(dialog);
+  });
+
+  it("traps Tab inside the dialog when native inert behavior is unavailable", async () => {
+    setMobileViewport(true);
+    const user = userEvent.setup();
+    mountTerminals({ shell: true });
+
+    await user.click(screen.getByRole("button", { name: "Attach" }));
+
+    const dialog = screen.getByRole("dialog", { name: "claude" });
+    const occludedNavigation = screen.getByRole("navigation");
+    const backgroundButton = screen.getByRole("button", { name: "Occluded navigation" });
+
+    // jsdom does not implement inert focus suppression, which models the
+    // browser gap the fallback must cover.
+    backgroundButton.focus();
+    expect(document.activeElement).toBe(backgroundButton);
+
+    expect(fireEvent.keyDown(document, { key: "Tab" })).toBe(false);
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(occludedNavigation.contains(document.activeElement)).toBe(false);
+
+    expect(fireEvent.keyDown(document, { key: "Tab", shiftKey: true })).toBe(false);
+    expect(dialog.contains(document.activeElement)).toBe(true);
+  });
+
+  it("does not steal Tab focus from a modal stacked above the terminal dialog", async () => {
+    setMobileViewport(true);
+    const user = userEvent.setup();
+    mountTerminals({ shell: true, stackedModal: true });
+
+    await user.click(screen.getByRole("button", { name: "Attach" }));
+
+    const terminalDialog = screen.getByRole("dialog", { name: "claude" });
+    const stackedDialog = screen.getByRole("dialog", { name: "Re-authenticate" });
+    const password = screen.getByLabelText("Password");
+    password.focus();
+
+    expect(terminalDialog.contains(password)).toBe(false);
+    expect(screen.getByRole("navigation").contains(password)).toBe(false);
+    expect(fireEvent.keyDown(document, { key: "Tab" })).toBe(true);
+    expect(stackedDialog.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toBe(password);
+  });
+
+  it("wraps Tab at the dialog's real first and last focusable edges", async () => {
+    setMobileViewport(true);
+    const user = userEvent.setup();
+    mountTerminals({ shell: true });
+
+    await user.click(screen.getByRole("button", { name: "Attach" }));
+
+    const dialog = screen.getByRole("dialog", { name: "claude" });
+    const focusables = [...dialog.querySelectorAll<HTMLElement>(
+      'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    )];
+    expect(focusables.length).toBeGreaterThan(1);
+
+    // jsdom reports offsetParent === null universally. Give the dialog's
+    // actual controls a layout parent so the production visibility filter
+    // exercises its first/last ordering instead of the empty-list fallback.
+    for (const element of focusables) {
+      Object.defineProperty(element, "offsetParent", {
+        configurable: true,
+        value: dialog,
+      });
+    }
+
+    const first = focusables[0];
+    const last = focusables.at(-1)!;
+    last.focus();
+    expect(fireEvent.keyDown(document, { key: "Tab" })).toBe(false);
+    expect(document.activeElement).toBe(first);
+
+    first.focus();
+    expect(fireEvent.keyDown(document, { key: "Tab", shiftKey: true })).toBe(false);
+    expect(document.activeElement).toBe(last);
   });
 });
 

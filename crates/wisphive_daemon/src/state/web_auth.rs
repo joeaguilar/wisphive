@@ -296,10 +296,11 @@ impl StateDb {
         ))
     }
 
-    /// Flip `revoked_at` on a device, idempotently. A second call is a
-    /// no-op because the WHERE clause filters already-revoked rows.
+    /// Flip `revoked_at` on a device. Repeated calls remain idempotent, but
+    /// an unknown ID returns [`WebAuthError::NotFound`] rather than silently
+    /// succeeding.
     pub async fn revoke_web_device(&self, id: &str) -> WebAuthResult<()> {
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE web_devices SET revoked_at = ?
              WHERE id = ? AND revoked_at IS NULL",
         )
@@ -308,7 +309,22 @@ impl StateDb {
         .execute(&self.pool)
         .await
         .map_err(WebAuthError::from_sqlx)?;
-        Ok(())
+
+        if result.rows_affected() == 1 {
+            return Ok(());
+        }
+
+        let exists: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM web_devices WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(WebAuthError::from_sqlx)?;
+
+        if exists.is_some() {
+            Ok(())
+        } else {
+            Err(WebAuthError::NotFound)
+        }
     }
 
     /// Record that we've just served a request on behalf of `device_id`.

@@ -23,6 +23,11 @@ fn connect_to_daemon() -> Result<(BufReader<UnixStream>, UnixStream)> {
 fn connect_to_socket(socket_path: &Path) -> Result<(BufReader<UnixStream>, UnixStream)> {
     let stream = UnixStream::connect(socket_path)
         .context("could not connect to daemon — is it running? (wisphive daemon start)")?;
+
+    connect_on_stream(stream)
+}
+
+fn connect_on_stream(stream: UnixStream) -> Result<(BufReader<UnixStream>, UnixStream)> {
     stream.set_read_timeout(Some(SOCKET_TIMEOUT))?;
     stream.set_write_timeout(Some(SOCKET_TIMEOUT))?;
 
@@ -360,6 +365,95 @@ mod tests {
     use wisphive_daemon::hook_install::install_hooks;
     use wisphive_daemon::project_audit::{CLAUDE_HOOK_EVENTS, CODEX_HOOK_EVENTS};
 
+    fn unix_sockets_are_available() -> bool {
+        let temp = tempfile::tempdir().unwrap();
+        match UnixListener::bind(temp.path().join("probe.sock")) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => false,
+            Err(error) => panic!("probe Unix socket support: {error}"),
+        }
+    }
+
+    /// Exercise the real CLI correlation loop against a scripted daemon that
+    /// interleaves an unrelated exit and a same-variant reply for another
+    /// request before this command's reply.
+    ///
+    /// The daemon dispatcher is private to `wisphive_daemon`, so this unit-test
+    /// boundary cannot invoke `handle_agent_command` to verify its stamping.
+    /// Gap #2 (daemon-side stamping) is therefore not closed by this harness;
+    /// these tests specifically prevent regressions in `send_and_recv_on`.
+    fn agent_command_after_interleaved_messages(
+        request: ClientMessage,
+        expected_request: &'static str,
+        replies: impl FnOnce(String) -> Vec<ServerMessage> + Send + 'static,
+    ) -> ServerMessage {
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+
+        let fake_daemon = std::thread::spawn(move || {
+            let mut stream = server_stream;
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+            let mut hello_line = String::new();
+            reader.read_line(&mut hello_line).unwrap();
+            let hello: ClientMessage = wisphive_protocol::decode(&hello_line).unwrap();
+            assert!(matches!(
+                hello,
+                ClientMessage::Hello {
+                    client: ClientType::Tui,
+                    version: PROTOCOL_VERSION
+                }
+            ));
+
+            for message in [
+                ServerMessage::Welcome {
+                    version: PROTOCOL_VERSION,
+                },
+                ServerMessage::AgentsSnapshot { agents: Vec::new() },
+                ServerMessage::QueueSnapshot { items: Vec::new() },
+                ServerMessage::AuditSnapshot { items: Vec::new() },
+            ] {
+                stream
+                    .write_all(wisphive_protocol::encode(&message).unwrap().as_bytes())
+                    .unwrap();
+            }
+
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let command: ClientCommand = wisphive_protocol::decode(&request_line).unwrap();
+            match expected_request {
+                "stop" => assert!(matches!(command.body, ClientMessage::StopAgent { .. })),
+                "spawn" => assert!(matches!(command.body, ClientMessage::SpawnAgent(_))),
+                other => panic!("unsupported fake-daemon request kind: {other}"),
+            }
+            let correlation_id = command
+                .correlation_id
+                .expect("CLI request must be correlated");
+
+            let interleaved_exit = ServerMessage::AgentExited {
+                agent_id: "unrelated-agent".into(),
+                exit_code: Some(17),
+            };
+            stream
+                .write_all(
+                    wisphive_protocol::encode(&interleaved_exit)
+                        .unwrap()
+                        .as_bytes(),
+                )
+                .unwrap();
+            for reply in replies(correlation_id) {
+                stream
+                    .write_all(wisphive_protocol::encode(&reply).unwrap().as_bytes())
+                    .unwrap();
+            }
+        });
+
+        let connection = connect_on_stream(client_stream).unwrap();
+        let response = send_and_recv_on(&request, "our-agent-command".into(), connection).unwrap();
+
+        fake_daemon.join().unwrap();
+        response
+    }
+
     fn write_hook_settings(path: &Path, events: &[&str], command: &str) {
         let hooks = events
             .iter()
@@ -455,6 +549,11 @@ mod tests {
 
     #[test]
     fn list_agents_skips_snapshots_and_interleaved_broadcast_before_own_reply() {
+        if !unix_sockets_are_available() {
+            eprintln!("skipping agent interleave test: AF_UNIX sockets are unavailable");
+            return;
+        }
+
         let temp = tempfile::tempdir().unwrap();
         let socket_path = temp.path().join("fake-daemon.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
@@ -542,5 +641,83 @@ mod tests {
             matches!(response, ServerMessage::AgentList { agents, correlation_id: Some(id) } if agents.is_empty() && id == "our-list-request")
         );
         fake_daemon.join().unwrap();
+    }
+
+    #[test]
+    fn stop_agent_skips_interleaved_exit_and_other_correlated_reply() {
+        let response = agent_command_after_interleaved_messages(
+            ClientMessage::StopAgent {
+                agent_id: "agent-being-stopped".into(),
+            },
+            "stop",
+            |correlation_id| {
+                vec![
+                    ServerMessage::AgentStopResponse {
+                        agent_id: "other-agent".into(),
+                        exit_code: Some(9),
+                        correlation_id: Some("another-stop-command".into()),
+                    },
+                    ServerMessage::AgentStopResponse {
+                        agent_id: "agent-being-stopped".into(),
+                        exit_code: Some(0),
+                        correlation_id: Some(correlation_id),
+                    },
+                ]
+            },
+        );
+
+        assert!(matches!(
+            response,
+            ServerMessage::AgentStopResponse {
+                agent_id,
+                exit_code: Some(0),
+                correlation_id: Some(correlation_id),
+            } if agent_id == "agent-being-stopped" && correlation_id == "our-agent-command"
+        ));
+    }
+
+    #[test]
+    fn spawn_agent_skips_interleaved_exit_and_other_correlated_reply() {
+        let project = tempfile::tempdir().unwrap();
+        let request: SpawnAgentRequest = serde_json::from_value(serde_json::json!({
+            "agent_type": "codex",
+            "project": project.path(),
+            "prompt": "review this repository",
+        }))
+        .unwrap();
+        let queued_decision = wisphive_protocol::DecisionRequestBuilder::new(
+            "SpawnAgent",
+            "__wisphive_spawn__",
+            project.path(),
+        )
+        .agent_type(AgentType::Codex)
+        .tool_input(serde_json::to_value(&request).unwrap())
+        .build();
+        let other_decision = queued_decision.clone();
+
+        let response = agent_command_after_interleaved_messages(
+            ClientMessage::SpawnAgent(request),
+            "spawn",
+            move |correlation_id| {
+                vec![
+                    ServerMessage::AgentSpawnQueued {
+                        decision: other_decision,
+                        correlation_id: Some("another-spawn-command".into()),
+                    },
+                    ServerMessage::AgentSpawnQueued {
+                        decision: queued_decision,
+                        correlation_id: Some(correlation_id),
+                    },
+                ]
+            },
+        );
+
+        assert!(matches!(
+            response,
+            ServerMessage::AgentSpawnQueued {
+                correlation_id: Some(correlation_id),
+                ..
+            } if correlation_id == "our-agent-command"
+        ));
     }
 }

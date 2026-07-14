@@ -646,9 +646,19 @@ pub fn has_wisphive_hook(rule: &serde_json::Value) -> bool {
 /// gates tool calls.
 ///
 /// Fail-closed: a missing, unreadable, or malformed hooks file returns `false`.
-/// This is the authoritative check a security gate should use before spawning a
-/// Codex agent with hook-trust bypassed (itr#467) — the substring matcher in
-/// `project_audit` is deliberately looser and must not be trusted for gating.
+///
+/// Scope (itr#511): this checks ONLY the project's `.codex/hooks.json` — an
+/// install-status signal, NOT proof that a spawned Codex child has an enabled
+/// gate at runtime. Codex merges hooks from more sources (user-level
+/// `~/.codex/hooks.json`, inline `[hooks]` TOML, plugins, managed dirs) and
+/// can disable them all (`features.hooks = false`, its deprecated
+/// `features.codex_hooks` alias, persisted `/hooks` state).
+/// The authoritative process-boundary gate is
+/// `process_registry::audit_codex_effective_hooks`, which audits the locally
+/// enumerable, agent-writable inventory and fails closed on anything it cannot
+/// confirm. Its residual-limits documentation covers managed trust roots and
+/// remote plugin extras that are not locally enumerable. The substring matcher
+/// in `project_audit` is looser still and must not be trusted for gating.
 pub fn codex_pretooluse_hook_installed(project: &Path) -> bool {
     let hooks_path = project.join(".codex").join("hooks.json");
     let Ok(content) = std::fs::read_to_string(&hooks_path) else {
@@ -674,6 +684,13 @@ pub fn codex_pretooluse_hook_installed(project: &Path) -> bool {
 /// caller already fail-closes on the wisphive-hook-present check) and
 /// de-duplicates repeated commands. Order is deterministic (by event name, then
 /// position within the event) but not otherwise meaningful.
+///
+/// Scope (itr#511): project-file only, like
+/// [`codex_pretooluse_hook_installed`]. The spawn boundary instead audits the
+/// locally enumerable, agent-writable inventory (user-level hooks.json,
+/// inline `[hooks]` TOML, and locally configured plugins) via
+/// `process_registry::audit_codex_effective_hooks`; use this function for
+/// reporting, not gating.
 pub fn codex_foreign_hook_commands(project: &Path) -> Vec<String> {
     let hooks_path = project.join(".codex").join("hooks.json");
     let Ok(content) = std::fs::read_to_string(&hooks_path) else {

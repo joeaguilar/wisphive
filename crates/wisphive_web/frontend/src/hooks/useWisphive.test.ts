@@ -1,7 +1,7 @@
 import { StrictMode } from "react";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useWisphive } from "./useWisphive";
+import { decodeBase64, encodeBase64, useWisphive } from "./useWisphive";
 import type { ProjectHookStatus } from "../types/protocol";
 
 // Minimal WebSocket stand-in: records outbound frames and lets the test
@@ -67,6 +67,15 @@ const BASH_REQUEST_ID = "00000000-0000-4000-8000-000000000003";
 const READ_REQUEST_ID = "00000000-0000-4000-8000-000000000004";
 const HISTORY_ID = "00000000-0000-4000-8000-000000000005";
 const TERMINAL_ID = "00000000-0000-4000-8000-000000000006";
+
+function restoreProperty(
+  target: object,
+  key: string,
+  descriptor: PropertyDescriptor | undefined,
+) {
+  if (descriptor) Object.defineProperty(target, key, descriptor);
+  else Reflect.deleteProperty(target, key);
+}
 
 function status(overrides: Partial<ProjectHookStatus> = {}): ProjectHookStatus {
   return {
@@ -675,6 +684,48 @@ describe("useWisphive hook-gating (itr#460)", () => {
     act(() => result.current.retryPendingApprove());
     const installs = latest().sentMessages().filter((m) => m.type === "install_hooks");
     expect(installs.length).toBe(1);
+  });
+});
+
+describe("terminal base64 helpers (itr#139)", () => {
+  const binary = new Uint8Array([0x00, 0xff, 0x80, 0x41, 0x0a]);
+  const ascii = new TextEncoder().encode("wisphive terminal");
+
+  it("round-trips ASCII and arbitrary binary bytes through the fallback", () => {
+    const fromBase64 = Object.getOwnPropertyDescriptor(Uint8Array, "fromBase64");
+    const toBase64 = Object.getOwnPropertyDescriptor(Uint8Array.prototype, "toBase64");
+    Object.defineProperty(Uint8Array, "fromBase64", { configurable: true, value: undefined });
+    Object.defineProperty(Uint8Array.prototype, "toBase64", { configurable: true, value: undefined });
+
+    try {
+      expect(Array.from(decodeBase64(encodeBase64(ascii)))).toEqual(Array.from(ascii));
+      expect(Array.from(decodeBase64(encodeBase64(binary)))).toEqual(Array.from(binary));
+    } finally {
+      restoreProperty(Uint8Array, "fromBase64", fromBase64);
+      restoreProperty(Uint8Array.prototype, "toBase64", toBase64);
+    }
+  });
+
+  it("uses native Uint8Array base64 methods when available", () => {
+    const fromBase64 = Object.getOwnPropertyDescriptor(Uint8Array, "fromBase64");
+    const toBase64 = Object.getOwnPropertyDescriptor(Uint8Array.prototype, "toBase64");
+    const nativeDecode = vi.fn(() => binary);
+    const nativeEncode = vi.fn(function (this: Uint8Array) {
+      expect(this).toBe(binary);
+      return "AP+AQQo=";
+    });
+    Object.defineProperty(Uint8Array, "fromBase64", { configurable: true, value: nativeDecode });
+    Object.defineProperty(Uint8Array.prototype, "toBase64", { configurable: true, value: nativeEncode });
+
+    try {
+      expect(decodeBase64("AP+AQQo=")).toBe(binary);
+      expect(encodeBase64(binary)).toBe("AP+AQQo=");
+      expect(nativeDecode).toHaveBeenCalledWith("AP+AQQo=");
+      expect(nativeEncode).toHaveBeenCalledOnce();
+    } finally {
+      restoreProperty(Uint8Array, "fromBase64", fromBase64);
+      restoreProperty(Uint8Array.prototype, "toBase64", toBase64);
+    }
   });
 });
 

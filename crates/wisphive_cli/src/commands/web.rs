@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use wisphive_daemon::state::StateDb;
+use wisphive_daemon::state::{StateDb, WebAuthError};
 use wisphive_web::auth;
 use wisphive_web::tls;
 use zeroize::Zeroize;
@@ -192,16 +192,22 @@ pub async fn devices_list() -> Result<()> {
 
 /// `wisphive web devices revoke <id>`
 ///
-/// Idempotent — the underlying `UPDATE ... WHERE revoked_at IS NULL` simply
-/// does nothing on a second call. We still succeed so scripted revokes stay
-/// simple.
+/// Idempotent for existing devices: a second call succeeds, while an unknown
+/// ID returns an error so scripts cannot silently accept a typo.
 pub async fn devices_revoke(id: String) -> Result<()> {
     let db = open_db().await?;
-    db.revoke_web_device(&id)
-        .await
-        .with_context(|| format!("revoking device {id}"))?;
-    eprintln!("Device {id} revoked (or already was).");
-    Ok(())
+    revoke_device(&db, &id).await
+}
+
+async fn revoke_device(db: &StateDb, id: &str) -> Result<()> {
+    match db.revoke_web_device(id).await {
+        Ok(()) => {
+            eprintln!("Device {id} revoked (or already was).");
+            Ok(())
+        }
+        Err(WebAuthError::NotFound) => Err(anyhow::anyhow!("unknown device id: {id}")),
+        Err(error) => Err(error).with_context(|| format!("revoking device {id}")),
+    }
 }
 
 /// `wisphive web fingerprint`
@@ -288,5 +294,60 @@ mod tests {
         let phc = db.get_web_password_hash().await.unwrap().unwrap();
         assert!(!auth::verify_password("first", &phc));
         assert!(auth::verify_password("second", &phc));
+    }
+
+    #[tokio::test]
+    async fn revoke_unknown_device_returns_a_clear_error() {
+        let (_dir, db) = tmp_db().await;
+
+        let error = revoke_device(&db, "unknown-uuid")
+            .await
+            .expect_err("an unknown device ID must not be accepted as success");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unknown device id: unknown-uuid"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_known_already_revoked_device_is_idempotent() {
+        let (_dir, db) = tmp_db().await;
+        db.insert_web_device("known-uuid", "phone", "token-hash")
+            .await
+            .unwrap();
+        db.revoke_web_device("known-uuid").await.unwrap();
+
+        revoke_device(&db, "known-uuid").await.unwrap();
+
+        let device = db
+            .list_web_devices()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|device| device.id == "known-uuid")
+            .unwrap();
+        assert!(device.revoked_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn revoke_active_device_succeeds_and_revokes_it() {
+        let (_dir, db) = tmp_db().await;
+        db.insert_web_device("active-uuid", "phone", "token-hash")
+            .await
+            .unwrap();
+
+        revoke_device(&db, "active-uuid").await.unwrap();
+
+        let device = db
+            .list_web_devices()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|device| device.id == "active-uuid")
+            .unwrap();
+        assert!(device.revoked_at.is_some());
     }
 }

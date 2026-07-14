@@ -33,6 +33,10 @@ wisphive_web = { path = "crates/wisphive_web" }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# itr#511: real TOML parsing for the Codex effective-hook-inventory audit. A
+# hand-rolled scanner cannot be trusted at a security boundary (basic-string
+# escapes like "\u0068ooks" decode to key paths a line scanner mis-reads).
+toml = "0.9"
 
 # Identifiers & time
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
