@@ -85,11 +85,21 @@ fn trim_wrapping(token: &str) -> &str {
 
 /// Copy text into a log-safe buffer, retaining structural whitespace while
 /// preserving other C0 control bytes in an unambiguous escaped form.
+///
+/// The escaping is **injective** (itr#530): backslash itself is self-escaped
+/// (`\` → `\\`) in the same pass, so a literal 4-char `\x1B` in the input and
+/// a real ESC byte produce distinct outputs (`\\x1B` vs `\x1B`). In escaped
+/// output every `\` is followed by either `\` (a literal backslash) or `xHH`
+/// (a control byte), so audit rows round-trip losslessly. Note this makes the
+/// pass non-idempotent — callers scrub raw data exactly once (itr#89), and
+/// already-redacted data must not be re-scrubbed.
 fn push_log_safe(out: &mut String, text: &str) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
     for c in text.chars() {
-        if c.is_ascii_control() && !matches!(c, '\t' | '\n') {
+        if c == '\\' {
+            out.push_str("\\\\");
+        } else if c.is_ascii_control() && !matches!(c, '\t' | '\n') {
             let byte = c as u8;
             out.push('\\');
             out.push('x');
@@ -144,7 +154,8 @@ fn redact_word(word: &str, prev_word: &str) -> String {
 }
 
 /// Redact secrets in free text (shell commands, notification bodies, file
-/// contents). Tabs and newlines are preserved; other C0 controls are escaped.
+/// contents). Tabs and newlines are preserved; other C0 controls are escaped
+/// and backslashes self-escaped so the sanitization is injective (itr#530).
 pub fn redact_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut prev_word = "";
@@ -250,6 +261,90 @@ mod tests {
             redact_text("before\u{001B}[31m\r\n\tafter\0"),
             "before\\x1B[31m\\x0D\n\tafter\\x00"
         );
+    }
+
+    #[test]
+    fn literal_backslash_sequence_distinct_from_real_control_byte() {
+        // The itr#530 ambiguous pair: the 4-char literal string `\x1B` and a
+        // real ESC byte must not sanitize to the same output.
+        let literal = redact_text("\\x1B"); // chars: '\' 'x' '1' 'B'
+        let real_esc = redact_text("\u{001B}"); // one ESC byte
+        assert_eq!(literal, "\\\\x1B");
+        assert_eq!(real_esc, "\\x1B");
+        assert_ne!(literal, real_esc);
+    }
+
+    /// Inverse of the `push_log_safe` escaping: `\\` → `\`, `\xHH` → control
+    /// byte. Panics on malformed escapes, which sanitized output never emits.
+    fn unescape_log_safe(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('\\') => out.push('\\'),
+                Some('x') => {
+                    let hi = chars.next().expect("truncated \\xHH escape");
+                    let lo = chars.next().expect("truncated \\xHH escape");
+                    let byte =
+                        u8::from_str_radix(&format!("{hi}{lo}"), 16).expect("non-hex \\xHH escape");
+                    out.push(char::from(byte));
+                }
+                other => panic!("dangling backslash escape: {other:?}"),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn escaping_is_injective_and_round_trips() {
+        // Benign corpus (no secrets, so redact_text == pure escaping) of
+        // pairwise-distinct tricky inputs: real controls, their literal
+        // spellings, backslash runs, and Windows-path-style text.
+        let corpus: &[&str] = &[
+            "\\",
+            "\\\\",
+            "\\x1B",
+            "\u{001B}",
+            "\\\u{001B}",
+            "\\x00",
+            "\0",
+            "\\x0D",
+            "\r",
+            "a\\b",
+            "a\u{0007}b",
+            "a\\x07b",
+            "C:\\path\\to\\file",
+            "grep '\\d+' file",
+            "before\u{001B}[31m\r\n\tafter\0",
+            "before\\x1B[31m\\x0D\n\tafter\\x00",
+            "plain text, tab\tand\nnewline survive",
+        ];
+
+        let outputs: Vec<String> = corpus.iter().map(|s| redact_text(s)).collect();
+
+        // Round-trip: the decoder recovers every original input exactly.
+        for (input, output) in corpus.iter().zip(&outputs) {
+            assert_eq!(
+                unescape_log_safe(output),
+                *input,
+                "escaping lost fidelity for {input:?} -> {output:?}"
+            );
+        }
+
+        // Injectivity: no two distinct inputs collide on the same output.
+        for i in 0..corpus.len() {
+            for j in (i + 1)..corpus.len() {
+                assert_ne!(
+                    outputs[i], outputs[j],
+                    "distinct inputs {:?} and {:?} collided on {:?}",
+                    corpus[i], corpus[j], outputs[i]
+                );
+            }
+        }
     }
 
     #[test]
