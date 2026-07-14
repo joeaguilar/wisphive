@@ -3416,6 +3416,12 @@ mod tests {
     /// Bind a fake daemon socket, run `server` on the single accepted
     /// connection in a thread, and return the failure `request_decision`
     /// classified. The `server` closure receives the accepted stream.
+    ///
+    /// The listener is bound on the test thread *before* the server thread is
+    /// spawned and before `request_decision` connects, so the connect can
+    /// never race the bind. Scenarios whose final act is a *response* the
+    /// hook must consume (rather than a deliberate teardown) must end with
+    /// `linger_until_hook_eof` — see itr#525/#527.
     fn socket_scenario<F>(server: F) -> HookFailure
     where
         F: FnOnce(std::os::unix::net::UnixStream) + Send + 'static,
@@ -3442,6 +3448,21 @@ mod tests {
     fn drain_line(reader: &mut impl std::io::BufRead) {
         let mut line = String::new();
         let _ = reader.read_line(&mut line);
+    }
+
+    /// Keep the fake daemon's socket alive until the hook has consumed the
+    /// response and closed its end (itr#525/#527). Dropping the stream right
+    /// after `write_all` races the hook under parallel scheduler load: the
+    /// hook can observe connection teardown (DaemonUnreachable → fail-open)
+    /// before it reads the buffered response line (Runtime → fail-closed).
+    /// `shutdown(Write)` delivers an orderly EOF *after* the buffered data,
+    /// and the blocking `read_to_end` holds the socket open until the hook
+    /// exits `request_decision` and drops its end.
+    fn linger_until_hook_eof(stream: std::os::unix::net::UnixStream) {
+        use std::io::Read;
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let mut sink = Vec::new();
+        let _ = (&stream).read_to_end(&mut sink);
     }
 
     fn send_welcome(writer: &mut impl std::io::Write) {
@@ -3500,6 +3521,7 @@ mod tests {
             })
             .unwrap();
             let _ = writer.write_all(msg.as_bytes());
+            linger_until_hook_eof(writer);
         });
         assert_eq!(err.kind, HookFailureKind::Runtime);
         assert_eq!(
@@ -3525,6 +3547,7 @@ mod tests {
             send_welcome(&mut writer);
             drain_line(&mut reader);
             let _ = writer.write_all(b"this is not valid json\n");
+            linger_until_hook_eof(writer);
         });
         assert_eq!(err.kind, HookFailureKind::Runtime);
         assert_eq!(
