@@ -192,6 +192,9 @@ export type ServerMessage =
     }
   | { type: "agent_connected"; agent: AgentInfo }
   | { type: "agent_disconnected"; agent_id: string }
+  // Protocol-compat only (itr#518/#531): current daemons never send
+  // `agent_spawned` (spawns are queued for approval instead). Kept so frames
+  // from older daemons validate cleanly rather than logging as wire drift.
   | { type: "agent_spawned"; agent: ManagedAgent }
   | { type: "agent_exited"; agent_id: string; exit_code?: number }
   | { type: "agent_list"; agents: ManagedAgent[] }
@@ -337,6 +340,8 @@ export function parseServerMessage(data: string): ServerMessage {
         agent_id: readField(message, "agent_id", readString, "message"),
       };
     case "agent_spawned":
+      // Protocol-compat only (itr#518/#531): never sent by current daemons;
+      // parsed so a legacy daemon's frame is ignored instead of warned about.
       return { type, agent: parseManagedAgent(message, "message") };
     case "agent_exited":
       return {
