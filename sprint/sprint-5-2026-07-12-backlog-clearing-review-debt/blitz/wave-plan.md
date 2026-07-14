@@ -531,6 +531,37 @@ Ordering rationale: #510/#511/#515 (process_registry.rs 3-way clique) land in wa
   none yet independently re-verified outside the sandbox. **This is the resume point** — see the handoff
   doc for exact next steps.
 
+## Wave 3 review + commit / Wave 4 (resumed 2026-07-14)
+
+Resumed from the handoff (`docs/handoff/2026-07-14-sprint5-crossfire-blitz-wave3-wave4.md`).
+
+- **Wave 3 cross-review (opus-4.8, independent): SHIP.** All 5 tickets verified to do what they claim —
+  no vacuous tests, no no-op refactors, no deleted coverage. Two P2 nits raised on #512: (A) rotated-events
+  recovery used `read_dir()?.flatten()`, which silently drops a mid-iteration readdir `Err` — inconsistent
+  with the new `file_type()`-error `warn!`+skip branch; **folded into the commit** (explicit `Err` arm now
+  logs+skips). (B) the `skips_dangling_symlink` test exercises the `!is_file()` path, not the new
+  `file_type()`-error branch (a dangling symlink is `Ok(symlink)` on Unix, not `Err`); left as-is — the
+  test is honestly named and the error branch isn't portably forceable. All 5 sandbox-artifact FAILs from
+  the execution log re-verified benign under a full local `just verify` (all gates green).
+- **Wave 3 committed:** `02c7d7f` (11 files). Closed #515, #518, #512, #514, #519.
+- **Wave 4 executed (opus-4.8) + cross-reviewed (independent): SHIP, no findings.**
+  - **#292** — `logging.rs`: `envfilter_floor_and_stderr_ceiling_are_independent`, a non-global subscriber
+    mirroring `init()`'s stack; asserts the registry EnvFilter floor (DEBUG reaches store) and per-layer
+    stderr WARN ceiling (DEBUG clamped off stderr; WARN reaches both) independently. Positive `warn-line`
+    assertion guards against a vacuous pass. Documents why global `try_init` is untestable.
+  - **#520** — inbox e2e: header count timeout 15s→30s (`toHaveText` already polls) and the `wisphive audit`
+    oracle wrapped in `expect.poll(...).toBe(1)` to retry the CLI read. Both exact assertions preserved —
+    over-count still fails. Reviewer confirmed poll retries the read, not the threshold.
+  - **#450** — `docs/smoke/CHECKLIST.md`: corrected inbox smoke provenance — AC2/AC3 via the real
+    `wisphive-hook` binary, AC1 via the real-wire socket fixture (`e2e/fixtures/hook-client.ts`); removed
+    the overstated "all via the hook binary" claim. Matches the spec header exactly.
+- **Wave 4 committed:** `f7dd6de` (3 files). Closed #292, #520, #450. Full `just verify` green (incl. the
+  new logging test and the hardened inbox e2e spec, 11/11 e2e pass).
+- **All 19 sprint-5 member issues now closed.** Epic #524's acceptance is met. Follow-ups filed during the
+  run remain open by design and are NOT members: #528 (ADR-track, Codex hook-audit redesign), #526
+  (daemon-side dispatch_command correlation-stamping test), #525 (flaky hook socket-test harness).
+  Remaining step: `/sprint-review` (Outcomes/Demo/Retro + epic close).
+
 ## Outcomes
 
 _populated at Phase 8_
