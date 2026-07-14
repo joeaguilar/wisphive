@@ -308,37 +308,13 @@ pub async fn reimport_rotated_segments(
     log_dir: &std::path::Path,
     state_db: &StateDb,
 ) -> anyhow::Result<u64> {
-    let mut segments = Vec::new();
-    for entry in std::fs::read_dir(log_dir)? {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    "skipping unreadable directory entry during rotated events recovery"
-                );
-                continue;
-            }
-        };
-        let Ok(file_type) = entry.file_type() else {
-            warn!(
-                path = %entry.path().display(),
-                "skipping unreadable entry during rotated events recovery"
-            );
-            continue;
-        };
-        if !file_type.is_file() {
-            continue;
-        }
-
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let is_failed = name.starts_with("events-") && name.ends_with(".failed.jsonl");
-        let is_normal = name.starts_with("events-") && name.ends_with(".jsonl") && !is_failed;
-        if is_normal || is_failed {
-            segments.push((entry.path(), is_failed));
-        }
-    }
+    let mut segments = collect_recovery_segments(std::fs::read_dir(log_dir)?.map(|entry| {
+        entry.map(|entry| RecoveryDirEntry {
+            path: entry.path(),
+            file_name: entry.file_name(),
+            file_type: entry.file_type(),
+        })
+    }));
     segments.sort_by(|(left, _), (right, _)| left.cmp(right));
 
     let mut imported = 0;
@@ -383,6 +359,60 @@ pub async fn reimport_rotated_segments(
     }
 
     Ok(imported)
+}
+
+/// One directory entry from the rotated-segment recovery scan, with the
+/// fallible pieces pre-extracted. Test seam for the itr#512 log-and-skip
+/// arms: real `read_dir` entry errors and `file_type()` errors are not
+/// portably forceable, so tests construct these with injected `Err` values.
+struct RecoveryDirEntry {
+    path: std::path::PathBuf,
+    file_name: std::ffi::OsString,
+    file_type: std::io::Result<std::fs::FileType>,
+}
+
+/// Scan the readdir stream for rotated event segments, returning
+/// `(path, is_failed)` candidates.
+///
+/// Infallible by design (itr#512): an `Err` readdir entry or an `Err`
+/// `file_type()` is logged and skipped so one unreadable entry cannot abort
+/// recovery of every other segment. Do not reintroduce `?` here — the
+/// `collect_recovery_segments_skips_*` tests feed `Err` inputs and would
+/// fail (or stop compiling, if this returns `Result` again) on regression.
+fn collect_recovery_segments(
+    entries: impl IntoIterator<Item = std::io::Result<RecoveryDirEntry>>,
+) -> Vec<(std::path::PathBuf, bool)> {
+    let mut segments = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "skipping unreadable directory entry during rotated events recovery"
+                );
+                continue;
+            }
+        };
+        let Ok(file_type) = entry.file_type else {
+            warn!(
+                path = %entry.path.display(),
+                "skipping unreadable entry during rotated events recovery"
+            );
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let name = entry.file_name.to_string_lossy();
+        let is_failed = name.starts_with("events-") && name.ends_with(".failed.jsonl");
+        let is_normal = name.starts_with("events-") && name.ends_with(".jsonl") && !is_failed;
+        if is_normal || is_failed {
+            segments.push((entry.path, is_failed));
+        }
+    }
+    segments
 }
 
 /// Parse a single JSONL line and insert into decision_log.
@@ -750,8 +780,9 @@ mod tests {
     /// Covers only the `!file_type.is_file()` skip path: on Unix a dangling
     /// symlink's `file_type()` returns `Ok(is_symlink)`, not `Err`, so this
     /// entry never reaches the `#512` readdir-`Err` / `file_type()`-`Err`
-    /// log-and-skip arms — those aren't portably forceable and remain uncovered
-    /// (itr follow-up). Do **not** treat this as the #512 regression guard.
+    /// log-and-skip arms. Those arms are guarded by the
+    /// `collect_recovery_segments_skips_*` tests below, which inject `Err`
+    /// values through the `collect_recovery_segments` seam (itr#529).
     #[tokio::test]
     async fn reimport_rotated_segments_skips_dangling_symlink() {
         let db = test_db().await;
@@ -773,6 +804,79 @@ mod tests {
 
         assert_eq!(reimport_rotated_segments(&log_dir, &db).await.unwrap(), 1);
         assert_eq!(db.query_history(None, 10).await.unwrap().len(), 1);
+    }
+
+    /// Build a `RecoveryDirEntry` for a regular file named `name`, using a
+    /// real on-disk file so `file_type` is a genuine `Ok(is_file)` value
+    /// (`std::fs::FileType` cannot be constructed synthetically).
+    fn recovery_file_entry(dir: &std::path::Path, name: &str) -> RecoveryDirEntry {
+        let path = dir.join(name);
+        std::fs::write(&path, b"").unwrap();
+        RecoveryDirEntry {
+            file_name: path.file_name().unwrap().to_os_string(),
+            file_type: std::fs::metadata(&path).map(|m| m.file_type()),
+            path,
+        }
+    }
+
+    /// itr#512 regression guard, arm (a): an `Err` readdir entry is logged and
+    /// skipped, and the scan still collects the segments around it. If `?`
+    /// propagation were reintroduced, the surviving segments would be lost
+    /// (and the seam's signature would no longer accept this call).
+    #[test]
+    fn collect_recovery_segments_skips_readdir_entry_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let segments = collect_recovery_segments([
+            Ok(recovery_file_entry(
+                tmp.path(),
+                "events-20260101-000000.jsonl",
+            )),
+            Err(std::io::Error::other("injected readdir entry failure")),
+            Ok(recovery_file_entry(
+                tmp.path(),
+                "events-20260101-000001.failed.jsonl",
+            )),
+        ]);
+        assert_eq!(
+            segments,
+            vec![
+                (tmp.path().join("events-20260101-000000.jsonl"), false),
+                (tmp.path().join("events-20260101-000001.failed.jsonl"), true),
+            ],
+            "an Err readdir entry must be skipped without aborting the scan"
+        );
+    }
+
+    /// itr#512 regression guard, arm (b): an entry whose `file_type()` failed
+    /// is logged and skipped, and the scan still collects the segments around
+    /// it.
+    #[test]
+    fn collect_recovery_segments_skips_file_type_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unreadable = RecoveryDirEntry {
+            path: tmp.path().join("events-20260101-000001.jsonl"),
+            file_name: "events-20260101-000001.jsonl".into(),
+            file_type: Err(std::io::Error::other("injected file_type failure")),
+        };
+        let segments = collect_recovery_segments([
+            Ok(recovery_file_entry(
+                tmp.path(),
+                "events-20260101-000000.jsonl",
+            )),
+            Ok(unreadable),
+            Ok(recovery_file_entry(
+                tmp.path(),
+                "events-20260101-000002.jsonl",
+            )),
+        ]);
+        assert_eq!(
+            segments,
+            vec![
+                (tmp.path().join("events-20260101-000000.jsonl"), false),
+                (tmp.path().join("events-20260101-000002.jsonl"), false),
+            ],
+            "an Err file_type entry must be skipped without aborting the scan"
+        );
     }
 
     // ════════════════════════════════════════════════════════════
