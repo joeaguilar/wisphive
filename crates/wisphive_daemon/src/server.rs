@@ -221,7 +221,7 @@ impl Server {
         let process_registry = Arc::new(Mutex::new(ProcessRegistry::new(
             config.codex_allow_foreign_hooks,
             config.hook_timeout_secs,
-            config.home_dir.clone(),
+            config.mode_path.clone(),
         )));
         let agent_registry = Arc::new(Mutex::new(AgentRegistry::new()));
         let terminal_manager = Arc::new(TerminalSessionManager::new(

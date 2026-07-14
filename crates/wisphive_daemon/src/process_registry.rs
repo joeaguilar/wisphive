@@ -2297,15 +2297,21 @@ struct ManagedProcess {
 }
 
 impl ProcessRegistry {
-    /// `home_dir` and `hook_timeout_secs` must come from the running daemon's
-    /// `DaemonConfig`. They are deliberately parameters, not re-derived here
-    /// from the default `~/.wisphive` home: a daemon started with a non-default
-    /// home (custom state dir) must validate the same kill switch and hook
-    /// timeout as the daemon itself.
-    pub fn new(codex_allow_foreign_hooks: bool, hook_timeout_secs: u64, home_dir: PathBuf) -> Self {
+    /// `mode_path` and `hook_timeout_secs` must come from the running daemon's
+    /// `DaemonConfig` (`config.mode_path` / `config.hook_timeout_secs`). They
+    /// are deliberately parameters, not re-derived here from the default
+    /// `~/.wisphive` home: a daemon started with a non-default home (custom
+    /// state dir) must validate the same kill switch and hook timeout as the
+    /// daemon itself, and consuming the single `DaemonConfig`-owned derivation
+    /// keeps the two from ever diverging (itr#532).
+    pub fn new(
+        codex_allow_foreign_hooks: bool,
+        hook_timeout_secs: u64,
+        mode_path: PathBuf,
+    ) -> Self {
         Self::with_paths(
             codex_allow_foreign_hooks,
-            home_dir.join("mode"),
+            mode_path,
             hook_timeout_secs,
             default_codex_home(),
         )
@@ -3151,7 +3157,7 @@ mod tests {
             ProcessRegistry::new(
                 false,
                 cfg_short.hook_timeout_secs,
-                home_short.path().to_path_buf(),
+                cfg_short.mode_path.clone(),
             )
             .hook_timeout_secs,
             3_600
@@ -3160,7 +3166,7 @@ mod tests {
             ProcessRegistry::new(
                 false,
                 cfg_long.hook_timeout_secs,
-                home_long.path().to_path_buf(),
+                cfg_long.mode_path.clone(),
             )
             .hook_timeout_secs,
             86_400
@@ -3208,22 +3214,25 @@ mod tests {
         assert!(registry.is_empty());
     }
 
-    /// itr#515: managed spawns must validate the running daemon's configured
-    /// mode file, not a path re-derived from this process's HOME.
+    /// itr#515/#532: managed spawns must validate the running daemon's
+    /// configured mode file (`DaemonConfig::mode_path`), not a path re-derived
+    /// from this process's HOME.
     #[test]
     fn registry_validates_mode_under_constructed_home_dir() {
         let active_home = tempfile::tempdir().unwrap();
         let inactive_home = tempfile::tempdir().unwrap();
-        crate::config::write_mode_file_atomic(&active_home.path().join("mode"), "active")
+        let active_cfg = crate::config::DaemonConfig::new(active_home.path().to_path_buf());
+        let inactive_cfg = crate::config::DaemonConfig::new(inactive_home.path().to_path_buf());
+        crate::config::write_mode_file_atomic(&active_cfg.mode_path, "active")
             .expect("active mode should be written securely");
-        crate::config::write_mode_file_atomic(&inactive_home.path().join("mode"), "off")
+        crate::config::write_mode_file_atomic(&inactive_cfg.mode_path, "off")
             .expect("inactive mode should be written securely");
 
         let project = tempfile::tempdir().unwrap();
         let active_error = ProcessRegistry::new(
             false,
             TEST_DAEMON_TIMEOUT_SECS,
-            active_home.path().to_path_buf(),
+            active_cfg.mode_path.clone(),
         )
         .spawn_agent(codex_req(project.path()))
         .expect_err("an active constructed home should proceed to hook validation");
@@ -3235,7 +3244,7 @@ mod tests {
         let inactive_error = ProcessRegistry::new(
             false,
             TEST_DAEMON_TIMEOUT_SECS,
-            inactive_home.path().to_path_buf(),
+            inactive_cfg.mode_path.clone(),
         )
         .spawn_agent(codex_req(project.path()))
         .expect_err("an inactive constructed home must block managed spawn");
