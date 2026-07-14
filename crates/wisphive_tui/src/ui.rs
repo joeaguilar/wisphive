@@ -514,7 +514,7 @@ fn draw_history_detail_view(frame: &mut Frame, app: &App) {
                     .title(format!(" History Detail: {} ", entry.tool_name)),
             )
             .wrap(Wrap { trim: false })
-            .scroll((app.detail_scroll as u16, 0));
+            .scroll((u16::try_from(app.detail_scroll).unwrap_or(u16::MAX), 0));
         frame.render_widget(paragraph, chunks[0]);
     } else {
         let msg = Paragraph::new("No entry selected. Press Esc to return.")

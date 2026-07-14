@@ -83,6 +83,24 @@ fn trim_wrapping(token: &str) -> &str {
     })
 }
 
+/// Copy text into a log-safe buffer, retaining structural whitespace while
+/// preserving other C0 control bytes in an unambiguous escaped form.
+fn push_log_safe(out: &mut String, text: &str) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    for c in text.chars() {
+        if c.is_ascii_control() && !matches!(c, '\t' | '\n') {
+            let byte = c as u8;
+            out.push('\\');
+            out.push('x');
+            out.push(char::from(HEX[usize::from(byte >> 4)]));
+            out.push(char::from(HEX[usize::from(byte & 0x0F)]));
+        } else {
+            out.push(c);
+        }
+    }
+}
+
 /// Redact one whitespace-delimited word in place, given the previous word.
 /// Returns the (possibly replaced) word.
 fn redact_word(word: &str, prev_word: &str) -> String {
@@ -126,21 +144,21 @@ fn redact_word(word: &str, prev_word: &str) -> String {
 }
 
 /// Redact secrets in free text (shell commands, notification bodies, file
-/// contents). Whitespace layout is preserved.
+/// contents). Tabs and newlines are preserved; other C0 controls are escaped.
 pub fn redact_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut prev_word = "";
     let mut rest = text;
     while !rest.is_empty() {
         let ws_len = rest.len() - rest.trim_start().len();
-        out.push_str(&rest[..ws_len]);
+        push_log_safe(&mut out, &rest[..ws_len]);
         rest = &rest[ws_len..];
         if rest.is_empty() {
             break;
         }
         let word_len = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
         let word = &rest[..word_len];
-        out.push_str(&redact_word(word, prev_word));
+        push_log_safe(&mut out, &redact_word(word, prev_word));
         prev_word = word;
         rest = &rest[word_len..];
     }
@@ -224,6 +242,14 @@ mod tests {
         ] {
             assert_eq!(redact_text(benign), benign, "false positive on: {benign}");
         }
+    }
+
+    #[test]
+    fn escapes_non_structural_control_characters() {
+        assert_eq!(
+            redact_text("before\u{001B}[31m\r\n\tafter\0"),
+            "before\\x1B[31m\\x0D\n\tafter\\x00"
+        );
     }
 
     #[test]

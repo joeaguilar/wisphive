@@ -488,6 +488,49 @@ Ordering rationale: #510/#511/#515 (process_registry.rs 3-way clique) land in wa
   real coverage gap). **Verdict: CLOSE**, filing the daemon-side dispatch_command stamping test as a
   fast-follow (same treatment as other minor findings this run).
 
+## Wave 3 execution log
+
+- **#518 (terra, worktree): all 5 sub-items fixed.** (a) ci.yml — rg exit-code branch (0=violation,
+  1=pass, 2=hard-failure with distinct message). (b) retention.rs — BufWriter + serde_json::to_vec +
+  explicit flush before the existing fsync (preserves the audit-never-lost invariant). (c) ui.rs —
+  `u16::try_from(...).unwrap_or(u16::MAX)` clamp instead of raw `as u16` wrap. (d) server.rs — removed
+  the dead `AgentSpawned` construction on the spawn success path (protocol variant retained, CLI still
+  matches it). (e) redact.rs — new `push_log_safe` helper escaping C0 control chars (except `\t`/`\n`) as
+  `\xHH`; new test asserts exact escaped output. Build+clippy clean; retention (7) + redact (6) unit
+  tests pass directly. Codex self-reported FAIL only because all 27 daemon integration tests fail at
+  socket-permission setup under the sandbox (chmod denied) — same known artifact category as this run's
+  earlier findings, not yet independently re-verified outside the sandbox as of this log entry.
+- **#514 (terra, worktree): PASS.** Added `ViteTypeOptions.strictImportMetaEnv` interface (drops the
+  permissive index signature from ImportMetaEnv). Proved the typo now errors via a standalone
+  TypeScript-compiler-API probe injecting a synthetic source file into the real tsconfig program —
+  confirmed diagnostic TS2339 fires, not just "added the interface and assumed." 2 new tests (omitted env
+  var accepted; blank VITE_API_URL throws, mirroring the existing VITE_WS_URL pattern). 151/151 vitest,
+  eslint + tsc --noEmit clean.
+- **#519 (terra, worktree): PASS.** `--host` changed from `String` with a default to `Option<String>` (no
+  default), so `daemon_web_requested` can distinguish "explicitly passed 127.0.0.1" from "omitted
+  entirely" — mirrors itr#348's existing `Option`-based pattern for `--port`. Default bind behavior
+  preserved (unwrapped to "127.0.0.1" after the web-requested check). New regression test confirms
+  explicit `--host 127.0.0.1` now triggers web. 40/40 tests, clippy clean.
+- **#512 (terra, worktree): fix applied, same known sandbox artifact.** Mirrored the pruner's tolerant
+  pattern: `read_dir(log_dir)?.flatten()` for the initial listing (directory-level readability stays a
+  startup precondition) + `let Ok(file_type) = entry.file_type() else { warn!(...); continue }` for
+  per-entry errors, instead of `?`-propagating a single broken dirent into a fatal startup abort. New
+  regression test `reimport_rotated_segments_skips_dangling_symlink` (dangling symlink + one valid
+  segment, asserts the valid one still ingests). `cargo test -p wisphive_daemon --lib`: 395/395 pass
+  (including the new test), clippy clean. Same Unix-socket-bind sandbox artifact as #518/#516/#263/#511
+  blocks the `server_integration` test binary specifically (confirmed by Codex itself: same 27 failures
+  reproduce against the unmodified file in the same sandbox — not caused by this change).
+- **#515 (terra, worktree): fix applied, same known sandbox artifact.** Deleted `default_mode_path()`;
+  `ProcessRegistry::new` gained a third `home_dir: PathBuf` param, builds the mode path via
+  `home_dir.join("mode")` instead of re-deriving from `$HOME`. Server.rs's sole call site now passes
+  `config.home_dir.clone()`. New regression test constructs two registries against synthetic homes with
+  `mode=active` vs `mode=off`, proving the check follows the injected home_dir. Did not touch itr#511's
+  hook-audit/TOCTOU/TOML code (correctly scoped). `cargo test -p wisphive_daemon --lib`: 395/395 pass,
+  clippy clean. Same `server_integration` sandbox artifact as #512/#516/#518/#263/#511.
+- **All 5 Wave 3 tasks reported.** None yet integrated into the shared checkout, none yet cross-reviewed,
+  none yet independently re-verified outside the sandbox. **This is the resume point** — see the handoff
+  doc for exact next steps.
+
 ## Outcomes
 
 _populated at Phase 8_

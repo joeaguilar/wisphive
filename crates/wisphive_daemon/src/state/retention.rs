@@ -1,6 +1,6 @@
 use anyhow::Result;
 use sqlx::QueryBuilder;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, BufWriter};
 
 use super::{ARCHIVE_SINK_MAX_BYTES, DecisionLogRow, StateDb, rotate_if_large};
 
@@ -179,11 +179,12 @@ impl StateDb {
         .await?;
 
         let mut archived = 0u64;
-        let mut file = tokio::fs::OpenOptions::new()
+        let file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(archive_path)
             .await?;
+        let mut file = BufWriter::new(file);
 
         for chunk in ids.chunks(500) {
             let mut query = QueryBuilder::<sqlx::Sqlite>::new(
@@ -237,9 +238,9 @@ impl StateDb {
                     "decided_by": decided_by,
                     "config_hash": config_hash,
                 });
-                let mut line = serde_json::to_string(&entry).unwrap_or_default();
-                line.push('\n');
-                file.write_all(line.as_bytes()).await?;
+                let mut line = serde_json::to_vec(&entry).unwrap_or_default();
+                line.push(b'\n');
+                file.write_all(&line).await?;
                 archived += 1;
             }
             // fsync before the DELETE commits (itr#368): `flush()` on a raw
@@ -247,7 +248,8 @@ impl StateDb {
             // cache while SQLite durably deletes them — a power loss in that
             // window would lose audit rows from BOTH the DB and the archive,
             // violating the "audit data is never deleted" invariant (itr#340).
-            file.sync_data().await?;
+            file.flush().await?;
+            file.get_ref().sync_data().await?;
 
             // Batch delete after archive is durably on disk
             let mut delete_query =

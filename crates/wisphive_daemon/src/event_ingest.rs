@@ -310,8 +310,24 @@ pub async fn reimport_rotated_segments(
 ) -> anyhow::Result<u64> {
     let mut segments = Vec::new();
     for entry in std::fs::read_dir(log_dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "skipping unreadable directory entry during rotated events recovery"
+                );
+                continue;
+            }
+        };
+        let Ok(file_type) = entry.file_type() else {
+            warn!(
+                path = %entry.path().display(),
+                "skipping unreadable entry during rotated events recovery"
+            );
+            continue;
+        };
+        if !file_type.is_file() {
             continue;
         }
 
@@ -729,6 +745,29 @@ mod tests {
             "a subsequent startup must not double-insert the normal segment"
         );
         assert_eq!(db.query_history(None, 10).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reimport_rotated_segments_skips_dangling_symlink() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let log_dir = tmp.path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+
+        let valid = auto_approved_event("Bash", "cc-1", Some("segment-1"));
+        std::fs::write(
+            log_dir.join("events-20260101-000000.jsonl"),
+            format!("{valid}\n"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            log_dir.join("missing-segment.jsonl"),
+            log_dir.join("events-20260101-000001.jsonl"),
+        )
+        .unwrap();
+
+        assert_eq!(reimport_rotated_segments(&log_dir, &db).await.unwrap(), 1);
+        assert_eq!(db.query_history(None, 10).await.unwrap().len(), 1);
     }
 
     // ════════════════════════════════════════════════════════════

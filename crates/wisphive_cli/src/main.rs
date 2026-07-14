@@ -279,13 +279,10 @@ enum DaemonAction {
         /// Also serve the web UI in this process.
         #[arg(long)]
         web: bool,
-        /// Web UI bind address (implies --web). Use 0.0.0.0 for LAN access.
-        #[arg(
-            long,
-            default_value = "127.0.0.1",
-            value_parser = parse_host_arg
-        )]
-        host: String,
+        /// Web UI bind address (default: 127.0.0.1; explicitly setting it
+        /// implies --web). Use 0.0.0.0 for LAN access.
+        #[arg(long, value_parser = parse_host_arg)]
+        host: Option<String>,
         /// Web UI HTTP port (default: 3100; explicitly setting it implies --web).
         #[arg(long)]
         port: Option<u16>,
@@ -472,8 +469,8 @@ enum ProjectsAction {
     },
 }
 
-fn daemon_web_requested(web: bool, host: &str, port: Option<u16>, web_dev: bool) -> bool {
-    web || web_dev || host != "127.0.0.1" || port.is_some()
+fn daemon_web_requested(web: bool, host: Option<&str>, port: Option<u16>, web_dev: bool) -> bool {
+    web || web_dev || host.is_some() || port.is_some()
 }
 
 fn main() -> anyhow::Result<()> {
@@ -599,11 +596,13 @@ fn main() -> anyhow::Result<()> {
                         auth_profile,
                         auth_rp_id,
                     } => {
-                        // Any of --web / non-default --host / explicit --port / --web-dev
-                        // implies "serve the web UI too". Keeping `port` optional at the
-                        // Clap boundary preserves whether the operator specified the flag,
-                        // including the sentinel default port 3100.
-                        let web_requested = daemon_web_requested(web, &host, port, web_dev);
+                        // Any of --web / explicit --host / explicit --port / --web-dev
+                        // implies "serve the web UI too". Keeping `host` and `port` optional
+                        // at the Clap boundary preserves whether the operator specified either
+                        // flag, including the loopback host and sentinel default port 3100.
+                        let web_requested =
+                            daemon_web_requested(web, host.as_deref(), port, web_dev);
+                        let host = host.unwrap_or_else(|| "127.0.0.1".to_string());
                         let port = port.unwrap_or(3100);
                         let web_opts = if web_requested {
                             // Use the same parser as `web serve` — including
@@ -1048,7 +1047,7 @@ mod cli_tests {
                     },
             } => {
                 assert_eq!(port, Some(3100));
-                assert!(daemon_web_requested(web, &host, port, web_dev));
+                assert!(daemon_web_requested(web, host.as_deref(), port, web_dev));
             }
             _ => panic!("unexpected command"),
         }
@@ -1070,8 +1069,32 @@ mod cli_tests {
                         ..
                     },
             } => {
+                assert_eq!(host, None);
                 assert_eq!(port, None);
-                assert!(!daemon_web_requested(web, &host, port, web_dev));
+                assert!(!daemon_web_requested(web, host.as_deref(), port, web_dev));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn daemon_start_explicit_default_host_requests_web() {
+        let cli = Cli::try_parse_from(["wisphive", "daemon", "start", "--host", "127.0.0.1"])
+            .expect("daemon start with an explicit default host should parse");
+
+        match cli.command {
+            Command::Daemon {
+                action:
+                    DaemonAction::Start {
+                        web,
+                        host,
+                        port,
+                        web_dev,
+                        ..
+                    },
+            } => {
+                assert_eq!(host.as_deref(), Some("127.0.0.1"));
+                assert!(daemon_web_requested(web, host.as_deref(), port, web_dev));
             }
             _ => panic!("unexpected command"),
         }

@@ -221,6 +221,7 @@ impl Server {
         let process_registry = Arc::new(Mutex::new(ProcessRegistry::new(
             config.codex_allow_foreign_hooks,
             config.hook_timeout_secs,
+            config.home_dir.clone(),
         )));
         let agent_registry = Arc::new(Mutex::new(AgentRegistry::new()));
         let terminal_manager = Arc::new(TerminalSessionManager::new(
@@ -2452,49 +2453,47 @@ async fn handle_agent_command(
                 .await;
                 settle_spawn_expiry(expiry, &expiry_started).await;
 
-                let response = match result {
-                    Ok(agent) => ServerMessage::AgentSpawned(agent),
-                    Err(e) => {
-                        match &e {
-                            SpawnRunError::ChannelClosed => {
-                                if let Err(cleanup_err) = finalize_spawn_abandonment(
-                                    &state_db,
-                                    &queue,
-                                    decision_id,
-                                    "spawn_channel_drop:deny",
-                                )
+                if let Err(e) = result {
+                    match &e {
+                        SpawnRunError::ChannelClosed => {
+                            if let Err(cleanup_err) = finalize_spawn_abandonment(
+                                &state_db,
+                                &queue,
+                                decision_id,
+                                "spawn_channel_drop:deny",
+                            )
+                            .await
+                            {
+                                warn!(%decision_id, "failed to persist spawn channel drop: {cleanup_err}");
+                            }
+                        }
+                        SpawnRunError::InvalidRequest(message) | SpawnRunError::Action(message) => {
+                            match state_db
+                                .record_spawn_action_failure(decision_id, message)
                                 .await
-                                {
-                                    warn!(%decision_id, "failed to persist spawn channel drop: {cleanup_err}");
-                                }
+                            {
+                                Ok(true) => {}
+                                Ok(false) => warn!(
+                                    %decision_id,
+                                    "approved spawn action failure had no matching audit row"
+                                ),
+                                Err(audit_err) => warn!(
+                                    %decision_id,
+                                    "failed to persist approved spawn action failure: {audit_err}"
+                                ),
                             }
-                            SpawnRunError::InvalidRequest(message)
-                            | SpawnRunError::Action(message) => {
-                                match state_db
-                                    .record_spawn_action_failure(decision_id, message)
-                                    .await
-                                {
-                                    Ok(true) => {}
-                                    Ok(false) => warn!(
-                                        %decision_id,
-                                        "approved spawn action failure had no matching audit row"
-                                    ),
-                                    Err(audit_err) => warn!(
-                                        %decision_id,
-                                        "failed to persist approved spawn action failure: {audit_err}"
-                                    ),
-                                }
-                            }
-                            SpawnRunError::Denied | SpawnRunError::Deferred => {}
                         }
-                        ServerMessage::Error {
-                            message: format!("failed to spawn agent: {e}"),
-                        }
+                        SpawnRunError::Denied | SpawnRunError::Deferred => {}
                     }
-                };
-
-                if response_tx.send(response).await.is_err() {
-                    debug!(%decision_id, "spawn response dropped: originating client disconnected");
+                    if response_tx
+                        .send(ServerMessage::Error {
+                            message: format!("failed to spawn agent: {e}"),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        debug!(%decision_id, "spawn response dropped: originating client disconnected");
+                    }
                 }
             });
         }

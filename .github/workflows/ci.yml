@@ -106,7 +106,26 @@ jobs:
           if matches="$(rg --pcre2 --multiline --line-number --glob '*.rs' \
             '(?is)format!\s*\((?=[^)]*\b(?:select\s+.+\s+from|insert\s+(?:or\s+\w+\s+)?into|update\s+\w+\s+set|delete\s+from)\b)(?=[^)]*\{[^}]*\})[^)]*\)' \
             "${sql_format_allowlist[@]}" crates/wisphive_daemon)"; then
+            rg_status=0
+          else
+            rg_status=$?
+          fi
+
+          case "$rg_status" in
+          0)
             echo "DENY-LIST violation: use parameter binding or QueryBuilder, never format! for DML."
             echo "$matches"
             exit 1
-          fi
+            ;;
+          1)
+            # No matches: the deny-list gate passes.
+            ;;
+          2)
+            echo "DENY-LIST check failed: ripgrep could not compile or run the pattern." >&2
+            exit 2
+            ;;
+          *)
+            echo "DENY-LIST check failed: ripgrep exited with status $rg_status." >&2
+            exit "$rg_status"
+            ;;
+          esac

@@ -36,12 +36,6 @@ const SYSTEM_PROMPT_DENY_PATTERNS: &[&str] = &[
     "skip human approval",
 ];
 
-fn default_mode_path() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
-        .join(".wisphive")
-        .join("mode")
-}
-
 /// The Codex home directory the spawned child will actually use: the
 /// `CODEX_HOME` environment variable when set (managed children inherit the
 /// daemon's environment), else `~/.codex`. The itr#511 effective-hook-inventory
@@ -2303,18 +2297,15 @@ struct ManagedProcess {
 }
 
 impl ProcessRegistry {
-    /// `hook_timeout_secs` must be the *running daemon's* effective
-    /// hook-approval timeout — `DaemonConfig::hook_timeout_secs`, computed
-    /// from the daemon's actual home dir. It is deliberately a parameter, not
-    /// re-derived here from the default `~/.wisphive` home: a daemon started
-    /// with a non-default home (custom state dir) would otherwise gate spawns
-    /// against a *different* config's timeout, accepting installs whose hook
-    /// `timeout` the real daemon outlives — reintroducing the itr#510
-    /// cancel-before-resolve bug.
-    pub fn new(codex_allow_foreign_hooks: bool, hook_timeout_secs: u64) -> Self {
+    /// `home_dir` and `hook_timeout_secs` must come from the running daemon's
+    /// `DaemonConfig`. They are deliberately parameters, not re-derived here
+    /// from the default `~/.wisphive` home: a daemon started with a non-default
+    /// home (custom state dir) must validate the same kill switch and hook
+    /// timeout as the daemon itself.
+    pub fn new(codex_allow_foreign_hooks: bool, hook_timeout_secs: u64, home_dir: PathBuf) -> Self {
         Self::with_paths(
             codex_allow_foreign_hooks,
-            default_mode_path(),
+            home_dir.join("mode"),
             hook_timeout_secs,
             default_codex_home(),
         )
@@ -3157,11 +3148,21 @@ mod tests {
         // The constructor stores exactly the value it was handed — no
         // recomputation against a default home.
         assert_eq!(
-            ProcessRegistry::new(false, cfg_short.hook_timeout_secs).hook_timeout_secs,
+            ProcessRegistry::new(
+                false,
+                cfg_short.hook_timeout_secs,
+                home_short.path().to_path_buf(),
+            )
+            .hook_timeout_secs,
             3_600
         );
         assert_eq!(
-            ProcessRegistry::new(false, cfg_long.hook_timeout_secs).hook_timeout_secs,
+            ProcessRegistry::new(
+                false,
+                cfg_long.hook_timeout_secs,
+                home_long.path().to_path_buf(),
+            )
+            .hook_timeout_secs,
             86_400
         );
 
@@ -3205,6 +3206,43 @@ mod tests {
             "refusal should cite the running daemon's own timeout, got: {msg}"
         );
         assert!(registry.is_empty());
+    }
+
+    /// itr#515: managed spawns must validate the running daemon's configured
+    /// mode file, not a path re-derived from this process's HOME.
+    #[test]
+    fn registry_validates_mode_under_constructed_home_dir() {
+        let active_home = tempfile::tempdir().unwrap();
+        let inactive_home = tempfile::tempdir().unwrap();
+        crate::config::write_mode_file_atomic(&active_home.path().join("mode"), "active")
+            .expect("active mode should be written securely");
+        crate::config::write_mode_file_atomic(&inactive_home.path().join("mode"), "off")
+            .expect("inactive mode should be written securely");
+
+        let project = tempfile::tempdir().unwrap();
+        let active_error = ProcessRegistry::new(
+            false,
+            TEST_DAEMON_TIMEOUT_SECS,
+            active_home.path().to_path_buf(),
+        )
+        .spawn_agent(codex_req(project.path()))
+        .expect_err("an active constructed home should proceed to hook validation");
+        assert!(
+            active_error.to_string().contains("hooks install"),
+            "the active constructed home should not block on mode: {active_error:#}"
+        );
+
+        let inactive_error = ProcessRegistry::new(
+            false,
+            TEST_DAEMON_TIMEOUT_SECS,
+            inactive_home.path().to_path_buf(),
+        )
+        .spawn_agent(codex_req(project.path()))
+        .expect_err("an inactive constructed home must block managed spawn");
+        assert!(
+            inactive_error.to_string().contains("secure active mode"),
+            "the inactive constructed home should block on mode: {inactive_error:#}"
+        );
     }
 
     #[test]
