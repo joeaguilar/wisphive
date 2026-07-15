@@ -1,0 +1,74 @@
+cargo build --release --bin wisphive --bin wisphive-hook
+    Finished `release` profile [optimized] target(s) in 0.12s
+./scripts/redteam-decision-plane.sh
+=== SETUP: wisphive 0.1.0, HOME=/tmp/wh-rt.RnWhmA ===
+daemon up (pid 10940)
+
+=== SCENARIO 1 — ghost approval (kill hook mid-decision, itr#363) ===
+  PASS: decision reached the queue
+./scripts/redteam-decision-plane.sh: line 76: 10943 Killed: 9               HOME="$H" WISPHIVE_AGENT_TYPE=claude_code "$HOOK" < "$H/ev-$1.json" > "$H/out-$1.json" 2> "$H/err-$1.json"
+  PASS: no leaked pending row after hook death
+  PASS: exactly one terminal audit row (no contradiction)
+  PASS: records DENY (tool did not run)
+  PASS: attributed hook_disconnected:abandoned
+  PASS: no contradictory APPROVE row
+
+=== SCENARIO 2 — daemon crash mid-stream (itr#299/#301) ===
+  PASS: orphan pending row persisted before crash
+  crashed daemon (pid 10940)
+./scripts/redteam-decision-plane.sh: line 89: 10940 Killed: 9               HOME="$H" "$WISP" daemon start >> "$H/daemon.log" 2>&1
+  PASS: blocked hook fail-open APPROVED (exit 0, silent allow)
+  PASS: downtime auto-approve written to events.jsonl
+  PASS: orphan still pending while daemon down
+  PASS: restart drained the orphan
+  PASS: orphan recorded APPROVE/daemon_restart:failopen (truthful fail-open)
+  PASS: downtime auto-answer reimported into decision_log (no loss)
+
+=== SCENARIO 3 — secret redaction (itr#89) ===
+  PASS: secret NOT in pending_decisions
+  PASS: pending row shows ***REDACTED***
+  PASS: secret NOT in events.jsonl
+./scripts/redteam-decision-plane.sh: line 111: 11064 Killed: 9               HOME="$H" WISPHIVE_AGENT_TYPE=claude_code "$HOOK" < "$H/ev-$1.json" > "$H/out-$1.json" 2> "$H/err-$1.json"
+  PASS: secret NOT in decision_log
+  (notify path: notify.rs wraps tool_input_summary in redact::redact_text — same scrubber, not screen-captured)
+
+=== RESULT: 17 passed, 0 failed ===
+./scripts/redteam-decision-plane.sh: line 33: 11030 Killed: 9               HOME="$H" "$WISP" daemon start >> "$H/daemon.log" 2>&1
+./scripts/redteam-upgrade-safety.sh
+=== SETUP: legacy-perm state dir (incident 2026-07-15 shape), HOME=/tmp/wh-up.n7sNLL ===
+
+=== (a) legacy perms => deliberate DENY naming file + fix commands (itr#535) ===
+  PASS: PreToolUse denied (exit 2) — fail-closed held
+  PASS: denial names the failing path (/tmp/wh-up.n7sNLL/.wisphive)
+  PASS: denial carries the exact chmod repair
+  PASS: denial names doctor --fix-perms
+  PASS: denial names wisphive-rescue.sh
+
+=== (e) UserPromptSubmit remains DENIED while broken (ADR-0010) ===
+  PASS: UserPromptSubmit denied (exit 2) — no human-origin fail-open hole
+
+=== (b) brick detector: repeated same cause => exactly ONE notification + marker (itr#538) ===
+  PASS: BRICKED marker dropped in state dir
+  PASS: marker carries repair guidance
+  PASS: exactly 1 notification after 12 same-cause denials
+  PASS: still 1 notification after 20 more (no storm, rate-limited per cause)
+
+=== (d) install.sh preflight catches the broken state (itr#536/#534) ===
+  PASS: install.sh ABORTED on broken state (rc=1)
+  PASS: abort explains the preflight failure
+  PASS: abort names the repair options
+  PASS: old binaries untouched after abort
+  PASS: no staged leftovers after abort
+  PASS: install.sh --fix-perms repaired and installed (rc=0)
+  PASS: repair was announced, not silent (itr#534)
+  PASS: state repaired to 0700/0600
+  PASS: new hook binary swapped into place
+  PASS: installed hook's own statecheck passes post-swap (working binary, healthy state)
+
+=== (c) repaired state => hook accepts; healthy invocation clears marker (itr#537/#538) ===
+  PASS: re-broken state denies again
+  PASS: doctor --fix-perms tightened to 0700/0600
+  PASS: hook accepts after repair (exit 0)
+  PASS: healthy invocation cleared the BRICKED marker
+
+=== RESULT: 24 passed, 0 failed ===

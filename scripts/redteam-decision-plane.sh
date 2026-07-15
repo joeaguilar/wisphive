@@ -36,7 +36,12 @@ trap cleanup EXIT
 PASS=0; FAIL=0
 ok()  { echo "  PASS: $1"; PASS=$((PASS+1)); }
 bad() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
-q()   { sqlite3 "$DB" "$1" 2>/dev/null; }
+# READ-ONLY on purpose: a plain read-write sqlite3 CLI open/close against the
+# LIVE daemon's WAL database checkpoints/unlinks the WAL on close, after which
+# the daemon keeps committing into the detached WAL and every later CLI read
+# sees stale data — scenarios then fail on phantom "leaked" rows. -readonly
+# cannot checkpoint, so the daemon's WAL stays attached and visible.
+q()   { sqlite3 -readonly "$DB" "$1" 2>/dev/null; }
 
 for bin in "$WISP" "$HOOK"; do
   [ -x "$bin" ] || { echo "missing binary: $bin (run: cargo build --release)"; exit 1; }
@@ -46,6 +51,10 @@ command -v sqlite3 >/dev/null || { echo "sqlite3 not found"; exit 1; }
 mkdir -p "$WD"
 printf 'active' > "$WD/mode"
 printf '{ "notifications": false, "auto_approve_level": "read" }\n' > "$WD/config.json"
+# The hook's strict validators (itr#535, ADR-0010) require dir 0700 and mode
+# 0600 — umask defaults would deny every event before any scenario runs.
+chmod 700 "$WD"
+chmod 600 "$WD/mode"
 
 wait_socket() { for _ in $(seq 1 50); do [ -S "$SOCK" ] && return 0; sleep 0.1; done; return 1; }
 start_daemon() { HOME="$H" "$WISP" daemon start >>"$H/daemon.log" 2>&1 & DPID=$!; }

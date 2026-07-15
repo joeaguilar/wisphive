@@ -155,8 +155,12 @@ rescue *ARGS:
 doctor:
     wisphive doctor
 
-# Decision-plane integrity red-team (epic #403): ghost-approval, crash mid-stream,
-# secret redaction — against release binaries in an isolated throwaway HOME.
+# Red-team suites against release binaries in isolated throwaway HOMEs:
+# decision-plane integrity (epic #403: ghost-approval, crash mid-stream,
+# secret redaction) + upgrade safety (epic #533/#539: legacy perms deny
+# deliberately with repair guidance, brick detector, doctor/rescue repair,
+# install.sh preflight, UserPromptSubmit stays fail-closed).
 redteam:
     cargo build --release --bin wisphive --bin wisphive-hook
     ./scripts/redteam-decision-plane.sh
+    ./scripts/redteam-upgrade-safety.sh

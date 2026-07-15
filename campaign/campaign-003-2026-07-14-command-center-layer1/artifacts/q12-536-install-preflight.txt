@@ -1,0 +1,136 @@
+== CASE 1: legacy-perm state dir -> abort with guidance, old binary untouched ==
+    | Skipping build (WISPHIVE_SKIP_BUILD=1); using existing target/release binaries.
+    | Staging binaries in /tmp/wh-inst.YwKVes/bin...
+    | Staged binaries signed (ad-hoc).
+    | 
+    | Preflight: probing /tmp/wh-inst.YwKVes/.wisphive with the NEW wisphive-hook (read-only)...
+    | statecheck FAILED: this binary's validators REJECT the current state — once installed, EVERY hook event would be denied fail-closed (ADR-0010).
+    | Wisphive denied this hook because the mode file is missing, unreadable, or unsafe: state directory /tmp/wh-inst.YwKVes/.wisphive must be a non-symlink directory owned by the effective user (uid 501) with mode 0700 — found mode 0755, owner uid 501
+    | Required state: '/tmp/wh-inst.YwKVes/.wisphive' is a non-symlink directory owned by you with mode 0700, and '/tmp/wh-inst.YwKVes/.wisphive/mode' is a non-symlink regular file owned by you with mode 0600 containing 'active' or 'off'.
+    | Repair (perms): chmod 700 '/tmp/wh-inst.YwKVes/.wisphive' && chmod 600 '/tmp/wh-inst.YwKVes/.wisphive/mode'
+    | Repair (foreign owner): chown "$(id -un)" '/tmp/wh-inst.YwKVes/.wisphive' '/tmp/wh-inst.YwKVes/.wisphive/mode'
+    | Repair (missing file): printf 'off' > '/tmp/wh-inst.YwKVes/.wisphive/mode' && chmod 600 '/tmp/wh-inst.YwKVes/.wisphive/mode'
+    | Or run: wisphive doctor --fix-perms
+    | Or run: scripts/wisphive-rescue.sh
+    | Emergency exit (disables all Wisphive gating): wisphive emergency-off
+    | 
+    | PREFLIGHT FAILED: installing now would deny every hook event on this
+    | machine (fail-closed, ADR-0010) until the state above is repaired.
+    | Repair is a deliberate act (itr#534); it will NOT happen silently.
+    | 
+    | ABORT: old binaries in /tmp/wh-inst.YwKVes/bin are untouched.
+    | Fix options:
+    |   ./install.sh --fix-perms          repair during install (announced)
+    |   wisphive doctor --fix-perms       repair via the installed CLI
+    |   sh scripts/wisphive-rescue.sh     diagnose/repair, no binary needed
+  PASS: aborted (rc=1)
+  PASS: printed PREFLIGHT FAILED
+  PASS: printed exact chmod repair
+  PASS: offered doctor --fix-perms
+  PASS: offered rescue script
+  PASS: old binaries byte-identical after abort
+  PASS: no staged leftovers
+
+== CASE 2: same broken state + --fix-perms -> announced repair, then atomic swap ==
+    | Skipping build (WISPHIVE_SKIP_BUILD=1); using existing target/release binaries.
+    | Staging binaries in /tmp/wh-inst.YwKVes/bin...
+    | Staged binaries signed (ad-hoc).
+    | 
+    | Preflight: probing /tmp/wh-inst.YwKVes/.wisphive with the NEW wisphive-hook (read-only)...
+    | statecheck FAILED: this binary's validators REJECT the current state — once installed, EVERY hook event would be denied fail-closed (ADR-0010).
+    | Wisphive denied this hook because the mode file is missing, unreadable, or unsafe: state directory /tmp/wh-inst.YwKVes/.wisphive must be a non-symlink directory owned by the effective user (uid 501) with mode 0700 — found mode 0755, owner uid 501
+    | Required state: '/tmp/wh-inst.YwKVes/.wisphive' is a non-symlink directory owned by you with mode 0700, and '/tmp/wh-inst.YwKVes/.wisphive/mode' is a non-symlink regular file owned by you with mode 0600 containing 'active' or 'off'.
+    | Repair (perms): chmod 700 '/tmp/wh-inst.YwKVes/.wisphive' && chmod 600 '/tmp/wh-inst.YwKVes/.wisphive/mode'
+    | Repair (foreign owner): chown "$(id -un)" '/tmp/wh-inst.YwKVes/.wisphive' '/tmp/wh-inst.YwKVes/.wisphive/mode'
+    | Repair (missing file): printf 'off' > '/tmp/wh-inst.YwKVes/.wisphive/mode' && chmod 600 '/tmp/wh-inst.YwKVes/.wisphive/mode'
+    | Or run: wisphive doctor --fix-perms
+    | Or run: scripts/wisphive-rescue.sh
+    | Emergency exit (disables all Wisphive gating): wisphive emergency-off
+    | 
+    | PREFLIGHT FAILED: installing now would deny every hook event on this
+    | machine (fail-closed, ADR-0010) until the state above is repaired.
+    | Repair is a deliberate act (itr#534); it will NOT happen silently.
+    | 
+    | Repairing (deliberate, per --fix-perms/confirmation):
+    | wisphive-rescue: strict-state fix for /tmp/wh-inst.YwKVes/.wisphive
+    | 
+    | PASS  state dir exists (/tmp/wh-inst.YwKVes/.wisphive)
+    | PASS  state dir is not a symlink
+    | PASS  state dir is a directory
+    | PASS  state dir owned by you (uid 501)
+    | FAIL  state dir permissions are exactly 0700
+    |       /tmp/wh-inst.YwKVes/.wisphive has 0755; the hook requires exactly 0700
+    |       fix: chmod 0700 '/tmp/wh-inst.YwKVes/.wisphive'
+    | FIXED chmod 0700 /tmp/wh-inst.YwKVes/.wisphive
+    | PASS  mode file exists (/tmp/wh-inst.YwKVes/.wisphive/mode)
+    | PASS  mode file is not a symlink
+    | PASS  mode file is a regular file
+    | PASS  mode file owned by you (uid 501)
+    | FAIL  mode file permissions are exactly 0600
+    |       /tmp/wh-inst.YwKVes/.wisphive/mode has 0644; the hook requires exactly 0600
+    |       fix: chmod 0600 '/tmp/wh-inst.YwKVes/.wisphive/mode'
+    | FIXED chmod 0600 /tmp/wh-inst.YwKVes/.wisphive/mode
+    | PASS  mode file is <= 64 bytes (6)
+    | PASS  mode file content is valid ("active": gating enabled)
+    | INFO  config.json absent (fine: safe defaults apply)
+    | INFO  auto-approve.json (legacy) absent (fine: safe defaults apply)
+    | INFO  config.json.lock absent (fine: safe defaults apply)
+    | INFO  fail-mode absent (defaults to closed: runtime hook errors deny)
+    | 
+    | 2 repair(s) applied. Re-run '/Users/josefaguilar/AI_Projects/wisphive/scripts/wisphive-rescue.sh --home /tmp/wh-inst.YwKVes' to verify.
+    | 
+    | Re-probing after repair...
+    | statecheck OK: /tmp/wh-inst.YwKVes/.wisphive passes this binary's strict validators (dir 0700, mode 0600, owner-only, non-symlink). Gating mode: ACTIVE (hooks gate tool calls).
+    | 
+    | Installing (atomic rename) to /tmp/wh-inst.YwKVes/bin...
+    | 
+    | Installed:
+    |   wisphive      -> /tmp/wh-inst.YwKVes/bin/wisphive
+    |   wisphive-hook -> /tmp/wh-inst.YwKVes/bin/wisphive-hook
+    | 
+    | Quick start:
+    |   wisphive on                        # enable gating with strict perms
+    |   wisphive daemon start              # in a dedicated terminal
+    |   wisphive hooks install --project .  # in your project
+    |   wisphive hooks enable
+    |   wisphive tui                       # in another terminal
+  PASS: install succeeded (rc=0)
+  PASS: repair announced (itr#534, never silent)
+  PASS: state tightened to 0700/0600
+  PASS: installed hook binary works and accepts the state
+
+== CASE 3: healthy state dir -> preflight passes, swap succeeds ==
+    | Skipping build (WISPHIVE_SKIP_BUILD=1); using existing target/release binaries.
+    | Staging binaries in /tmp/wh-inst.YwKVes/bin...
+    | Staged binaries signed (ad-hoc).
+    | 
+    | Preflight: probing /tmp/wh-inst.YwKVes/.wisphive with the NEW wisphive-hook (read-only)...
+    | statecheck OK: /tmp/wh-inst.YwKVes/.wisphive passes this binary's strict validators (dir 0700, mode 0600, owner-only, non-symlink). Gating mode: ACTIVE (hooks gate tool calls).
+    | 
+    | Installing (atomic rename) to /tmp/wh-inst.YwKVes/bin...
+    | 
+    | Installed:
+    |   wisphive      -> /tmp/wh-inst.YwKVes/bin/wisphive
+    |   wisphive-hook -> /tmp/wh-inst.YwKVes/bin/wisphive-hook
+    | 
+    | Quick start:
+    |   wisphive on                        # enable gating with strict perms
+    |   wisphive daemon start              # in a dedicated terminal
+    |   wisphive hooks install --project .  # in your project
+    |   wisphive hooks enable
+    |   wisphive tui                       # in another terminal
+  PASS: install succeeded over healthy state (rc=0)
+  PASS: preflight reported statecheck OK
+  PASS: hook binary replaced
+
+== CASE 4: missing state dir (fresh install) -> preflight passes with 'wisphive on' note ==
+  PASS: fresh-install path succeeds (rc=0)
+  PASS: recommends 'wisphive on' for strict init (no 0755 mkdir brick)
+  PASS: install.sh no longer creates a loose-perm ~/.wisphive
+
+== CASE 5: no unsigned/half-written window at the final path (swap ordering) ==
+  PASS: codesign targets STAGED paths only
+  PASS: final path receives an atomic mv -f rename
+  PASS: no in-place cp to the final path anywhere
+
+== RESULT: 20 passed, 0 failed ==
