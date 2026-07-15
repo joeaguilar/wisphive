@@ -1,0 +1,222 @@
+{
+  "waves": [
+    {
+      "n": 1,
+      "started_at": "2026-07-15T04:45:00Z",
+      "ended_at": "2026-07-15T08:35:00Z",
+      "bundles_run": 4,
+      "items": [
+        "Q-13",
+        "Q-10",
+        "Q-11",
+        "Q-2"
+      ],
+      "verify_result": "green",
+      "retries": 2,
+      "quarantines": [
+        "Q-1"
+      ],
+      "tokens_used": 800736,
+      "notes": "Q-1 killed by PO mid-incident (#533 machine-wide gating brick from worker install.sh); scope amended by PO directive — fail-safe bundle (#473+#535, #541+#537, #540) rode alongside #400. Reviewer 7/7 clean, 3 P2s filed (#544-546). Full gate green after 2 environment-related retries (cli WIP teardown, itr#520 e2e saturation flake)."
+    },
+    {
+      "n": 2,
+      "started_at": "2026-07-15T08:40:00Z",
+      "ended_at": "2026-07-15T09:55:00Z",
+      "bundles_run": 1,
+      "items": [
+        "Q-3"
+      ],
+      "verify_result": "green",
+      "retries": 0,
+      "quarantines": [],
+      "tokens_used": 385270,
+      "notes": "#401 landed (faa32b0) + IPC docs (14d2274). Reviewer: security invariants genuinely enforced (read-only git allowlist, no client-supplied paths, write-affordance-free UI, honest tests). P1 raw-NUL-byte (source file self-hiding from diff review) repaired by orchestrator (36fb881); P2s filed #548-#550."
+    },
+    {
+      "n": 3,
+      "started_at": "2026-07-15T10:00:00Z",
+      "ended_at": "2026-07-15T10:55:00Z",
+      "bundles_run": 1,
+      "items": [
+        "Q-4"
+      ],
+      "verify_result": "green",
+      "retries": 0,
+      "quarantines": [],
+      "tokens_used": 400768,
+      "notes": "#402 landed (88bcaf0) + IPC docs (f96eca6) + NUL repair (d2f0446). Reviewer: safe-to-close verdict for epic #398 → CLOSED with all seven children done. Honest-proxy labeling verified at three layers. Repeat NUL-byte P1 → #551 escalated to high."
+    },
+    {
+      "n": 4,
+      "started_at": "2026-07-15T07:50:00Z",
+      "ended_at": "2026-07-15T08:30:00Z",
+      "bundles_run": 2,
+      "items": [
+        "Q-5",
+        "Q-12"
+      ],
+      "verify_result": "green",
+      "retries": 0,
+      "quarantines": [],
+      "tokens_used": 307484,
+      "notes": "#449 (test-first proof still-live, b9daa0c) + fail-safe tail #534/#536/#538/#539 (fe3c1ae, ce85d35, 2f3c1fc). Bonus: decision-plane redteam script repaired (silently broken since strict-perms) + sqlite -readonly footgun found (#554/#555). Reviewer: 9/9 checks, 0 P0/P1, re-ran redteam live 24/24. Follow-ups #556-#558."
+    }
+  ],
+  "signals": {
+    "total_waves": 4,
+    "retries": 2,
+    "quarantines": 1,
+    "verify_failures": 0,
+    "scout_tickets_accepted": 6,
+    "scout_tickets_parked": 4,
+    "scout_tickets_next_campaign": 6
+  },
+  "retro": {
+    "what_slowed": [
+      "INCIDENT 2026-07-15: Q-1 worker ran ./install.sh per repo convention; new hook's strict perms checks + legacy ~/.wisphive perms + fail-closed default denied ALL hook events machine-wide (Claude+Codex, incl. UserPromptSubmit) until operator chmod'ed. PO ruled the stop is desired security; gap = unclear exits.",
+      "W2 P1: worker embedded a raw NUL byte as a React key separator — git classified the source as binary, hiding the diff from review; caught only via the Bin flag in stat. Consider a repo-wide check (e.g. gitattributes or CI grep) for NUL bytes in source.",
+      "W3 repeat of the W2 NUL-byte P1 (burnMeter.ts, 7 bytes) — same worker pattern (NUL as collision-proof key separator, typed raw). #551 escalated to high; until it lands, worker prompts should say: never embed raw control bytes, use \\u0000 escapes."
+    ],
+    "process_fixes": [
+      "itr#540 landed (CLAUDE.md, 34d05ee): install.sh is human-supervised; workers verify via ./target/release + isolated strict-perms HOME. Fail-safe epic #533 filed (#534-#539, #541), re-scoped to PO ruling: deliberate stops, actionable denials, binary-independent rescue script.",
+      "W4 bonus find: a red-team script can rot silently when the invariants it tests harden — redteam is now part of the story evidence chain (41/41), and the WAL/-readonly caution landed in CLAUDE.md."
+    ],
+    "followups": [
+      "itr#533 epic",
+      "Q-12",
+      "itr flaky daemon_pidfile_lifecycle (filed)",
+      "itr#543 shared validator module",
+      "shellcheck absent on host — run real shellcheck on wisphive-rescue.sh when available",
+      "from-review-c3w1 P2s filed (doctor exit code, head -c POSIX, deferredKey test import)",
+      "from-review-c3w2 filed: #548 stream cap, #549 Bash false-attribution ranking, #550 allowlist width"
+    ]
+  },
+  "smoke_test": {
+    "how_to_run": [
+      "git pull on branch crossfire-blitz/20260712-230112",
+      "./install.sh   # S-7: now atomic + preflighted — this is the operator install moment",
+      "wisphive daemon start --web",
+      "Open the web UI (default :3100): Inbox, Board (key 8), Worktrees (key 9), Burn view"
+    ],
+    "items": [
+      {
+        "id": "S-1",
+        "label": "Read the new CLAUDE.md install.sh policy paragraph; confirm it matches your intent (deliberate stops, operator-chosen install moments)",
+        "evidence_refs": [
+          "e-1"
+        ],
+        "source_items": [
+          "Q-13"
+        ]
+      },
+      {
+        "id": "S-2",
+        "label": "Trigger AskUserQuestion in a gated session: it appears once as deferred in the inbox (no permanent duplicate); break a perms bit on a THROWAWAY copy and confirm the denial message walks you to the fix",
+        "evidence_refs": [
+          "e-3",
+          "e-4"
+        ],
+        "source_items": [
+          "Q-10"
+        ]
+      },
+      {
+        "id": "S-3",
+        "label": "THE INCIDENT DRILL: on a throwaway HOME, break perms (chmod 644 mode) → confirm the denial message walks you out; run scripts/wisphive-rescue.sh → --fix → gating works again; try rescue.sh --off as the emergency exit",
+        "evidence_refs": [
+          "e-7"
+        ],
+        "source_items": [
+          "Q-11"
+        ]
+      },
+      {
+        "id": "S-4",
+        "label": "Open the web UI → view 8 (Board): your live sessions appear in lanes; kill an agent and watch it flip to 'stalled · silent 10m' within ~10min; click 'Answer in Inbox →' on a waiting lane",
+        "evidence_refs": [
+          "e-9",
+          "e-10"
+        ],
+        "source_items": [
+          "Q-2"
+        ]
+      },
+      {
+        "id": "S-5",
+        "label": "Open view 9 (Worktrees): your real dirty repos appear with generated Conventional Commit messages and per-change agent attribution; copy a message and commit manually — it should pass your CC hooks; confirm there is NO commit/write button anywhere on the strip",
+        "evidence_refs": [
+          "e-12",
+          "e-13"
+        ],
+        "source_items": [
+          "Q-3"
+        ]
+      },
+      {
+        "id": "S-6",
+        "label": "Open the Burn view: your sessions show 'activity proxy' tiles (never dollar/token figures); confirm the label 'token spend not observable' is visible; if you have a long read-only session running, check whether the DEAD RUN alert state looks right to you (thresholds: >=10 calls over >=10 min, zero artifacts)",
+        "evidence_refs": [
+          "e-14",
+          "e-15"
+        ],
+        "source_items": [
+          "Q-4"
+        ]
+      },
+      {
+        "id": "S-7",
+        "label": "THE INSTALL MOMENT (operator-chosen, per #540): run ./install.sh yourself to pick up all campaign binaries (installed hook is still the 07-14 23:46 build — it predates the actionable denials, brick detector, and statecheck). You should see: staging, codesign, statecheck probe of your real ~/.wisphive (healthy now), atomic swap. Then wisphive doctor for a green bill of health.",
+        "evidence_refs": [
+          "e-17",
+          "e-18"
+        ],
+        "source_items": [
+          "Q-12"
+        ]
+      }
+    ],
+    "questions_for_po": [
+      "campaign-004 tracker boundary: Phase 4 (werkit#6 state-of-play) is program-order next but lives in the werkit tracker — werkit-scoped campaign, or take the wisphive-scoped scrollback G (epic #284) drafted in campaign/campaign-004-DRAFT-scrollback-layer1-tail/draft.md?",
+      "#439 (remote answering, reverses ADR-0002 always-defer) needs an ADR spike before any implementation — approve filing that spike?"
+    ],
+    "non_goals": [
+      "Agent start/stop/retarget controls (spec §5: state mirror, not steering wheel)",
+      "Remote answering of AskUserQuestion/ExitPlanMode (#439 — next campaign)",
+      "Auto-clear of answered deferred items (#440 — next campaign)"
+    ]
+  },
+  "roadmap_update": {
+    "section_updates": [
+      {
+        "section": "Phase 2 (#403)",
+        "current": "(unmarked)",
+        "proposed": "✅",
+        "evidence": "STALE-ROW CORRECTION: itr#403 closed 2026-07-03 — 16/16 member bugs + epic red-team pass 17/17 green against release binaries (commit 0bf1b73, just redteam). Roadmap table never got the checkmark.",
+        "linked_work": [
+          "itr#403"
+        ]
+      },
+      {
+        "section": "Phase 3 (#398) / §A.4 Layer-1 rows",
+        "current": "🟡",
+        "proposed": "✅",
+        "evidence": "Epic #398 closed 2026-07-15: all seven children (#249 #250 #253 #399 #400 #401 #402) done with runtime evidence; three wave gates green (just verify incl. e2e 12-14 specs); three adversarial reviews; zero write affordances test-enforced per spec §5. Also closed alongside: #473 inbox regression + fail-safe issues #535 #537 #540 #541 (epic #533 partial).",
+        "linked_work": [
+          "itr#398",
+          "itr#400",
+          "itr#401",
+          "itr#402",
+          "itr#473",
+          "itr#535",
+          "itr#537",
+          "itr#540",
+          "itr#541"
+        ]
+      }
+    ],
+    "new_coverage": [],
+    "po_owned_or_ambiguous": [],
+    "suggested_command": "/roadmap --update"
+  }
+}

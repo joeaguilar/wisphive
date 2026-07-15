@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smoke test — campaign-003-2026-07-14-command-center-layer1</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --fg: #1a1a1a;
+  --fg-dim: #555;
+  --bg: #fdfdfc;
+  --bg-soft: #f4f3ef;
+  --border: #d8d6cf;
+  --accent: #0a5;
+  --accent-soft: #cfe9d8;
+  --warn: #c60;
+  --warn-soft: #f4e1c8;
+  --danger: #c33;
+  --danger-soft: #f3cdcd;
+  --info: #36c;
+  --info-soft: #d4ddef;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg: #e8e6e1;
+    --fg-dim: #999;
+    --bg: #161514;
+    --bg-soft: #20201d;
+    --border: #36352f;
+    --accent: #6ec988;
+    --accent-soft: #1f3a27;
+    --warn: #d99a5b;
+    --warn-soft: #3e2e15;
+    --danger: #e57b7b;
+    --danger-soft: #3d1c1c;
+    --info: #7aa3e0;
+    --info-soft: #1c2a3e;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--fg);
+  background: var(--bg);
+  padding: 32px 24px 64px;
+  max-width: 1100px;
+  margin: 0 auto;
+}
+h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
+h2 { font-size: 17px; margin: 32px 0 8px; padding-bottom: 4px; border-bottom: 1px solid var(--border); }
+h3 { font-size: 14px; margin: 20px 0 6px; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.04em; }
+a { color: var(--info); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code, pre, .mono { font-family: var(--mono); font-size: 13px; }
+pre {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 10px 12px;
+  overflow-x: auto;
+  margin: 8px 0;
+}
+code { background: var(--bg-soft); padding: 1px 5px; border-radius: 3px; }
+pre code { background: none; padding: 0; }
+
+.meta {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 16px;
+  font-size: 13px;
+  color: var(--fg-dim);
+  margin: 8px 0 16px;
+}
+.meta dt { font-weight: 600; color: var(--fg); }
+.meta dd { margin: 0; font-family: var(--mono); }
+
+.banner {
+  padding: 10px 12px;
+  border-radius: 4px;
+  margin: 12px 0;
+  font-size: 13px;
+}
+.banner.info { background: var(--info-soft); border: 1px solid var(--info); }
+.banner.warn { background: var(--warn-soft); border: 1px solid var(--warn); }
+.banner.muted { background: var(--bg-soft); border: 1px solid var(--border); color: var(--fg-dim); }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 8px 0 16px;
+  font-size: 13px;
+}
+th, td {
+  padding: 8px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+th {
+  font-weight: 600;
+  color: var(--fg-dim);
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  border-bottom: 2px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+}
+tbody tr:hover { background: var(--bg-soft); }
+
+.badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-family: var(--mono);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.badge.ok      { background: var(--accent-soft); color: var(--accent); }
+.badge.warn    { background: var(--warn-soft);   color: var(--warn); }
+.badge.danger  { background: var(--danger-soft); color: var(--danger); }
+.badge.info    { background: var(--info-soft);   color: var(--info); }
+.badge.muted   { background: var(--bg-soft);     color: var(--fg-dim); border: 1px solid var(--border); }
+
+.totals {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px;
+  margin: 12px 0 20px;
+}
+.tile {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 10px 12px;
+  background: var(--bg-soft);
+}
+.tile .n { font-size: 22px; font-weight: 600; font-family: var(--mono); }
+.tile .k { font-size: 11px; text-transform: uppercase; color: var(--fg-dim); letter-spacing: 0.04em; }
+
+.empty {
+  color: var(--fg-dim);
+  font-style: italic;
+  font-size: 13px;
+  padding: 12px;
+  text-align: center;
+  border: 1px dashed var(--border);
+  border-radius: 4px;
+}
+
+.files { font-family: var(--mono); font-size: 12px; color: var(--fg-dim); }
+.files span { display: inline-block; margin-right: 8px; }
+
+.evidence-list { list-style: none; padding: 0; margin: 0; font-size: 12px; }
+.evidence-list li { margin: 2px 0; }
+
+.checkbox-row {
+  display: grid;
+  grid-template-columns: 28px 1fr;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  align-items: start;
+}
+.checkbox-row:hover { background: var(--bg-soft); }
+.checkbox-row input[type="checkbox"] {
+  width: 18px; height: 18px; margin-top: 2px; cursor: pointer;
+}
+.checkbox-row.checked { opacity: 0.55; text-decoration: line-through solid currentColor 1px; }
+.checkbox-row .label { font-weight: 500; }
+.checkbox-row .sub { font-size: 12px; color: var(--fg-dim); margin-top: 2px; }
+.checkbox-row .sub a { font-family: var(--mono); }
+.checkbox-row .fail-btn {
+  margin-left: 8px;
+  padding: 1px 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--fg-dim);
+  font-size: 11px;
+  font-family: var(--mono);
+  cursor: pointer;
+}
+.checkbox-row .fail-btn:hover { border-color: var(--danger); color: var(--danger); }
+.checkbox-row .fail-btn.active {
+  background: var(--danger-soft); color: var(--danger); border-color: var(--danger);
+}
+
+.summary-bar {
+  position: sticky;
+  bottom: 0;
+  background: var(--bg);
+  border-top: 2px solid var(--border);
+  padding: 10px 12px;
+  margin: 24px -24px -64px;
+  font-size: 13px;
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.summary-bar .count { font-family: var(--mono); font-weight: 600; }
+.summary-bar button {
+  margin-left: auto;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-soft);
+  font-family: var(--sans);
+  font-size: 13px;
+  cursor: pointer;
+  color: var(--fg);
+}
+.summary-bar button:hover { background: var(--border); }
+
+.footer {
+  margin-top: 48px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--fg-dim);
+  text-align: center;
+}
+
+</style>
+</head>
+<body data-campaign="campaign-003-2026-07-14-command-center-layer1">
+
+<h1>Smoke test — campaign-003-2026-07-14-command-center-layer1</h1>
+<p style="margin:0; color: var(--fg-dim); font-size: 14px;">Close epic wisphive#398 — Command Center Layer 1 live ops console: liveness board #400, working-tree strip #401, burn meter #402, plus inbox regression #473 — all with runtime evidence</p>
+
+<dl class="meta"><dt>Status</dt><dd><span class="badge ok">COMPLETE</span></dd><dt>Window</dt><dd>2026-07-15 04:36:30 UTC → 2026-07-15 08:30:00 UTC</dd><dt>Roadmap rows</dt><dd>Phase 3 (#398), §A.4</dd><dt>Out of scope</dt><dd>#439, #440, #441 (fast-follow epics → next campaign), #451-#453 (continuous process), Phase 4+ (werkit#5), §B.*, §C.*</dd><dt>Verify gate</dt><dd><code>just verify (incl. verify-e2e) + per-story runtime screenshots on isolated daemon</code></dd><dt>Orchestrator tokens</dt><dd>122,000 / 200,000</dd><dt>Roadmap source</dt><dd><code>docs/ROADMAP.md</code></dd><dt>Tracker</dt><dd>itr</dd></dl>
+
+<div class="banner info">
+  <strong>This is async acceptance, not the done gate.</strong>
+  Every item below already passed the verify gate and has agent-recorded evidence.
+  Your job is to spot-check user-visible behavior.
+</div>
+
+<h2>How to run locally</h2>
+<pre>git pull on branch crossfire-blitz/20260712-230112
+./install.sh   # S-7: now atomic + preflighted — this is the operator install moment
+wisphive daemon start --web
+Open the web UI (default :3100): Inbox, Board (key 8), Worktrees (key 9), Burn view</pre>
+
+<h2>Checklist</h2>
+<div id="checklist">
+<div class="checkbox-row" data-id="S-1"><input type="checkbox" id="cb-S-1"><div><div class="label"><label for="cb-S-1">Read the new CLAUDE.md install.sh policy paragraph; confirm it matches your intent (deliberate stops, operator-chosen install moments)</label><button type="button" class="fail-btn" title="Mark failed">fail</button></div><div class="sub">Evidence — docs: CLAUDE.md install.sh policy (itr#540)<br>Source — Q-13 <span style="color: var(--fg-dim);">(Policy: install.sh human-supervised (docs) — CLAUDE.md)</span></div></div></div><div class="checkbox-row" data-id="S-2"><input type="checkbox" id="cb-S-2"><div><div class="label"><label for="cb-S-2">Trigger AskUserQuestion in a gated session: it appears once as deferred in the inbox (no permanent duplicate); break a perms bit on a THROWAWAY copy and confirm the denial message walks you to the fix</label><button type="button" class="fail-btn" title="Mark failed">fail</button></div><div class="sub">Evidence — log: <a href="campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q10-473-e2e.txt">#473 E2E: 9/9 assertions, release hook vs isolated strict-perms HOME (dup deferred gone, #388 intact, Codex preserved)</a> · log: <a href="campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q10-535-denial-message.txt">#535 E2E: UserPromptSubmit still DENIES (exit 2) with full repair-path message on broken HOME</a><br>Source — Q-10 <span style="color: var(--fg-dim);">(Fix #473 (no install.sh) + #535 actionable denials + fail-closed posture ADR)</span></div></div></div><div class="checkbox-row" data-id="S-3"><input type="checkbox" id="cb-S-3"><div><div class="label"><label for="cb-S-3">THE INCIDENT DRILL: on a throwaway HOME, break perms (chmod 644 mode) → confirm the denial message walks you out; run scripts/wisphive-rescue.sh → --fix → gating works again; try rescue.sh --off as the emergency exit</label><button type="button" class="fail-btn" title="Mark failed">fail</button></div><div class="sub">Evidence — log: <a href="campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q11-541-537-e2e.txt">Rescue/doctor E2E 5/5: broken-perms diagnose+fix→hook accepts; --off emergency exit; on-from-empty compliant; symlink refused; doctor --fix-perms repairs</a><br>Source — Q-11 <span style="color: var(--fg-dim);">(#541 rescue script + strict on/off transitions + #537 doctor --fix-perms)</span></div></div></div><div class="checkbox-row" data-id="S-4"><input type="checkbox" id="cb-S-4"><div><div class="label"><label for="cb-S-4">Open the web UI → view 8 (Board): your live sessions appear in lanes; kill an agent and watch it flip to &#x27;stalled · silent 10m&#x27; within ~10min; click &#x27;Answer in Inbox →&#x27; on a waiting lane</label><button type="button" class="fail-btn" title="Mark failed">fail</button></div><div class="sub">Evidence — screenshot: <a href="campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q2-400-board-lanes.png">Liveness board: 2 projects, working/waiting/stalled lanes, Codex badge, real clock-driven stalled flip, inbox cross-link target (reviewer-verified untruncated detail)</a> · e2e: Gates: workspace green (q2-400-rust), clippy, eslint, vitest 176/176, just e2e 12/12 incl. new liveness-board spec with live 600s stall flip<br>Source — Q-2 <span style="color: var(--fg-dim);">(Agent liveness board: working/waiting/stalled per project x session x subagent, with wave progress)</span></div></div></div><div class="checkbox-row" data-id="S-5"><input type="checkbox" id="cb-S-5"><div><div class="label"><label for="cb-S-5">Open view 9 (Worktrees): your real dirty repos appear with generated Conventional Commit messages and per-change agent attribution; copy a message and commit manually — it should pass your CC hooks; confirm there is NO commit/write button anywhere on the strip</label><button type="button" class="fail-btn" title="Mark failed">fail</button></div><div class="sub">Evidence — screenshot: <a href="campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q3-401-strip-two-repos.png">Strip: two dirty fixture repos w/ CC headers + attribution; copy affordance (clipboard-equality in spec); regenerated-clean after manual commit; mobile 390px</a> · test: <a href="campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q3-401-e2e.txt">Gates: workspace+clippy green, vitest 206, just e2e 13/13; wave gate just verify exit 0; reviewer 9/9 checks (P1 NUL byte repaired in 36fb881, targeted eslint+vitest 9/9 green)</a><br>Source — Q-3 <span style="color: var(--fg-dim);">(Working-tree strip: per-repo dirty summary, pre-generated conventional commit, per-change agent attribution)</span></div></div></div><div class="checkbox-row" data-id="S-6"><input type="checkbox" id="cb-S-6"><div><div class="label"><label for="cb-S-6">Open the Burn view: your sessions show &#x27;activity proxy&#x27; tiles (never dollar/token figures); confirm the label &#x27;token spend not observable&#x27; is visible; if you have a long read-only session running, check whether the DEAD RUN alert state looks right to you (thresholds: &gt;=10 calls over &gt;=10 min, zero artifacts)</label><button type="button" class="fail-btn" title="Mark failed">fail</button></div><div class="sub">Evidence — screenshot: <a href="campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q4-402-dead-run.png">Burn view: productive tile (labeled &#x27;activity proxy · token spend not observable&#x27;, commit subject + file paths x2) AND red DEAD RUN tile &#x27;12 tool calls over 14m with zero artifacts&#x27; (note: tile/dead-run PNGs are one identical full-page capture — both claims visible); mobile 390px legible</a> · test: <a href="campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q4-402-e2e.txt">Gates: workspace green (q4-402-rust), clippy, eslint, vitest 233, just e2e 14/14 (gatr q4-402-e2e independently confirmed); wave gate just verify exit 0; reviewer 10 checks — P1 NUL bytes repaired (d2f0446), P2/P3s filed #552 #553</a><br>Source — Q-4 <span style="color: var(--fg-dim);">(Burn meter: spend vs artifacts per session/run, with dead-run alert)</span></div></div></div><div class="checkbox-row" data-id="S-7"><input type="checkbox" id="cb-S-7"><div><div class="label"><label for="cb-S-7">THE INSTALL MOMENT (operator-chosen, per #540): run ./install.sh yourself to pick up all campaign binaries (installed hook is still the 07-14 23:46 build — it predates the actionable denials, brick detector, and statecheck). You should see: staging, codesign, statecheck probe of your real ~/.wisphive (healthy now), atomic swap. Then wisphive doctor for a green bill of health.</label><button type="button" class="fail-btn" title="Mark failed">fail</button></div><div class="sub">Evidence — log: <a href="campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q12-redteam.txt">just redteam capstone: 17/17 decision-plane (script repaired — had been silently broken since strict-perms) + 24/24 upgrade-safety incl. (a) deliberate deny-all w/ actionable message (b) brick marker/notification once (c) doctor/rescue repair -&gt; hook accepts (d) install preflight aborts/repairs per flag (e) UserPromptSubmit stays DENIED while broken. Reviewer independently RE-RAN: 24/24 reproduced</a> · test: <a href="campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q12-536-install-preflight.txt">Install preflight 20/20 (abort leaves old binaries byte-identical; no copy-&gt;codesign window; --fix-perms opt-in repair; env overrides); hook suite 89 green (13 brick/statecheck); final gate just verify exit 0; reviewer paramount check PASS: no new code path alters a decision outcome</a><br>Source — Q-12 <span style="color: var(--fg-dim);">(Fail-safe tail: #534 deliberate perms repair, #536 atomic install preflight, #538 brick detector, #539 red-team upgrade scenario)</span></div></div></div>
+</div>
+
+<h2>Questions for PO</h2>
+<ul><li>campaign-004 tracker boundary: Phase 4 (werkit#6 state-of-play) is program-order next but lives in the werkit tracker — werkit-scoped campaign, or take the wisphive-scoped scrollback G (epic #284) drafted in campaign/campaign-004-DRAFT-scrollback-layer1-tail/draft.md?</li><li>#439 (remote answering, reverses ADR-0002 always-defer) needs an ADR spike before any implementation — approve filing that spike?</li></ul>
+
+<h2>Known non-goals (won't work, by design)</h2>
+<ul><li>Agent start/stop/retarget controls (spec §5: state mirror, not steering wheel)</li><li>Remote answering of AskUserQuestion/ExitPlanMode (#439 — next campaign)</li><li>Auto-clear of answered deferred items (#440 — next campaign)</li></ul>
+
+<div class="summary-bar">
+  <span class="count"><span id="checked-count">0</span> / <span id="total-count">7</span> checked</span>
+  <span class="count" id="fail-count" style="color: var(--danger); display: none;">— <span id="fail-n">0</span> marked failed</span>
+  <button type="button" onclick="copyResults()">Copy results as markdown</button>
+  <button type="button" onclick="resetState()">Reset</button>
+</div>
+
+<div class="footer">
+  Generated by <code>render_campaign_report.py</code> at 2026-07-15 08:30 UTC.
+  Companion reports: <a href="changelog.html">changelog</a> ·
+  <a href="roadmap-update.html">roadmap-update</a> ·
+  <a href="retro.html">retro</a>
+</div>
+
+<script>
+(function() {
+  var key = "proof-campaign:" + document.body.dataset.campaign;
+  var state = {};
+  try { state = JSON.parse(localStorage.getItem(key) || "{}"); } catch (e) { state = {}; }
+
+  function save() { localStorage.setItem(key, JSON.stringify(state)); }
+  function recount() {
+    var rows = document.querySelectorAll(".checkbox-row");
+    var checked = 0, failed = 0;
+    rows.forEach(function(row) {
+      var id = row.dataset.id;
+      var cb = row.querySelector('input[type="checkbox"]');
+      var failBtn = row.querySelector(".fail-btn");
+      if (state[id] && state[id].checked) { cb.checked = true; row.classList.add("checked"); checked++; }
+      else { cb.checked = false; row.classList.remove("checked"); }
+      if (state[id] && state[id].failed) { failBtn.classList.add("active"); failed++; }
+      else { failBtn.classList.remove("active"); }
+    });
+    document.getElementById("checked-count").textContent = checked;
+    document.getElementById("fail-n").textContent = failed;
+    document.getElementById("fail-count").style.display = failed > 0 ? "" : "none";
+  }
+  function onCheck(e) {
+    var row = e.target.closest(".checkbox-row");
+    var id = row.dataset.id;
+    state[id] = state[id] || {};
+    state[id].checked = e.target.checked;
+    save(); recount();
+  }
+  function onFail(btn) {
+    var row = btn.closest(".checkbox-row");
+    var id = row.dataset.id;
+    state[id] = state[id] || {};
+    state[id].failed = !state[id].failed;
+    save(); recount();
+  }
+  window.copyResults = function() {
+    var rows = document.querySelectorAll(".checkbox-row");
+    var lines = ["# Smoke test results — " + document.body.dataset.campaign, ""];
+    rows.forEach(function(row) {
+      var id = row.dataset.id;
+      var label = row.querySelector(".label").textContent.trim();
+      var s = state[id] || {};
+      var mark = s.failed ? "[FAIL]" : s.checked ? "[x]" : "[ ]";
+      lines.push("- " + mark + " " + label);
+    });
+    var text = lines.join("\n");
+    navigator.clipboard.writeText(text).then(
+      function() { alert("Copied to clipboard."); },
+      function() {
+        var ta = document.createElement("textarea");
+        ta.value = text; document.body.appendChild(ta); ta.select();
+        document.execCommand("copy"); document.body.removeChild(ta);
+        alert("Copied.");
+      }
+    );
+  };
+  window.resetState = function() {
+    if (!confirm("Clear all checks for this campaign?")) return;
+    state = {}; save(); recount();
+  };
+  document.querySelectorAll(".checkbox-row input[type='checkbox']").forEach(function(cb) {
+    cb.addEventListener("change", onCheck);
+  });
+  document.querySelectorAll(".checkbox-row .fail-btn").forEach(function(btn) {
+    btn.addEventListener("click", function() { onFail(btn); });
+  });
+  recount();
+})();
+</script>
+
+</body>
+</html>

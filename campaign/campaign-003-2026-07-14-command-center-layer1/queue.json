@@ -1,0 +1,388 @@
+{
+  "items": [
+    {
+      "id": "Q-1",
+      "title": "Fix deferred AskUserQuestion sticks forever: PermissionRequest twin has null tool_use_id",
+      "source": "itr#473",
+      "roadmap_rows": [
+        "Phase 3 (#398)"
+      ],
+      "lane": "quarantined",
+      "owned_files": [
+        "crates/wisphive_hook/**"
+      ],
+      "forbidden_files": [
+        "crates/wisphive_daemon/**",
+        "crates/wisphive_web/**",
+        "crates/wisphive_protocol/**",
+        "docs/ROADMAP.md",
+        "sprint/**"
+      ],
+      "acceptance": [
+        "Hook does NOT write a duplicate 'deferred' audit record for a Claude Code PermissionRequest of an always-defer tool",
+        "PermissionRequest STILL returns Decision::Ask so the native dialog renders (itr#388 not regressed)",
+        "Codex PermissionRequest audit record preserved",
+        "Verified end-to-end by driving the installed binary, not just unit tests"
+      ],
+      "verify": "cargo test -p wisphive_hook + installed-binary E2E drive",
+      "evidence_needed": [
+        "test",
+        "log"
+      ],
+      "evidence_refs": [],
+      "token_estimate": 25000,
+      "deps": [],
+      "risk": "medium",
+      "wave": 1,
+      "notes": "Worker killed by PO mid-incident 2026-07-15 (epic #533: install.sh binary swap bricked live gating). Superseded by Q-10 under the no-install.sh rule (#540). Leftover untracked test file crates/wisphive_hook/tests/defer_audit_dedup.rs handed to Q-10."
+    },
+    {
+      "id": "Q-2",
+      "title": "Agent liveness board: working/waiting/stalled per project x session x subagent, with wave progress",
+      "source": "itr#400",
+      "roadmap_rows": [
+        "Phase 3 (#398)",
+        "§A.4"
+      ],
+      "lane": "verified",
+      "owned_files": [
+        "crates/wisphive_daemon/**",
+        "crates/wisphive_protocol/**",
+        "crates/wisphive_web/**",
+        "crates/wisphive_tui/**"
+      ],
+      "forbidden_files": [
+        "crates/wisphive_hook/**",
+        "docs/ROADMAP.md",
+        "sprint/**"
+      ],
+      "acceptance": [
+        "During a real multi-session sitting (2+ projects, 1+ subagent fan-out) the board shows correct lanes and states",
+        "Killing an agent mid-run flips its lane to stalled within 600s+epsilon",
+        "A waiting-on-input session shows waiting and cross-links to its inbox item",
+        "Codex activity appears in its own lane",
+        "Screenshot evidence on close",
+        "NO steering controls — state mirror only (spec §5)"
+      ],
+      "verify": "cargo test + frontend lint+vitest + isolated-daemon Playwright screenshots",
+      "evidence_needed": [
+        "test",
+        "screenshot"
+      ],
+      "evidence_refs": [
+        "e-9",
+        "e-10"
+      ],
+      "token_estimate": 120000,
+      "deps": [],
+      "risk": "medium",
+      "wave": 1,
+      "closed_at": "2026-07-15T08:30:00Z",
+      "token_actual": 717618,
+      "user_visible_change": "Agent liveness board (view 8): working/waiting/stalled lanes per project x session, Codex lanes, wave progress, inbox cross-link"
+    },
+    {
+      "id": "Q-3",
+      "title": "Working-tree strip: per-repo dirty summary, pre-generated conventional commit, per-change agent attribution",
+      "source": "itr#401",
+      "roadmap_rows": [
+        "Phase 3 (#398)",
+        "§A.4"
+      ],
+      "lane": "verified",
+      "owned_files": [
+        "crates/wisphive_daemon/**",
+        "crates/wisphive_protocol/**",
+        "crates/wisphive_web/**"
+      ],
+      "forbidden_files": [
+        "crates/wisphive_hook/**",
+        "docs/ROADMAP.md",
+        "sprint/**"
+      ],
+      "acceptance": [
+        "After a real session edits files in two repos, the strip shows both dirty trees with plausible conforming commit messages and correct attribution for agent-made changes",
+        "Copying the message and committing manually produces a Conventional Commits-valid commit",
+        "NO write affordances exist",
+        "Screenshot evidence on close"
+      ],
+      "verify": "cargo test + frontend lint+vitest + isolated-daemon Playwright screenshots",
+      "evidence_needed": [
+        "test",
+        "screenshot"
+      ],
+      "evidence_refs": [
+        "e-12",
+        "e-13"
+      ],
+      "token_estimate": 60000,
+      "deps": [
+        "Q-2"
+      ],
+      "risk": "medium",
+      "wave": 2,
+      "notes": "Serialized after Q-2: shares useWisphive.ts, types/protocol.ts, wire.rs, nav shell.",
+      "closed_at": "2026-07-15T09:50:00Z",
+      "token_actual": 281154,
+      "user_visible_change": "Working-tree strip (view 9): per-repo dirty summary, deterministic Conventional-Commit message with copy button, per-change agent attribution — zero write affordances"
+    },
+    {
+      "id": "Q-4",
+      "title": "Burn meter: spend vs artifacts per session/run, with dead-run alert",
+      "source": "itr#402",
+      "roadmap_rows": [
+        "Phase 3 (#398)",
+        "§A.4"
+      ],
+      "lane": "verified",
+      "owned_files": [
+        "crates/wisphive_daemon/**",
+        "crates/wisphive_protocol/**",
+        "crates/wisphive_web/**"
+      ],
+      "forbidden_files": [
+        "crates/wisphive_hook/**",
+        "docs/ROADMAP.md",
+        "sprint/**"
+      ],
+      "acceptance": [
+        "A real session's tile shows spend (or labeled proxy) alongside its artifact list",
+        "A deliberately artifact-free run trips the dead-run alert",
+        "Screenshot evidence on close"
+      ],
+      "verify": "cargo test + frontend lint+vitest + isolated-daemon Playwright screenshots",
+      "evidence_needed": [
+        "test",
+        "screenshot"
+      ],
+      "evidence_refs": [
+        "e-14",
+        "e-15"
+      ],
+      "token_estimate": 60000,
+      "deps": [
+        "Q-3"
+      ],
+      "risk": "low",
+      "wave": 3,
+      "notes": "Serialized after Q-3: same shared frontend shell files.",
+      "closed_at": "2026-07-15T10:50:00Z",
+      "token_actual": 298750,
+      "user_visible_change": "Burn meter (view): labeled activity proxy vs artifact list per session + dead-run alert"
+    },
+    {
+      "id": "Q-5",
+      "title": "Deferred deep-link silently no-ops for a stale / non-embedded terminal session",
+      "source": "itr#449",
+      "roadmap_rows": [
+        "Phase 3 (#398)"
+      ],
+      "lane": "verified",
+      "owned_files": [
+        "crates/wisphive_web/frontend/src/components/Terminals.tsx",
+        "crates/wisphive_web/frontend/src/components/Inbox.tsx"
+      ],
+      "acceptance": [
+        "Deep-link to a stale/non-embedded terminal session surfaces feedback instead of silently no-oping"
+      ],
+      "verify": "frontend vitest",
+      "evidence_needed": [
+        "test"
+      ],
+      "token_estimate": 10000,
+      "risk": "low",
+      "notes": "Pull only if budget allows after Q-1..Q-4 verified.",
+      "wave": 4,
+      "closed_at": "2026-07-15T11:40:00Z",
+      "token_actual": 106483,
+      "evidence_refs": [
+        "e-16"
+      ],
+      "user_visible_change": "Deferred deep-link to a stale/non-embedded terminal shows a dismissible notice instead of silently no-oping; inbox never wedges"
+    },
+    {
+      "id": "Q-6",
+      "title": "EPIC: In-console remote answering of AskUserQuestion / ExitPlanMode",
+      "source": "itr#439",
+      "roadmap_rows": [],
+      "lane": "next_campaign",
+      "token_estimate": 120000,
+      "risk": "high",
+      "notes": "needs-sprint epic; reverses always-defer for remote answer — security design work. Drafted for campaign-004."
+    },
+    {
+      "id": "Q-7",
+      "title": "EPIC: Auto-clear deferred inbox items when the native prompt is answered",
+      "source": "itr#440",
+      "roadmap_rows": [],
+      "lane": "next_campaign",
+      "token_estimate": 60000,
+      "risk": "medium",
+      "notes": "needs-sprint epic; #473 fix is the prerequisite regression cleanup. Drafted for campaign-004."
+    },
+    {
+      "id": "Q-8",
+      "title": "Fast-follow: auto-answer feed as full searchable audit surface",
+      "source": "itr#441",
+      "roadmap_rows": [],
+      "lane": "next_campaign",
+      "token_estimate": 60000,
+      "risk": "medium",
+      "notes": "Drafted for campaign-004."
+    },
+    {
+      "id": "Q-9",
+      "title": "Process: e2e in per-story verify gate for view/routing/nav stories (#451), AC-contradiction check (#452), full-X-reachable test rule (#453)",
+      "source": "itr#451,itr#452,itr#453",
+      "roadmap_rows": [],
+      "lane": "parked",
+      "token_estimate": 0,
+      "risk": "low",
+      "notes": "Continuous process improvements — applied as worker-prompt rules in THIS campaign (e2e mandated per story; full-X-reachable tests required), but the itr tickets themselves are /sprint-process work, not campaign deliverables."
+    },
+    {
+      "id": "Q-10",
+      "title": "Fix #473 (no install.sh) + #535 actionable denials + fail-closed posture ADR",
+      "source": "itr#473,itr#535",
+      "roadmap_rows": [
+        "Phase 3 (#398)"
+      ],
+      "lane": "verified",
+      "owned_files": [
+        "crates/wisphive_hook/**",
+        "docs/decisions/**"
+      ],
+      "forbidden_files": [
+        "crates/wisphive_daemon/**",
+        "crates/wisphive_web/**",
+        "crates/wisphive_cli/**",
+        "install.sh",
+        "~/.cargo/bin/**"
+      ],
+      "acceptance": [
+        "#473 four ACs (installed-binary AC satisfied via ./target/release + isolated strict-perms HOME per #540)",
+        "Every config/perms denial names file + required state + exact repair commands (matrix-tested)",
+        "Posture ADR filed + linked from CLAUDE.md"
+      ],
+      "verify": "cargo test -p wisphive_hook + release-binary E2E drive (isolated HOME, strict perms)",
+      "evidence_needed": [
+        "test",
+        "log"
+      ],
+      "evidence_refs": [
+        "e-2",
+        "e-3",
+        "e-4",
+        "e-5"
+      ],
+      "token_estimate": 45000,
+      "deps": [],
+      "risk": "medium",
+      "wave": 1,
+      "notes": "PO-mandated scope addition (incident 2026-07-15). SECURITY: keep fail-closed sacred.",
+      "closed_at": "2026-07-15T06:20:00Z",
+      "token_actual": 119354,
+      "user_visible_change": "Deferred AskUserQuestion no longer sticks forever in the inbox; every perms denial now names the exact repair commands (ADR-0010)"
+    },
+    {
+      "id": "Q-11",
+      "title": "#541 rescue script + strict on/off transitions + #537 doctor --fix-perms",
+      "source": "itr#541,itr#537",
+      "roadmap_rows": [],
+      "lane": "verified",
+      "owned_files": [
+        "scripts/wisphive-rescue.sh",
+        "crates/wisphive_cli/**",
+        "justfile"
+      ],
+      "forbidden_files": [
+        "crates/wisphive_hook/**",
+        "install.sh"
+      ],
+      "acceptance": [
+        "rescue.sh diagnoses+fixes with NO wisphive binary; --off emergency exit",
+        "wisphive on/off create compliant 0600/0700 state",
+        "doctor lists each failing validator w/ exact fix; --fix-perms repairs"
+      ],
+      "verify": "cargo test -p wisphive_cli + scripted rescue-script E2E on broken-perms fixtures",
+      "evidence_needed": [
+        "test",
+        "log"
+      ],
+      "evidence_refs": [
+        "e-6",
+        "e-7",
+        "e-8"
+      ],
+      "token_estimate": 50000,
+      "deps": [],
+      "risk": "medium",
+      "wave": 1,
+      "notes": "PO-mandated (\"ways out clearer — perhaps a script\"). Mirrors hook validators read-only; shared-module refactor is a follow-up.",
+      "closed_at": "2026-07-15T07:05:00Z",
+      "token_actual": 162716,
+      "user_visible_change": "wisphive on/off strict transitions, doctor --fix-perms, and scripts/wisphive-rescue.sh binary-independent escape hatch"
+    },
+    {
+      "id": "Q-12",
+      "title": "Fail-safe tail: #534 deliberate perms repair, #536 atomic install preflight, #538 brick detector, #539 red-team upgrade scenario",
+      "source": "itr#534,itr#536,itr#538,itr#539",
+      "roadmap_rows": [],
+      "lane": "verified",
+      "owned_files": [
+        "install.sh",
+        "scripts/**",
+        "crates/wisphive_hook/**"
+      ],
+      "acceptance": [
+        "per member issues (re-scoped per PO ruling: deliberate stops, clear exits)"
+      ],
+      "verify": "just redteam + scripted install preflight test",
+      "evidence_needed": [
+        "test",
+        "log"
+      ],
+      "evidence_refs": [
+        "e-17",
+        "e-18"
+      ],
+      "token_estimate": 70000,
+      "deps": [
+        "Q-10",
+        "Q-11"
+      ],
+      "risk": "medium",
+      "wave": 4,
+      "notes": "Runs after Q-10/Q-11 (file overlap with hook crate + scripts). May split to campaign-004 on cap pressure.",
+      "closed_at": "2026-07-15T08:25:00Z",
+      "token_actual": 201001,
+      "user_visible_change": "install.sh is now an atomic preflighted upgrade; brick detector notifies once with repair commands; 41/41 red-team invariants proven vs release binaries"
+    },
+    {
+      "id": "Q-13",
+      "title": "Policy: install.sh human-supervised (docs) — CLAUDE.md",
+      "source": "itr#540",
+      "roadmap_rows": [],
+      "lane": "verified",
+      "owned_files": [
+        "CLAUDE.md"
+      ],
+      "acceptance": [
+        "CLAUDE.md states rule + sanctioned alternative"
+      ],
+      "verify": "n/a (docs)",
+      "evidence_needed": [
+        "docs"
+      ],
+      "evidence_refs": [
+        "e-1"
+      ],
+      "token_estimate": 2000,
+      "token_actual": 2000,
+      "wave": 1,
+      "closed_at": "2026-07-15T05:41:00Z",
+      "user_visible_change": "Repo law: agents never swap live gated binaries",
+      "notes": "Done inline by orchestrator; commit 34d05ee; itr#540 closed."
+    }
+  ]
+}

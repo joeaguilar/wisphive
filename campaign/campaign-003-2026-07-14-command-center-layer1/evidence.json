@@ -1,0 +1,174 @@
+{
+  "evidence": [
+    {
+      "id": "e-1",
+      "item_id": "Q-13",
+      "kind": "docs",
+      "label": "CLAUDE.md install.sh policy (itr#540)",
+      "command": "git show 34d05ee --stat",
+      "result": "pass",
+      "artifact_inline": "commit 34d05ee docs(claude): install.sh is human-supervised — agents never swap live gated binaries (itr#540)",
+      "captured_at": "2026-07-15T05:41:00Z"
+    },
+    {
+      "id": "e-2",
+      "item_id": "Q-10",
+      "kind": "test",
+      "label": "wisphive_hook suite: 76 pass (incl. 4 defer_audit_dedup + 5 actionable_denials matrix)",
+      "command": "cargo test -p wisphive_hook (gatr q10-hook-test)",
+      "result": "pass",
+      "captured_at": "2026-07-15T06:20:00Z"
+    },
+    {
+      "id": "e-3",
+      "item_id": "Q-10",
+      "kind": "log",
+      "label": "#473 E2E: 9/9 assertions, release hook vs isolated strict-perms HOME (dup deferred gone, #388 intact, Codex preserved)",
+      "command": "see transcript",
+      "result": "pass",
+      "artifact_path": "campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q10-473-e2e.txt",
+      "captured_at": "2026-07-15T06:20:00Z"
+    },
+    {
+      "id": "e-4",
+      "item_id": "Q-10",
+      "kind": "log",
+      "label": "#535 E2E: UserPromptSubmit still DENIES (exit 2) with full repair-path message on broken HOME",
+      "command": "see transcript",
+      "result": "pass",
+      "artifact_path": "campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q10-535-denial-message.txt",
+      "captured_at": "2026-07-15T06:20:00Z"
+    },
+    {
+      "id": "e-5",
+      "item_id": "Q-10",
+      "kind": "docs",
+      "label": "ADR-0010 fail-closed posture (Accepted, extends ADR-0001) + CLAUDE.md bullet — commits 66ebaba, 0b27594",
+      "command": "git show 66ebaba 0b27594 --stat",
+      "result": "pass",
+      "captured_at": "2026-07-15T06:20:00Z"
+    },
+    {
+      "id": "e-6",
+      "item_id": "Q-11",
+      "kind": "test",
+      "label": "wisphive_cli suite: 49 pass; clippy clean; full workspace green (gatr q11-workspace-test, incl. Q-10 hook commits)",
+      "command": "cargo test -p wisphive_cli; cargo test --workspace",
+      "result": "pass",
+      "captured_at": "2026-07-15T07:05:00Z"
+    },
+    {
+      "id": "e-7",
+      "item_id": "Q-11",
+      "kind": "log",
+      "label": "Rescue/doctor E2E 5/5: broken-perms diagnose+fix→hook accepts; --off emergency exit; on-from-empty compliant; symlink refused; doctor --fix-perms repairs",
+      "command": "see transcript",
+      "result": "pass",
+      "artifact_path": "campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q11-541-537-e2e.txt",
+      "captured_at": "2026-07-15T07:05:00Z"
+    },
+    {
+      "id": "e-8",
+      "item_id": "Q-11",
+      "kind": "docs",
+      "label": "Commits 5a3742b (rescue+on/off), 6251d16 (doctor --fix-perms); follow-up itr#543 shared-validator module; CLAUDE.md CLI docs (orchestrator commit)",
+      "command": "git show 5a3742b 6251d16 --stat",
+      "result": "pass",
+      "captured_at": "2026-07-15T07:05:00Z"
+    },
+    {
+      "id": "e-9",
+      "item_id": "Q-2",
+      "kind": "screenshot",
+      "label": "Liveness board: 2 projects, working/waiting/stalled lanes, Codex badge, real clock-driven stalled flip, inbox cross-link target (reviewer-verified untruncated detail)",
+      "result": "pass",
+      "artifact_path": "campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q2-400-board-lanes.png",
+      "captured_at": "2026-07-15T08:00:00Z"
+    },
+    {
+      "id": "e-10",
+      "item_id": "Q-2",
+      "kind": "e2e",
+      "label": "Gates: workspace green (q2-400-rust), clippy, eslint, vitest 176/176, just e2e 12/12 incl. new liveness-board spec with live 600s stall flip",
+      "command": "just e2e",
+      "result": "pass",
+      "captured_at": "2026-07-15T08:00:00Z"
+    },
+    {
+      "id": "e-11",
+      "item_id": "wave-1",
+      "kind": "test",
+      "label": "Wave-close full gate: just verify exit 0 (verify-fmt/clippy/rust/frontend/e2e) on combined branch 34d05ee..a61e7d9",
+      "command": "just verify",
+      "result": "pass",
+      "captured_at": "2026-07-15T08:35:00Z"
+    },
+    {
+      "id": "e-12",
+      "item_id": "Q-3",
+      "kind": "screenshot",
+      "label": "Strip: two dirty fixture repos w/ CC headers + attribution; copy affordance (clipboard-equality in spec); regenerated-clean after manual commit; mobile 390px",
+      "result": "pass",
+      "artifact_path": "campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q3-401-strip-two-repos.png",
+      "captured_at": "2026-07-15T09:30:00Z"
+    },
+    {
+      "id": "e-13",
+      "item_id": "Q-3",
+      "kind": "test",
+      "label": "Gates: workspace+clippy green, vitest 206, just e2e 13/13; wave gate just verify exit 0; reviewer 9/9 checks (P1 NUL byte repaired in 36fb881, targeted eslint+vitest 9/9 green)",
+      "command": "just verify",
+      "result": "pass",
+      "artifact_path": "campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q3-401-e2e.txt",
+      "captured_at": "2026-07-15T09:50:00Z"
+    },
+    {
+      "id": "e-14",
+      "item_id": "Q-4",
+      "kind": "screenshot",
+      "label": "Burn view: productive tile (labeled 'activity proxy · token spend not observable', commit subject + file paths x2) AND red DEAD RUN tile '12 tool calls over 14m with zero artifacts' (note: tile/dead-run PNGs are one identical full-page capture — both claims visible); mobile 390px legible",
+      "result": "pass",
+      "artifact_path": "campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q4-402-dead-run.png",
+      "captured_at": "2026-07-15T10:30:00Z"
+    },
+    {
+      "id": "e-15",
+      "item_id": "Q-4",
+      "kind": "test",
+      "label": "Gates: workspace green (q4-402-rust), clippy, eslint, vitest 233, just e2e 14/14 (gatr q4-402-e2e independently confirmed); wave gate just verify exit 0; reviewer 10 checks — P1 NUL bytes repaired (d2f0446), P2/P3s filed #552 #553",
+      "command": "just verify",
+      "result": "pass",
+      "artifact_path": "campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q4-402-e2e.txt",
+      "captured_at": "2026-07-15T10:50:00Z"
+    },
+    {
+      "id": "e-16",
+      "item_id": "Q-5",
+      "kind": "test",
+      "label": "#449 still-live proven test-first vs pre-fix code (itr#464 only covered observed disconnects); fix b9daa0c: 2s bounded wait anchored to first sighting, role=status notice, onFocusHandled always fires. Terminals 14/14, frontend vitest 237/237, eslint+tsc clean",
+      "command": "npx vitest run",
+      "result": "pass",
+      "captured_at": "2026-07-15T11:40:00Z"
+    },
+    {
+      "id": "e-17",
+      "item_id": "Q-12",
+      "kind": "log",
+      "label": "just redteam capstone: 17/17 decision-plane (script repaired — had been silently broken since strict-perms) + 24/24 upgrade-safety incl. (a) deliberate deny-all w/ actionable message (b) brick marker/notification once (c) doctor/rescue repair -> hook accepts (d) install preflight aborts/repairs per flag (e) UserPromptSubmit stays DENIED while broken. Reviewer independently RE-RAN: 24/24 reproduced",
+      "command": "just redteam",
+      "result": "pass",
+      "artifact_path": "campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q12-redteam.txt",
+      "captured_at": "2026-07-15T08:25:00Z"
+    },
+    {
+      "id": "e-18",
+      "item_id": "Q-12",
+      "kind": "test",
+      "label": "Install preflight 20/20 (abort leaves old binaries byte-identical; no copy->codesign window; --fix-perms opt-in repair; env overrides); hook suite 89 green (13 brick/statecheck); final gate just verify exit 0; reviewer paramount check PASS: no new code path alters a decision outcome",
+      "command": "cargo test -p wisphive_hook; just verify",
+      "result": "pass",
+      "artifact_path": "campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q12-536-install-preflight.txt",
+      "captured_at": "2026-07-15T08:25:00Z"
+    }
+  ]
+}

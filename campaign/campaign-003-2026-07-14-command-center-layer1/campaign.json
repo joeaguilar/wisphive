@@ -1,0 +1,45 @@
+{
+  "id": "campaign-003-2026-07-14-command-center-layer1",
+  "slug": "command-center-layer1",
+  "n": 3,
+  "goal": "Close epic wisphive#398 — Command Center Layer 1 live ops console: liveness board #400, working-tree strip #401, burn meter #402, plus inbox regression #473 — all with runtime evidence",
+  "scope": {
+    "roadmap_rows": [
+      "Phase 3 (#398)",
+      "§A.4"
+    ],
+    "intended_final_status": {
+      "Phase 3 (#398)": "✅",
+      "§A.4": "🟡"
+    },
+    "out_of_scope": [
+      "#439",
+      "#440",
+      "#441 (fast-follow epics → next campaign)",
+      "#451-#453 (continuous process)",
+      "Phase 4+ (werkit#5)",
+      "§B.*",
+      "§C.*"
+    ]
+  },
+  "window": {
+    "started_at": "2026-07-15T04:36:30Z",
+    "ended_at": "2026-07-15T08:30:00Z"
+  },
+  "verify_gate": "just verify (incl. verify-e2e) + per-story runtime screenshots on isolated daemon",
+  "work_cap_tokens": 200000,
+  "work_used_tokens": 122000,
+  "concurrency": 3,
+  "max_waves": null,
+  "totals": {
+    "verified": 8,
+    "blocked": 0,
+    "parked": 3,
+    "next_campaign": 3,
+    "quarantined": 1
+  },
+  "status": "complete",
+  "divergence_note": "Also fixes #473 (inbox deferred-item regression) — not a #398 child, but Layer 1 cannot honestly claim 'live' with its centerpiece regressed. Roadmap correction flagged: Phase 2 (#403) is done in itr but unmarked in docs/ROADMAP.md. SCOPE AMENDED 2026-07-15 by PO directive (incident #533): fail-safe work #473+#535 (Q-10), #541+#537 (Q-11), #540 (done) pulled in; #534/#536/#538/#539 queued as Q-12.",
+  "roadmap_path": "docs/ROADMAP.md",
+  "tracker": "itr"
+}

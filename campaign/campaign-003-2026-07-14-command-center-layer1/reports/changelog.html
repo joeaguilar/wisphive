@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Changelog — campaign-003-2026-07-14-command-center-layer1</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --fg: #1a1a1a;
+  --fg-dim: #555;
+  --bg: #fdfdfc;
+  --bg-soft: #f4f3ef;
+  --border: #d8d6cf;
+  --accent: #0a5;
+  --accent-soft: #cfe9d8;
+  --warn: #c60;
+  --warn-soft: #f4e1c8;
+  --danger: #c33;
+  --danger-soft: #f3cdcd;
+  --info: #36c;
+  --info-soft: #d4ddef;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg: #e8e6e1;
+    --fg-dim: #999;
+    --bg: #161514;
+    --bg-soft: #20201d;
+    --border: #36352f;
+    --accent: #6ec988;
+    --accent-soft: #1f3a27;
+    --warn: #d99a5b;
+    --warn-soft: #3e2e15;
+    --danger: #e57b7b;
+    --danger-soft: #3d1c1c;
+    --info: #7aa3e0;
+    --info-soft: #1c2a3e;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--fg);
+  background: var(--bg);
+  padding: 32px 24px 64px;
+  max-width: 1100px;
+  margin: 0 auto;
+}
+h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
+h2 { font-size: 17px; margin: 32px 0 8px; padding-bottom: 4px; border-bottom: 1px solid var(--border); }
+h3 { font-size: 14px; margin: 20px 0 6px; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.04em; }
+a { color: var(--info); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code, pre, .mono { font-family: var(--mono); font-size: 13px; }
+pre {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 10px 12px;
+  overflow-x: auto;
+  margin: 8px 0;
+}
+code { background: var(--bg-soft); padding: 1px 5px; border-radius: 3px; }
+pre code { background: none; padding: 0; }
+
+.meta {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 16px;
+  font-size: 13px;
+  color: var(--fg-dim);
+  margin: 8px 0 16px;
+}
+.meta dt { font-weight: 600; color: var(--fg); }
+.meta dd { margin: 0; font-family: var(--mono); }
+
+.banner {
+  padding: 10px 12px;
+  border-radius: 4px;
+  margin: 12px 0;
+  font-size: 13px;
+}
+.banner.info { background: var(--info-soft); border: 1px solid var(--info); }
+.banner.warn { background: var(--warn-soft); border: 1px solid var(--warn); }
+.banner.muted { background: var(--bg-soft); border: 1px solid var(--border); color: var(--fg-dim); }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 8px 0 16px;
+  font-size: 13px;
+}
+th, td {
+  padding: 8px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+th {
+  font-weight: 600;
+  color: var(--fg-dim);
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  border-bottom: 2px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+}
+tbody tr:hover { background: var(--bg-soft); }
+
+.badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-family: var(--mono);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.badge.ok      { background: var(--accent-soft); color: var(--accent); }
+.badge.warn    { background: var(--warn-soft);   color: var(--warn); }
+.badge.danger  { background: var(--danger-soft); color: var(--danger); }
+.badge.info    { background: var(--info-soft);   color: var(--info); }
+.badge.muted   { background: var(--bg-soft);     color: var(--fg-dim); border: 1px solid var(--border); }
+
+.totals {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px;
+  margin: 12px 0 20px;
+}
+.tile {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 10px 12px;
+  background: var(--bg-soft);
+}
+.tile .n { font-size: 22px; font-weight: 600; font-family: var(--mono); }
+.tile .k { font-size: 11px; text-transform: uppercase; color: var(--fg-dim); letter-spacing: 0.04em; }
+
+.empty {
+  color: var(--fg-dim);
+  font-style: italic;
+  font-size: 13px;
+  padding: 12px;
+  text-align: center;
+  border: 1px dashed var(--border);
+  border-radius: 4px;
+}
+
+.files { font-family: var(--mono); font-size: 12px; color: var(--fg-dim); }
+.files span { display: inline-block; margin-right: 8px; }
+
+.evidence-list { list-style: none; padding: 0; margin: 0; font-size: 12px; }
+.evidence-list li { margin: 2px 0; }
+
+.checkbox-row {
+  display: grid;
+  grid-template-columns: 28px 1fr;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  align-items: start;
+}
+.checkbox-row:hover { background: var(--bg-soft); }
+.checkbox-row input[type="checkbox"] {
+  width: 18px; height: 18px; margin-top: 2px; cursor: pointer;
+}
+.checkbox-row.checked { opacity: 0.55; text-decoration: line-through solid currentColor 1px; }
+.checkbox-row .label { font-weight: 500; }
+.checkbox-row .sub { font-size: 12px; color: var(--fg-dim); margin-top: 2px; }
+.checkbox-row .sub a { font-family: var(--mono); }
+.checkbox-row .fail-btn {
+  margin-left: 8px;
+  padding: 1px 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--fg-dim);
+  font-size: 11px;
+  font-family: var(--mono);
+  cursor: pointer;
+}
+.checkbox-row .fail-btn:hover { border-color: var(--danger); color: var(--danger); }
+.checkbox-row .fail-btn.active {
+  background: var(--danger-soft); color: var(--danger); border-color: var(--danger);
+}
+
+.summary-bar {
+  position: sticky;
+  bottom: 0;
+  background: var(--bg);
+  border-top: 2px solid var(--border);
+  padding: 10px 12px;
+  margin: 24px -24px -64px;
+  font-size: 13px;
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.summary-bar .count { font-family: var(--mono); font-weight: 600; }
+.summary-bar button {
+  margin-left: auto;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-soft);
+  font-family: var(--sans);
+  font-size: 13px;
+  cursor: pointer;
+  color: var(--fg);
+}
+.summary-bar button:hover { background: var(--border); }
+
+.footer {
+  margin-top: 48px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--fg-dim);
+  text-align: center;
+}
+
+</style>
+</head>
+<body>
+
+<h1>Changelog — campaign-003-2026-07-14-command-center-layer1</h1>
+<p style="margin:0; color: var(--fg-dim); font-size: 14px;">Close epic wisphive#398 — Command Center Layer 1 live ops console: liveness board #400, working-tree strip #401, burn meter #402, plus inbox regression #473 — all with runtime evidence</p>
+
+<dl class="meta"><dt>Status</dt><dd><span class="badge ok">COMPLETE</span></dd><dt>Window</dt><dd>2026-07-15 04:36:30 UTC → 2026-07-15 08:30:00 UTC</dd><dt>Roadmap rows</dt><dd>Phase 3 (#398), §A.4</dd><dt>Out of scope</dt><dd>#439, #440, #441 (fast-follow epics → next campaign), #451-#453 (continuous process), Phase 4+ (werkit#5), §B.*, §C.*</dd><dt>Verify gate</dt><dd><code>just verify (incl. verify-e2e) + per-story runtime screenshots on isolated daemon</code></dd><dt>Orchestrator tokens</dt><dd>122,000 / 200,000</dd><dt>Roadmap source</dt><dd><code>docs/ROADMAP.md</code></dd><dt>Tracker</dt><dd>itr</dd></dl>
+
+<div class="totals"><div class="tile"><div class="n">8</div><div class="k">Verified</div></div><div class="tile"><div class="n">0</div><div class="k">Blocked</div></div><div class="tile"><div class="n">3</div><div class="k">Parked</div></div><div class="tile"><div class="n">3</div><div class="k">Next campaign</div></div><div class="tile"><div class="n">1</div><div class="k">Quarantined</div></div></div>
+
+
+
+<h2>Verified changes</h2>
+<table><thead><tr><th>Item</th><th>Source</th><th>User-visible change</th><th>Evidence</th><th>Files</th></tr></thead><tbody><tr><td><strong>Q-2</strong><br><span style="color: var(--fg-dim);">Agent liveness board: working/waiting/stalled per project x session x subagent, with wave progress</span></td><td>itr#400</td><td>Agent liveness board (view 8): working/waiting/stalled lanes per project x session, Codex lanes, wave progress, inbox cross-link</td><td><ul class="evidence-list"><li><strong>screenshot</strong> · Liveness board: 2 projects, working/waiting/stalled lanes, Codex badge, real clock-driven stalled flip, inbox cross-link target (reviewer-verified untruncated detail) <span class="badge ok">PASS</span> <a href="campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q2-400-board-lanes.png">campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q2-400-board-lanes.png</a></li><li><strong>e2e</strong> · Gates: workspace green (q2-400-rust), clippy, eslint, vitest 176/176, just e2e 12/12 incl. new liveness-board spec with live 600s stall flip <span class="badge ok">PASS</span></li></ul></td><td><span class="files"><span>crates/wisphive_daemon/**</span><span>crates/wisphive_protocol/**</span><span>crates/wisphive_web/**</span><span>crates/wisphive_tui/**</span></span></td></tr><tr><td><strong>Q-3</strong><br><span style="color: var(--fg-dim);">Working-tree strip: per-repo dirty summary, pre-generated conventional commit, per-change agent attribution</span></td><td>itr#401</td><td>Working-tree strip (view 9): per-repo dirty summary, deterministic Conventional-Commit message with copy button, per-change agent attribution — zero write affordances</td><td><ul class="evidence-list"><li><strong>screenshot</strong> · Strip: two dirty fixture repos w/ CC headers + attribution; copy affordance (clipboard-equality in spec); regenerated-clean after manual commit; mobile 390px <span class="badge ok">PASS</span> <a href="campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q3-401-strip-two-repos.png">campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q3-401-strip-two-repos.png</a></li><li><strong>test</strong> · Gates: workspace+clippy green, vitest 206, just e2e 13/13; wave gate just verify exit 0; reviewer 9/9 checks (P1 NUL byte repaired in 36fb881, targeted eslint+vitest 9/9 green) <span class="badge ok">PASS</span> <a href="campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q3-401-e2e.txt">campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q3-401-e2e.txt</a></li></ul></td><td><span class="files"><span>crates/wisphive_daemon/**</span><span>crates/wisphive_protocol/**</span><span>crates/wisphive_web/**</span></span></td></tr><tr><td><strong>Q-4</strong><br><span style="color: var(--fg-dim);">Burn meter: spend vs artifacts per session/run, with dead-run alert</span></td><td>itr#402</td><td>Burn meter (view): labeled activity proxy vs artifact list per session + dead-run alert</td><td><ul class="evidence-list"><li><strong>screenshot</strong> · Burn view: productive tile (labeled &#x27;activity proxy · token spend not observable&#x27;, commit subject + file paths x2) AND red DEAD RUN tile &#x27;12 tool calls over 14m with zero artifacts&#x27; (note: tile/dead-run PNGs are one identical full-page capture — both claims visible); mobile 390px legible <span class="badge ok">PASS</span> <a href="campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q4-402-dead-run.png">campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q4-402-dead-run.png</a></li><li><strong>test</strong> · Gates: workspace green (q4-402-rust), clippy, eslint, vitest 233, just e2e 14/14 (gatr q4-402-e2e independently confirmed); wave gate just verify exit 0; reviewer 10 checks — P1 NUL bytes repaired (d2f0446), P2/P3s filed #552 #553 <span class="badge ok">PASS</span> <a href="campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q4-402-e2e.txt">campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q4-402-e2e.txt</a></li></ul></td><td><span class="files"><span>crates/wisphive_daemon/**</span><span>crates/wisphive_protocol/**</span><span>crates/wisphive_web/**</span></span></td></tr><tr><td><strong>Q-5</strong><br><span style="color: var(--fg-dim);">Deferred deep-link silently no-ops for a stale / non-embedded terminal session</span></td><td>itr#449</td><td>Deferred deep-link to a stale/non-embedded terminal shows a dismissible notice instead of silently no-oping; inbox never wedges</td><td><ul class="evidence-list"><li><strong>test</strong> · #449 still-live proven test-first vs pre-fix code (itr#464 only covered observed disconnects); fix b9daa0c: 2s bounded wait anchored to first sighting, role=status notice, onFocusHandled always fires. Terminals 14/14, frontend vitest 237/237, eslint+tsc clean <span class="badge ok">PASS</span></li></ul></td><td><span class="files"><span>crates/wisphive_web/frontend/src/components/Terminals.tsx</span><span>crates/wisphive_web/frontend/src/components/Inbox.tsx</span></span></td></tr><tr><td><strong>Q-10</strong><br><span style="color: var(--fg-dim);">Fix #473 (no install.sh) + #535 actionable denials + fail-closed posture ADR</span></td><td>itr#473,itr#535</td><td>Deferred AskUserQuestion no longer sticks forever in the inbox; every perms denial now names the exact repair commands (ADR-0010)</td><td><ul class="evidence-list"><li><strong>test</strong> · wisphive_hook suite: 76 pass (incl. 4 defer_audit_dedup + 5 actionable_denials matrix) <span class="badge ok">PASS</span></li><li><strong>log</strong> · #473 E2E: 9/9 assertions, release hook vs isolated strict-perms HOME (dup deferred gone, #388 intact, Codex preserved) <span class="badge ok">PASS</span> <a href="campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q10-473-e2e.txt">campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q10-473-e2e.txt</a></li><li><strong>log</strong> · #535 E2E: UserPromptSubmit still DENIES (exit 2) with full repair-path message on broken HOME <span class="badge ok">PASS</span> <a href="campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q10-535-denial-message.txt">campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q10-535-denial-message.txt</a></li><li><strong>docs</strong> · ADR-0010 fail-closed posture (Accepted, extends ADR-0001) + CLAUDE.md bullet — commits 66ebaba, 0b27594 <span class="badge ok">PASS</span></li></ul></td><td><span class="files"><span>crates/wisphive_hook/**</span><span>docs/decisions/**</span></span></td></tr><tr><td><strong>Q-11</strong><br><span style="color: var(--fg-dim);">#541 rescue script + strict on/off transitions + #537 doctor --fix-perms</span></td><td>itr#541,itr#537</td><td>wisphive on/off strict transitions, doctor --fix-perms, and scripts/wisphive-rescue.sh binary-independent escape hatch</td><td><ul class="evidence-list"><li><strong>test</strong> · wisphive_cli suite: 49 pass; clippy clean; full workspace green (gatr q11-workspace-test, incl. Q-10 hook commits) <span class="badge ok">PASS</span></li><li><strong>log</strong> · Rescue/doctor E2E 5/5: broken-perms diagnose+fix→hook accepts; --off emergency exit; on-from-empty compliant; symlink refused; doctor --fix-perms repairs <span class="badge ok">PASS</span> <a href="campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q11-541-537-e2e.txt">campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q11-541-537-e2e.txt</a></li><li><strong>docs</strong> · Commits 5a3742b (rescue+on/off), 6251d16 (doctor --fix-perms); follow-up itr#543 shared-validator module; CLAUDE.md CLI docs (orchestrator commit) <span class="badge ok">PASS</span></li></ul></td><td><span class="files"><span>scripts/wisphive-rescue.sh</span><span>crates/wisphive_cli/**</span><span>justfile</span></span></td></tr><tr><td><strong>Q-12</strong><br><span style="color: var(--fg-dim);">Fail-safe tail: #534 deliberate perms repair, #536 atomic install preflight, #538 brick detector, #539 red-team upgrade scenario</span></td><td>itr#534,itr#536,itr#538,itr#539</td><td>install.sh is now an atomic preflighted upgrade; brick detector notifies once with repair commands; 41/41 red-team invariants proven vs release binaries</td><td><ul class="evidence-list"><li><strong>log</strong> · just redteam capstone: 17/17 decision-plane (script repaired — had been silently broken since strict-perms) + 24/24 upgrade-safety incl. (a) deliberate deny-all w/ actionable message (b) brick marker/notification once (c) doctor/rescue repair -&gt; hook accepts (d) install preflight aborts/repairs per flag (e) UserPromptSubmit stays DENIED while broken. Reviewer independently RE-RAN: 24/24 reproduced <span class="badge ok">PASS</span> <a href="campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q12-redteam.txt">campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q12-redteam.txt</a></li><li><strong>test</strong> · Install preflight 20/20 (abort leaves old binaries byte-identical; no copy-&gt;codesign window; --fix-perms opt-in repair; env overrides); hook suite 89 green (13 brick/statecheck); final gate just verify exit 0; reviewer paramount check PASS: no new code path alters a decision outcome <span class="badge ok">PASS</span> <a href="campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q12-536-install-preflight.txt">campaign/campaign-003-2026-07-14-command-center-layer1/artifacts/q12-536-install-preflight.txt</a></li></ul></td><td><span class="files"><span>install.sh</span><span>scripts/**</span><span>crates/wisphive_hook/**</span></span></td></tr><tr><td><strong>Q-13</strong><br><span style="color: var(--fg-dim);">Policy: install.sh human-supervised (docs) — CLAUDE.md</span></td><td>itr#540</td><td>Repo law: agents never swap live gated binaries</td><td><ul class="evidence-list"><li><strong>docs</strong> · CLAUDE.md install.sh policy (itr#540) <span class="badge ok">PASS</span></li></ul></td><td><span class="files"><span>CLAUDE.md</span></span></td></tr></tbody></table>
+
+<h2>Blocked &amp; parked</h2>
+<table><thead><tr><th>Item</th><th>Lane</th><th>Notes</th><th>Source</th></tr></thead><tbody><tr><td><strong>Q-1</strong><br><span style="color: var(--fg-dim);">Fix deferred AskUserQuestion sticks forever: PermissionRequest twin has null tool_use_id</span></td><td><span class="badge warn">QUARANTINED</span></td><td>Worker killed by PO mid-incident 2026-07-15 (epic #533: install.sh binary swap bricked live gating). Superseded by Q-10 under the no-install.sh rule (#540). Leftover untracked test file crates/wisphive_hook/tests/defer_audit_dedup.rs handed to Q-10.</td><td>itr#473</td></tr><tr><td><strong>Q-9</strong><br><span style="color: var(--fg-dim);">Process: e2e in per-story verify gate for view/routing/nav stories (#451), AC-contradiction check (#452), full-X-reachable test rule (#453)</span></td><td><span class="badge muted">PARKED</span></td><td>Continuous process improvements — applied as worker-prompt rules in THIS campaign (e2e mandated per story; full-X-reachable tests required), but the itr tickets themselves are /sprint-process work, not campaign deliverables.</td><td>itr#451,itr#452,itr#453</td></tr></tbody></table>
+
+<h2>Drafted into next campaign</h2>
+<table><thead><tr><th>Item</th><th>Source</th><th>Roadmap rows</th><th>Notes</th></tr></thead><tbody><tr><td><strong>Q-6</strong><br><span style="color: var(--fg-dim);">EPIC: In-console remote answering of AskUserQuestion / ExitPlanMode</span></td><td>itr#439</td><td>—</td><td>needs-sprint epic; reverses always-defer for remote answer — security design work. Drafted for campaign-004.</td></tr><tr><td><strong>Q-7</strong><br><span style="color: var(--fg-dim);">EPIC: Auto-clear deferred inbox items when the native prompt is answered</span></td><td>itr#440</td><td>—</td><td>needs-sprint epic; #473 fix is the prerequisite regression cleanup. Drafted for campaign-004.</td></tr><tr><td><strong>Q-8</strong><br><span style="color: var(--fg-dim);">Fast-follow: auto-answer feed as full searchable audit surface</span></td><td>itr#441</td><td>—</td><td>Drafted for campaign-004.</td></tr></tbody></table>
+
+<h2>Wave history</h2>
+<table><thead><tr><th>Wave</th><th>Window</th><th>Bundles</th><th>Verify</th><th>Friction</th><th>Tokens</th><th>Notes</th></tr></thead><tbody><tr><td><strong>W1</strong></td><td>2026-07-15 04:45:00 UTC → 2026-07-15 08:35:00 UTC</td><td>4</td><td><span class="badge ok">GREEN</span></td><td>2 retries, 1 quarantines</td><td>800,736</td><td>Q-1 killed by PO mid-incident (#533 machine-wide gating brick from worker install.sh); scope amended by PO directive — fail-safe bundle (#473+#535, #541+#537, #540) rode alongside #400. Reviewer 7/7 clean, 3 P2s filed (#544-546). Full gate green after 2 environment-related retries (cli WIP teardown, itr#520 e2e saturation flake).</td></tr><tr><td><strong>W2</strong></td><td>2026-07-15 08:40:00 UTC → 2026-07-15 09:55:00 UTC</td><td>1</td><td><span class="badge ok">GREEN</span></td><td>0 retries, 0 quarantines</td><td>385,270</td><td>#401 landed (faa32b0) + IPC docs (14d2274). Reviewer: security invariants genuinely enforced (read-only git allowlist, no client-supplied paths, write-affordance-free UI, honest tests). P1 raw-NUL-byte (source file self-hiding from diff review) repaired by orchestrator (36fb881); P2s filed #548-#550.</td></tr><tr><td><strong>W3</strong></td><td>2026-07-15 10:00:00 UTC → 2026-07-15 10:55:00 UTC</td><td>1</td><td><span class="badge ok">GREEN</span></td><td>0 retries, 0 quarantines</td><td>400,768</td><td>#402 landed (88bcaf0) + IPC docs (f96eca6) + NUL repair (d2f0446). Reviewer: safe-to-close verdict for epic #398 → CLOSED with all seven children done. Honest-proxy labeling verified at three layers. Repeat NUL-byte P1 → #551 escalated to high.</td></tr><tr><td><strong>W4</strong></td><td>2026-07-15 07:50:00 UTC → 2026-07-15 08:30:00 UTC</td><td>2</td><td><span class="badge ok">GREEN</span></td><td>0 retries, 0 quarantines</td><td>307,484</td><td>#449 (test-first proof still-live, b9daa0c) + fail-safe tail #534/#536/#538/#539 (fe3c1ae, ce85d35, 2f3c1fc). Bonus: decision-plane redteam script repaired (silently broken since strict-perms) + sqlite -readonly footgun found (#554/#555). Reviewer: 9/9 checks, 0 P0/P1, re-ran redteam live 24/24. Follow-ups #556-#558.</td></tr></tbody></table>
+
+<div class="footer">
+  Generated by <code>render_campaign_report.py</code> at 2026-07-15 08:30 UTC.
+  Companion reports: <a href="smoke-test.html">smoke-test</a> ·
+  <a href="roadmap-update.html">roadmap-update</a> ·
+  <a href="retro.html">retro</a>
+</div>
+
+</body>
+</html>
