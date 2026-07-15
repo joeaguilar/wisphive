@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use wisphive_daemon::config::{ModeFileState, read_mode_file, write_mode_file_atomic};
+
+use super::statecheck as commands_statecheck;
 use wisphive_daemon::hook_install;
 use wisphive_daemon::project_audit::{AgentHookAudit, HookMode, audit_project};
 
@@ -16,11 +18,10 @@ fn mode_path() -> PathBuf {
     wisphive_home().join("mode")
 }
 
-/// Emergency kill switch — writes "off" to the mode file.
+/// Emergency kill switch — writes "off" to the mode file. Same strict
+/// transition as `wisphive off` (itr#541).
 pub fn emergency_off() -> Result<()> {
-    set_mode("off")?;
-    eprintln!("All Wisphive hooks disabled. Run 'wisphive hooks enable' to re-enable.");
-    Ok(())
+    mode_off()
 }
 
 /// Set the mode file to the given value.
@@ -29,6 +30,49 @@ pub fn set_mode(mode: &str) -> Result<()> {
     write_mode_file_atomic(&path, mode)
         .with_context(|| format!("securely writing {}", path.display()))?;
     eprintln!("Wisphive hooks mode: {mode}");
+    Ok(())
+}
+
+/// `wisphive on` — strict mode transition (itr#541): create/repair the state
+/// dir (0700) and mode file (0600, atomic) so an enabled system always
+/// satisfies the hook's strict validators, refusing on tamper-evidence-class
+/// state (symlinks / foreign owners).
+pub fn mode_on() -> Result<()> {
+    transition_at(&wisphive_home(), "active")?;
+    eprintln!("Wisphive gating is ON: hooks route tool calls through the daemon for review.");
+    Ok(())
+}
+
+/// `wisphive off` — same strict transition writing "off", with a loud notice.
+pub fn mode_off() -> Result<()> {
+    transition_at(&wisphive_home(), "off")?;
+    eprintln!("Wisphive gating is OFF: every hook passes tool calls through WITHOUT review.");
+    eprintln!("Re-enable with: wisphive on");
+    Ok(())
+}
+
+/// Strict, repair-then-enable mode transition against a specific state dir.
+///
+/// Tamper-evidence-class state (symlinked or foreign-owned dir/mode file)
+/// refuses with the exact reason — never silently replaced, because that
+/// state is evidence the operator must inspect. Everything else is repaired
+/// by `write_mode_file_atomic` itself: it creates the dir, tightens it to
+/// 0700 (owner-only, never chowns), and atomically writes a fresh 0600 mode
+/// file, then re-reads it through the same strict validators the hook uses.
+fn transition_at(wisphive_dir: &std::path::Path, mode: &str) -> Result<()> {
+    if let Err(reason) = commands_statecheck::refuse_if_tampered(wisphive_dir) {
+        anyhow::bail!(
+            "refusing to set mode {mode:?}: {reason}\n\
+             (binary-independent alternative: scripts/wisphive-rescue.sh)"
+        );
+    }
+    let path = wisphive_dir.join("mode");
+    write_mode_file_atomic(&path, mode)
+        .with_context(|| format!("securely writing {}", path.display()))?;
+    eprintln!(
+        "Wrote {} = {mode:?} (state dir 0700, mode file 0600, atomic replace)",
+        path.display()
+    );
     Ok(())
 }
 
@@ -191,6 +235,8 @@ fn process_exists(pid: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::install;
+    #[cfg(unix)]
+    use super::{ModeFileState, read_mode_file, transition_at};
 
     fn write_claude_settings(project: &std::path::Path, settings: serde_json::Value) {
         let claude_dir = project.join(".claude");
@@ -300,5 +346,77 @@ mod tests {
         let f = tmp.path().join("mode");
         std::fs::write(&f, "  active  \n").unwrap();
         assert_eq!(std::fs::read_to_string(&f).unwrap().trim(), "active");
+    }
+
+    // ══ Strict mode transitions (itr#541) ══
+
+    #[test]
+    #[cfg(unix)]
+    fn transition_from_empty_home_yields_strict_validator_compliant_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".wisphive");
+        transition_at(&dir, "active").unwrap();
+
+        let dir_perms = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(dir_perms, 0o700);
+        let mode_perms = std::fs::metadata(dir.join("mode"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode_perms, 0o600);
+        // Same strict reader contract the hook enforces.
+        assert_eq!(
+            read_mode_file(&dir.join("mode")).unwrap(),
+            ModeFileState::Active
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn transition_repairs_legacy_loose_perms_then_enables() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".wisphive");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dir.join("mode"), "off").unwrap();
+        std::fs::set_permissions(dir.join("mode"), std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        transition_at(&dir, "active").unwrap();
+        assert_eq!(
+            read_mode_file(&dir.join("mode")).unwrap(),
+            ModeFileState::Active
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn transition_refuses_symlinked_mode_file_with_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".wisphive");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(
+            &dir,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
+        let target = tmp.path().join("target");
+        std::fs::write(&target, "active").unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("mode")).unwrap();
+
+        let error = transition_at(&dir, "off").unwrap_err().to_string();
+        assert!(error.contains("symlink"), "{error}");
+        assert!(error.contains("tamper evidence"), "{error}");
+        // The symlink is untouched — it is evidence.
+        assert!(
+            std::fs::symlink_metadata(dir.join("mode"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 }

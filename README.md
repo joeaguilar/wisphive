@@ -57,7 +57,14 @@ wisphive hooks disable     # instant pass-through, agents keep running
 wisphive hooks uninstall   # remove hooks from .claude/settings.json and .codex/hooks.json
 wisphive daemon stop       # stop the daemon
 wisphive emergency-off     # panic button — disables everything instantly
+wisphive on / wisphive off # strict mode transitions (create/repair mode file with 0700 dir + 0600 file)
 ```
+
+If the hook is denying everything and no wisphive binary works (broken build,
+mis-signed binary, mid-upgrade), `scripts/wisphive-rescue.sh` is the
+binary-independent way out: it diagnoses every strict check the hook enforces
+on `~/.wisphive` with the exact fix per failure, `--fix` applies safe
+owner-only repairs, and `--off` is the emergency exit that disables gating.
 
 ## TUI Dashboard
 
@@ -195,9 +202,13 @@ wisphive hooks enable              # set mode to active
 wisphive hooks disable             # set mode to off (pass-through)
 wisphive hooks status              # show hook/daemon status and Codex hook-review reminder
 wisphive emergency-off             # kill switch — disables everything
+wisphive on                        # enable gating (strict transition: dir 0700, mode file 0600)
+wisphive off                       # disable gating via the same strict transition
 wisphive config list               # show all config
 wisphive config set <key> <value>  # set a config value
-wisphive doctor                    # diagnose setup issues
+wisphive doctor                    # diagnose setup issues (incl. every strict hook validator)
+wisphive doctor --fix-perms        # apply safe owner-only permission repairs
+scripts/wisphive-rescue.sh         # same diagnosis/repair with NO wisphive binary required
 wisphive agent start --agent-type claude_code --prompt "..."  # spawn Claude Code
 wisphive agent start --agent-type codex --prompt "..."        # spawn Codex
 wisphive history list              # browse audit history

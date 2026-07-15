@@ -146,6 +146,11 @@ reinstall:
 off:
     wisphive emergency-off
 
+# Binary-independent rescue: diagnose the strict ~/.wisphive state the hook
+# enforces (works even when every wisphive binary is broken). Also: --fix, --off.
+rescue *ARGS:
+    sh scripts/wisphive-rescue.sh {{ARGS}}
+
 # Doctor / health check
 doctor:
     wisphive doctor
