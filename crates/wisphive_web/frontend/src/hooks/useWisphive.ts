@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   AgentInfo,
+  ArtifactTouch,
   AuditDecision,
   ClientMessage,
   ConfigAlertKind,
@@ -30,6 +31,10 @@ export interface WisphiveState {
   /** Read-only working-tree probe results (itr#401, spec §5.3). Refreshed by
    * `query_worktrees`; the Worktrees strip polls it. */
   worktrees: WorktreeStatus[];
+  /** Recent approved artifact-candidate tool calls (itr#402, spec §5.4).
+   * Refreshed by `query_burn`; the Burn meter polls it and classifies the
+   * rows into artifact signals client-side (components/burnMeter.ts). */
+  burnTouches: ArtifactTouch[];
   /** Per-project Wisphive hook install state (itr#460), keyed by absolute
    * project path. Lazily populated by `query_project_hook_status` /
    * `install_hooks_result`; drives the Projects view gating badges. */
@@ -170,6 +175,7 @@ export function useWisphive() {
     sessions: [],
     projects: [],
     worktrees: [],
+    burnTouches: [],
     hookStatus: {},
     hookErrors: {},
     auditDecisions: [],
@@ -373,6 +379,9 @@ export function useWisphive() {
 
           case "worktrees_response":
             return { ...prev, worktrees: msg.worktrees };
+
+          case "burn_response":
+            return { ...prev, burnTouches: msg.touches };
 
           case "project_hook_status": {
             const status = msg.status;
@@ -727,6 +736,12 @@ export function useWisphive() {
     send({ type: "query_worktrees" });
   }, [send]);
 
+  /** Ask the daemon for recent approved artifact-candidate calls (itr#402).
+   * Read-only server-side — one windowed SELECT over decision_log. */
+  const queryBurn = useCallback(() => {
+    send({ type: "query_burn" });
+  }, [send]);
+
   /** Install (or repair) Wisphive hooks into a project (itr#460). Sudo-gated
    * server-side: the daemon may bounce with `web_reauth_required`, so we stash
    * the project before sending — a successful reauth replays exactly this
@@ -863,6 +878,7 @@ export function useWisphive() {
     querySessions,
     queryProjects,
     queryWorktrees,
+    queryBurn,
     installHooks,
     queryProjectHookStatus,
     searchHistory,

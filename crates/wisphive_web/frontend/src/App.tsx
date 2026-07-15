@@ -13,6 +13,7 @@ import { History } from "./components/History";
 import { Sessions } from "./components/Sessions";
 import { Projects } from "./components/Projects";
 import { Worktrees } from "./components/Worktrees";
+import { Burn } from "./components/Burn";
 import { Agents } from "./components/Agents";
 import { SpawnModal } from "./components/SpawnModal";
 import { Modal } from "./components/Modal";
@@ -24,7 +25,7 @@ import { DiskAlertBanner } from "./components/DiskAlertBanner";
 import { ConfigAlertBanner } from "./components/ConfigAlertBanner";
 import "./app.css";
 
-type View = "inbox" | "board" | "queue" | "history" | "sessions" | "projects" | "worktrees" | "agents" | "config" | "terminals";
+type View = "inbox" | "board" | "queue" | "history" | "sessions" | "projects" | "worktrees" | "burn" | "agents" | "config" | "terminals";
 
 function App() {
   const auth = useAuth();
@@ -62,9 +63,9 @@ function App() {
 
 function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
   const {
-    connected, queue, agents, projects, worktrees, hookStatus, hookErrors, auditDecisions, endedAgentIds, history, agentTimeline, sessionTimeline, sessions, terminals,
+    connected, queue, agents, projects, worktrees, burnTouches, hookStatus, hookErrors, auditDecisions, endedAgentIds, history, agentTimeline, sessionTimeline, sessions, terminals,
     pendingReauth, diskAlerts, configAlerts, approve, deny, dismissReauth, retryPendingApprove,
-    spawnAgent, queryProjects, queryWorktrees, installHooks, queryProjectHookStatus, queryHistory, queryAgentTimeline, querySessionTimeline, searchHistory, querySessions,
+    spawnAgent, queryProjects, queryWorktrees, queryBurn, installHooks, queryProjectHookStatus, queryHistory, queryAgentTimeline, querySessionTimeline, searchHistory, querySessions,
     termList, termCreate, termAttach, termDetach, termInput, termResize, termClose, termReplay, termSetGroup, termReorder, registerTerminalHandler,
   } = useWisphive();
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -104,6 +105,14 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
     }
     setView("inbox");
   }, []);
+
+  // The burn meter's pull feeds: artifact-candidate rows (query_burn) plus the
+  // session aggregates that type its tiles. Stable identity so the meter's
+  // poll effect doesn't churn.
+  const loadBurn = useCallback(() => {
+    queryBurn();
+    querySessions();
+  }, [queryBurn, querySessions]);
 
   // The keyboard-navigation list must match the on-screen order of the active
   // view: the Inbox renders oldest-first (orderByAge), the Queue renders raw
@@ -159,6 +168,7 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
     onViewConfig: () => setView("config"),
     onViewTerminals: () => setView("terminals"),
     onViewWorktrees: () => setView("worktrees"),
+    onViewBurn: () => setView("burn"),
     onSpawn: () => setShowSpawn(true),
     onHelp: () => setShowHelp((v) => !v),
   }), [handleNext, handlePrev, selectedId, view, navList, approve, deny, showHelp, showSpawn, agentDrilldown, sessionAgent]);
@@ -202,6 +212,9 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
         </button>
         <button className={view === "worktrees" ? "active" : ""} onClick={() => setView("worktrees")}>
           Worktrees
+        </button>
+        <button className={view === "burn" ? "active" : ""} onClick={() => setView("burn")}>
+          Burn
         </button>
         <button className={view === "agents" ? "active" : ""} onClick={() => setView("agents")}>
           Agents {agents.length > 0 && <span className="badge">{agents.length}</span>}
@@ -321,6 +334,14 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
         {view === "worktrees" && (
           <Worktrees worktrees={worktrees} onLoad={queryWorktrees} />
         )}
+        {view === "burn" && (
+          <Burn
+            sessions={sessions}
+            auditDecisions={auditDecisions}
+            burnTouches={burnTouches}
+            onLoad={loadBurn}
+          />
+        )}
         {view === "terminals" && (
           <Terminals
             terminals={terminals}
@@ -376,6 +397,7 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
               <div className="help-row"><kbd>7</kbd> Terminals</div>
               <div className="help-row"><kbd>8</kbd> Board</div>
               <div className="help-row"><kbd>9</kbd> Worktrees</div>
+              <div className="help-row"><kbd>0</kbd> Burn</div>
               <div className="help-row"><kbd>?</kbd> This help</div>
             </div>
           </div>

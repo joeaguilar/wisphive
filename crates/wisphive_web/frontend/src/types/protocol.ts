@@ -203,6 +203,7 @@ export type ServerMessage =
   | { type: "sessions_response"; sessions: SessionSummary[] }
   | { type: "projects_response"; projects: ProjectSummary[] }
   | { type: "worktrees_response"; worktrees: WorktreeStatus[] }
+  | { type: "burn_response"; touches: ArtifactTouch[] }
   | { type: "project_hook_status"; status: ProjectHookStatus }
   | { type: "install_hooks_result"; project: string; status?: ProjectHookStatus; error?: string }
   | { type: "reimport_complete"; count: number }
@@ -276,6 +277,20 @@ export interface WorktreeStatus {
   diffstat?: string;
   probed_at: string;
   error?: string;
+}
+
+/** One APPROVED artifact-candidate tool call from the decision log (itr#402,
+ * spec §5.4 burn meter): Edit/Write/MultiEdit/NotebookEdit/Bash rows the
+ * client classifies into artifact signals (see components/burnMeter.ts). Covers
+ * both human-approved and auto-approved calls. `tool_input` is redacted
+ * upstream (itr#89) and is untrusted display data — inert text only. */
+export interface ArtifactTouch {
+  agent_id: string;
+  project: string;
+  tool_name: string;
+  /** Optional on the wire (elided when null) — additive-fields contract. */
+  tool_input?: JsonValue;
+  ts: string;
 }
 
 /** Wire mirror of `wisphive_protocol::ProjectHookStatus` (itr#460) — a
@@ -413,6 +428,11 @@ export function parseServerMessage(data: string): ServerMessage {
       return {
         type,
         worktrees: readField(message, "worktrees", arrayOf(parseWorktreeStatus), "message"),
+      };
+    case "burn_response":
+      return {
+        type,
+        touches: readField(message, "touches", arrayOf(parseArtifactTouch), "message"),
       };
     case "project_hook_status":
       return { type, status: parseProjectHookStatus(message, "message") };
@@ -748,6 +768,18 @@ function parseWorktreeStatus(value: unknown, path: string): WorktreeStatus {
   };
 }
 
+function parseArtifactTouch(value: unknown, path: string): ArtifactTouch {
+  const touch = readObject(value, path);
+  return {
+    agent_id: readField(touch, "agent_id", readString, path),
+    project: readField(touch, "project", readString, path),
+    tool_name: readField(touch, "tool_name", readString, path),
+    // Optional on the wire (elided when null) — additive-fields contract.
+    tool_input: readOptionalField(touch, "tool_input", readJsonValue, path),
+    ts: readField(touch, "ts", readRfc3339, path),
+  };
+}
+
 function parseProjectHookStatus(value: unknown, path: string): ProjectHookStatus {
   const status = readObject(value, path);
   return {
@@ -1080,6 +1112,7 @@ export type ClientMessage =
   | { type: "query_sessions" }
   | { type: "query_projects" }
   | { type: "query_worktrees" }
+  | { type: "query_burn" }
   | { type: "install_hooks"; project: string }
   | { type: "query_project_hook_status"; project: string }
   | { type: "reimport_events" }

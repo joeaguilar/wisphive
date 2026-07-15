@@ -1089,6 +1089,34 @@ pub struct WorktreeStatus {
     pub error: Option<String>,
 }
 
+/// One APPROVED artifact-candidate tool call from the decision log, served in
+/// [`crate::ServerMessage::BurnResponse`] for the burn meter (itr#402,
+/// Command Center spec §5.4).
+///
+/// The daemon returns raw rows for the tools whose inputs can evidence a
+/// concrete artifact (`Edit`/`Write`/`MultiEdit`/`NotebookEdit`/`Bash` — the
+/// same candidate set as the working-tree attribution query, itr#401);
+/// classification into artifact signals (file writes, `git commit`
+/// invocations) happens client-side so the honest-proxy math stays
+/// unit-testable in one place. Rows cover both human-approved and
+/// auto-approved calls. `tool_input` is secret-redacted upstream (itr#89).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArtifactTouch {
+    /// Session/agent id the call belongs to.
+    pub agent_id: String,
+    /// Project the call ran in.
+    pub project: PathBuf,
+    /// Gated tool name (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`, `Bash`).
+    pub tool_name: String,
+    /// Redacted tool input (file paths / Bash command text). Untrusted display
+    /// data. Optional on the wire — an elided field decodes as `Null` per the
+    /// additive-fields contract.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub tool_input: serde_json::Value,
+    /// When the call was resolved (approved).
+    pub ts: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::fixtures::make_request;

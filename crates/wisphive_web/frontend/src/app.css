@@ -2846,3 +2846,254 @@ kbd {
     flex-wrap: wrap;
   }
 }
+
+/* ── Burn meter (itr#402, spec §5.4) ─────────────────────────────────
+ * Read-only state mirror: per session — a LABELLED activity proxy for
+ * spend (gated tool calls · active wall-clock; model tokens are not
+ * observable) beside the session's concrete artifact signals, with a
+ * loud dead-run alert. The ONLY interactive elements are artifact-list
+ * expanders — the meter never stops, throttles, or retargets anything. */
+
+.burn {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-lg);
+  max-width: 900px;
+}
+
+.burn-header h2 {
+  font-size: 18px;
+  margin-bottom: var(--space-xs);
+}
+
+.burn-counts {
+  color: var(--text);
+  font-size: var(--font-base);
+}
+
+.burn-note {
+  color: var(--text-dim);
+  font-size: var(--font-sm);
+  margin-top: var(--space-xs);
+}
+
+.burn-empty {
+  color: var(--text-dim);
+  padding: var(--space-xl);
+  text-align: center;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.burn-project-header {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-sm);
+  margin-bottom: var(--space-sm);
+  min-width: 0;
+}
+
+.burn-project-name {
+  font-weight: 700;
+  color: var(--text);
+}
+
+.burn-project-path {
+  color: var(--text-dim);
+  font-size: var(--font-sm);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.burn-tiles {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+
+.burn-tile {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-md);
+  min-width: 0;
+}
+
+/* Redundant Signal Rule: dead runs carry the border, the banner word, and
+ * the role="alert" together — never hue alone. */
+.burn-tile.dead-run {
+  border-color: var(--red);
+  background: rgba(244, 67, 54, 0.08);
+}
+
+.burn-topline {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  min-width: 0;
+}
+
+.burn-agent {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.burn-type-badge {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1px 6px;
+}
+
+.burn-type-badge.type-codex { color: var(--cyan); border-color: var(--cyan); }
+
+.burn-age {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--text-dim);
+  font-size: var(--font-sm);
+}
+
+.burn-spend {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--space-sm);
+  margin-top: var(--space-sm);
+}
+
+.burn-proxy-label {
+  flex: 0 0 auto;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1px 6px;
+}
+
+.burn-spend-value {
+  color: var(--text);
+  font-size: var(--font-base);
+}
+
+.burn-proxy-note {
+  color: var(--text-dim);
+  font-size: 10px;
+}
+
+.burn-dead-alert {
+  margin-top: var(--space-sm);
+  color: var(--red);
+  font-weight: 700;
+  font-size: var(--font-base);
+  overflow-wrap: anywhere;
+}
+
+.burn-no-artifacts {
+  margin-top: var(--space-sm);
+  color: var(--text-dim);
+  font-size: var(--font-sm);
+}
+
+.burn-artifact-summary {
+  margin-top: var(--space-sm);
+  color: var(--text);
+  font-size: var(--font-sm);
+}
+
+.burn-artifacts {
+  list-style: none;
+  margin: var(--space-xs) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+}
+
+.burn-artifact {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-sm);
+  font-size: var(--font-sm);
+  min-width: 0;
+}
+
+.artifact-kind {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0 6px;
+}
+
+.artifact-kind.commit {
+  color: var(--green);
+  border-color: var(--green);
+}
+
+.artifact-label {
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.artifact-count {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+}
+
+.artifact-tool {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--text-dim);
+  font-size: 10px;
+}
+
+.burn-expand {
+  margin-top: var(--space-sm);
+  background: var(--bg-card);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px 10px;
+  font-size: var(--font-sm);
+  cursor: pointer;
+  min-height: var(--touch-min);
+}
+
+.burn-expand:hover {
+  background: var(--bg-card-hover);
+}
+
+@media (max-width: 768px) {
+  .burn-topline {
+    flex-wrap: wrap;
+  }
+  .burn-age {
+    margin-left: 0;
+    width: 100%;
+  }
+  .burn-spend {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--space-xs);
+  }
+  .burn-artifact {
+    flex-wrap: wrap;
+  }
+  .artifact-tool {
+    margin-left: 0;
+  }
+  .burn-project-path { display: none; }
+  .burn-expand {
+    width: 100%;
+  }
+}

@@ -6,10 +6,10 @@ use std::path::PathBuf;
 use std::collections::HashMap;
 
 use crate::types::{
-    AgentInfo, AgentType, AuditDecision, Decision, DecisionFilter, DecisionRequest, HistoryEntry,
-    HistorySearch, ManagedAgent, PermissionSuggestion, ProjectHookStatus, ProjectSummary,
-    SessionSummary, SpawnAgentRequest, TerminalDirection, TerminalSessionMeta, TerminalStatus,
-    ToolResult, WorktreeStatus,
+    AgentInfo, AgentType, ArtifactTouch, AuditDecision, Decision, DecisionFilter, DecisionRequest,
+    HistoryEntry, HistorySearch, ManagedAgent, PermissionSuggestion, ProjectHookStatus,
+    ProjectSummary, SessionSummary, SpawnAgentRequest, TerminalDirection, TerminalSessionMeta,
+    TerminalStatus, ToolResult, WorktreeStatus,
 };
 
 /// Identifies the type of client connecting to the daemon.
@@ -160,6 +160,14 @@ pub enum ClientMessage {
     /// stages, commits, or otherwise writes — the strip is a state mirror.
     #[serde(rename = "query_worktrees")]
     QueryWorktrees,
+
+    /// Query recent APPROVED artifact-candidate tool calls for the burn meter
+    /// (itr#402, Command Center spec §5.4). Strictly read-only daemon-side —
+    /// one windowed SELECT over `decision_log`; the meter is a state mirror
+    /// that never stops, throttles, or retargets anything. Answered with a
+    /// [`ServerMessage::BurnResponse`].
+    #[serde(rename = "query_burn")]
+    QueryBurn,
 
     /// Web UI asks the daemon to install Wisphive hooks into `project`
     /// (itr#460). Sudo-class: the write lands in the project's
@@ -465,6 +473,12 @@ pub enum ServerMessage {
     /// status per active project (itr#401, spec §5.3).
     #[serde(rename = "worktrees_response")]
     WorktreesResponse { worktrees: Vec<WorktreeStatus> },
+
+    /// Response to [`ClientMessage::QueryBurn`]: recent approved
+    /// artifact-candidate tool calls from the decision log (itr#402,
+    /// spec §5.4 burn meter).
+    #[serde(rename = "burn_response")]
+    BurnResponse { touches: Vec<ArtifactTouch> },
 
     /// Response to [`ClientMessage::QueryProjectHookStatus`]: the project's
     /// current hook install state (itr#460).
@@ -1227,6 +1241,57 @@ mod tests {
                 assert!(!wt.detached);
                 assert!(wt.changes.is_empty());
                 assert!(!wt.changes_truncated);
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_query_burn() {
+        let msg = ClientMessage::QueryBurn;
+        let encoded = encode(&msg).unwrap();
+        assert!(encoded.contains("\"type\":\"query_burn\""));
+        let decoded: ClientMessage = decode(&encoded).unwrap();
+        assert!(matches!(decoded, ClientMessage::QueryBurn));
+    }
+
+    #[test]
+    fn round_trip_burn_response() {
+        use crate::types::ArtifactTouch;
+        let touch = ArtifactTouch {
+            agent_id: "cc-burn-1".into(),
+            project: PathBuf::from("/proj/alpha"),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({"command": "git commit -m 'feat: x'"}),
+            ts: chrono::Utc::now(),
+        };
+        let msg = ServerMessage::BurnResponse {
+            touches: vec![touch.clone()],
+        };
+        let encoded = encode(&msg).unwrap();
+        assert!(encoded.contains("\"type\":\"burn_response\""));
+        let decoded: ServerMessage = decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::BurnResponse { touches } => {
+                assert_eq!(touches, vec![touch]);
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    /// A minimal frame from an older/leaner daemon (`tool_input` elided) must
+    /// still decode — the additive-fields contract (mirrors the worktrees
+    /// backward-compat test).
+    #[test]
+    fn decode_minimal_artifact_touch_is_backward_compatible() {
+        let minimal = r#"{"type":"burn_response","touches":[{"agent_id":"cc-1","project":"/p","tool_name":"Write","ts":"2026-07-15T00:00:00Z"}]}"#;
+        let decoded: ServerMessage = decode(minimal).unwrap();
+        match decoded {
+            ServerMessage::BurnResponse { touches } => {
+                assert_eq!(touches.len(), 1);
+                assert_eq!(touches[0].agent_id, "cc-1");
+                assert_eq!(touches[0].tool_name, "Write");
+                assert!(touches[0].tool_input.is_null());
             }
             _ => panic!("unexpected variant"),
         }

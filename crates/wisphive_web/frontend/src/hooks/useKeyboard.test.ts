@@ -38,6 +38,16 @@ describe("useKeyboard", () => {
     expect(onViewWorktrees).toHaveBeenCalledOnce();
   });
 
+  it("invokes onViewBurn when 0 is pressed", () => {
+    const onViewBurn = vi.fn();
+
+    renderHook(() => useKeyboard({ onViewBurn }));
+
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "0" }));
+
+    expect(onViewBurn).toHaveBeenCalledOnce();
+  });
+
   it("keeps one listener across action changes and calls the latest action", () => {
     const addListener = vi.spyOn(window, "addEventListener");
     const removeListener = vi.spyOn(window, "removeEventListener");

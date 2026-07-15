@@ -1360,6 +1360,7 @@ async fn dispatch_command(
         | ClientMessage::QuerySessions
         | ClientMessage::QueryProjects
         | ClientMessage::QueryWorktrees
+        | ClientMessage::QueryBurn
         | ClientMessage::QueryProjectHookStatus { .. } => {
             handle_query_command(writer, ctx, msg).await?;
         }
@@ -2872,6 +2873,57 @@ async fn handle_query_command(
             }
 
             write_msg(writer, &ServerMessage::WorktreesResponse { worktrees }).await?;
+        }
+        ClientMessage::QueryBurn => {
+            // Burn meter (itr#402, spec §5.4). Strictly read-only: one
+            // windowed SELECT over decision_log — the meter displays and
+            // alerts; it never stops, throttles, or retargets anything. No
+            // sudo gate — nothing is written.
+            //
+            // Window mirrors the client's BURN_WINDOW_MS (1h, the Burst-mode
+            // horizon shared with the liveness board / audit snapshot) so a
+            // reconnecting client can honestly reconstruct every visible
+            // meter row. Row cap bounds a pathological hour.
+            const BURN_WINDOW_SECS: i64 = 3600;
+            const MAX_BURN_ROWS: u32 = 1000;
+
+            let since =
+                (chrono::Utc::now() - chrono::Duration::seconds(BURN_WINDOW_SECS)).to_rfc3339();
+            match ctx
+                .state_db
+                .recent_artifact_touches(&since, MAX_BURN_ROWS)
+                .await
+            {
+                Ok(rows) => {
+                    let touches: Vec<wisphive_protocol::ArtifactTouch> = rows
+                        .into_iter()
+                        .filter_map(|(agent_id, project, tool_name, tool_input, resolved_at)| {
+                            Some(wisphive_protocol::ArtifactTouch {
+                                agent_id,
+                                project: std::path::PathBuf::from(project),
+                                tool_name,
+                                // Redacted upstream (itr#89); unparseable input
+                                // degrades to Null, never drops the row.
+                                tool_input: serde_json::from_str(&tool_input)
+                                    .unwrap_or(serde_json::Value::Null),
+                                ts: chrono::DateTime::parse_from_rfc3339(&resolved_at)
+                                    .ok()?
+                                    .with_timezone(&chrono::Utc),
+                            })
+                        })
+                        .collect();
+                    write_msg(writer, &ServerMessage::BurnResponse { touches }).await?;
+                }
+                Err(e) => {
+                    write_msg(
+                        writer,
+                        &ServerMessage::Error {
+                            message: format!("burn query failed: {e}"),
+                        },
+                    )
+                    .await?;
+                }
+            }
         }
         ClientMessage::QueryProjectHookStatus { ref project } => {
             // Read-only: audit the project on disk and reply. No sudo gate —

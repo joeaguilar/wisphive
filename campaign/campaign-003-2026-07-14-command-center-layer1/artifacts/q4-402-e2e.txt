@@ -1,0 +1,6 @@
+
+Running 1 test using 1 worker
+
+  ✓  1 [chromium] › e2e/burn-meter.spec.ts:168:1 › burn meter shows labelled spend proxy + artifacts, and trips the dead-run alert (15.9s)
+
+  1 passed (17.7s)
