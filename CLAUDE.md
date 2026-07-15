@@ -34,6 +34,8 @@ just e2e                         # Playwright e2e smoke suite (isolated temp HOM
 
 `just verify` is the close-with-evidence gate: it runs every sub-gate under its own gatr tag (`verify-fmt`, `verify-clippy`, `verify-rust`, `verify-frontend`, `verify-e2e`), fails fast on the first red gate, and `gatr last` / `gatr errors` reproduce each tag's result afterward. TUI snapshot tests run inside `verify-rust` (`cargo test --workspace`).
 
+**`./install.sh` is a human-supervised action — agents/subagents must NEVER run it while live gated sessions exist** (incident 2026-07-15, itr#533): swapping the installed `wisphive-hook` under running Claude Code/Codex sessions can change enforcement semantics mid-flight (e.g. new strict perms checks + legacy `~/.wisphive` state + fail-closed default denied every hook event, including UserPromptSubmit, until the operator repaired perms by hand — a deliberate security stop, but only the operator may choose that moment). Agents verify hook changes by driving the freshly built `./target/release/wisphive-hook` against an **isolated temp HOME** instead; an AC saying "verified against the installed binary" is satisfied that way, with the actual install left to the operator (see itr#536/#540/#541 for the atomic-install preflight, policy, and rescue-script work).
+
 Prefer `just <task>` for common workflows — see `justfile` for the full list (`build`, `test`, `clippy`, `daemon`, `tui`, `web`, `web-dev`, `frontend-dev`, `frontend-build`, `bootstrap`, `reinstall`, `doctor`, `off`, etc.).
 
 Two binaries are produced: `wisphive` (CLI/daemon/TUI/web) and `wisphive-hook` (Claude Code/Codex hook subprocess).
