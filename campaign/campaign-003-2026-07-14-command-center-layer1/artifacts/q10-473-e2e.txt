@@ -1,0 +1,49 @@
+=== itr#473 E2E transcript — 2026-07-15T05:48:47Z ===
+binary: /Users/josefaguilar/AI_Projects/wisphive/target/release/wisphive-hook
+sha256: d7297dea4a7de36c7f86e3fd9f39fe75a56f234eceeb291cb641b00b36ecc53d
+built from: 34d05eedbe2fc97fa03337333ca036b9af0fbcb9 (branch crossfire-blitz/20260712-230112)
+
+--- isolated HOME state (/tmp/whq10) ---
+total 16
+drwx------@ 4 josefaguilar  wheel  128 Jul 15 00:48 .
+drwx------@ 3 josefaguilar  wheel   96 Jul 15 00:48 ..
+-rw-------@ 1 josefaguilar  wheel    2 Jul 15 00:48 config.json
+-rw-------@ 1 josefaguilar  wheel    7 Jul 15 00:48 mode
+
+=== (a) Claude PreToolUse AskUserQuestion (tool_use_id=toolu_q10_473) ===
+stdin: {"hook_event_name":"PreToolUse","session_id":"q10-473-e2e","tool_name":"AskUserQuestion","tool_use_id":"toolu_q10_473","tool_input":{"questions":[{"question":"Which option?","options":[{"label":"A"},{"label":"B"}]}]},"cwd":"/tmp/whq10"}
+exit: 0
+stdout: {"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask"}}
+stderr: 
+PASS: (a) exit code 0
+PASS: (a) permissionDecision == ask (defers to native prompt)
+
+=== (b) Claude PermissionRequest twin (tool_use_id=null, permission_suggestions present) ===
+stdin: {"hook_event_name":"PermissionRequest","session_id":"q10-473-e2e","tool_name":"AskUserQuestion","tool_use_id":null,"tool_input":{"questions":[{"question":"Which option?","options":[{"label":"A"},{"label":"B"}]}]},"permission_suggestions":[{"behavior":"allow","destination":"session","rules":[{"toolName":"AskUserQuestion"}]}],"cwd":"/tmp/whq10"}
+exit: 0
+stdout: ''
+stderr: 
+PASS: (b) exit code 0
+PASS: (b) empty stdout (Ask emits no decision object -> native dialog renders, itr#388 intact)
+
+=== (c) Codex PermissionRequest AskUserQuestion (no PreToolUse twin exists on Codex) ===
+stdin: {"hook_event_name":"PermissionRequest","session_id":"q10-473-codex","tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Which option?","options":[{"label":"A"},{"label":"B"}]}]},"cwd":"/tmp/whq10"}
+exit: 0
+stdout: ''
+stderr: 
+PASS: (c) exit code 0
+PASS: (c) empty stdout (Ask on Codex PermissionRequest defers to Codex native approval)
+
+=== $HOME/.wisphive/events.jsonl (full contents) ===
+{"agent_id":"cc-q10-473-e2e","agent_type":"claude_code","config_hash":"44136fa355b3678a","decided_by":"always_ask:intrinsic","event":"deferred","hook_event_name":"PreToolUse","project":"/tmp/whq10","timestamp":"2026-07-15T05:48:47.290136+00:00","tool_input":{"questions":[{"options":[{"label":"A"},{"label":"B"}],"question":"Which option?"}]},"tool_name":"AskUserQuestion","tool_use_id":"toolu_q10_473"}
+{"agent_id":"codex-q10-473-codex","agent_type":"codex","config_hash":"44136fa355b3678a","decided_by":"always_ask:intrinsic","event":"deferred","hook_event_name":"PermissionRequest","project":"/tmp/whq10","timestamp":"2026-07-15T05:48:47.369999+00:00","tool_input":{"questions":[{"options":[{"label":"A"},{"label":"B"}],"question":"Which option?"}]},"tool_name":"AskUserQuestion","tool_use_id":null}
+
+PASS: exactly ONE Claude deferred record for the twin pair
+PASS: ...and it is the resolvable PreToolUse record carrying toolu_q10_473
+PASS: ZERO Claude PermissionRequest orphan records (the itr#473 bug)
+PASS: Codex PermissionRequest deferred record PRESERVED
+PASS: total deferred records == 2 (one Claude + one Codex)
+
+=== real ~/.wisphive untouched check ===
+isolated HOME used: /tmp/whq10 (real HOME /Users/josefaguilar was never passed to the hook)
+RESULT: ALL ASSERTIONS PASSED
