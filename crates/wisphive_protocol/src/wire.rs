@@ -9,7 +9,7 @@ use crate::types::{
     AgentInfo, AgentType, AuditDecision, Decision, DecisionFilter, DecisionRequest, HistoryEntry,
     HistorySearch, ManagedAgent, PermissionSuggestion, ProjectHookStatus, ProjectSummary,
     SessionSummary, SpawnAgentRequest, TerminalDirection, TerminalSessionMeta, TerminalStatus,
-    ToolResult,
+    ToolResult, WorktreeStatus,
 };
 
 /// Identifies the type of client connecting to the daemon.
@@ -153,6 +153,13 @@ pub enum ClientMessage {
     /// Query project summaries (aggregated across all agents).
     #[serde(rename = "query_projects")]
     QueryProjects,
+
+    /// Query working-tree status for the daemon's active projects (itr#401,
+    /// Command Center spec §5.3). Strictly read-only daemon-side: the probe
+    /// runs only non-mutating git commands (`status` / `diff`) and never
+    /// stages, commits, or otherwise writes — the strip is a state mirror.
+    #[serde(rename = "query_worktrees")]
+    QueryWorktrees,
 
     /// Web UI asks the daemon to install Wisphive hooks into `project`
     /// (itr#460). Sudo-class: the write lands in the project's
@@ -453,6 +460,11 @@ pub enum ServerMessage {
     /// Response to QueryProjects: list of project summaries.
     #[serde(rename = "projects_response")]
     ProjectsResponse { projects: Vec<ProjectSummary> },
+
+    /// Response to [`ClientMessage::QueryWorktrees`]: read-only working-tree
+    /// status per active project (itr#401, spec §5.3).
+    #[serde(rename = "worktrees_response")]
+    WorktreesResponse { worktrees: Vec<WorktreeStatus> },
 
     /// Response to [`ClientMessage::QueryProjectHookStatus`]: the project's
     /// current hook install state (itr#460).
@@ -1134,6 +1146,90 @@ mod tests {
         let encoded = encode(&msg).unwrap();
         let decoded: ClientMessage = decode(&encoded).unwrap();
         assert!(matches!(decoded, ClientMessage::QueryProjects));
+    }
+
+    #[test]
+    fn round_trip_query_worktrees() {
+        let msg = ClientMessage::QueryWorktrees;
+        let encoded = encode(&msg).unwrap();
+        assert!(encoded.contains("\"type\":\"query_worktrees\""));
+        let decoded: ClientMessage = decode(&encoded).unwrap();
+        assert!(matches!(decoded, ClientMessage::QueryWorktrees));
+    }
+
+    #[test]
+    fn round_trip_worktrees_response() {
+        use crate::types::{WorktreeChange, WorktreeStatus};
+        let wt = WorktreeStatus {
+            project: PathBuf::from("/Users/test/proj"),
+            is_git_repo: true,
+            branch: Some("main".into()),
+            detached: false,
+            head: Some("abc123def4567890abc123def4567890abc123de".into()),
+            upstream: Some("origin/main".into()),
+            ahead: Some(2),
+            behind: Some(0),
+            changes: vec![
+                WorktreeChange {
+                    path: "src/lib.rs".into(),
+                    status: ".M".into(),
+                    orig_path: None,
+                    attributed_to: Some("cc-worker-1".into()),
+                    attributed_tool: Some("Edit".into()),
+                },
+                WorktreeChange {
+                    path: "notes.txt".into(),
+                    status: "??".into(),
+                    orig_path: None,
+                    attributed_to: None,
+                    attributed_tool: None,
+                },
+                WorktreeChange {
+                    path: "b.txt".into(),
+                    status: "R.".into(),
+                    orig_path: Some("a.txt".into()),
+                    attributed_to: None,
+                    attributed_tool: None,
+                },
+            ],
+            changes_truncated: false,
+            diffstat: Some("1 file changed, 3 insertions(+)".into()),
+            probed_at: chrono::Utc::now(),
+            error: None,
+        };
+        let msg = ServerMessage::WorktreesResponse {
+            worktrees: vec![wt.clone()],
+        };
+        let encoded = encode(&msg).unwrap();
+        assert!(encoded.contains("\"type\":\"worktrees_response\""));
+        // Elided-when-None fields must not appear for the untracked entry.
+        let decoded: ServerMessage = decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::WorktreesResponse { worktrees } => {
+                assert_eq!(worktrees, vec![wt]);
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    /// A minimal frame from an older/leaner daemon (optional fields absent)
+    /// must still decode — the additive-fields contract.
+    #[test]
+    fn decode_minimal_worktree_status_is_backward_compatible() {
+        let minimal = r#"{"type":"worktrees_response","worktrees":[{"project":"/p","is_git_repo":false,"probed_at":"2026-07-15T00:00:00Z"}]}"#;
+        let decoded: ServerMessage = decode(minimal).unwrap();
+        match decoded {
+            ServerMessage::WorktreesResponse { worktrees } => {
+                assert_eq!(worktrees.len(), 1);
+                let wt = &worktrees[0];
+                assert!(!wt.is_git_repo);
+                assert!(wt.branch.is_none());
+                assert!(!wt.detached);
+                assert!(wt.changes.is_empty());
+                assert!(!wt.changes_truncated);
+            }
+            _ => panic!("unexpected variant"),
+        }
     }
 
     #[test]

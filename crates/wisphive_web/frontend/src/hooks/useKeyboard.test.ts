@@ -28,6 +28,16 @@ describe("useKeyboard", () => {
     expect(onViewBoard).toHaveBeenCalledOnce();
   });
 
+  it("invokes onViewWorktrees when 9 is pressed", () => {
+    const onViewWorktrees = vi.fn();
+
+    renderHook(() => useKeyboard({ onViewWorktrees }));
+
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "9" }));
+
+    expect(onViewWorktrees).toHaveBeenCalledOnce();
+  });
+
   it("keeps one listener across action changes and calls the latest action", () => {
     const addListener = vi.spyOn(window, "addEventListener");
     const removeListener = vi.spyOn(window, "removeEventListener");

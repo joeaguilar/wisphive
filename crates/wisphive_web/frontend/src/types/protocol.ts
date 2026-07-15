@@ -202,6 +202,7 @@ export type ServerMessage =
   | { type: "history_response"; entries: HistoryEntry[]; request_id?: string }
   | { type: "sessions_response"; sessions: SessionSummary[] }
   | { type: "projects_response"; projects: ProjectSummary[] }
+  | { type: "worktrees_response"; worktrees: WorktreeStatus[] }
   | { type: "project_hook_status"; status: ProjectHookStatus }
   | { type: "install_hooks_result"; project: string; status?: ProjectHookStatus; error?: string }
   | { type: "reimport_complete"; count: number }
@@ -242,6 +243,39 @@ export interface ProjectSummary {
   pending_count?: number;
   /** Present on current daemons; optional here for persisted/test fixtures. */
   has_live_agents?: boolean;
+}
+
+/** One changed path in a working tree (itr#401, spec §5.3). `path` and
+ * `orig_path` are agent-influenced untrusted display data — inert text only. */
+export interface WorktreeChange {
+  /** Repo-relative path (rename destination for renames). */
+  path: string;
+  /** Two-char porcelain-v2 XY code ('.' = unchanged side) or "??" untracked. */
+  status: string;
+  orig_path?: string;
+  /** Agent id from the decision audit stream; absent = human/unknown. */
+  attributed_to?: string;
+  /** Tool of the attributing call (Edit/Write/Bash/…). */
+  attributed_tool?: string;
+}
+
+/** Read-only working-tree probe result for one project (itr#401, spec §5.3).
+ * Produced by non-mutating git commands daemon-side — the strip is a state
+ * mirror with zero write affordances ("you own git"). */
+export interface WorktreeStatus {
+  project: string;
+  is_git_repo: boolean;
+  branch?: string;
+  detached: boolean;
+  head?: string;
+  upstream?: string;
+  ahead?: number;
+  behind?: number;
+  changes: WorktreeChange[];
+  changes_truncated: boolean;
+  diffstat?: string;
+  probed_at: string;
+  error?: string;
 }
 
 /** Wire mirror of `wisphive_protocol::ProjectHookStatus` (itr#460) — a
@@ -374,6 +408,11 @@ export function parseServerMessage(data: string): ServerMessage {
       return {
         type,
         projects: readField(message, "projects", arrayOf(parseProjectSummary), "message"),
+      };
+    case "worktrees_response":
+      return {
+        type,
+        worktrees: readField(message, "worktrees", arrayOf(parseWorktreeStatus), "message"),
       };
     case "project_hook_status":
       return { type, status: parseProjectHookStatus(message, "message") };
@@ -674,6 +713,38 @@ function parseProjectSummary(value: unknown, path: string): ProjectSummary {
     agent_count: readField(project, "agent_count", readU32, path),
     pending_count: readField(project, "pending_count", readU32, path),
     has_live_agents: readField(project, "has_live_agents", readBoolean, path),
+  };
+}
+
+function parseWorktreeChange(value: unknown, path: string): WorktreeChange {
+  const change = readObject(value, path);
+  return {
+    path: readField(change, "path", readString, path),
+    status: readField(change, "status", readString, path),
+    orig_path: readOptionalField(change, "orig_path", readString, path),
+    attributed_to: readOptionalField(change, "attributed_to", readString, path),
+    attributed_tool: readOptionalField(change, "attributed_tool", readString, path),
+  };
+}
+
+function parseWorktreeStatus(value: unknown, path: string): WorktreeStatus {
+  const wt = readObject(value, path);
+  return {
+    project: readField(wt, "project", readString, path),
+    is_git_repo: readField(wt, "is_git_repo", readBoolean, path),
+    branch: readOptionalField(wt, "branch", readString, path),
+    // Optional on the wire (skip-if-default) so older/leaner frames decode.
+    detached: readOptionalField(wt, "detached", readBoolean, path) ?? false,
+    head: readOptionalField(wt, "head", readString, path),
+    upstream: readOptionalField(wt, "upstream", readString, path),
+    ahead: readOptionalField(wt, "ahead", readU32, path),
+    behind: readOptionalField(wt, "behind", readU32, path),
+    changes: readOptionalField(wt, "changes", arrayOf(parseWorktreeChange), path) ?? [],
+    changes_truncated:
+      readOptionalField(wt, "changes_truncated", readBoolean, path) ?? false,
+    diffstat: readOptionalField(wt, "diffstat", readString, path),
+    probed_at: readField(wt, "probed_at", readRfc3339, path),
+    error: readOptionalField(wt, "error", readString, path),
   };
 }
 
@@ -1008,6 +1079,7 @@ export type ClientMessage =
   | { type: "query_history"; agent_id?: string; limit?: number; request_id?: string }
   | { type: "query_sessions" }
   | { type: "query_projects" }
+  | { type: "query_worktrees" }
   | { type: "install_hooks"; project: string }
   | { type: "query_project_hook_status"; project: string }
   | { type: "reimport_events" }

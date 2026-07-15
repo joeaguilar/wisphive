@@ -2636,3 +2636,213 @@ kbd {
   /* Full path stays reachable via the name's title on desktop; on touch,
      the Sessions/Projects views carry it — the board keeps the short name. */
 }
+
+/* ── Working-tree strip (itr#401, spec §5.3) ─────────────────────────────
+ * Read-only state mirror: per active repo — branch, dirty count,
+ * ahead/behind, diff summary, pre-generated commit message, per-change
+ * agent attribution. The ONLY interactive elements are copy buttons. */
+
+.worktrees {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-lg);
+  max-width: 900px;
+}
+
+.worktrees-header h2 {
+  font-size: 18px;
+  margin-bottom: var(--space-xs);
+}
+
+.worktrees-counts {
+  color: var(--text);
+  font-size: var(--font-base);
+}
+
+.worktrees-note {
+  color: var(--text-dim);
+  font-size: var(--font-sm);
+  margin-top: var(--space-xs);
+}
+
+.worktrees-empty {
+  color: var(--text-dim);
+  padding: var(--space-xl);
+  text-align: center;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.worktree-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-md);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  min-width: 0;
+}
+
+.worktree-topline {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.worktree-name {
+  font-weight: 700;
+  color: var(--text);
+}
+
+.worktree-path {
+  color: var(--text-dim);
+  font-size: var(--font-sm);
+  overflow-wrap: anywhere;
+}
+
+.worktree-branch {
+  flex: 0 0 auto;
+  margin-left: auto;
+  font-size: var(--font-sm);
+  color: var(--cyan);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1px 6px;
+}
+
+.worktree-branch.non-git {
+  color: var(--text-dim);
+}
+
+.worktree-ab {
+  flex: 0 0 auto;
+  font-size: var(--font-sm);
+  color: var(--text-dim);
+}
+
+.worktree-error {
+  color: var(--red);
+  font-size: var(--font-sm);
+}
+
+.worktree-clean {
+  color: var(--text-dim);
+  font-size: var(--font-sm);
+}
+
+.worktree-summary {
+  color: var(--text);
+  font-size: var(--font-sm);
+}
+
+.worktree-changes {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  margin: 0;
+  padding: 0;
+}
+
+.worktree-change {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-sm);
+  min-width: 0;
+  font-size: var(--font-sm);
+}
+
+.change-status {
+  flex: 0 0 auto;
+  color: var(--yellow);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0 4px;
+}
+
+.change-path {
+  color: var(--text);
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.change-attribution {
+  flex: 0 0 auto;
+  margin-left: auto;
+  font-size: var(--font-sm);
+}
+
+.change-attribution.agent {
+  color: var(--cyan);
+}
+
+.change-attribution.human {
+  color: var(--text-dim);
+}
+
+.worktree-truncated {
+  color: var(--text-dim);
+  font-size: var(--font-sm);
+}
+
+.worktree-commit {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  border-top: 1px solid var(--border);
+  padding-top: var(--space-sm);
+}
+
+.worktree-commit-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.worktree-commit-label {
+  color: var(--text-dim);
+  font-size: var(--font-sm);
+}
+
+.worktree-commit-toolbar .copy-btn {
+  margin-left: auto;
+  min-height: var(--touch-min);
+}
+
+.worktree-commit-msg {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-sm);
+  font-size: var(--font-sm);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 0;
+}
+
+@media (max-width: 768px) {
+  .worktree-topline {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--space-xs);
+  }
+  .worktree-branch {
+    margin-left: 0;
+  }
+  .worktree-change {
+    flex-wrap: wrap;
+  }
+  .change-attribution {
+    margin-left: 0;
+    width: 100%;
+    padding-left: var(--space-lg);
+  }
+  .worktree-commit-toolbar {
+    flex-wrap: wrap;
+  }
+}

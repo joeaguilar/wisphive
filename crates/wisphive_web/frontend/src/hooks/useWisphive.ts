@@ -12,6 +12,7 @@ import type {
   SessionSummary,
   SpawnAgentRequest,
   TerminalSessionMeta,
+  WorktreeStatus,
 } from "../types/protocol";
 import { parseServerMessage } from "../types/protocol";
 import { apiFetch, clearWebToken, getWebToken, subscribeAuthChange } from "../api";
@@ -26,6 +27,9 @@ export interface WisphiveState {
   sessionTimeline: HistoryEntry[];
   sessions: SessionSummary[];
   projects: ProjectSummary[];
+  /** Read-only working-tree probe results (itr#401, spec §5.3). Refreshed by
+   * `query_worktrees`; the Worktrees strip polls it. */
+  worktrees: WorktreeStatus[];
   /** Per-project Wisphive hook install state (itr#460), keyed by absolute
    * project path. Lazily populated by `query_project_hook_status` /
    * `install_hooks_result`; drives the Projects view gating badges. */
@@ -165,6 +169,7 @@ export function useWisphive() {
     sessionTimeline: [],
     sessions: [],
     projects: [],
+    worktrees: [],
     hookStatus: {},
     hookErrors: {},
     auditDecisions: [],
@@ -365,6 +370,9 @@ export function useWisphive() {
 
           case "projects_response":
             return { ...prev, projects: msg.projects };
+
+          case "worktrees_response":
+            return { ...prev, worktrees: msg.worktrees };
 
           case "project_hook_status": {
             const status = msg.status;
@@ -714,6 +722,11 @@ export function useWisphive() {
     send({ type: "query_projects" });
   }, [send]);
 
+  /** Ask the daemon for a fresh read-only working-tree probe (itr#401). */
+  const queryWorktrees = useCallback(() => {
+    send({ type: "query_worktrees" });
+  }, [send]);
+
   /** Install (or repair) Wisphive hooks into a project (itr#460). Sudo-gated
    * server-side: the daemon may bounce with `web_reauth_required`, so we stash
    * the project before sending — a successful reauth replays exactly this
@@ -849,6 +862,7 @@ export function useWisphive() {
     querySessionTimeline,
     querySessions,
     queryProjects,
+    queryWorktrees,
     installHooks,
     queryProjectHookStatus,
     searchHistory,

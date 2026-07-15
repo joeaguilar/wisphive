@@ -1014,6 +1014,81 @@ pub struct ProjectHookStatus {
     pub all_enabled: bool,
 }
 
+/// One changed path in a working tree, from a read-only `git status` probe
+/// (itr#401, Command Center spec §5.3).
+///
+/// `path` is repo-relative and untrusted display data (an agent chose the
+/// filename) — render as inert text only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeChange {
+    /// Repo-relative path (rename destination for renames).
+    pub path: String,
+    /// Two-character porcelain-v2 `XY` code (`.` = unchanged on that side),
+    /// or `??` for untracked entries.
+    pub status: String,
+    /// Rename/copy source path, when `status` carries an `R`/`C`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub orig_path: Option<String>,
+    /// Agent id attributed from the decision audit stream (the most recent
+    /// approved Edit/Write/MultiEdit/NotebookEdit call targeting this path, or
+    /// a Bash command mentioning it). `None` = human/unknown.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub attributed_to: Option<String>,
+    /// Tool name of the attributing call (`Edit`, `Write`, `Bash`, …).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub attributed_tool: Option<String>,
+}
+
+/// Read-only working-tree probe result for one known project (itr#401,
+/// Command Center spec §5.3 working-tree strip).
+///
+/// Produced daemon-side by `git status --porcelain=v2 --branch` /
+/// `git diff HEAD --shortstat` — strictly read-only git; the strip is a state
+/// mirror with no write affordances ("you own git").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeStatus {
+    /// The probed project directory.
+    pub project: PathBuf,
+    /// Whether the directory is inside a git work tree.
+    pub is_git_repo: bool,
+    /// Current branch name. `None` when detached or when the probe failed.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub branch: Option<String>,
+    /// HEAD is detached (no branch checked out).
+    #[serde(default)]
+    pub detached: bool,
+    /// HEAD commit id (full oid as reported by git). `None` on an unborn
+    /// branch (no commits yet).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub head: Option<String>,
+    /// Upstream ref name, when one is configured.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub upstream: Option<String>,
+    /// Commits ahead of upstream, when an upstream is configured.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ahead: Option<u32>,
+    /// Commits behind upstream, when an upstream is configured.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub behind: Option<u32>,
+    /// Changed paths (staged, unstaged, unmerged, untracked), capped
+    /// daemon-side (`changes_truncated` set when the cap was hit).
+    #[serde(default)]
+    pub changes: Vec<WorktreeChange>,
+    /// The daemon capped `changes`; the tree has more entries than shown.
+    #[serde(default)]
+    pub changes_truncated: bool,
+    /// One-line `git diff HEAD --shortstat` output (tracked changes only),
+    /// when derivable.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub diffstat: Option<String>,
+    /// When the daemon ran the probe.
+    pub probed_at: DateTime<Utc>,
+    /// Probe error text (git missing, timeout, unreadable dir). Untrusted
+    /// display data.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub error: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::fixtures::make_request;

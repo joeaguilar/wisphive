@@ -96,6 +96,33 @@ impl StateDb {
             )
             .collect())
     }
+
+    /// Recent approved file-touching tool calls for one project, newest first
+    /// (itr#401 working-tree attribution). Returns
+    /// `(agent_id, tool_name, tool_input_json)` rows for
+    /// Edit/Write/MultiEdit/NotebookEdit/Bash — the tools whose inputs carry
+    /// the file paths the working-tree strip attributes changes against.
+    /// `tool_input` is already secret-redacted upstream (itr#89).
+    pub async fn recent_file_touches(
+        &self,
+        project: &str,
+        limit: u32,
+    ) -> Result<Vec<(String, String, String)>> {
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT agent_id, tool_name, tool_input
+             FROM decision_log
+             WHERE project = ?1
+               AND decision = '\"approve\"'
+               AND tool_name IN ('Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'Bash')
+             ORDER BY resolved_at DESC
+             LIMIT ?2",
+        )
+        .bind(project)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
 }
 
 #[cfg(test)]

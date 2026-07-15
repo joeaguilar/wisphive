@@ -15,6 +15,7 @@ interface KeyboardActions {
   onViewAgents?: () => void;
   onViewTerminals?: () => void;
   onViewBoard?: () => void;
+  onViewWorktrees?: () => void;
   onSpawn?: () => void;
   onHelp?: () => void;
 }
@@ -92,6 +93,9 @@ export function useKeyboard(actions: KeyboardActions) {
           break;
         case "8":
           currentActions.onViewBoard?.();
+          break;
+        case "9":
+          currentActions.onViewWorktrees?.();
           break;
 
         // Spawn

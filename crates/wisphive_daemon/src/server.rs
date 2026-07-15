@@ -1359,6 +1359,7 @@ async fn dispatch_command(
         | ClientMessage::SearchHistory(_)
         | ClientMessage::QuerySessions
         | ClientMessage::QueryProjects
+        | ClientMessage::QueryWorktrees
         | ClientMessage::QueryProjectHookStatus { .. } => {
             handle_query_command(writer, ctx, msg).await?;
         }
@@ -2783,6 +2784,94 @@ async fn handle_query_command(
                     .await?;
                 }
             }
+        }
+        ClientMessage::QueryWorktrees => {
+            // Working-tree strip (itr#401, spec §5.3). Strictly read-only:
+            // crate::worktree spawns only allowlisted non-mutating git
+            // subcommands (status/diff) under GIT_OPTIONAL_LOCKS=0. No sudo
+            // gate — nothing is written, in the repo or under ~/.wisphive.
+            //
+            // Candidate set = projects with live agents plus decision_log
+            // projects seen within the 21-day activity window (spec §5.3
+            // "active repo"), bounded so a pathological history can't fan out
+            // hundreds of git spawns per query.
+            const ACTIVITY_WINDOW_DAYS: i64 = 21;
+            const MAX_PROBED_PROJECTS: usize = 24;
+            const MAX_ATTRIBUTION_ROWS: u32 = 500;
+
+            let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+            {
+                let reg = ctx.agent_registry.lock().await;
+                for agent in reg.snapshot() {
+                    if !candidates.contains(&agent.project) {
+                        candidates.push(agent.project.clone());
+                    }
+                }
+            }
+            if let Ok(projects) = ctx.state_db.query_projects().await {
+                let cutoff = chrono::Utc::now() - chrono::Duration::days(ACTIVITY_WINDOW_DAYS);
+                for p in projects {
+                    if p.last_seen >= cutoff && !candidates.contains(&p.project) {
+                        candidates.push(p.project);
+                    }
+                }
+            }
+            candidates.truncate(MAX_PROBED_PROJECTS);
+
+            // Probe concurrently (each git call has its own timeout), keep
+            // the candidate order (live-agent projects first).
+            let mut join_set = tokio::task::JoinSet::new();
+            for (idx, project) in candidates.iter().cloned().enumerate() {
+                join_set
+                    .spawn(async move { (idx, crate::worktree::probe_worktree(&project).await) });
+            }
+            let mut worktrees: Vec<Option<wisphive_protocol::WorktreeStatus>> =
+                (0..candidates.len()).map(|_| None).collect();
+            while let Some(res) = join_set.join_next().await {
+                if let Ok((idx, wt)) = res {
+                    worktrees[idx] = Some(wt);
+                }
+            }
+            let mut worktrees: Vec<wisphive_protocol::WorktreeStatus> =
+                worktrees.into_iter().flatten().collect();
+
+            // Attribute dirty paths from the decision audit stream (itr#397
+            // rows carry redacted tool_input with the file paths).
+            for wt in worktrees.iter_mut() {
+                if !wt.is_git_repo || wt.changes.is_empty() {
+                    continue;
+                }
+                let project_key = wt.project.to_string_lossy().to_string();
+                match ctx
+                    .state_db
+                    .recent_file_touches(&project_key, MAX_ATTRIBUTION_ROWS)
+                    .await
+                {
+                    Ok(rows) => {
+                        let touches: Vec<crate::worktree::FileTouch> = rows
+                            .into_iter()
+                            .map(
+                                |(agent_id, tool_name, tool_input)| crate::worktree::FileTouch {
+                                    agent_id,
+                                    tool_name,
+                                    tool_input: serde_json::from_str(&tool_input)
+                                        .unwrap_or(serde_json::Value::Null),
+                                },
+                            )
+                            .collect();
+                        crate::worktree::attribute_changes(
+                            &wt.project.clone(),
+                            &mut wt.changes,
+                            &touches,
+                        );
+                    }
+                    Err(e) => {
+                        warn!(project = %project_key, error = %e, "worktree attribution query failed");
+                    }
+                }
+            }
+
+            write_msg(writer, &ServerMessage::WorktreesResponse { worktrees }).await?;
         }
         ClientMessage::QueryProjectHookStatus { ref project } => {
             // Read-only: audit the project on disk and reply. No sudo gate —
