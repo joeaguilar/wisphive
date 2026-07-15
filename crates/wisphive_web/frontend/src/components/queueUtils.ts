@@ -1,4 +1,4 @@
-import type { DecisionRequest } from "../types/protocol";
+import type { AuditDecision, DecisionRequest } from "../types/protocol";
 import { parseToolInput } from "./toolInput";
 
 export function timeAgo(timestamp: string, nowMs = Date.now()): string {
@@ -141,6 +141,13 @@ export function deferredPromptSummary(
 export function shortProject(project: string): string {
   const parts = project.split("/");
   return parts[parts.length - 1] || project;
+}
+
+// Stable identity for a deferred AuditDecision row. Shared by the Inbox (row
+// expansion state) and the liveness board (waiting-lane → inbox deep-link,
+// itr#400) so a board cross-link targets exactly the row the Inbox renders.
+export function deferredKey(d: AuditDecision): string {
+  return `${d.ts}|${d.agent_id}|${d.tool_name}|${d.terminal_session_id ?? ""}`;
 }
 
 // Oldest-first ordering for the inbox. Shared by the Inbox render and the

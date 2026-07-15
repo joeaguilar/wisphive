@@ -2454,3 +2454,185 @@ kbd {
     width: 100%;
   }
 }
+
+/* ── Agent liveness board (spec §5.2, itr#400) ─────────────────────
+ * Read-only lanes per project → session: working / waiting / stalled / done.
+ * Redundant Signal Rule: every state pairs its colour (dot + label tint) with
+ * the state WORD, so the board reads identically for colourblind operators.
+ * Stalled is the loud state — a full red hairline + faint red wash (mirrors
+ * the login-error treatment), never a decorative side rail. */
+
+.board {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-lg);
+  max-width: 900px;
+}
+
+.board-header h2 {
+  font-size: 18px;
+  margin-bottom: var(--space-xs);
+}
+
+.board-counts {
+  color: var(--text);
+  font-size: var(--font-base);
+}
+
+.board-note {
+  color: var(--text-dim);
+  font-size: var(--font-sm);
+  margin-top: var(--space-xs);
+}
+
+.board-empty {
+  color: var(--text-dim);
+  padding: var(--space-xl);
+  text-align: center;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.board-project-header {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-sm);
+  margin-bottom: var(--space-sm);
+  min-width: 0;
+}
+
+.board-project-name {
+  font-weight: 700;
+  color: var(--text);
+}
+
+.board-project-path {
+  color: var(--text-dim);
+  font-size: var(--font-sm);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.board-lanes {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+
+.board-lane {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-md);
+  min-width: 0;
+}
+
+.board-lane.state-done { opacity: 0.6; }
+
+.board-lane.state-stalled {
+  border-color: var(--red);
+  background: rgba(244, 67, 54, 0.08);
+}
+
+.lane-dot {
+  flex: 0 0 auto;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+
+.lane-dot.working { background: var(--green); }
+.lane-dot.waiting { background: var(--yellow); }
+.lane-dot.stalled { background: var(--red); }
+.lane-dot.done { background: var(--text-dim); }
+
+.lane-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+}
+
+.lane-topline {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  min-width: 0;
+}
+
+.lane-agent {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lane-type-badge {
+  flex: 0 0 auto;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 1px 5px;
+}
+
+.lane-type-badge.type-codex { color: var(--cyan); border-color: var(--cyan); }
+
+.lane-state-label {
+  flex: 0 0 auto;
+  margin-left: auto;
+  font-size: var(--font-sm);
+}
+
+.lane-state-label.working { color: var(--green); }
+.lane-state-label.waiting { color: var(--yellow); }
+.lane-state-label.stalled { color: var(--red); font-weight: 700; }
+.lane-state-label.done { color: var(--text-dim); }
+
+.lane-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-sm) var(--space-md);
+  color: var(--text-dim);
+  font-size: var(--font-sm);
+}
+
+.lane-pending { color: var(--yellow); }
+
+.lane-inbox-link {
+  flex: 0 0 auto;
+  background: var(--bg-card);
+  color: var(--yellow);
+  border: 1px solid var(--yellow);
+  border-radius: var(--radius);
+  padding: 6px 10px;
+  font-size: var(--font-sm);
+  cursor: pointer;
+  min-height: var(--touch-min);
+}
+
+.lane-inbox-link:hover {
+  background: var(--bg-card-hover);
+}
+
+@media (max-width: 768px) {
+  .board-lane {
+    flex-wrap: wrap;
+  }
+  .lane-inbox-link {
+    width: 100%;
+    margin-left: 22px; /* align under lane-main, past the dot */
+    flex-basis: auto;
+  }
+  .board-project-path { display: none; }
+  /* Full path stays reachable via the name's title on desktop; on touch,
+     the Sessions/Projects views carry it — the board keeps the short name. */
+}

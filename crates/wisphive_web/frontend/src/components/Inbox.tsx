@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import type { AuditDecision, DecisionRequest } from "../types/protocol";
 import {
+  deferredKey,
   deferredPromptSummary,
   eventPrefix,
   inputSummary,
@@ -29,6 +30,12 @@ interface InboxProps {
    * carry a `terminal_session_id`; hook-only sessions get a text pointer
    * instead (there is no embedded terminal to focus). */
   onFocusTerminal: (terminalSessionId: string) => void;
+  /** Deep-link target from the liveness board (itr#400): the `deferredKey` of
+   * a waiting-on-input row. When set, that deferred row is expanded and
+   * scrolled into view; the handled callback clears it so the same row can be
+   * re-focused later. */
+  focusDeferredKey?: string | null;
+  onFocusDeferredHandled?: () => void;
 }
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -42,6 +49,8 @@ export function Inbox({
   onApprove,
   onDeny,
   onFocusTerminal,
+  focusDeferredKey,
+  onFocusDeferredHandled,
 }: InboxProps) {
   const [now, setNow] = useState(() => Date.now());
   // The "decided without you" feed starts collapsed; '(view)' reveals it
@@ -51,11 +60,36 @@ export function Inbox({
   // AuditDecisions (not DecisionRequests) so they never join `selectedId` /
   // keyboard nav — they can't be answered in-console.
   const [expandedDeferred, setExpandedDeferred] = useState<string | null>(null);
+  // Board → inbox deep-link (itr#400), part 1: adopt the focus target as the
+  // expanded row during render (React's adjust-state-on-prop-change pattern —
+  // no setState-in-effect). Part 2 (scroll + handled ack) lives in the effect
+  // below.
+  const [adoptedFocusKey, setAdoptedFocusKey] = useState<string | null>(null);
+  if (focusDeferredKey && focusDeferredKey !== adoptedFocusKey) {
+    setAdoptedFocusKey(focusDeferredKey);
+    setExpandedDeferred(focusDeferredKey);
+  }
 
   useEffect(() => {
     const id = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(id);
   }, []);
+
+  // Board → inbox deep-link (itr#400), part 2: with the row expanded (see the
+  // render-phase adoption above), bring it into view and report handled so
+  // App clears the one-shot target and the same row can be re-focused later.
+  useEffect(() => {
+    if (!focusDeferredKey) return;
+    onFocusDeferredHandled?.();
+    // Defer the scroll until after the expanded row has rendered.
+    const raf = window.requestAnimationFrame(() => {
+      const row = document.querySelector<HTMLElement>(
+        `[data-deferred-key="${CSS.escape(focusDeferredKey)}"]`,
+      );
+      row?.scrollIntoView?.({ block: "center" });
+    });
+    return () => window.cancelAnimationFrame(raf);
+  }, [focusDeferredKey, onFocusDeferredHandled]);
 
   // The 1s `now` keeps the small pending list's ages live. The hour-windowed
   // audit work below, though, scans the whole auditDecisions array (up to
@@ -278,6 +312,7 @@ function DeferredRow({ decision, now, expanded, onToggle, onFocusTerminal }: Def
     <article
       className="inbox-item inbox-deferred-item"
       style={{ borderLeftColor: color }}
+      data-deferred-key={deferredKey(decision)}
       aria-expanded={expanded}
       aria-label={`${decision.tool_name} — waiting in your terminal`}
       onClick={onToggle}
@@ -338,10 +373,6 @@ function groupColor(key: string): string {
     hash = (hash * 31 + key.charCodeAt(i)) % 360;
   }
   return `hsl(${hash}, 60%, 60%)`;
-}
-
-function deferredKey(d: AuditDecision): string {
-  return `${d.ts}|${d.agent_id}|${d.tool_name}|${d.terminal_session_id ?? ""}`;
 }
 
 function groupDeferred(items: AuditDecision[]): [string, AuditDecision[]][] {

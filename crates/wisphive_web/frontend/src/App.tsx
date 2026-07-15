@@ -5,6 +5,8 @@ import { useAuth } from "./hooks/useAuth";
 import { useIsMobile } from "./hooks/useViewport";
 import { Queue } from "./components/Queue";
 import { Inbox } from "./components/Inbox";
+import { Board } from "./components/Board";
+import type { InboxTarget } from "./components/liveness";
 import { orderByAge } from "./components/queueUtils";
 import { DetailView } from "./components/DetailView";
 import { History } from "./components/History";
@@ -21,7 +23,7 @@ import { DiskAlertBanner } from "./components/DiskAlertBanner";
 import { ConfigAlertBanner } from "./components/ConfigAlertBanner";
 import "./app.css";
 
-type View = "inbox" | "queue" | "history" | "sessions" | "projects" | "agents" | "config" | "terminals";
+type View = "inbox" | "board" | "queue" | "history" | "sessions" | "projects" | "agents" | "config" | "terminals";
 
 function App() {
   const auth = useAuth();
@@ -75,6 +77,10 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
   // tells Terminals which session to auto-select. Cleared once Terminals
   // honours it so the same session can be re-focused later.
   const [focusTerminalId, setFocusTerminalId] = useState<string | null>(null);
+  // Deep-link target for the liveness board's "Answer in Inbox" cross-link on
+  // a waiting-on-input lane (itr#400): a deferred row's stable key. Cleared
+  // once the Inbox has expanded/scrolled the row so it can be re-focused.
+  const [focusDeferredKey, setFocusDeferredKey] = useState<string | null>(null);
   const [showSpawn, setShowSpawn] = useState(false);
   const [spawnDefaultProject, setSpawnDefaultProject] = useState<string | undefined>();
   const [sessionAgent, setSessionAgent] = useState<string | null>(null);
@@ -83,6 +89,20 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
   const sidebarRef = useRef<HTMLElement>(null);
 
   const selectedRequest = queue.find((r) => r.id === selectedId);
+
+  // Board → Inbox cross-link (itr#400): a queued decision selects its inbox
+  // row (which renders the full DetailView); a deferred native prompt expands
+  // its "waiting in your terminal" row via focusDeferredKey.
+  const openInboxTarget = useCallback((target: InboxTarget) => {
+    if (target.kind === "decision") {
+      setSelectedId(target.requestId);
+      setFocusDeferredKey(null);
+    } else {
+      setSelectedId(null);
+      setFocusDeferredKey(target.deferredKey);
+    }
+    setView("inbox");
+  }, []);
 
   // The keyboard-navigation list must match the on-screen order of the active
   // view: the Inbox renders oldest-first (orderByAge), the Queue renders raw
@@ -130,6 +150,7 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
       }
     },
     onViewQueue: () => setView("queue"),
+    onViewBoard: () => setView("board"),
     onViewHistory: () => setView("history"),
     onViewSessions: () => setView("sessions"),
     onViewProjects: () => setView("projects"),
@@ -161,6 +182,9 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
         </div>
         <button className={view === "inbox" ? "active" : ""} onClick={() => setView("inbox")}>
           Inbox {queue.length > 0 && <span className="badge">{queue.length}</span>}
+        </button>
+        <button className={view === "board" ? "active" : ""} onClick={() => setView("board")}>
+          Board
         </button>
         <button className={view === "queue" ? "active" : ""} onClick={() => setView("queue")}>
           Queue {queue.length > 0 && <span className="badge">{queue.length}</span>}
@@ -212,6 +236,19 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
             onApprove={(id, opts) => { approve(id, opts); setSelectedId(null); }}
             onDeny={(id, msg) => { deny(id, msg); setSelectedId(null); }}
             onFocusTerminal={(termId) => { setFocusTerminalId(termId); setView("terminals"); }}
+            focusDeferredKey={focusDeferredKey}
+            onFocusDeferredHandled={() => setFocusDeferredKey(null)}
+          />
+        )}
+        {view === "board" && (
+          <Board
+            sessions={sessions}
+            agents={agents}
+            queue={queue}
+            auditDecisions={auditDecisions}
+            endedAgentIds={endedAgentIds}
+            onLoad={querySessions}
+            onOpenInbox={openInboxTarget}
           />
         )}
         {view === "queue" && (
@@ -329,6 +366,7 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
               <div className="help-row"><kbd>5</kbd> Agents</div>
               <div className="help-row"><kbd>6</kbd> Config</div>
               <div className="help-row"><kbd>7</kbd> Terminals</div>
+              <div className="help-row"><kbd>8</kbd> Board</div>
               <div className="help-row"><kbd>?</kbd> This help</div>
             </div>
           </div>

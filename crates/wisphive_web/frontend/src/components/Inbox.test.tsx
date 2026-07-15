@@ -324,6 +324,26 @@ describe("Inbox", () => {
     expect(within(detail).queryByRole("button", { name: "Approve" })).not.toBeInTheDocument();
   });
 
+  it("expands and acks a deferred row targeted by the board's focusDeferredKey deep-link (itr#400)", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(NOW));
+
+    const row = deferred({});
+    // Same key derivation the liveness board uses for its inbox cross-link.
+    const key = `${row.ts}|${row.agent_id}|${row.tool_name}|`;
+    const onFocusDeferredHandled = vi.fn();
+    renderInbox({
+      auditDecisions: [row],
+      focusDeferredKey: key,
+      onFocusDeferredHandled,
+    });
+
+    // The targeted row arrives already expanded to its read-only detail —
+    // no click required — and the one-shot target is acked back to App.
+    expect(screen.getByLabelText("Deferred detail for AskUserQuestion")).toBeInTheDocument();
+    expect(onFocusDeferredHandled).toHaveBeenCalled();
+  });
+
   it("shows a one-line question summary on the deferred row and the full options in its detail", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(NOW));

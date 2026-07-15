@@ -18,6 +18,16 @@ describe("useKeyboard", () => {
     expect(onViewTerminals).toHaveBeenCalledOnce();
   });
 
+  it("invokes onViewBoard when 8 is pressed", () => {
+    const onViewBoard = vi.fn();
+
+    renderHook(() => useKeyboard({ onViewBoard }));
+
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "8" }));
+
+    expect(onViewBoard).toHaveBeenCalledOnce();
+  });
+
   it("keeps one listener across action changes and calls the latest action", () => {
     const addListener = vi.spyOn(window, "addEventListener");
     const removeListener = vi.spyOn(window, "removeEventListener");
