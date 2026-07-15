@@ -142,6 +142,8 @@ Unix socket at `~/.wisphive/wisphive.sock`. Newline-delimited JSON. Two client t
 - **Hook**: ephemeral — sends Hello + DecisionRequest, blocks for DecisionResponse, exits.
 - **TUI**: long-lived — sends Hello, receives QueueSnapshot, then bidirectional streaming of commands and events.
 
+TUI/web clients may also send `query_worktrees`; the daemon replies `worktrees_response` with read-only per-project `WorktreeStatus` (branch, dirty changes, ahead/behind, per-change agent attribution) for the Command Center working-tree strip (itr#401). The probe runs only allowlisted non-mutating git subcommands (`status`/`diff`) under `GIT_OPTIONAL_LOCKS=0` — the strip is a state mirror with zero write affordances; commit messages are generated client-side (deterministic heuristic in `crates/wisphive_web/frontend/src/components/commitMessage.ts`).
+
 ## Runtime Files
 
 All under `~/.wisphive/`:
