@@ -144,6 +144,8 @@ Unix socket at `~/.wisphive/wisphive.sock`. Newline-delimited JSON. Two client t
 
 TUI/web clients may also send `query_worktrees`; the daemon replies `worktrees_response` with read-only per-project `WorktreeStatus` (branch, dirty changes, ahead/behind, per-change agent attribution) for the Command Center working-tree strip (itr#401). The probe runs only allowlisted non-mutating git subcommands (`status`/`diff`) under `GIT_OPTIONAL_LOCKS=0` — the strip is a state mirror with zero write affordances; commit messages are generated client-side (deterministic heuristic in `crates/wisphive_web/frontend/src/components/commitMessage.ts`).
 
+TUI/web clients may also send `query_burn`; the daemon replies `burn_response` with `ArtifactTouch` rows — approved artifact-candidate calls (Edit/Write/MultiEdit/NotebookEdit/Bash, redacted `tool_input`) from the last hour of `decision_log` — for the Command Center burn meter (itr#402, spec §5.4). Strictly read-only; the web client classifies rows into artifact signals (file writes, `git commit` subcommand only — read-only Bash never counts) and derives the labelled activity proxy ("N tool calls · M min — token spend not observable") and the dead-run alert (≥10 approved calls over ≥10 min with zero artifacts) in `crates/wisphive_web/frontend/src/components/burnMeter.ts`.
+
 ## Runtime Files
 
 All under `~/.wisphive/`:
