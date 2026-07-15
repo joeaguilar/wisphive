@@ -1,0 +1,126 @@
+{
+  "evidence": [
+    {
+      "id": "e-1",
+      "item_id": "Q-1",
+      "kind": "test",
+      "label": "cargo test -p wisphive_hook: 66 passed + 1 integration",
+      "command": "cargo test -p wisphive_hook",
+      "result": "pass",
+      "artifact_inline": "test result: ok. 66 passed; 0 failed (lib) + 1 passed (mode_failclosed integration)",
+      "captured_at": "2026-07-14T23:40:00Z"
+    },
+    {
+      "id": "e-2",
+      "item_id": "Q-1",
+      "kind": "log",
+      "label": "Stress: 30/30 filtered rounds + 50/50 named-test runs under concurrent full-crate load",
+      "command": "for i in $(seq 1 30); do cargo test -p wisphive_hook socket_ -- --test-threads=8; done  # plus 5 concurrent full runs x 10 named-test iterations",
+      "result": "pass",
+      "artifact_path": "scratchpad itr525-stress.log / itr525-concurrent2.log (session-temp)",
+      "artifact_inline": "30/30 rounds 'ok. 4 passed'; 50/50 named runs 'ok. 2 passed'; 5/5 concurrent full runs green; 0 FAILED",
+      "captured_at": "2026-07-14T23:45:00Z"
+    },
+    {
+      "id": "e-3",
+      "item_id": "Q-2",
+      "kind": "test",
+      "label": "3 new correlation-stamping tests; inversion of Some/None branch empirically observed red then reverted",
+      "command": "gatr run --tag itr526-daemon-tests -- cargo test -p wisphive_daemon",
+      "result": "pass",
+      "artifact_inline": "lib 402 passed; 0 failed; integrations 1+27 passed; clippy --all-targets -D warnings clean (tags itr526-clippy, itr526-clippy-all)",
+      "captured_at": "2026-07-14T23:50:00Z"
+    },
+    {
+      "id": "e-4",
+      "item_id": "Q-4",
+      "kind": "test",
+      "label": "Seam tests cover both #512 error arms (readdir Err, file_type Err)",
+      "command": "cargo test -p wisphive_daemon event_ingest && cargo test -p wisphive_daemon",
+      "result": "pass",
+      "artifact_inline": "event_ingest: ok. 21 passed. Full crate: 402 passed (lib) + 1 + 27 integration. clippy -D warnings clean. Seam infallible by signature \u2014 restoring ?-propagation breaks guard compilation.",
+      "captured_at": "2026-07-14T23:48:00Z"
+    },
+    {
+      "id": "e-5",
+      "item_id": "Q-5",
+      "kind": "test",
+      "label": "Injectivity: ambiguous pair distinct + decoder-backed 17-entry round-trip corpus",
+      "command": "cargo test -p wisphive_protocol",
+      "result": "pass",
+      "artifact_inline": "ok. 95 passed; 0 failed; 1 ignored. New: literal_backslash_sequence_distinct_from_real_control_byte, escaping_is_injective_and_round_trips. clippy -D warnings clean.",
+      "captured_at": "2026-07-14T23:52:00Z"
+    },
+    {
+      "id": "e-6",
+      "item_id": "Q-5",
+      "kind": "test",
+      "label": "Ripple check: daemon + TUI suites green; no external assertions on escaped format",
+      "command": "gatr run --tag itr530-ripple -- cargo test -p wisphive_daemon -p wisphive_tui",
+      "result": "pass",
+      "artifact_inline": "GATR exit=0 dur=428.8s errors=0. TUI snapshots contain no \\x escapes; notify.rs AppleScript escaping is layered downstream and independent.",
+      "captured_at": "2026-07-15T00:05:00Z"
+    },
+    {
+      "id": "e-7",
+      "item_id": "Q-6",
+      "kind": "test",
+      "label": "CLI + frontend gates for AgentSpawned prune/annotate",
+      "command": "cargo test -p wisphive_cli; cargo clippy -p wisphive_cli -- -D warnings; just frontend-lint; just frontend-test; npx tsc --noEmit",
+      "result": "pass",
+      "artifact_inline": "cli: ok. 40 passed. clippy clean. eslint clean. vitest: 18 files, 151 tests passed. tsc clean.",
+      "captured_at": "2026-07-14T23:35:00Z"
+    },
+    {
+      "id": "e-8",
+      "item_id": "Q-1",
+      "kind": "test",
+      "label": "Wave 1 full gate: just verify (fmt, clippy, workspace tests incl. TUI snapshots, frontend lint+vitest, e2e)",
+      "command": "just verify",
+      "result": "pass",
+      "artifact_inline": "exit 0 \u2014 all sub-gates green (verify-fmt, verify-clippy, verify-rust, verify-frontend, verify-e2e). Covers Q-1 Q-2 Q-4 Q-5 Q-6 post-commit.",
+      "captured_at": "2026-07-15T00:20:00Z"
+    },
+    {
+      "id": "e-9",
+      "item_id": "Q-3",
+      "kind": "docs",
+      "label": "ADR-0009 (Proposed): isolated CODEX_HOME over Codex config emulation; index row added",
+      "command": "git show a351fa5 --stat",
+      "result": "pass",
+      "artifact_path": "docs/decisions/0009-isolated-codex-home-over-config-emulation.md",
+      "artifact_inline": "201-line ADR covering acceptance (a) introspection (codex-cli 0.144.1: no 'codex config' subcommand; 'codex features list' authoritative only for kill switch), (b) isolated CODEX_HOME feasibility + codex_managed_home_import opt-in, (c) phased-hybrid recommendation sized M+M+S.",
+      "captured_at": "2026-07-15T00:15:00Z"
+    },
+    {
+      "id": "e-10",
+      "item_id": "Q-7",
+      "kind": "test",
+      "label": "mode_path refactor: daemon tests, clippy --all-targets, workspace check",
+      "command": "gatr run --tag itr532-test|itr532-clippy|itr532-check",
+      "result": "pass",
+      "artifact_inline": "cargo test -p wisphive_daemon: 402+27+1 passed. clippy --all-targets -D warnings: 0. cargo check --workspace: green \u2014 proves sole external call site (server.rs:224) updated.",
+      "captured_at": "2026-07-14T23:45:00Z"
+    },
+    {
+      "id": "e-11",
+      "item_id": "Q-7",
+      "kind": "test",
+      "label": "Final full gate: just verify green on complete campaign tree (retry after itr#520-family e2e flake)",
+      "command": "just verify",
+      "result": "pass",
+      "artifact_inline": "First run red on inbox e2e auto-answered assertion while reviewer's concurrent cargo runs saturated the machine; spec passed alone in 4.1s and full gate green on quiet rerun. Flake datapoint recorded on itr#520; hook->events.jsonl->daemon->audit hop independently proven healthy via isolated-HOME probe.",
+      "captured_at": "2026-07-15T00:04:00Z"
+    },
+    {
+      "id": "e-12",
+      "item_id": "Q-1",
+      "kind": "manual",
+      "label": "Reviewer pass over all 7 commits: signoff-clean (0 blocking, 0 should-fix, 2 NITs)",
+      "command": "read-only reviewer agent: git show per commit vs itr acceptance; double-scrub audit for #530; inversion-sensitivity check for #526; CLAUDE.md hygiene confirmed none required",
+      "result": "pass",
+      "artifact_inline": "NIT-1: #526 StopAgent Ok-arm pinned at unit level (disclosed on ticket). NIT-2: server.rs:139/:1989 still derive home_dir.join('mode') \u2014 pre-existing, optional S follow-up (noted on itr#532).",
+      "captured_at": "2026-07-15T00:00:00Z"
+    }
+  ]
+}

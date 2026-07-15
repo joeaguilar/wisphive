@@ -1,0 +1,218 @@
+{
+  "items": [
+    {
+      "id": "Q-1",
+      "title": "wisphive_hook socket-test harness: fake-daemon teardown race (DaemonUnreachable vs Runtime flake)",
+      "source": "itr#525",
+      "roadmap_rows": [],
+      "lane": "verified",
+      "owned_files": [
+        "crates/wisphive_hook/src/main.rs"
+      ],
+      "forbidden_files": [],
+      "acceptance": [
+        "socket_scenario (or callers) synchronizes so the hook consumes the Error line before the fake daemon drops the socket",
+        "socket_error_response_fails_closed and socket_garbage_decision_fails_closed no longer flake under full-workspace parallel load"
+      ],
+      "verify": "cargo test -p wisphive_hook",
+      "evidence_needed": [
+        "test",
+        "log"
+      ],
+      "evidence_refs": [
+        "e-1",
+        "e-2",
+        "e-8"
+      ],
+      "token_estimate": 15000,
+      "deps": [],
+      "risk": "low",
+      "wave": 1,
+      "notes": "Root cause per itr#527 dup: fake daemon write_all()s then drops socket without waiting for hook read; fix = read-to-EOF or shutdown(Write) before drop.",
+      "token_actual": 56600,
+      "closed_at": "2026-07-15T00:20:00Z"
+    },
+    {
+      "id": "Q-2",
+      "title": "Daemon-side dispatch_command correlation-stamping test for StopAgent/SpawnAgent",
+      "source": "itr#526",
+      "roadmap_rows": [],
+      "lane": "verified",
+      "owned_files": [
+        "crates/wisphive_daemon/src/server.rs"
+      ],
+      "forbidden_files": [],
+      "acceptance": [
+        "Daemon-crate test drives dispatch_command directly over UnixStream::pair() (server.rs:4680 pattern) for StopAgent, ideally SpawnAgent",
+        "Asserts correlation-id stamped into AgentStopResponse (Some) vs AgentExited (None) per branch"
+      ],
+      "verify": "cargo test -p wisphive_daemon",
+      "evidence_needed": [
+        "test"
+      ],
+      "evidence_refs": [
+        "e-3",
+        "e-8"
+      ],
+      "token_estimate": 15000,
+      "deps": [],
+      "risk": "low",
+      "wave": 1,
+      "token_actual": 110400,
+      "closed_at": "2026-07-15T00:20:00Z"
+    },
+    {
+      "id": "Q-3",
+      "title": "ADR: redesign Codex managed-spawn hook audit away from reimplementing Codex config-resolution internals",
+      "source": "itr#528",
+      "roadmap_rows": [],
+      "lane": "verified",
+      "owned_files": [
+        "docs/decisions/"
+      ],
+      "forbidden_files": [
+        "crates/wisphive_daemon/src/process_registry.rs"
+      ],
+      "acceptance": [
+        "ADR at docs/decisions/ evaluates (a) authoritative Codex effective-hook-inventory introspection, (b) fully daemon-controlled isolated CODEX_HOME, (c) recommendation + rough sizing",
+        "Index row added to docs/decisions/README.md",
+        "No code changes required"
+      ],
+      "verify": "doc review; cargo unaffected",
+      "evidence_needed": [
+        "docs"
+      ],
+      "evidence_refs": [
+        "e-9"
+      ],
+      "token_estimate": 25000,
+      "deps": [],
+      "risk": "low",
+      "wave": 2,
+      "notes": "Reads process_registry.rs for context but must not modify it.",
+      "token_actual": 73600,
+      "closed_at": "2026-07-15T00:15:00Z"
+    },
+    {
+      "id": "Q-4",
+      "title": "event_ingest #512 error arms: cover via test seam or record accepted-gap rationale",
+      "source": "itr#529",
+      "roadmap_rows": [],
+      "lane": "verified",
+      "owned_files": [
+        "crates/wisphive_daemon/src/event_ingest.rs"
+      ],
+      "forbidden_files": [],
+      "acceptance": [
+        "readdir-Err / file_type()-Err log-and-skip arms gain coverage via a test seam, OR gap explicitly accepted with recorded rationale on the issue"
+      ],
+      "verify": "cargo test -p wisphive_daemon event_ingest",
+      "evidence_needed": [
+        "test"
+      ],
+      "evidence_refs": [
+        "e-4",
+        "e-8"
+      ],
+      "token_estimate": 12000,
+      "deps": [],
+      "risk": "low",
+      "wave": 1,
+      "notes": "PO pre-approved fix-if-cheap-else-rationale default.",
+      "token_actual": 58800,
+      "closed_at": "2026-07-15T00:20:00Z"
+    },
+    {
+      "id": "Q-5",
+      "title": "redact \\xHH escaping: make injective (self-escape backslash) or scope to display sinks",
+      "source": "itr#530",
+      "roadmap_rows": [],
+      "lane": "verified",
+      "owned_files": [
+        "crates/wisphive_protocol/src/redact.rs"
+      ],
+      "forbidden_files": [],
+      "acceptance": [
+        "Decision recorded on audit-trail round-trip fidelity",
+        "If required: escaping made injective (backslash self-escape) with tests proving round-trip unambiguity"
+      ],
+      "verify": "cargo test -p wisphive_protocol",
+      "evidence_needed": [
+        "test"
+      ],
+      "evidence_refs": [
+        "e-5",
+        "e-6",
+        "e-8"
+      ],
+      "token_estimate": 15000,
+      "deps": [],
+      "risk": "medium",
+      "wave": 1,
+      "notes": "PO pre-approved default: implement injective self-escaping if cheap/portable. Risk medium: output-format change touches durable audit rows; check existing snapshot/format tests.",
+      "token_actual": 76000,
+      "closed_at": "2026-07-15T00:20:00Z"
+    },
+    {
+      "id": "Q-6",
+      "title": "Prune unreachable client-side AgentSpawned handling (daemon stopped emitting it in #518)",
+      "source": "itr#531",
+      "roadmap_rows": [],
+      "lane": "verified",
+      "owned_files": [
+        "crates/wisphive_cli/src/commands/agent.rs",
+        "crates/wisphive_web/frontend/src/types/protocol.ts"
+      ],
+      "forbidden_files": [],
+      "acceptance": [
+        "Unreachable AgentSpawned client paths removed or annotated protocol-compat-only with a comment"
+      ],
+      "verify": "cargo test -p wisphive_cli && frontend lint+vitest",
+      "evidence_needed": [
+        "test",
+        "diff"
+      ],
+      "evidence_refs": [
+        "e-7",
+        "e-8"
+      ],
+      "token_estimate": 10000,
+      "deps": [],
+      "risk": "low",
+      "wave": 1,
+      "token_actual": 63200,
+      "closed_at": "2026-07-15T00:20:00Z"
+    },
+    {
+      "id": "Q-7",
+      "title": "ProcessRegistry consumes DaemonConfig-owned mode_path instead of re-deriving it",
+      "source": "itr#532",
+      "roadmap_rows": [],
+      "lane": "verified",
+      "owned_files": [
+        "crates/wisphive_daemon/src/process_registry.rs",
+        "crates/wisphive_daemon/src/config.rs"
+      ],
+      "forbidden_files": [],
+      "acceptance": [
+        "ProcessRegistry consumes the single DaemonConfig-owned mode path rather than re-deriving home_dir.join(\"mode\"), or duplication accepted with a note"
+      ],
+      "verify": "cargo test -p wisphive_daemon",
+      "evidence_needed": [
+        "test",
+        "diff"
+      ],
+      "evidence_refs": [
+        "e-10",
+        "e-11"
+      ],
+      "token_estimate": 10000,
+      "deps": [],
+      "risk": "low",
+      "wave": 2,
+      "notes": "Runs in wave 2 so it never overlaps Q-3's process_registry.rs read window. Accepted one-line out-of-ownership server.rs call-site swap.",
+      "token_actual": 54500,
+      "closed_at": "2026-07-15T00:05:00Z"
+    }
+  ]
+}

@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Retro — campaign-002-2026-07-14-sprint5-residue</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --fg: #1a1a1a;
+  --fg-dim: #555;
+  --bg: #fdfdfc;
+  --bg-soft: #f4f3ef;
+  --border: #d8d6cf;
+  --accent: #0a5;
+  --accent-soft: #cfe9d8;
+  --warn: #c60;
+  --warn-soft: #f4e1c8;
+  --danger: #c33;
+  --danger-soft: #f3cdcd;
+  --info: #36c;
+  --info-soft: #d4ddef;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg: #e8e6e1;
+    --fg-dim: #999;
+    --bg: #161514;
+    --bg-soft: #20201d;
+    --border: #36352f;
+    --accent: #6ec988;
+    --accent-soft: #1f3a27;
+    --warn: #d99a5b;
+    --warn-soft: #3e2e15;
+    --danger: #e57b7b;
+    --danger-soft: #3d1c1c;
+    --info: #7aa3e0;
+    --info-soft: #1c2a3e;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--fg);
+  background: var(--bg);
+  padding: 32px 24px 64px;
+  max-width: 1100px;
+  margin: 0 auto;
+}
+h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
+h2 { font-size: 17px; margin: 32px 0 8px; padding-bottom: 4px; border-bottom: 1px solid var(--border); }
+h3 { font-size: 14px; margin: 20px 0 6px; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.04em; }
+a { color: var(--info); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code, pre, .mono { font-family: var(--mono); font-size: 13px; }
+pre {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 10px 12px;
+  overflow-x: auto;
+  margin: 8px 0;
+}
+code { background: var(--bg-soft); padding: 1px 5px; border-radius: 3px; }
+pre code { background: none; padding: 0; }
+
+.meta {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 16px;
+  font-size: 13px;
+  color: var(--fg-dim);
+  margin: 8px 0 16px;
+}
+.meta dt { font-weight: 600; color: var(--fg); }
+.meta dd { margin: 0; font-family: var(--mono); }
+
+.banner {
+  padding: 10px 12px;
+  border-radius: 4px;
+  margin: 12px 0;
+  font-size: 13px;
+}
+.banner.info { background: var(--info-soft); border: 1px solid var(--info); }
+.banner.warn { background: var(--warn-soft); border: 1px solid var(--warn); }
+.banner.muted { background: var(--bg-soft); border: 1px solid var(--border); color: var(--fg-dim); }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 8px 0 16px;
+  font-size: 13px;
+}
+th, td {
+  padding: 8px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+th {
+  font-weight: 600;
+  color: var(--fg-dim);
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  border-bottom: 2px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+}
+tbody tr:hover { background: var(--bg-soft); }
+
+.badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-family: var(--mono);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.badge.ok      { background: var(--accent-soft); color: var(--accent); }
+.badge.warn    { background: var(--warn-soft);   color: var(--warn); }
+.badge.danger  { background: var(--danger-soft); color: var(--danger); }
+.badge.info    { background: var(--info-soft);   color: var(--info); }
+.badge.muted   { background: var(--bg-soft);     color: var(--fg-dim); border: 1px solid var(--border); }
+
+.totals {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px;
+  margin: 12px 0 20px;
+}
+.tile {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 10px 12px;
+  background: var(--bg-soft);
+}
+.tile .n { font-size: 22px; font-weight: 600; font-family: var(--mono); }
+.tile .k { font-size: 11px; text-transform: uppercase; color: var(--fg-dim); letter-spacing: 0.04em; }
+
+.empty {
+  color: var(--fg-dim);
+  font-style: italic;
+  font-size: 13px;
+  padding: 12px;
+  text-align: center;
+  border: 1px dashed var(--border);
+  border-radius: 4px;
+}
+
+.files { font-family: var(--mono); font-size: 12px; color: var(--fg-dim); }
+.files span { display: inline-block; margin-right: 8px; }
+
+.evidence-list { list-style: none; padding: 0; margin: 0; font-size: 12px; }
+.evidence-list li { margin: 2px 0; }
+
+.checkbox-row {
+  display: grid;
+  grid-template-columns: 28px 1fr;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  align-items: start;
+}
+.checkbox-row:hover { background: var(--bg-soft); }
+.checkbox-row input[type="checkbox"] {
+  width: 18px; height: 18px; margin-top: 2px; cursor: pointer;
+}
+.checkbox-row.checked { opacity: 0.55; text-decoration: line-through solid currentColor 1px; }
+.checkbox-row .label { font-weight: 500; }
+.checkbox-row .sub { font-size: 12px; color: var(--fg-dim); margin-top: 2px; }
+.checkbox-row .sub a { font-family: var(--mono); }
+.checkbox-row .fail-btn {
+  margin-left: 8px;
+  padding: 1px 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--fg-dim);
+  font-size: 11px;
+  font-family: var(--mono);
+  cursor: pointer;
+}
+.checkbox-row .fail-btn:hover { border-color: var(--danger); color: var(--danger); }
+.checkbox-row .fail-btn.active {
+  background: var(--danger-soft); color: var(--danger); border-color: var(--danger);
+}
+
+.summary-bar {
+  position: sticky;
+  bottom: 0;
+  background: var(--bg);
+  border-top: 2px solid var(--border);
+  padding: 10px 12px;
+  margin: 24px -24px -64px;
+  font-size: 13px;
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.summary-bar .count { font-family: var(--mono); font-weight: 600; }
+.summary-bar button {
+  margin-left: auto;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-soft);
+  font-family: var(--sans);
+  font-size: 13px;
+  cursor: pointer;
+  color: var(--fg);
+}
+.summary-bar button:hover { background: var(--border); }
+
+.footer {
+  margin-top: 48px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--fg-dim);
+  text-align: center;
+}
+
+</style>
+</head>
+<body>
+
+<h1>Retro — campaign-002-2026-07-14-sprint5-residue</h1>
+<p style="margin:0; color: var(--fg-dim); font-size: 14px;">Close sprint-5 residue: itr#525 #526 #528 #529 #530 #531 #532 agent-verified (or explicitly parked with recorded rationale)</p>
+
+<dl class="meta"><dt>Status</dt><dd><span class="badge ok">COMPLETE</span></dd><dt>Window</dt><dd>2026-07-14 23:15:00 UTC → 2026-07-15 00:10:00 UTC</dd><dt>Out of scope</dt><dd>all other open itr issues, docs/ROADMAP.md rows</dd><dt>Verify gate</dt><dd><code>just verify</code></dd><dt>Orchestrator tokens</dt><dd>90,000 / 200,000</dd><dt>Roadmap source</dt><dd><code>docs/ROADMAP.md</code></dd><dt>Tracker</dt><dd>itr</dd></dl>
+
+<div class="banner warn">Friction signals fired — full retro below.</div>
+
+<h2>Signals</h2>
+<div class="totals"><div class="tile"><div class="n">2</div><div class="k">Waves</div></div><div class="tile"><div class="n">1</div><div class="k">Retries</div></div><div class="tile"><div class="n">0</div><div class="k">Quarantines</div></div><div class="tile"><div class="n">1</div><div class="k">Verify failures</div></div><div class="tile"><div class="n">0</div><div class="k">Scout accepted</div></div><div class="tile"><div class="n">0</div><div class="k">Scout → next</div></div></div>
+
+<h2>What slowed agents</h2>
+<ul><li>Q-5 worker twice ended its turn &#x27;waiting&#x27; on a background test run instead of finishing synchronously — needed two orchestrator nudges</li><li>Concurrent cargo sessions from parallel workers caused one transient integration-test flake (known itr#520 family) — resolved by clean rerun</li><li>Final gate red once: itr#520-family e2e ingestion-hop flake, self-inflicted by running the reviewer&#x27;s cargo suites concurrently with the gate</li></ul>
+
+<h2>Process fixes</h2>
+<ul><li>Worker prompts should forbid ending a turn on an unfinished background verification (run gates in foreground)</li><li>Don&#x27;t run reviewer cargo suites concurrently with the just-verify gate on one machine; datapoint noted on itr#520</li></ul>
+
+<h2>Follow-up tickets</h2>
+<ul><li>Candidate: #[cfg(test)] insert seam in process_registry.rs so StopAgent&#x27;s Ok-arm stamping is testable end-to-end through dispatch_command (Q-2 caveat)</li><li>Optional S: unify remaining home_dir.join(&#x27;mode&#x27;) derivations in server.rs:139/:1989 onto config.mode_path (reviewer NIT, noted on itr#532)</li></ul>
+
+<div class="footer">
+  Generated by <code>render_campaign_report.py</code> at 2026-07-15 00:05 UTC.
+  Companion reports: <a href="changelog.html">changelog</a> ·
+  <a href="smoke-test.html">smoke-test</a> ·
+  <a href="roadmap-update.html">roadmap-update</a>
+</div>
+
+</body>
+</html>

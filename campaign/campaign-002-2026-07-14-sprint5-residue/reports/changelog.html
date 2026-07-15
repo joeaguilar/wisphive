@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Changelog — campaign-002-2026-07-14-sprint5-residue</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --fg: #1a1a1a;
+  --fg-dim: #555;
+  --bg: #fdfdfc;
+  --bg-soft: #f4f3ef;
+  --border: #d8d6cf;
+  --accent: #0a5;
+  --accent-soft: #cfe9d8;
+  --warn: #c60;
+  --warn-soft: #f4e1c8;
+  --danger: #c33;
+  --danger-soft: #f3cdcd;
+  --info: #36c;
+  --info-soft: #d4ddef;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg: #e8e6e1;
+    --fg-dim: #999;
+    --bg: #161514;
+    --bg-soft: #20201d;
+    --border: #36352f;
+    --accent: #6ec988;
+    --accent-soft: #1f3a27;
+    --warn: #d99a5b;
+    --warn-soft: #3e2e15;
+    --danger: #e57b7b;
+    --danger-soft: #3d1c1c;
+    --info: #7aa3e0;
+    --info-soft: #1c2a3e;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--fg);
+  background: var(--bg);
+  padding: 32px 24px 64px;
+  max-width: 1100px;
+  margin: 0 auto;
+}
+h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
+h2 { font-size: 17px; margin: 32px 0 8px; padding-bottom: 4px; border-bottom: 1px solid var(--border); }
+h3 { font-size: 14px; margin: 20px 0 6px; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.04em; }
+a { color: var(--info); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code, pre, .mono { font-family: var(--mono); font-size: 13px; }
+pre {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 10px 12px;
+  overflow-x: auto;
+  margin: 8px 0;
+}
+code { background: var(--bg-soft); padding: 1px 5px; border-radius: 3px; }
+pre code { background: none; padding: 0; }
+
+.meta {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 16px;
+  font-size: 13px;
+  color: var(--fg-dim);
+  margin: 8px 0 16px;
+}
+.meta dt { font-weight: 600; color: var(--fg); }
+.meta dd { margin: 0; font-family: var(--mono); }
+
+.banner {
+  padding: 10px 12px;
+  border-radius: 4px;
+  margin: 12px 0;
+  font-size: 13px;
+}
+.banner.info { background: var(--info-soft); border: 1px solid var(--info); }
+.banner.warn { background: var(--warn-soft); border: 1px solid var(--warn); }
+.banner.muted { background: var(--bg-soft); border: 1px solid var(--border); color: var(--fg-dim); }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 8px 0 16px;
+  font-size: 13px;
+}
+th, td {
+  padding: 8px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+th {
+  font-weight: 600;
+  color: var(--fg-dim);
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  border-bottom: 2px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+}
+tbody tr:hover { background: var(--bg-soft); }
+
+.badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-family: var(--mono);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.badge.ok      { background: var(--accent-soft); color: var(--accent); }
+.badge.warn    { background: var(--warn-soft);   color: var(--warn); }
+.badge.danger  { background: var(--danger-soft); color: var(--danger); }
+.badge.info    { background: var(--info-soft);   color: var(--info); }
+.badge.muted   { background: var(--bg-soft);     color: var(--fg-dim); border: 1px solid var(--border); }
+
+.totals {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px;
+  margin: 12px 0 20px;
+}
+.tile {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 10px 12px;
+  background: var(--bg-soft);
+}
+.tile .n { font-size: 22px; font-weight: 600; font-family: var(--mono); }
+.tile .k { font-size: 11px; text-transform: uppercase; color: var(--fg-dim); letter-spacing: 0.04em; }
+
+.empty {
+  color: var(--fg-dim);
+  font-style: italic;
+  font-size: 13px;
+  padding: 12px;
+  text-align: center;
+  border: 1px dashed var(--border);
+  border-radius: 4px;
+}
+
+.files { font-family: var(--mono); font-size: 12px; color: var(--fg-dim); }
+.files span { display: inline-block; margin-right: 8px; }
+
+.evidence-list { list-style: none; padding: 0; margin: 0; font-size: 12px; }
+.evidence-list li { margin: 2px 0; }
+
+.checkbox-row {
+  display: grid;
+  grid-template-columns: 28px 1fr;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  align-items: start;
+}
+.checkbox-row:hover { background: var(--bg-soft); }
+.checkbox-row input[type="checkbox"] {
+  width: 18px; height: 18px; margin-top: 2px; cursor: pointer;
+}
+.checkbox-row.checked { opacity: 0.55; text-decoration: line-through solid currentColor 1px; }
+.checkbox-row .label { font-weight: 500; }
+.checkbox-row .sub { font-size: 12px; color: var(--fg-dim); margin-top: 2px; }
+.checkbox-row .sub a { font-family: var(--mono); }
+.checkbox-row .fail-btn {
+  margin-left: 8px;
+  padding: 1px 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--fg-dim);
+  font-size: 11px;
+  font-family: var(--mono);
+  cursor: pointer;
+}
+.checkbox-row .fail-btn:hover { border-color: var(--danger); color: var(--danger); }
+.checkbox-row .fail-btn.active {
+  background: var(--danger-soft); color: var(--danger); border-color: var(--danger);
+}
+
+.summary-bar {
+  position: sticky;
+  bottom: 0;
+  background: var(--bg);
+  border-top: 2px solid var(--border);
+  padding: 10px 12px;
+  margin: 24px -24px -64px;
+  font-size: 13px;
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.summary-bar .count { font-family: var(--mono); font-weight: 600; }
+.summary-bar button {
+  margin-left: auto;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-soft);
+  font-family: var(--sans);
+  font-size: 13px;
+  cursor: pointer;
+  color: var(--fg);
+}
+.summary-bar button:hover { background: var(--border); }
+
+.footer {
+  margin-top: 48px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--fg-dim);
+  text-align: center;
+}
+
+</style>
+</head>
+<body>
+
+<h1>Changelog — campaign-002-2026-07-14-sprint5-residue</h1>
+<p style="margin:0; color: var(--fg-dim); font-size: 14px;">Close sprint-5 residue: itr#525 #526 #528 #529 #530 #531 #532 agent-verified (or explicitly parked with recorded rationale)</p>
+
+<dl class="meta"><dt>Status</dt><dd><span class="badge ok">COMPLETE</span></dd><dt>Window</dt><dd>2026-07-14 23:15:00 UTC → 2026-07-15 00:10:00 UTC</dd><dt>Out of scope</dt><dd>all other open itr issues, docs/ROADMAP.md rows</dd><dt>Verify gate</dt><dd><code>just verify</code></dd><dt>Orchestrator tokens</dt><dd>90,000 / 200,000</dd><dt>Roadmap source</dt><dd><code>docs/ROADMAP.md</code></dd><dt>Tracker</dt><dd>itr</dd></dl>
+
+<div class="totals"><div class="tile"><div class="n">7</div><div class="k">Verified</div></div><div class="tile"><div class="n">0</div><div class="k">Blocked</div></div><div class="tile"><div class="n">0</div><div class="k">Parked</div></div><div class="tile"><div class="n">0</div><div class="k">Next campaign</div></div><div class="tile"><div class="n">0</div><div class="k">Quarantined</div></div></div>
+
+
+
+<h2>Verified changes</h2>
+<table><thead><tr><th>Item</th><th>Source</th><th>User-visible change</th><th>Evidence</th><th>Files</th></tr></thead><tbody><tr><td><strong>Q-1</strong><br><span style="color: var(--fg-dim);">wisphive_hook socket-test harness: fake-daemon teardown race (DaemonUnreachable vs Runtime flake)</span></td><td>itr#525</td><td>—</td><td><ul class="evidence-list"><li><strong>test</strong> · cargo test -p wisphive_hook: 66 passed + 1 integration <span class="badge ok">PASS</span></li><li><strong>log</strong> · Stress: 30/30 filtered rounds + 50/50 named-test runs under concurrent full-crate load <span class="badge ok">PASS</span> <a href="scratchpad itr525-stress.log / itr525-concurrent2.log (session-temp)">scratchpad itr525-stress.log / itr525-concurrent2.log (session-temp)</a></li><li><strong>test</strong> · Wave 1 full gate: just verify (fmt, clippy, workspace tests incl. TUI snapshots, frontend lint+vitest, e2e) <span class="badge ok">PASS</span></li></ul></td><td><span class="files"><span>crates/wisphive_hook/src/main.rs</span></span></td></tr><tr><td><strong>Q-2</strong><br><span style="color: var(--fg-dim);">Daemon-side dispatch_command correlation-stamping test for StopAgent/SpawnAgent</span></td><td>itr#526</td><td>—</td><td><ul class="evidence-list"><li><strong>test</strong> · 3 new correlation-stamping tests; inversion of Some/None branch empirically observed red then reverted <span class="badge ok">PASS</span></li><li><strong>test</strong> · Wave 1 full gate: just verify (fmt, clippy, workspace tests incl. TUI snapshots, frontend lint+vitest, e2e) <span class="badge ok">PASS</span></li></ul></td><td><span class="files"><span>crates/wisphive_daemon/src/server.rs</span></span></td></tr><tr><td><strong>Q-3</strong><br><span style="color: var(--fg-dim);">ADR: redesign Codex managed-spawn hook audit away from reimplementing Codex config-resolution internals</span></td><td>itr#528</td><td>—</td><td><ul class="evidence-list"><li><strong>docs</strong> · ADR-0009 (Proposed): isolated CODEX_HOME over Codex config emulation; index row added <span class="badge ok">PASS</span> <a href="docs/decisions/0009-isolated-codex-home-over-config-emulation.md">docs/decisions/0009-isolated-codex-home-over-config-emulation.md</a></li></ul></td><td><span class="files"><span>docs/decisions/</span></span></td></tr><tr><td><strong>Q-4</strong><br><span style="color: var(--fg-dim);">event_ingest #512 error arms: cover via test seam or record accepted-gap rationale</span></td><td>itr#529</td><td>—</td><td><ul class="evidence-list"><li><strong>test</strong> · Seam tests cover both #512 error arms (readdir Err, file_type Err) <span class="badge ok">PASS</span></li><li><strong>test</strong> · Wave 1 full gate: just verify (fmt, clippy, workspace tests incl. TUI snapshots, frontend lint+vitest, e2e) <span class="badge ok">PASS</span></li></ul></td><td><span class="files"><span>crates/wisphive_daemon/src/event_ingest.rs</span></span></td></tr><tr><td><strong>Q-5</strong><br><span style="color: var(--fg-dim);">redact \xHH escaping: make injective (self-escape backslash) or scope to display sinks</span></td><td>itr#530</td><td>—</td><td><ul class="evidence-list"><li><strong>test</strong> · Injectivity: ambiguous pair distinct + decoder-backed 17-entry round-trip corpus <span class="badge ok">PASS</span></li><li><strong>test</strong> · Ripple check: daemon + TUI suites green; no external assertions on escaped format <span class="badge ok">PASS</span></li><li><strong>test</strong> · Wave 1 full gate: just verify (fmt, clippy, workspace tests incl. TUI snapshots, frontend lint+vitest, e2e) <span class="badge ok">PASS</span></li></ul></td><td><span class="files"><span>crates/wisphive_protocol/src/redact.rs</span></span></td></tr><tr><td><strong>Q-6</strong><br><span style="color: var(--fg-dim);">Prune unreachable client-side AgentSpawned handling (daemon stopped emitting it in #518)</span></td><td>itr#531</td><td>—</td><td><ul class="evidence-list"><li><strong>test</strong> · CLI + frontend gates for AgentSpawned prune/annotate <span class="badge ok">PASS</span></li><li><strong>test</strong> · Wave 1 full gate: just verify (fmt, clippy, workspace tests incl. TUI snapshots, frontend lint+vitest, e2e) <span class="badge ok">PASS</span></li></ul></td><td><span class="files"><span>crates/wisphive_cli/src/commands/agent.rs</span><span>crates/wisphive_web/frontend/src/types/protocol.ts</span></span></td></tr><tr><td><strong>Q-7</strong><br><span style="color: var(--fg-dim);">ProcessRegistry consumes DaemonConfig-owned mode_path instead of re-deriving it</span></td><td>itr#532</td><td>—</td><td><ul class="evidence-list"><li><strong>test</strong> · mode_path refactor: daemon tests, clippy --all-targets, workspace check <span class="badge ok">PASS</span></li><li><strong>test</strong> · Final full gate: just verify green on complete campaign tree (retry after itr#520-family e2e flake) <span class="badge ok">PASS</span></li></ul></td><td><span class="files"><span>crates/wisphive_daemon/src/process_registry.rs</span><span>crates/wisphive_daemon/src/config.rs</span></span></td></tr></tbody></table>
+
+<h2>Blocked &amp; parked</h2>
+<div class="empty">No blocked or parked items.</div>
+
+<h2>Drafted into next campaign</h2>
+<div class="empty">No items drafted into a next campaign.</div>
+
+<h2>Wave history</h2>
+<table><thead><tr><th>Wave</th><th>Window</th><th>Bundles</th><th>Verify</th><th>Friction</th><th>Tokens</th><th>Notes</th></tr></thead><tbody><tr><td><strong>W1</strong></td><td>2026-07-14 23:20:00 UTC → 2026-07-15 00:20:00 UTC</td><td>5</td><td><span class="badge ok">GREEN</span></td><td>0 retries, 0 quarantines</td><td>385,000</td><td>All five worker-verified. Commits 79659c5 d98c1d4 47b1330 9709924 70b635a. Q-5 worker needed two resume nudges (kept ending turn on a background test watch). One transient tui_snapshot_reflects_pending_decisions failure during 3-way cargo contention — green on clean rerun and in the full gate; known machine-load flake family (itr#520). Subagent tokens counted here are worker budgets, not orchestrator cap.</td></tr><tr><td><strong>W2</strong></td><td>2026-07-14 23:30:00 UTC → 2026-07-15 00:05:00 UTC</td><td>2</td><td><span class="badge ok">GREEN</span></td><td>1 retries, 0 quarantines</td><td>128,500</td><td>Q-3 (ADR-0009) committed a351fa5; Q-7 committed 858bfb0. Final just verify red once on the itr#520-family inbox e2e flake (machine saturated by the reviewer&#x27;s concurrent cargo runs) — root-caused via isolated-HOME probe (hook/daemon/audit hop healthy) + spec-alone pass in 4.1s; green on quiet rerun. Reviewer pass: signoff-clean.</td></tr></tbody></table>
+
+<div class="footer">
+  Generated by <code>render_campaign_report.py</code> at 2026-07-15 00:05 UTC.
+  Companion reports: <a href="smoke-test.html">smoke-test</a> ·
+  <a href="roadmap-update.html">roadmap-update</a> ·
+  <a href="retro.html">retro</a>
+</div>
+
+</body>
+</html>

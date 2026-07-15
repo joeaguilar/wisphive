@@ -1,0 +1,94 @@
+{
+  "waves": [
+    {
+      "n": 1,
+      "started_at": "2026-07-14T23:20:00Z",
+      "ended_at": "2026-07-15T00:20:00Z",
+      "bundles_run": 5,
+      "items": [
+        "Q-1",
+        "Q-2",
+        "Q-4",
+        "Q-5",
+        "Q-6"
+      ],
+      "verify_result": "green",
+      "retries": 0,
+      "quarantines": [],
+      "tokens_used": 385000,
+      "notes": "All five worker-verified. Commits 79659c5 d98c1d4 47b1330 9709924 70b635a. Q-5 worker needed two resume nudges (kept ending turn on a background test watch). One transient tui_snapshot_reflects_pending_decisions failure during 3-way cargo contention \u2014 green on clean rerun and in the full gate; known machine-load flake family (itr#520). Subagent tokens counted here are worker budgets, not orchestrator cap."
+    },
+    {
+      "n": 2,
+      "started_at": "2026-07-14T23:30:00Z",
+      "ended_at": "2026-07-15T00:05:00Z",
+      "bundles_run": 2,
+      "items": [
+        "Q-3",
+        "Q-7"
+      ],
+      "verify_result": "green",
+      "retries": 1,
+      "quarantines": [],
+      "tokens_used": 128500,
+      "notes": "Q-3 (ADR-0009) committed a351fa5; Q-7 committed 858bfb0. Final just verify red once on the itr#520-family inbox e2e flake (machine saturated by the reviewer's concurrent cargo runs) \u2014 root-caused via isolated-HOME probe (hook/daemon/audit hop healthy) + spec-alone pass in 4.1s; green on quiet rerun. Reviewer pass: signoff-clean."
+    }
+  ],
+  "signals": {
+    "total_waves": 2,
+    "retries": 1,
+    "quarantines": 0,
+    "verify_failures": 1,
+    "scout_tickets_accepted": 0,
+    "scout_tickets_parked": 0,
+    "scout_tickets_next_campaign": 0
+  },
+  "retro": {
+    "what_slowed": [
+      "Q-5 worker twice ended its turn 'waiting' on a background test run instead of finishing synchronously \u2014 needed two orchestrator nudges",
+      "Concurrent cargo sessions from parallel workers caused one transient integration-test flake (known itr#520 family) \u2014 resolved by clean rerun",
+      "Final gate red once: itr#520-family e2e ingestion-hop flake, self-inflicted by running the reviewer's cargo suites concurrently with the gate"
+    ],
+    "process_fixes": [
+      "Worker prompts should forbid ending a turn on an unfinished background verification (run gates in foreground)",
+      "Don't run reviewer cargo suites concurrently with the just-verify gate on one machine; datapoint noted on itr#520"
+    ],
+    "followups": [
+      "Candidate: #[cfg(test)] insert seam in process_registry.rs so StopAgent's Ok-arm stamping is testable end-to-end through dispatch_command (Q-2 caveat)",
+      "Optional S: unify remaining home_dir.join('mode') derivations in server.rs:139/:1989 onto config.mode_path (reviewer NIT, noted on itr#532)"
+    ]
+  },
+  "smoke_test": {
+    "how_to_run": [
+      "git checkout crossfire-blitz/20260712-230112",
+      "No runtime smoke required \u2014 all seven items are tests, internal refactors, or docs with no user-visible surface; the verify gate is their done gate",
+      "PO review item: read docs/decisions/0009-isolated-codex-home-over-config-emulation.md and accept/amend its status"
+    ],
+    "items": [
+      {
+        "id": "S-1",
+        "label": "Review ADR-0009 (Proposed): isolated CODEX_HOME recommendation, M+M+S sizing, codex_managed_home_import opt-in \u2014 accept, amend, or reject",
+        "evidence_refs": [
+          "e-9"
+        ],
+        "source_items": [
+          "Q-3"
+        ]
+      }
+    ],
+    "questions_for_po": [
+      "ADR-0009 is filed as Proposed \u2014 flip to Accepted, or amend the recommendation?",
+      "Should the ADR-0009 phase-1 implementation (isolated CODEX_HOME, sized M) be filed as itr issues now or wait for ADR acceptance?"
+    ],
+    "non_goals": [
+      "Roadmap rows \u2014 campaign is tracker-scoped sprint-5 residue only",
+      "Landing code for itr#528 (ADR/decision-record is the deliverable)"
+    ]
+  },
+  "roadmap_update": {
+    "section_updates": [],
+    "new_coverage": [],
+    "po_owned_or_ambiguous": [],
+    "suggested_command": null
+  }
+}
