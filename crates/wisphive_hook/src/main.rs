@@ -378,11 +378,95 @@ fn agent_project_env(agent_type: &AgentType) -> Option<&'static str> {
 }
 
 fn main() {
+    // Hidden install-preflight flag (itr#536): `wisphive-hook --statecheck
+    // [--home <dir>]` runs the READ-ONLY state validators and exits 0/1
+    // without touching stdin, the daemon, or any detector/marker state.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--statecheck") {
+        process::exit(run_statecheck(&args[1..]));
+    }
     let code = match run() {
         Ok(response) => format_and_exit(&response),
         Err(failure) => format_pre_parse_deny(&failure, &mut std::io::stderr().lock()),
     };
     process::exit(code);
+}
+
+/// Validate-only probe of the state dir the way THIS binary's `run()` would
+/// see it (itr#536, ADR-0010). install.sh runs this against the staged NEW
+/// binary before the atomic swap, so a validator added without migration
+/// coverage aborts the install instead of bricking every agent. Read-only:
+/// prints findings, performs NO repairs, and leaves brick-detector state
+/// untouched.
+fn run_statecheck(rest: &[String]) -> i32 {
+    let mut home: Option<PathBuf> = None;
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index].as_str() {
+            "--home" => {
+                index += 1;
+                let Some(value) = rest.get(index) else {
+                    eprintln!("--statecheck: --home requires a directory argument");
+                    return 64;
+                };
+                home = Some(PathBuf::from(value));
+            }
+            other => {
+                eprintln!("--statecheck: unknown argument {other:?}");
+                return 64;
+            }
+        }
+        index += 1;
+    }
+    let home = home.unwrap_or_else(home_dir);
+    let (report, code) = statecheck_report(&home);
+    println!("{report}");
+    code
+}
+
+/// Pure statecheck body: (human-readable findings, exit code).
+/// Exit 0 = this binary's validators accept the state (or there is no state
+/// yet); exit 1 = every hook event would be DENIED fail-closed (ADR-0010).
+fn statecheck_report(home: &Path) -> (String, i32) {
+    let wisphive_dir = home.join(".wisphive");
+    match std::fs::symlink_metadata(&wisphive_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return (
+                format!(
+                    "statecheck OK: {} does not exist — nothing to validate (fresh install; no hook can be gated by it yet).\n\
+                     Initialize gating with strict perms via: wisphive on",
+                    wisphive_dir.display()
+                ),
+                0,
+            );
+        }
+        _ => {}
+    }
+    match read_mode_file(&wisphive_dir) {
+        Ok(state) => {
+            let gating = match state {
+                ModeFileState::Active => "ACTIVE (hooks gate tool calls)",
+                ModeFileState::Off => "OFF (hooks pass through)",
+            };
+            (
+                format!(
+                    "statecheck OK: {} passes this binary's strict validators (dir 0700, mode 0600, owner-only, non-symlink). Gating mode: {gating}.",
+                    wisphive_dir.display()
+                ),
+                0,
+            )
+        }
+        Err(error) => {
+            let deny = mode_failure(&error, &wisphive_dir);
+            (
+                format!(
+                    "statecheck FAILED: this binary's validators REJECT the current state — once installed, EVERY hook event would be denied fail-closed (ADR-0010).\n{}",
+                    deny.message
+                ),
+                1,
+            )
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2791,6 +2875,69 @@ mod tests {
         assert!(stderr.contains("wisphive doctor --fix-perms"));
         assert!(stderr.contains("scripts/wisphive-rescue.sh"));
         assert!(stderr.contains("wisphive emergency-off"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn statecheck_accepts_healthy_state_and_missing_state_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Missing state dir entirely: fresh install, nothing to brick.
+        let home = tempfile::tempdir().unwrap();
+        let (report, code) = statecheck_report(home.path());
+        assert_eq!(code, 0, "absent state dir must pass: {report}");
+        assert!(report.contains("wisphive on"));
+
+        // Healthy strict state: pass, and report the gating mode.
+        let wisphive_dir = home.path().join(".wisphive");
+        std::fs::create_dir(&wisphive_dir).unwrap();
+        std::fs::set_permissions(&wisphive_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_test_mode(&wisphive_dir, "active");
+        let (report, code) = statecheck_report(home.path());
+        assert_eq!(code, 0, "healthy state must pass: {report}");
+        assert!(report.contains("ACTIVE"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn statecheck_rejects_legacy_perms_with_repair_guidance_and_no_side_effects() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let wisphive_dir = home.path().join(".wisphive");
+        std::fs::create_dir(&wisphive_dir).unwrap();
+        write_test_mode(&wisphive_dir, "active");
+        // Legacy perms exactly as in incident 2026-07-15.
+        std::fs::set_permissions(&wisphive_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(
+            &wisphive_dir.join("mode"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        let (report, code) = statecheck_report(home.path());
+        assert_eq!(code, 1, "legacy perms must fail the probe");
+        assert!(report.contains("denied fail-closed"));
+        assert!(report.contains(&wisphive_dir.display().to_string()));
+        assert!(report.contains("chmod 700") && report.contains("chmod 600"));
+        assert!(report.contains("wisphive doctor --fix-perms"));
+        assert!(report.contains("scripts/wisphive-rescue.sh"));
+
+        // Read-only probe: no brick marker, no detector state, no repairs.
+        assert!(!wisphive_dir.join("BRICKED").exists());
+        assert!(!wisphive_dir.join("brick-state.json").exists());
+        let dir_mode = std::fs::metadata(&wisphive_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(dir_mode, 0o755, "statecheck must never repair perms");
+    }
+
+    #[test]
+    fn statecheck_rejects_unknown_arguments() {
+        assert_eq!(run_statecheck(&["--frobnicate".to_string()]), 64);
+        assert_eq!(run_statecheck(&["--home".to_string()]), 64);
     }
 
     #[test]
