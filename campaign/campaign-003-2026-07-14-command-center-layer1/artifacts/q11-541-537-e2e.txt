@@ -1,0 +1,330 @@
+Q-11 E2E transcript — 2026-07-15T06:01:42Z
+repo commit: 66ebaba
+hook binary: /Users/josefaguilar/AI_Projects/wisphive/target/release/wisphive-hook (read-only, built from this branch, NOT installed)
+cli binary:  /Users/josefaguilar/AI_Projects/wisphive/target/release/wisphive
+
+════════════════════════════════════════════════════════════════
+SCENARIO 1: broken-perms HOME (0755 dir, 0644 mode='active')
+════════════════════════════════════════════════════════════════
+--- state of /tmp/whq11-s1/.wisphive ---
+total 8
+drwxr-xr-x@ 3 josefaguilar  wheel  96 Jul 15 01:01 .
+drwxr-xr-x@ 3 josefaguilar  wheel  96 Jul 15 01:01 ..
+-rw-r--r--@ 1 josefaguilar  wheel   7 Jul 15 01:01 mode
+--- mode contents: 'active'
+
+--- 1a. hook run BEFORE repair (expect exit 2 pre-parse deny) ---
+Wisphive denied this hook because the mode file is missing, unreadable, or unsafe: state directory /tmp/whq11-s1/.wisphive must be a non-symlink directory owned by the effective user (uid 501) with mode 0700 — found mode 0755, owner uid 501
+Required state: '/tmp/whq11-s1/.wisphive' is a non-symlink directory owned by you with mode 0700, and '/tmp/whq11-s1/.wisphive/mode' is a non-symlink regular file owned by you with mode 0600 containing 'active' or 'off'.
+Repair (perms): chmod 700 '/tmp/whq11-s1/.wisphive' && chmod 600 '/tmp/whq11-s1/.wisphive/mode'
+Repair (foreign owner): chown "$(id -un)" '/tmp/whq11-s1/.wisphive' '/tmp/whq11-s1/.wisphive/mode'
+Repair (missing file): printf 'off' > '/tmp/whq11-s1/.wisphive/mode' && chmod 600 '/tmp/whq11-s1/.wisphive/mode'
+Or run: wisphive doctor --fix-perms
+Or run: scripts/wisphive-rescue.sh
+Emergency exit (disables all Wisphive gating): wisphive emergency-off
+
+[hook exit code: 2]
+
+--- 1b. rescue.sh diagnose (expect FAIL per check + exact fix, exit 1) ---
+wisphive-rescue: strict-state diagnose for /tmp/whq11-s1/.wisphive
+
+PASS  state dir exists (/tmp/whq11-s1/.wisphive)
+PASS  state dir is not a symlink
+PASS  state dir is a directory
+PASS  state dir owned by you (uid 501)
+FAIL  state dir permissions are exactly 0700
+      /tmp/whq11-s1/.wisphive has 0755; the hook requires exactly 0700
+      fix: chmod 0700 '/tmp/whq11-s1/.wisphive'
+PASS  mode file exists (/tmp/whq11-s1/.wisphive/mode)
+PASS  mode file is not a symlink
+PASS  mode file is a regular file
+PASS  mode file owned by you (uid 501)
+FAIL  mode file permissions are exactly 0600
+      /tmp/whq11-s1/.wisphive/mode has 0644; the hook requires exactly 0600
+      fix: chmod 0600 '/tmp/whq11-s1/.wisphive/mode'
+PASS  mode file is <= 64 bytes (7)
+PASS  mode file content is valid ("active": gating enabled)
+INFO  config.json absent (fine: safe defaults apply)
+INFO  auto-approve.json (legacy) absent (fine: safe defaults apply)
+INFO  config.json.lock absent (fine: safe defaults apply)
+INFO  fail-mode absent (defaults to closed: runtime hook errors deny)
+
+2 check(s) failing. Run '/Users/josefaguilar/AI_Projects/wisphive/scripts/wisphive-rescue.sh --fix --home /tmp/whq11-s1' to apply safe owner-only repairs,
+or '/Users/josefaguilar/AI_Projects/wisphive/scripts/wisphive-rescue.sh --off --home /tmp/whq11-s1' to disable gating entirely (emergency exit).
+[rescue diagnose exit: 1]
+
+--- 1c. rescue.sh --fix (expect echoed FIXED mutations, exit 0) ---
+wisphive-rescue: strict-state fix for /tmp/whq11-s1/.wisphive
+
+PASS  state dir exists (/tmp/whq11-s1/.wisphive)
+PASS  state dir is not a symlink
+PASS  state dir is a directory
+PASS  state dir owned by you (uid 501)
+FAIL  state dir permissions are exactly 0700
+      /tmp/whq11-s1/.wisphive has 0755; the hook requires exactly 0700
+      fix: chmod 0700 '/tmp/whq11-s1/.wisphive'
+FIXED chmod 0700 /tmp/whq11-s1/.wisphive
+PASS  mode file exists (/tmp/whq11-s1/.wisphive/mode)
+PASS  mode file is not a symlink
+PASS  mode file is a regular file
+PASS  mode file owned by you (uid 501)
+FAIL  mode file permissions are exactly 0600
+      /tmp/whq11-s1/.wisphive/mode has 0644; the hook requires exactly 0600
+      fix: chmod 0600 '/tmp/whq11-s1/.wisphive/mode'
+FIXED chmod 0600 /tmp/whq11-s1/.wisphive/mode
+PASS  mode file is <= 64 bytes (7)
+PASS  mode file content is valid ("active": gating enabled)
+INFO  config.json absent (fine: safe defaults apply)
+INFO  auto-approve.json (legacy) absent (fine: safe defaults apply)
+INFO  config.json.lock absent (fine: safe defaults apply)
+INFO  fail-mode absent (defaults to closed: runtime hook errors deny)
+
+2 repair(s) applied. Re-run '/Users/josefaguilar/AI_Projects/wisphive/scripts/wisphive-rescue.sh --home /tmp/whq11-s1' to verify.
+[rescue --fix exit: 0]
+--- state of /tmp/whq11-s1/.wisphive ---
+total 8
+drwx------@ 3 josefaguilar  wheel  96 Jul 15 01:01 .
+drwxr-xr-x@ 3 josefaguilar  wheel  96 Jul 15 01:01 ..
+-rw-------@ 1 josefaguilar  wheel   7 Jul 15 01:01 mode
+--- mode contents: 'active'
+
+--- 1d. rescue.sh re-diagnose (expect all PASS, exit 0) ---
+wisphive-rescue: strict-state diagnose for /tmp/whq11-s1/.wisphive
+
+PASS  state dir exists (/tmp/whq11-s1/.wisphive)
+PASS  state dir is not a symlink
+PASS  state dir is a directory
+PASS  state dir owned by you (uid 501)
+PASS  state dir permissions are exactly 0700
+PASS  mode file exists (/tmp/whq11-s1/.wisphive/mode)
+PASS  mode file is not a symlink
+PASS  mode file is a regular file
+PASS  mode file owned by you (uid 501)
+PASS  mode file permissions are exactly 0600
+PASS  mode file is <= 64 bytes (7)
+PASS  mode file content is valid ("active": gating enabled)
+INFO  config.json absent (fine: safe defaults apply)
+INFO  auto-approve.json (legacy) absent (fine: safe defaults apply)
+INFO  config.json.lock absent (fine: safe defaults apply)
+INFO  fail-mode absent (defaults to closed: runtime hook errors deny)
+
+All checks passing. The strict hook validators will accept this state.
+[rescue re-diagnose exit: 0]
+
+--- 1e. hook run AFTER repair (expect exit 0: strict validators accept; Read auto-approves) ---
+
+[hook exit code: 0]
+
+════════════════════════════════════════════════════════════════
+SCENARIO 2: rescue.sh --off = emergency exit (hook passes through)
+════════════════════════════════════════════════════════════════
+(fixture starts broken AND active — --off must both repair perms and disable)
+--- state of /tmp/whq11-s2/.wisphive ---
+total 8
+drwxr-xr-x@ 3 josefaguilar  wheel  96 Jul 15 01:01 .
+drwxr-xr-x@ 3 josefaguilar  wheel  96 Jul 15 01:01 ..
+-rw-r--r--@ 1 josefaguilar  wheel   7 Jul 15 01:01 mode
+--- mode contents: 'active'
+
+--- 2a. rescue.sh --off ---
+wisphive-rescue: strict-state off for /tmp/whq11-s2/.wisphive
+
+FIXED chmod 0700 /tmp/whq11-s2/.wisphive
+FIXED write "off" -> /tmp/whq11-s2/.wisphive/mode (atomic via /tmp/whq11-s2/.wisphive/.mode.rescue.15608)
+
+==============================================================
+  WISPHIVE GATING IS NOW OFF.
+  Every hook now passes tool calls through WITHOUT review.
+  Re-enable with:  wisphive on   (or: wisphive hooks enable)
+==============================================================
+[rescue --off exit: 0]
+--- state of /tmp/whq11-s2/.wisphive ---
+total 8
+drwx------@ 3 josefaguilar  wheel  96 Jul 15 01:01 .
+drwxr-xr-x@ 3 josefaguilar  wheel  96 Jul 15 01:01 ..
+-rw-------@ 1 josefaguilar  wheel   3 Jul 15 01:01 mode
+--- mode contents: 'off'
+
+--- 2b. hook run after --off (expect exit 0 approve: gating disabled, pass-through) ---
+
+[hook exit code: 0]
+
+════════════════════════════════════════════════════════════════
+SCENARIO 3: 'wisphive on' from an EMPTY home yields hook-accepted state
+════════════════════════════════════════════════════════════════
+--- 3a. wisphive on (expect create dir 0700 + mode 0600 atomically) ---
+Wrote /tmp/whq11-s3/.wisphive/mode = "active" (state dir 0700, mode file 0600, atomic replace)
+Wisphive gating is ON: hooks route tool calls through the daemon for review.
+[wisphive on exit: 0]
+--- state of /tmp/whq11-s3/.wisphive ---
+total 8
+drwx------@ 3 josefaguilar  wheel  96 Jul 15 01:01 .
+drwxr-xr-x@ 3 josefaguilar  wheel  96 Jul 15 01:01 ..
+-rw-------@ 1 josefaguilar  wheel   6 Jul 15 01:01 mode
+--- mode contents: 'active'
+
+--- 3b. hook run (expect exit 0: strict validators accept the sanctioned-verb state) ---
+
+[hook exit code: 0]
+
+--- 3c. wisphive off (strict transition back off) ---
+Wrote /tmp/whq11-s3/.wisphive/mode = "off" (state dir 0700, mode file 0600, atomic replace)
+Wisphive gating is OFF: every hook passes tool calls through WITHOUT review.
+Re-enable with: wisphive on
+[wisphive off exit: 0]
+--- state of /tmp/whq11-s3/.wisphive ---
+total 16
+drwx------@ 4 josefaguilar  wheel  128 Jul 15 01:01 .
+drwxr-xr-x@ 3 josefaguilar  wheel   96 Jul 15 01:01 ..
+-rw-r--r--@ 1 josefaguilar  wheel  341 Jul 15 01:01 events.jsonl
+-rw-------@ 1 josefaguilar  wheel    3 Jul 15 01:01 mode
+--- mode contents: 'off'
+--- 3d. hook run after wisphive off (expect exit 0 pass-through) ---
+
+[hook exit code: 0]
+
+════════════════════════════════════════════════════════════════
+SCENARIO 4: symlinked mode file is tamper evidence — --fix REFUSES
+════════════════════════════════════════════════════════════════
+--- state of /tmp/whq11-s4/.wisphive ---
+total 0
+drwx------@ 3 josefaguilar  wheel   96 Jul 15 01:01 .
+drwxr-xr-x@ 4 josefaguilar  wheel  128 Jul 15 01:01 ..
+lrwxr-xr-x@ 1 josefaguilar  wheel   25 Jul 15 01:01 mode -> /tmp/whq11-s4/evil-target
+--- mode contents: 'active'
+
+--- 4a. rescue.sh --fix (expect REFUSING explanation, exit 1, symlink untouched) ---
+wisphive-rescue: strict-state fix for /tmp/whq11-s4/.wisphive
+
+PASS  state dir exists (/tmp/whq11-s4/.wisphive)
+PASS  state dir is not a symlink
+PASS  state dir is a directory
+PASS  state dir owned by you (uid 501)
+PASS  state dir permissions are exactly 0700
+PASS  mode file exists (/tmp/whq11-s4/.wisphive/mode)
+FAIL  mode file is not a symlink
+      /tmp/whq11-s4/.wisphive/mode is a symlink; the hook refuses to follow it (O_NOFOLLOW)
+      REFUSING to auto-fix: this is tamper evidence. Inspect it,
+      then remove/replace it yourself if you trust the explanation.
+INFO  config.json absent (fine: safe defaults apply)
+INFO  auto-approve.json (legacy) absent (fine: safe defaults apply)
+INFO  config.json.lock absent (fine: safe defaults apply)
+INFO  fail-mode absent (defaults to closed: runtime hook errors deny)
+
+No repairs applied.
+1 check(s) REFUSED (tamper evidence: symlink / foreign owner / wrong type). See above.
+[rescue --fix exit: 1]
+--- symlink still present (evidence preserved): ---
+lrwxr-xr-x@ 1 josefaguilar  wheel  25 Jul 15 01:01 /tmp/whq11-s4/.wisphive/mode -> /tmp/whq11-s4/evil-target
+
+--- 4b. 'wisphive on' also refuses (same tamper class) ---
+Error: refusing to set mode "active": /tmp/whq11-s4/.wisphive/mode is a symlink — tamper evidence. Inspect it, then `rm '/tmp/whq11-s4/.wisphive/mode'` and retry.
+(binary-independent alternative: scripts/wisphive-rescue.sh)
+[wisphive on exit: 1]
+
+--- 4c. hook still denies the symlinked mode (validators hold) ---
+Wisphive denied this hook because the mode file is missing, unreadable, or unsafe: cannot open mode file /tmp/whq11-s4/.wisphive/mode (must exist and not be a symlink): Too many levels of symbolic links (os error 62)
+Required state: '/tmp/whq11-s4/.wisphive' is a non-symlink directory owned by you with mode 0700, and '/tmp/whq11-s4/.wisphive/mode' is a non-symlink regular file owned by you with mode 0600 containing 'active' or 'off'.
+Repair (perms): chmod 700 '/tmp/whq11-s4/.wisphive' && chmod 600 '/tmp/whq11-s4/.wisphive/mode'
+Repair (foreign owner): chown "$(id -un)" '/tmp/whq11-s4/.wisphive' '/tmp/whq11-s4/.wisphive/mode'
+Repair (missing file): printf 'off' > '/tmp/whq11-s4/.wisphive/mode' && chmod 600 '/tmp/whq11-s4/.wisphive/mode'
+Or run: wisphive doctor --fix-perms
+Or run: scripts/wisphive-rescue.sh
+Emergency exit (disables all Wisphive gating): wisphive emergency-off
+
+[hook exit code: 2]
+
+════════════════════════════════════════════════════════════════
+SCENARIO 5: wisphive doctor / doctor --fix-perms on broken-perms HOME
+════════════════════════════════════════════════════════════════
+--- state of /tmp/whq11-s5/.wisphive ---
+total 16
+drwxr-xr-x@ 4 josefaguilar  wheel  128 Jul 15 01:01 .
+drwxr-xr-x@ 3 josefaguilar  wheel   96 Jul 15 01:01 ..
+-rw-rw-r--@ 1 josefaguilar  wheel    2 Jul 15 01:01 config.json
+-rw-r--r--@ 1 josefaguilar  wheel    7 Jul 15 01:01 mode
+--- mode contents: 'active'
+
+--- 5a. wisphive doctor (expect named FAILs with exact chmod fixes) ---
+  OK  wisphive binary
+  OK  wisphive-hook binary
+  OK  state dir exists
+  OK  state dir is not a symlink
+  OK  state dir is a directory
+  OK  state dir owned by you
+  OK  mode file exists
+  OK  mode file is not a symlink
+  OK  mode file is a regular file
+  OK  mode file owned by you
+  OK  mode file is <= 64 bytes
+  OK  mode file content is "active" or "off"
+  --  auto-approve.json (legacy) trust: absent (fine: safe defaults apply)
+  --  config.json.lock trust: absent (fine: safe defaults apply)
+  --  fail-mode: absent (defaults to closed: runtime hook errors deny)
+
+  FAIL  state dir permissions are exactly 0700
+      /tmp/whq11-s5/.wisphive has 0755; the hook requires exactly 0700
+      fix: chmod 0700 '/tmp/whq11-s5/.wisphive'
+  FAIL  mode file permissions are exactly 0600
+      /tmp/whq11-s5/.wisphive/mode has 0644; the hook requires exactly 0600
+      fix: chmod 0600 '/tmp/whq11-s5/.wisphive/mode'
+  FAIL  config.json not group/world-writable
+      /tmp/whq11-s5/.wisphive/config.json has 0664; the hook ignores it and falls back to safe defaults
+      fix: chmod go-w '/tmp/whq11-s5/.wisphive/config.json'
+  FAIL  daemon is not running
+      fix: wisphive daemon start
+  FAIL  no /tmp/.claude/settings.json in tmp
+      fix: wisphive hooks install --project /tmp
+  FAIL  no /tmp/.codex/hooks.json in tmp
+      fix: wisphive hooks install --project /tmp
+
+12 passed, 6 issue(s) found.
+[doctor exit: 0]
+
+--- 5b. wisphive doctor --fix-perms (expect echoed FIXED repairs, then green strict checks) ---
+  OK  wisphive binary
+  OK  wisphive-hook binary
+  FIXED chmod 0700 '/tmp/whq11-s5/.wisphive'
+  FIXED chmod 0600 '/tmp/whq11-s5/.wisphive/mode'
+  FIXED chmod 0644 '/tmp/whq11-s5/.wisphive/config.json'
+  OK  state dir exists
+  OK  state dir is not a symlink
+  OK  state dir is a directory
+  OK  state dir owned by you
+  OK  state dir permissions are exactly 0700
+  OK  mode file exists
+  OK  mode file is not a symlink
+  OK  mode file is a regular file
+  OK  mode file owned by you
+  OK  mode file permissions are exactly 0600
+  OK  mode file is <= 64 bytes
+  OK  mode file content is "active" or "off"
+  OK  config.json not group/world-writable
+  --  auto-approve.json (legacy) trust: absent (fine: safe defaults apply)
+  --  config.json.lock trust: absent (fine: safe defaults apply)
+  --  fail-mode: absent (defaults to closed: runtime hook errors deny)
+
+  FAIL  daemon is not running
+      fix: wisphive daemon start
+  FAIL  no /tmp/.claude/settings.json in tmp
+      fix: wisphive hooks install --project /tmp
+  FAIL  no /tmp/.codex/hooks.json in tmp
+      fix: wisphive hooks install --project /tmp
+
+15 passed, 3 issue(s) found.
+[doctor --fix-perms exit: 0]
+--- state of /tmp/whq11-s5/.wisphive ---
+total 16
+drwx------@ 4 josefaguilar  wheel  128 Jul 15 01:01 .
+drwxr-xr-x@ 3 josefaguilar  wheel   96 Jul 15 01:01 ..
+-rw-r--r--@ 1 josefaguilar  wheel    2 Jul 15 01:01 config.json
+-rw-------@ 1 josefaguilar  wheel    7 Jul 15 01:01 mode
+--- mode contents: 'active'
+
+--- 5c. hook run after doctor --fix-perms (expect exit 0) ---
+
+[hook exit code: 0]
+
+════════════════════════════════════════════════════════════════
+END OF TRANSCRIPT
+════════════════════════════════════════════════════════════════

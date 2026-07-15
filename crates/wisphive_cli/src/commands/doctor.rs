@@ -3,11 +3,13 @@ use std::path::PathBuf;
 use anyhow::Result;
 use wisphive_daemon::project_audit::{AgentHookAudit, audit_project};
 
+use super::statecheck;
+
 const CODEX_HOOK_REVIEW_NOTE: &str = "Codex project hooks require /hooks review inside Codex; \
 trust the Wisphive hook command there if Codex does not appear in Wisphive after a tool call.";
 
-pub fn run(project: Option<PathBuf>) -> Result<()> {
-    let home = wisphive_home();
+pub fn run(project: Option<PathBuf>, fix_perms: bool) -> Result<()> {
+    let home = statecheck::wisphive_home();
     let project = project
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
@@ -33,31 +35,54 @@ pub fn run(project: Option<PathBuf>) -> Result<()> {
         &mut ok_count,
     );
 
-    // ── 2. Home directory ──
+    // ── 2/3. Strict state checks (the hook's validators, itr#537) ──
+    //
+    // Same checklist and repair semantics as scripts/wisphive-rescue.sh: any
+    // HARD failure means the hook denies every event; --fix-perms applies the
+    // safe owner-only tightenings and refuses tamper-evidence-class entries.
 
-    check(
-        "~/.wisphive directory",
-        home.is_dir(),
-        "mkdir -p ~/.wisphive",
-        &mut issues,
-        &mut ok_count,
-    );
+    if fix_perms {
+        let outcome = statecheck::fix_perms(&home);
+        for applied in &outcome.applied {
+            eprintln!("  FIXED {applied}");
+        }
+        for refused in &outcome.refused {
+            eprintln!("  REFUSED {refused}");
+        }
+        if outcome.applied.is_empty() && outcome.refused.is_empty() {
+            eprintln!("  --fix-perms: nothing to repair");
+        }
+    }
 
-    // ── 3. Mode file ──
-
-    let mode = std::fs::read_to_string(home.join("mode"))
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-
-    if mode == "active" {
-        eprintln!("  OK  hooks mode is active");
-        ok_count += 1;
-    } else if mode == "off" {
-        issues.push("FAIL  hooks mode is \"off\" (hooks are pass-through)\n      fix: wisphive hooks enable".to_string());
-    } else {
+    let mut gating_off = false;
+    for result in statecheck::run_checks(&home) {
+        match result.status {
+            statecheck::Status::Pass => {
+                eprintln!("  OK  {}", result.name);
+                ok_count += 1;
+                if result.detail.contains("\"off\"") {
+                    gating_off = true;
+                }
+            }
+            statecheck::Status::Info => {
+                eprintln!("  --  {}: {}", result.name, result.detail);
+            }
+            statecheck::Status::Fail => {
+                let fix = if result.tamper {
+                    "inspect manually (tamper evidence: never auto-repaired)".to_string()
+                } else {
+                    result.fix.unwrap_or_else(|| "see detail above".to_string())
+                };
+                issues.push(format!(
+                    "FAIL  {}\n      {}\n      fix: {fix}",
+                    result.name, result.detail
+                ));
+            }
+        }
+    }
+    if gating_off {
         issues.push(
-            "FAIL  hooks mode not set (defaults to off)\n      fix: wisphive hooks enable"
+            "WARN  hooks mode is \"off\" (hooks are pass-through)\n      fix: wisphive on"
                 .to_string(),
         );
     }
@@ -179,11 +204,6 @@ fn which(binary: &str) -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
-}
-
-fn wisphive_home() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home).join(".wisphive")
 }
 
 #[cfg(unix)]

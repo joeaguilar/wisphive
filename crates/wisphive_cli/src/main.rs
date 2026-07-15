@@ -45,6 +45,14 @@ enum Command {
     /// Emergency kill switch — disables all hooks instantly
     EmergencyOff,
 
+    /// Enable gating: create/repair ~/.wisphive/mode = "active" with the
+    /// strict perms the hook validators require (dir 0700, mode file 0600)
+    On,
+
+    /// Disable gating: set ~/.wisphive/mode = "off" via the same strict
+    /// transition (alias of emergency-off)
+    Off,
+
     /// Manage AI agent processes
     Agent {
         #[command(subcommand)]
@@ -86,6 +94,12 @@ enum Command {
         /// Project directory to check (defaults to current directory)
         #[arg(long)]
         project: Option<std::path::PathBuf>,
+        /// Apply safe owner-only permission repairs (chmod 0700 state dir,
+        /// 0600 mode file, strip group/other write on policy files). Never
+        /// loosens, never chowns; refuses symlinks/foreign owners (tamper
+        /// evidence). Same semantics as scripts/wisphive-rescue.sh --fix.
+        #[arg(long)]
+        fix_perms: bool,
     },
 
     /// Manage wisphive-owned terminal (PTY) sessions
@@ -497,8 +511,10 @@ fn main() -> anyhow::Result<()> {
                 AutoApproveAction::Reset => commands::config::auto_approve_reset(),
             },
         },
-        Command::Doctor { project } => commands::doctor::run(project),
+        Command::Doctor { project, fix_perms } => commands::doctor::run(project, fix_perms),
         Command::EmergencyOff => commands::hooks::emergency_off(),
+        Command::On => commands::hooks::mode_on(),
+        Command::Off => commands::hooks::mode_off(),
         Command::Hooks { action } => match action {
             HookAction::Enable => commands::hooks::set_mode("active"),
             HookAction::Disable => commands::hooks::set_mode("off"),
