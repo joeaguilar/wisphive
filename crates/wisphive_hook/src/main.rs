@@ -418,7 +418,16 @@ fn read_mode_file(wisphive_dir: &Path) -> std::io::Result<ModeFileState> {
     let directory = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(wisphive_dir)?;
+        .open(wisphive_dir)
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot open state directory {} (must exist and not be a symlink): {error}",
+                    wisphive_dir.display()
+                ),
+            )
+        })?;
     let directory_metadata = directory.metadata()?;
     // SAFETY: `geteuid` takes no arguments and has no preconditions.
     let effective_uid = unsafe { libc::geteuid() };
@@ -428,7 +437,12 @@ fn read_mode_file(wisphive_dir: &Path) -> std::io::Result<ModeFileState> {
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "Wisphive state directory must be a non-symlink directory owned by the effective user with mode 0700",
+            format!(
+                "state directory {} must be a non-symlink directory owned by the effective user (uid {effective_uid}) with mode 0700 — found mode {:04o}, owner uid {}",
+                wisphive_dir.display(),
+                directory_metadata.mode() & 0o7777,
+                directory_metadata.uid(),
+            ),
         ));
     }
 
@@ -445,7 +459,14 @@ fn read_mode_file(wisphive_dir: &Path) -> std::io::Result<ModeFileState> {
         )
     };
     if mode_fd < 0 {
-        return Err(std::io::Error::last_os_error());
+        let error = std::io::Error::last_os_error();
+        return Err(std::io::Error::new(
+            error.kind(),
+            format!(
+                "cannot open mode file {} (must exist and not be a symlink): {error}",
+                wisphive_dir.join("mode").display()
+            ),
+        ));
     }
     // SAFETY: `openat` returned a fresh owned descriptor above.
     let file = unsafe { std::fs::File::from_raw_fd(mode_fd) };
@@ -456,7 +477,12 @@ fn read_mode_file(wisphive_dir: &Path) -> std::io::Result<ModeFileState> {
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "mode must be a non-symlink regular file owned by the effective user with mode 0600",
+            format!(
+                "mode file {} must be a non-symlink regular file owned by the effective user (uid {effective_uid}) with mode 0600 — found mode {:04o}, owner uid {}",
+                wisphive_dir.join("mode").display(),
+                metadata.mode() & 0o7777,
+                metadata.uid(),
+            ),
         ));
     }
 
@@ -485,10 +511,25 @@ fn read_mode_file(_wisphive_dir: &Path) -> std::io::Result<ModeFileState> {
     ))
 }
 
-fn mode_failure(error: &std::io::Error) -> PreParseDeny {
+/// Compose the actionable fail-closed denial for a mode-file/perms failure
+/// (itr#535, ADR-0010). The posture is DELIBERATE — every event type,
+/// including UserPromptSubmit, denies until the state is repaired — so the
+/// message must carry the full way out: the failing path (embedded in
+/// `error` by `read_mode_file`), the required state, and the exact repair
+/// commands. Do NOT soften this into a fail-open branch; the PO endorsed the
+/// total stop as baked-in security after the 2026-07-15 incident.
+fn mode_failure(error: &std::io::Error, wisphive_dir: &Path) -> PreParseDeny {
+    let dir = wisphive_dir.display();
     PreParseDeny {
         message: format!(
-            "Wisphive denied this hook because the mode file is missing, unreadable, or unsafe: {error}"
+            "Wisphive denied this hook because the mode file is missing, unreadable, or unsafe: {error}\n\
+             Required state: '{dir}' is a non-symlink directory owned by you with mode 0700, and '{dir}/mode' is a non-symlink regular file owned by you with mode 0600 containing 'active' or 'off'.\n\
+             Repair (perms): chmod 700 '{dir}' && chmod 600 '{dir}/mode'\n\
+             Repair (foreign owner): chown \"$(id -un)\" '{dir}' '{dir}/mode'\n\
+             Repair (missing file): printf 'off' > '{dir}/mode' && chmod 600 '{dir}/mode'\n\
+             Or run: wisphive doctor --fix-perms\n\
+             Or run: scripts/wisphive-rescue.sh\n\
+             Emergency exit (disables all Wisphive gating): wisphive emergency-off"
         ),
     }
 }
@@ -916,7 +957,7 @@ fn run() -> Result<HookResponse, PreParseDeny> {
                 detect_agent_type(&serde_json::Value::Null),
             ));
         }
-        Err(error) => return Err(mode_failure(&error)),
+        Err(error) => return Err(mode_failure(&error, &wisphive_dir)),
     }
 
     let fail_mode = read_fail_mode(&wisphive_dir);
@@ -2728,7 +2769,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let error = read_mode_file(directory.path()).expect_err("missing mode must fail closed");
-        let failure = mode_failure(&error);
+        let failure = mode_failure(&error, directory.path());
         let mut stderr = Vec::new();
 
         assert_eq!(format_pre_parse_deny(&failure, &mut stderr), 2);
@@ -2736,6 +2777,20 @@ mod tests {
         assert!(stderr.contains("missing, unreadable, or unsafe"));
         assert!(!stderr.contains("PreToolUse"));
         assert!(!stderr.contains("hookSpecificOutput"));
+
+        // itr#535: the denial must be actionable — failing path, required
+        // state, and the exact repair commands, ending at the emergency exit.
+        let mode_path = directory.path().join("mode");
+        assert!(
+            stderr.contains(&mode_path.display().to_string()),
+            "denial must name the failing mode-file path: {stderr}"
+        );
+        assert!(stderr.contains("mode 0700") && stderr.contains("mode 0600"));
+        assert!(stderr.contains("chmod 700") && stderr.contains("chmod 600"));
+        assert!(stderr.contains("chown"));
+        assert!(stderr.contains("wisphive doctor --fix-perms"));
+        assert!(stderr.contains("scripts/wisphive-rescue.sh"));
+        assert!(stderr.contains("wisphive emergency-off"));
     }
 
     #[test]

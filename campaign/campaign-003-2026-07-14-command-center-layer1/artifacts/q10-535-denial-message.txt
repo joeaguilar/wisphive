@@ -1,0 +1,26 @@
+=== itr#535 E2E: real denial output from the release binary — 2026-07-15T05:49:34Z ===
+binary: /Users/josefaguilar/AI_Projects/wisphive/target/release/wisphive-hook
+sha256: d7297dea4a7de36c7f86e3fd9f39fe75a56f234eceeb291cb641b00b36ecc53d
+built from: 66ebaba4554191ad7e75cdecac2aa0e0c373acb2
+
+--- deliberately-broken isolated HOME (/tmp/whq10d): mode file chmod 644 (required 0600) ---
+total 8
+drwx------@ 3 josefaguilar  wheel  96 Jul 15 00:49 .
+drwx------@ 3 josefaguilar  wheel  96 Jul 15 00:49 ..
+-rw-r--r--@ 1 josefaguilar  wheel   7 Jul 15 00:49 mode
+
+--- drive: UserPromptSubmit (human-origin event — still DENIES per ADR-0010 posture) ---
+stdin: {"hook_event_name":"UserPromptSubmit","session_id":"q10-535","prompt":"hello","cwd":"/tmp/whq10d"}
+exit code: 2 (2 = deny)
+stdout: ''
+stderr (the full actionable denial message):
+  | Wisphive denied this hook because the mode file is missing, unreadable, or unsafe: mode file /tmp/whq10d/.wisphive/mode must be a non-symlink regular file owned by the effective user (uid 501) with mode 0600 — found mode 0644, owner uid 501
+  | Required state: '/tmp/whq10d/.wisphive' is a non-symlink directory owned by you with mode 0700, and '/tmp/whq10d/.wisphive/mode' is a non-symlink regular file owned by you with mode 0600 containing 'active' or 'off'.
+  | Repair (perms): chmod 700 '/tmp/whq10d/.wisphive' && chmod 600 '/tmp/whq10d/.wisphive/mode'
+  | Repair (foreign owner): chown "$(id -un)" '/tmp/whq10d/.wisphive' '/tmp/whq10d/.wisphive/mode'
+  | Repair (missing file): printf 'off' > '/tmp/whq10d/.wisphive/mode' && chmod 600 '/tmp/whq10d/.wisphive/mode'
+  | Or run: wisphive doctor --fix-perms
+  | Or run: scripts/wisphive-rescue.sh
+  | Emergency exit (disables all Wisphive gating): wisphive emergency-off
+
+RESULT: DENY preserved + message names failing path, required state, and all repair commands — PASS
