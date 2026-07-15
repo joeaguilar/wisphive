@@ -377,6 +377,8 @@ fn agent_project_env(agent_type: &AgentType) -> Option<&'static str> {
     }
 }
 
+mod brick;
+
 fn main() {
     // Hidden install-preflight flag (itr#536): `wisphive-hook --statecheck
     // [--home <dir>]` runs the READ-ONLY state validators and exits 0/1
@@ -1033,15 +1035,23 @@ fn run() -> Result<HookResponse, PreParseDeny> {
     let wisphive_dir = home.join(".wisphive");
 
     match read_mode_file(&wisphive_dir) {
-        Ok(ModeFileState::Active) => {}
+        Ok(ModeFileState::Active) => brick::clear_on_healthy(&wisphive_dir),
         Ok(ModeFileState::Off) => {
+            brick::clear_on_healthy(&wisphive_dir);
             return Ok(HookResponse::new(
                 Decision::Approve,
                 HookEventType::PreToolUse,
                 detect_agent_type(&serde_json::Value::Null),
             ));
         }
-        Err(error) => return Err(mode_failure(&error, &wisphive_dir)),
+        Err(error) => {
+            let deny = mode_failure(&error, &wisphive_dir);
+            // Brick detector (itr#538): passive escalation only. The DENY
+            // below is unchanged (fail-closed, ADR-0010) — this never repairs
+            // and never alters the decision.
+            brick::record_denial(&wisphive_dir, &error.to_string(), &deny.message);
+            return Err(deny);
+        }
     }
 
     let fail_mode = read_fail_mode(&wisphive_dir);
