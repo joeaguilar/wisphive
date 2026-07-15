@@ -41,6 +41,11 @@ interface TerminalsProps {
 // without requiring re-normalization.
 const SORT_GAP = 1_000_000;
 const UNGROUPED_KEY = "__ungrouped__";
+// Bounded wait for a deep-link focus target to show up in `terminals` before
+// the request is declared stale (itr#449). The view refreshes term_list on
+// mount, so a live target arrives well inside this window; anything slower is
+// a dead pointer (session ended, or never an embedded wisphive terminal).
+const FOCUS_WAIT_MS = 2_000;
 const FOCUSABLE =
   'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
@@ -57,6 +62,12 @@ export function Terminals(props: TerminalsProps) {
   } = props;
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [replayMode, setReplayMode] = useState(false);
+  // Feedback for a deep-link focus whose target never appeared (itr#449) —
+  // rendered as a dismissible inline notice instead of a silent no-op.
+  const [focusNotice, setFocusNotice] = useState<string | null>(null);
+  // Deadline anchor for the pending focus request, keyed by session id so
+  // unrelated `terminals` updates re-running the effect can't extend the wait.
+  const focusWaitRef = useRef<{ id: string; deadline: number } | null>(null);
   const isMobile = useIsMobile();
   const [showProjectPicker, setShowProjectPicker] = useState(false);
   const [orphanedOpen, setOrphanedOpen] = useState<boolean>(() => readBool("wisphive.terminals.orphaned.open", true));
@@ -291,12 +302,40 @@ export function Terminals(props: TerminalsProps) {
   // Honour an inbox deep-link focus (itr#437). Waits for the target session to
   // appear in `terminals` (term_list may not have arrived yet), then selects +
   // live-attaches it and clears the request upstream so it won't re-fire.
+  // A target that never arrives within FOCUS_WAIT_MS is stale (itr#449): the
+  // session ended, or the deferred row was mislabeled with a non-embedded
+  // terminal id. Surface an inline notice instead of a silent no-op, and still
+  // ack via onFocusHandled so the pending focus can't wedge the inbox.
   useEffect(() => {
-    if (!focusSessionId) return;
+    if (!focusSessionId) {
+      focusWaitRef.current = null;
+      return;
+    }
     const target = terminals.find((t) => t.id === focusSessionId);
-    if (!target) return;
-    handleSelect(target, false);
-    onFocusHandled?.();
+    if (target) {
+      focusWaitRef.current = null;
+      setFocusNotice(null);
+      handleSelect(target, false);
+      onFocusHandled?.();
+      return;
+    }
+    if (focusWaitRef.current?.id !== focusSessionId) {
+      focusWaitRef.current = { id: focusSessionId, deadline: Date.now() + FOCUS_WAIT_MS };
+    }
+    const giveUp = () => {
+      focusWaitRef.current = null;
+      setFocusNotice(
+        `Couldn't focus terminal ${focusSessionId.slice(0, 8)}… — the session is no longer available. It may have ended, or it isn't an embedded wisphive terminal.`,
+      );
+      onFocusHandled?.();
+    };
+    const remaining = focusWaitRef.current.deadline - Date.now();
+    if (remaining <= 0) {
+      giveUp();
+      return;
+    }
+    const timer = window.setTimeout(giveUp, remaining);
+    return () => window.clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusSessionId, terminals]);
 
@@ -402,6 +441,19 @@ export function Terminals(props: TerminalsProps) {
   return (
     <div className={`terminals-layout${selected ? " terminal-open" : ""}`}>
       <div className="terminals-sidebar">
+        {focusNotice && (
+          <div className="terminals-focus-notice" role="status">
+            <span className="terminals-focus-notice-message">{focusNotice}</span>
+            <button
+              type="button"
+              className="terminals-focus-notice-dismiss"
+              aria-label="Dismiss terminal focus notice"
+              onClick={() => setFocusNotice(null)}
+            >
+              ×
+            </button>
+          </div>
+        )}
         <div className="terminals-sidebar-toolbar">
           <button onClick={handleCreate}>+ New terminal</button>
           <button onClick={() => { onRefreshProjects(); setShowProjectPicker(true); }}>+ In project…</button>

@@ -1,6 +1,6 @@
 import { createRef, StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Terminals } from "./Terminals";
 import type { TerminalSessionMeta } from "../types/protocol";
@@ -265,6 +265,144 @@ describe("Terminals mobile dialog accessibility (itr#488)", () => {
     first.focus();
     expect(fireEvent.keyDown(document, { key: "Tab", shiftKey: true })).toBe(false);
     expect(document.activeElement).toBe(last);
+  });
+});
+
+describe("Terminals deferred deep-link focus (itr#437 / itr#449)", () => {
+  interface FocusMountOptions {
+    terminals?: TerminalSessionMeta[];
+    focusSessionId?: string;
+  }
+
+  function mountWithFocus(options: FocusMountOptions = {}) {
+    const onAttach = vi.fn();
+    const onFocusHandled = vi.fn();
+    const backgroundRef = createRef<HTMLElement>();
+    const build = (terminals: TerminalSessionMeta[], focusSessionId?: string) => (
+      <Terminals
+        terminals={terminals}
+        queue={[]}
+        projects={[]}
+        onRefresh={() => {}}
+        onRefreshProjects={() => {}}
+        onCreate={() => {}}
+        onAttach={onAttach}
+        onDetach={() => {}}
+        onClose={() => {}}
+        onReplay={() => {}}
+        onInput={() => {}}
+        onResize={() => {}}
+        onSetGroup={() => {}}
+        onReorder={() => {}}
+        onApprove={() => {}}
+        onDeny={() => {}}
+        onJumpToQueue={() => {}}
+        focusSessionId={focusSessionId}
+        onFocusHandled={onFocusHandled}
+        backgroundRef={backgroundRef}
+        registerHandler={vi.fn(() => () => {})}
+      />
+    );
+    const utils = render(build(options.terminals ?? [session], options.focusSessionId));
+    return {
+      ...utils,
+      onAttach,
+      onFocusHandled,
+      rerenderWith: (terminals: TerminalSessionMeta[], focusSessionId?: string) =>
+        utils.rerender(build(terminals, focusSessionId)),
+    };
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("focuses a live target immediately: attaches, acks, and shows no notice", () => {
+    const { container, onAttach, onFocusHandled } = mountWithFocus({
+      focusSessionId: session.id,
+    });
+
+    expect(onAttach).toHaveBeenCalledWith(session.id);
+    expect(onFocusHandled).toHaveBeenCalledTimes(1);
+    expect(container.querySelector(".terminals-focus-notice")).toBeNull();
+  });
+
+  it("surfaces a notice and still acks when the target never appears (itr#449)", () => {
+    const { container, onAttach, onFocusHandled } = mountWithFocus({
+      focusSessionId: "gone-session-1",
+    });
+
+    // Inside the bounded wait the miss is not yet a verdict: term_list may
+    // still be in flight, so no notice and no ack yet.
+    expect(container.querySelector(".terminals-focus-notice")).toBeNull();
+    expect(onFocusHandled).not.toHaveBeenCalled();
+
+    act(() => {
+      vi.advanceTimersByTime(2_000);
+    });
+
+    // Stale verdict: visible feedback instead of a silent no-op, and the
+    // pending focus is acked so the inbox deep-link state can't wedge.
+    const notice = container.querySelector(".terminals-focus-notice");
+    expect(notice).not.toBeNull();
+    expect(notice!.textContent).toContain("gone-ses");
+    expect(onFocusHandled).toHaveBeenCalledTimes(1);
+    expect(onAttach).not.toHaveBeenCalled();
+
+    // The notice announces itself to assistive tech and is dismissible.
+    expect(screen.getByRole("status").textContent).toContain("gone-ses");
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss terminal focus notice" }));
+    expect(container.querySelector(".terminals-focus-notice")).toBeNull();
+  });
+
+  it("still honours a target that arrives late within the wait window", () => {
+    const late: TerminalSessionMeta = { ...session, id: "late-arrival-1" };
+    const { container, onAttach, onFocusHandled, rerenderWith } = mountWithFocus({
+      terminals: [session],
+      focusSessionId: late.id,
+    });
+
+    act(() => {
+      vi.advanceTimersByTime(1_000);
+    });
+    expect(onFocusHandled).not.toHaveBeenCalled();
+
+    // term_list delivers the target before the deadline.
+    rerenderWith([session, late], late.id);
+
+    expect(onAttach).toHaveBeenCalledWith(late.id);
+    expect(onFocusHandled).toHaveBeenCalledTimes(1);
+    expect(container.querySelector(".terminals-focus-notice")).toBeNull();
+
+    // The abandoned deadline never fires afterwards.
+    act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
+    expect(container.querySelector(".terminals-focus-notice")).toBeNull();
+  });
+
+  it("keeps the deadline anchored across unrelated terminal-list updates", () => {
+    const other: TerminalSessionMeta = { ...session, id: "other-terminal-1" };
+    const { container, onFocusHandled, rerenderWith } = mountWithFocus({
+      terminals: [session],
+      focusSessionId: "gone-session-2",
+    });
+
+    // Unrelated list churn re-runs the focus effect; the deadline must not
+    // be extended past its original anchor by each update.
+    act(() => {
+      vi.advanceTimersByTime(1_500);
+    });
+    rerenderWith([session, other], "gone-session-2");
+    act(() => {
+      vi.advanceTimersByTime(600);
+    });
+
+    expect(container.querySelector(".terminals-focus-notice")).not.toBeNull();
+    expect(onFocusHandled).toHaveBeenCalledTimes(1);
   });
 });
 

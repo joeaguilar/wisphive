@@ -1643,6 +1643,32 @@ kbd {
   overflow: hidden;
 }
 
+/* Deep-link focus failure (itr#449): the inbox "Focus terminal" target never
+   appeared in the live terminal list — surface the miss instead of a silent
+   no-op. Lives at the top of the sidebar so it stays visible in the mobile
+   list-only state too. Styled after the disk/config alert banners. */
+.terminals-focus-notice {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-sm);
+  flex: 0 0 auto;
+  margin: var(--space-sm);
+  padding: 8px 12px;
+  border: 1px solid var(--yellow);
+  border-radius: 4px;
+  background: rgba(255, 183, 77, 0.08);
+  font-size: var(--font-sm);
+}
+
+.terminals-focus-notice-message {
+  flex: 1 1 auto;
+  color: var(--text);
+}
+
+.terminals-focus-notice-dismiss {
+  flex: 0 0 auto;
+}
+
 .terminals-sidebar-toolbar {
   display: flex;
   gap: var(--space-sm);
