@@ -1,4 +1,4 @@
-# ADR-0009: Isolated daemon-controlled CODEX_HOME instead of emulating Codex config resolution
+# ADR-0009: Isolated daemon-controlled CODEX_HOME to minimize Codex config emulation
 
 - **Status:** Proposed
 - **Date:** 2026-07-14
@@ -15,10 +15,11 @@ hook inventory, and (2) no un-vetted foreign hook will run headlessly — becaus
 `--dangerously-bypass-hook-trust`, which suppresses Codex's trust prompt for *every* enabled hook
 (itr#471; released only by the `codex_allow_foreign_hooks` opt-in).
 
-To prove that, the audit re-derives Codex's *effective* configuration from the outside. The file
-has grown to 5,595 lines (~2,650 implementation + ~2,940 tests), reimplementing, from observed
-behavior of an evolving third-party binary: semver parsing and precedence for plugin
-active-version selection, plugin manifest shape resolution, TOML profile layering
+To prove that, the audit re-derives Codex's *effective* configuration from the outside. At the
+time of this decision, the containing file exceeded 5,500 lines, split roughly evenly between
+implementation and tests. It reimplements, from observed behavior of an evolving third-party
+binary: semver parsing and precedence for plugin active-version selection, plugin manifest shape
+resolution, TOML profile layering
 (`$CODEX_HOME/<name>.config.toml` chased from `profile = ...`), kill-switch precedence
 (`features.hooks` vs the deprecated `features.codex_hooks` alias, `allow_managed_hooks_only`),
 and the persisted `/hooks`-disablement `hooks.state."<key>"` key format.
@@ -40,10 +41,14 @@ profiles, `requirements.toml`, the plugin cache) is agent-writable state the aud
 
 Facts about the installed Codex CLI (0.144.1, from `--help` surfaces only):
 
-- **No `codex config` subcommand exists** — there is no `codex config effective-hooks` or any
-  other effective-inventory introspection. The subcommand list is: exec, review, login, logout,
-  mcp, plugin, mcp-server, app-server, remote-control, app, completion, update, doctor, sandbox,
-  debug, apply, resume, archive, delete, unarchive, fork, cloud, exec-server, features.
+- **No `codex config` subcommand exists** — there is no `codex config effective-hooks` or other
+  authoritative, non-interactive, machine-readable effective-inventory surface that the daemon
+  can use as a pre-spawn gate. The subcommand list is: exec, review, login, logout, mcp, plugin,
+  mcp-server, app-server, remote-control, app, completion, update, doctor, sandbox, debug, apply,
+  resume, archive, delete, unarchive, fork, cloud, exec-server, features.
+- **Interactive `/hooks` inspection does exist.** It lets an operator inspect configured hook
+  sources, review trust, and disable hooks in the CLI. It is not a stable non-interactive output
+  or machine-readable effective-inventory API, so it cannot replace the daemon's pre-spawn proof.
 - **`codex doctor --json`** emits a "redacted machine-readable report" of "installation, config,
   auth, and runtime health" — its help makes no mention of hooks; it is not an effective-hook
   inventory surface today.
@@ -61,8 +66,9 @@ Spawn managed Codex children into a **daemon-provisioned, isolated `CODEX_HOME`*
 writes and therefore fully owns — eliminating the user-level configuration surface (user
 `hooks.json`, `config.toml`, profiles, `requirements.toml`, plugin cache, persisted
 `hooks.state`) from the audit entirely, because there is nothing there the daemon didn't write.
-User capability that isolation removes (plugins, personal config/MCP servers) is re-grantable via
-an operator-vetted import list behind a named opt-in flag. In parallel, file an upstream Codex
+Isolation does not preserve user capability by itself: plugins, personal config, and MCP servers
+disappear from managed children by default. Selected capability is re-grantable via an
+operator-vetted import list behind a named opt-in flag. In parallel, file an upstream Codex
 feature request for an effective-hook-inventory introspection surface and adopt it as a
 cross-check if it lands; do not block on it.
 
@@ -72,10 +78,11 @@ The three candidate directions, and why (b) wins:
 
 **(a) Query Codex for its own effective inventory.** This is the ideal end state — the same code
 that will load the hooks reports what it will load, so emulation drift is impossible by
-construction. But **the surface does not exist** (no `codex config` subcommand; `doctor --json`
-doesn't cover hooks), so this option reduces to filing an upstream feature request whose timeline
-we don't control. Even when granted, it has residual weaknesses as a *primary* gate: a TOCTOU
-window between the introspection invocation and the spawn (same class the current
+construction. But **an authoritative non-interactive surface does not exist** (interactive
+`/hooks` is operator-facing; there is no `codex config` subcommand; `doctor --json` doesn't cover
+hooks), so this option reduces to filing an upstream feature request whose timeline we don't
+control. Even when granted, it has residual weaknesses as a *primary* gate: a TOCTOU window
+between the introspection invocation and the spawn (same class the current
 `AuditSnapshot` re-verify narrows today), and dependence on the stability of an output schema.
 It is an excellent *cross-check* (defense-in-depth that would have caught all three round-3
 desyncs), not a foundation we can build on this quarter. The one fragment that exists today —
@@ -124,7 +131,7 @@ full isolated home is deferred; it is not the destination.
 **(c) Status quo** — keep hardening the emulation. Rejected: three under-detection desyncs in one
 review round is the empirical failure rate of this approach at Codex 0.144.x; each future Codex
 release re-rolls those dice, and the audit only fails safe when we correctly *anticipate* the
-ambiguity. The line count (~4,500+ audit lines and growing) is a symptom, not the disease.
+ambiguity. The several-thousand-line audit surface is a symptom, not the disease.
 
 ## Consequences
 
@@ -135,7 +142,7 @@ ambiguity. The line count (~4,500+ audit lines and growing) is a symptom, not th
   `.codex/` sources + integrity of the daemon-written home". `audit_codex_effective_hooks`'s
   user-config layering, profile chase, `requirements.toml` scan, and the entire plugin
   semver/manifest/active-version machinery become deletable — an estimated majority of the
-  ~2,650 implementation lines and their ~2,940 test lines retarget or go.
+  implementation and security tests retarget or go.
 - **Transition discipline: the existing audit is kept intact as defense-in-depth until the
   isolated home has shipped and soaked** (it still audits the controlled home — everything
   should come back clean, and any finding is a bug in provisioning). Only then is it shrunk to
@@ -163,7 +170,7 @@ ambiguity. The line count (~4,500+ audit lines and growing) is a symptom, not th
    the import copier need care, but every piece is daemon-owned code with no third-party
    semantics to reverse-engineer.
 2. **Audit shrink to project-scope + home-integrity (after soak) — M.** Mostly deletion plus test
-   retargeting; M rather than S because ~3k lines of security tests must be consciously
+   retargeting; M rather than S because the large security-test surface must be consciously
    dispositioned, not bulk-deleted.
 3. **Upstream ask + opportunistic adoption — S.** File the Codex feature request for
    `codex hooks list --effective --json` (or a hooks section in `codex doctor --json`); adopt
@@ -176,9 +183,9 @@ resolution emulation (the source of all three round-3 desyncs) ceases to exist.
 
 ## Alternatives considered
 
-- **(a) as primary: block on an authoritative Codex introspection surface** — rejected: the
-  surface doesn't exist in 0.144.1 and its delivery timeline is external; retained as a
-  defense-in-depth cross-check to adopt when available.
+- **(a) as primary: block on an authoritative Codex introspection surface** — rejected: no
+  authoritative non-interactive, machine-readable surface exists in 0.144.1, and its delivery
+  timeline is external; retained as a defense-in-depth cross-check to adopt when available.
 - **(b-lite) `--ignore-user-config` only** — rejected as the destination (leaves user
   `hooks.json`/`requirements.toml`/plugin surfaces live); acceptable as an S-sized stopgap if
   phase 1 is deferred.
@@ -196,6 +203,7 @@ resolution emulation (the source of all three round-3 desyncs) ceases to exist.
 - itr: #528 (this ADR), #511 (the audit), #471 (`codex_allow_foreign_hooks`), #467 (silent
   hook-trust skip)
 - ADR-0008 — same-UID tamper-evidence, not tamper-proofing
+- Official Codex hooks documentation: <https://learn.chatgpt.com/docs/hooks>
 - Codex CLI introspection ground truth: `codex --help`, `codex exec --help`,
   `codex doctor --help`, `codex features --help`, `codex plugin --help` at codex-cli 0.144.1
   (2026-07-14)

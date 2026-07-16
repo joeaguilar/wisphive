@@ -28,7 +28,7 @@ alternatives, or (c) someone will later ask "why is it done this way." When in d
 | [0006](0006-plugin-trust-model.md) | Decision-plugin trust model — observer-only, redacted, env-var shell hooks | Proposed | 2026-07-03 | #423, #425 |
 | [0007](0007-loop-supervisor-fails-toward-stop.md) | Loop supervisor fails toward stop | Proposed | 2026-07-03 | #421 |
 | [0008](0008-same-uid-tamper-evidence-not-tamper-proofing.md) | Same-UID config tampering — tamper-evidence, not tamper-proofing | Accepted | 2026-07-11 | #96, #508 |
-| [0009](0009-isolated-codex-home-over-config-emulation.md) | Isolated daemon-controlled CODEX_HOME instead of emulating Codex config resolution | Proposed | 2026-07-14 | #528, #511, #471 |
+| [0009](0009-isolated-codex-home-over-config-emulation.md) | Isolated daemon-controlled CODEX_HOME to minimize Codex config emulation | Proposed | 2026-07-14 | #528, #511, #471 |
 | [0010](0010-fail-closed-everywhere-repair-via-messages.md) | Fail-closed everywhere is deliberate — repair channels are messages and scripts, not fail-open holes | Accepted | 2026-07-15 | #533, #535, #541 |
 
 ## Status lifecycle
