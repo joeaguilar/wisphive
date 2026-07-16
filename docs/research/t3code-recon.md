@@ -741,3 +741,111 @@ in the safe-sounding direction, and only an adversarial check found it.
 - Treating this document as a decision. Every Tier-3 item needs its own ADR or plan; the ADR-0009
   amendment (L11) and the ADR-0001 managed-spawn carve-out (L7) are the two that constrain future
   work hardest and should be written first.
+
+---
+
+# CORRECTIONS (2026-07-16, ADR-mapping pass)
+
+Four agents re-checked this recon's claims against each `Proposed` ADR and the real source. They
+found six errors. **This section is appended, not merged into the text above** — the original claims
+stay visible so the reasoning trail survives. Where they conflict, **this section wins**.
+
+## C1 — The ADR-0009 corroboration claim is wrong: a provider conflation. **This is the big one.**
+
+The delta table (:133) and the `coreDifference` claim that t3code "blanks the child's config and
+passes policy in-band, which is exactly ADR-0009's thesis — independent confirmation" **does not
+survive contact with the source.**
+
+`OPENCODE_CONFIG_CONTENT="{}"` occurs at exactly **one** site — `opencodeRuntime.ts:352` — in the
+**OpenCode** driver. It never touches the Codex driver. The recon compared *t3code's OpenCode driver*
+to *Wisphive's Codex audit*: different providers, and OpenCode is under no gate-integrity requirement.
+
+**t3code's actual Codex driver does the opposite of ADR-0009.** `CodexHomeLayout.ts:354-359`
+symlinks every shared-home entry into the shadow home except `auth.json`/`models_cache.json` (`:31`)
+and `log`/`memories`/`tmp` (`:32`) — the shadow home's `config.toml` **is a symlink to the operator's
+real one**, asserted at `CodexHomeLayout.test.ts:126`. Its motive is **per-instance auth
+(multi-account)**, not gate integrity — the different-threat-model trap. Not convergent design.
+
+"CODEX_HOME spread LAST… clobbering the operator's value" is also misleading: the spread is
+**conditional** (`CodexSessionRuntime.ts:716-719`). With no configured `homePath` the operator's
+`CODEX_HOME` passes through untouched; when it does win it sets the operator's own configured path —
+precedence resolution, not daemon enforcement.
+
+t3code performs no hook audit and no Codex config emulation, so it is **silent** on ADR-0009's
+problem. Absence of emulation in a system with no gate is not a vote for isolation.
+
+**But chasing this produced the session's most valuable finding** (itr#569): t3code's generated
+protocol bindings surfaced **`hooks/list`**, verified against the operator's installed codex-cli
+0.144.5 via `codex app-server generate-json-schema`. It returns the effective per-project hook
+inventory — `enabled`, `source`, `sourcePath`, `isManaged`, `pluginId`, `trustStatus`, `eventName`,
+`matcher`, `command`, `timeoutSec`, `currentHash` — i.e. what `audit_codex_effective_hooks`
+re-derives in ~800 lines. Its `HookSource` enum enumerates the `mdm`/`cloudManagedConfig` layers
+ADR-0009:155-157 calls **"non-enumerable"**, and those live *outside* `CODEX_HOME`, so isolation
+cannot remove them — **(a) and (b) are complementary, not competing.** ADR-0009 rejected option (a)
+on "an authoritative non-interactive surface does not exist" (:80-82) and plans to *file a feature
+request* for it (:176-177). **The ask already ships.** The ADR's facts are scoped ":42 from `--help`
+surfaces only" — it never opened the JSON-RPC protocol it lists at :47.
+
+## C2 — "The one genuinely fail-open shape in the t3code code" is wrong (:704). :725 is the right half.
+
+This document contradicts itself; :725 wins. A silently-dead reaper is **not** fail-open in Wisphive:
+`reap_inactive` only does `HashMap::remove` (`registry.rs:70-85`), kills no process, and nothing
+gates on the registry. A dead tick is a **stale agents panel**. And conditionally it *inverts* — if a
+future L4 cap counts registry rows, a dead reaper fails **closed** (immortal rows fill the cap).
+Adopt the loop hardening on **robustness** grounds, not fail-open grounds.
+
+## C3 — "Adopt t3code's sweep-loop hardening verbatim" is wrong for the supervisor (:704).
+
+The hardening is real and correctly ordered (`ProviderSessionReaper.ts:109-120` puts `catch` +
+`catchDefect` *inside* the `repeat`). But its **handler body is `logWarning` — swallow and continue**,
+which is precisely what ADR-0007:20-23 forbids. Adopt the **structure** (the loop task cannot die
+silently); the handler body must route to **Abort**, not a log line. Verbatim adoption imports a
+janitor's posture into a spender.
+
+## C4 — The "reap on unknown" rejection (:726) is a strawman.
+
+t3code has no reap-on-unknown to reject. `ProviderSessionReaper.ts:47-54` does `continue` on a NaN
+`lastSeenAt` — it **skips**. The recon rejects a posture t3code never held, then lands on t3code's
+actual behavior. The sub-claims stand and are worth keeping: the `Date.parse` artifact genuinely
+cannot occur in Rust (Wisphive stores a typed `DateTime<Utc>`, `registry.rs:43` — no parse step, no
+NaN state, correct behavior for free), and the self-stamping critique is right (`upsert` stamps on
+*any* write, `ProviderSessionDirectory.ts:117`; Wisphive's `touch()` fires on real agent contact and
+is the better version).
+
+## C5 — The reaper-bounding requirement is real but not presently load-bearing (:704).
+
+`ProviderSessionReaper.ts:64-71` skipping unbounded on `activeTurnId != null` is confirmed. But
+"a hung-but-chatty agent could evade the reaper forever" must answer: evade to **what end**? Today
+reaping buys the agent nothing — it kills nothing and gates nothing. This is a design constraint on a
+**future** L4 cap, not a present need. Keep the advice; drop the urgency.
+
+## C6 — The wave reaper warning points the wrong way (:704). **The real direction is fail-open.**
+
+This document warns a naive reaper "would kill the wave from the front while the operator works the
+back of the queue." **Inverted.** Verified (itr#568): nothing refreshes `last_seen` while a hook
+blocks — both touch sites fire *after* resolution (`server.rs:930-934`, `:950-955`) and
+`register_agent_once` is `O_EXCL`-guarded to once per session (`main.rs:1684-1750`). With
+`agent_timeout_secs`=300 and `hook_timeout_secs`=3600, an agent waiting on a human goes "inactive"
+**12× over** before the approval window closes, and at ~t=305 the daemon broadcasts a **false
+`AgentDisconnected`** while the hook is still blocked and the decision still queued.
+
+So if a future L4 cap counts registry rows, agents blocked on the human fall **out** of the count and
+the cap admits **more** agents — **fail-open on admission**, under-counting exactly the population
+blocked on the human. *The cap stops binding precisely at peak human latency.* Any L4 cap must count
+blocked-on-human agents, or key on the queue (as `MAX_PENDING_SPAWNS` already does,
+`server.rs:2011`).
+
+## What survived
+
+The security analysis (settingSources-not-transport as the bypass vector; a transport decline
+suppressing the command before the hook fires; ACP `request_permission` being advisory and strictly
+weaker than the hook absent a sandbox), the `methodNotFound` hard-deny recommendation, the
+process-group finding (itr#561), the `detect_agent_type_from_env` finding (itr#562), the
+capacity fail-open (itr#560, the highest-value item and itself the product of a refutation), the
+`authOverlay` and `auth.json`-symlink rejections, and "t3code has nothing to teach about waves."
+
+**Method note.** Every error above is in the *corroborating* direction — claims that made an
+appealing conclusion look better-supported than it was. C1 flattered an ADR we wanted to accept. The
+adversarial verify caught inversions inside dimensions but could not catch a conflation *across*
+dimensions, because no single verifier held both drivers at once. Cross-dimension claims need a
+verifier that owns the comparison, not two that each own a side.
