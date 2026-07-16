@@ -1,5 +1,6 @@
 /research
 /target
+/inspiration
 **/*.rs.bk
 *.swp
 *.swo
