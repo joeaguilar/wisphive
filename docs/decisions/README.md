@@ -30,6 +30,7 @@ alternatives, or (c) someone will later ask "why is it done this way." When in d
 | [0008](0008-same-uid-tamper-evidence-not-tamper-proofing.md) | Same-UID config tampering — tamper-evidence, not tamper-proofing | Accepted | 2026-07-11 | #96, #508 |
 | [0009](0009-isolated-codex-home-over-config-emulation.md) | Isolated daemon-controlled CODEX_HOME to minimize Codex config emulation | Proposed | 2026-07-14 | #528, #511, #471 |
 | [0010](0010-fail-closed-everywhere-repair-via-messages.md) | Fail-closed everywhere is deliberate — repair channels are messages and scripts, not fail-open holes | Accepted | 2026-07-15 | #533, #535, #541 |
+| [0011](0011-authorized-gate-transfer-window.md) | A live-upgrade enforcement gap is permitted only if operator-authorized, surfaced, and audited | Proposed | 2026-07-17 | #588, #596, #599 |
 
 ## Status lifecycle
 
