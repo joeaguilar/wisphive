@@ -61,6 +61,7 @@ herdr's `--update --handoff` mechanism, adapted. Precursor spike already filed a
 - `SCM_RIGHTS` PTY-fd passing over a private two-daemon handoff socket + multi-phase commit + rollback-on-failure.
 - Wire it into the upgrade path (`install.sh` / daemon restart), tied to the 2026-07-15 incident (itr#533).
 - **Gating during the handoff window — PO decision:** the gate being briefly "off"/transferring during a *planned* upgrade is of **minor consequence**, because when wisphive is unavailable most agent prompts still surface through the **terminal window itself** (the agent's native prompt), which covers the gap. **Requirement:** surface an explicit user-facing message that the gate is momentarily transferring during an upgrade, with that rationale — making the (brief, deliberate) gap legible rather than silent. Still security-reviewed for enforcement-continuity, but the posture is "acceptable, surfaced," not "must be zero-gap."
+- **Authorize the action itself — PO decision:** the "brief gap is acceptable" argument only holds if the upgrade is genuinely operator-initiated, so **initiating a handoff upgrade must be an authorized action** — a password/passkey step-up (reuse `auth.rs`: fresh Argon2id re-auth or WebAuthn assertion, sudo-style, not just a valid device bearer). A **gated agent must never be able to trigger it** — that would turn the disclosed gap into a bypass ("trigger an upgrade to slip a call through the transfer window"). This extends the control-plane self-protection posture (`allow_self_modification=false` / itr#425): triggering an upgrade is a self-modification of the gate and routes to human authorization, never auto-approve. The authorized upgrade is recorded to the audit trail (who/when/which device). **Warrants an ADR.**
 - **Cost: Large.** Does **not** cover a crash — like herdr, it's the planned-upgrade path only.
 
 ### Plan C — VIP (Very Important Processes) — **last, unless it makes B easier**
@@ -73,5 +74,5 @@ Move PTY ownership *out* of the daemon into a separate long-lived PTY host (or d
 ## Recommendation / decisions recorded
 
 1. **Plan A now.** Most pieces exist; make it a first-class "pin this session, survive a restart" feature.
-2. **Plan B explored** as herdr-style FD-handoff for planned upgrades; the brief gate-transfer gap is accepted and **must be surfaced to the user**, leaning on the terminal-native prompt as the backstop.
+2. **Plan B explored** as herdr-style FD-handoff for planned upgrades; the brief gate-transfer gap is accepted and **must be surfaced to the user**, leaning on the terminal-native prompt as the backstop. The gap is only acceptable if the upgrade is **operator-authorized** (password/passkey step-up; a gated agent can never initiate it) — the upgrade action is gated by wisphive's own auth model. Warrants an ADR.
 3. **Plan C (VIP) last**, but the C-spike runs *before* committing B's design, because a PTY host could subsume B.
