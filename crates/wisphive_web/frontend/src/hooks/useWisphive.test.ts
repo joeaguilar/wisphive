@@ -1076,3 +1076,102 @@ describe("useWisphive error surfacing and spawn correlation (itr#567)", () => {
     expect(result.current.errors).toHaveLength(0);
   });
 });
+
+describe("useWisphive managed spawned-agent visibility (itr#565)", () => {
+  beforeEach(() => {
+    MockWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", MockWebSocket as unknown as typeof WebSocket);
+    localStorage.setItem("wisphive-web-token", "test-token");
+  });
+
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+    vi.unstubAllGlobals();
+  });
+
+  async function mountOpen() {
+    const view = renderHook(() => useWisphive());
+    await waitFor(() => expect(MockWebSocket.instances.length).toBeGreaterThan(0));
+    act(() => latest().open());
+    return view;
+  }
+
+  // Flattened ManagedAgent wire shape (serde internal tagging).
+  function spawnedFrame(agentId: string, overrides: Record<string, unknown> = {}) {
+    return {
+      type: "agent_spawned",
+      agent_id: agentId,
+      agent_type: "claude_code",
+      pid: 4242,
+      project: "/Users/j/proj",
+      started_at: "2026-07-18T12:00:00Z",
+      ...overrides,
+    };
+  }
+
+  it("an agent_spawned broadcast makes the launched process visible, upserting by id", async () => {
+    const { result } = await mountOpen();
+
+    act(() => latest().emit(spawnedFrame("agent-1")));
+    expect(result.current.managedAgents).toHaveLength(1);
+    expect(result.current.managedAgents[0]).toMatchObject({
+      agent_id: "agent-1",
+      agent_type: "claude_code",
+      pid: 4242,
+      project: "/Users/j/proj",
+    });
+
+    // A broadcast racing an agent_list reconcile must never duplicate.
+    act(() => latest().emit(spawnedFrame("agent-1", { pid: 4243 })));
+    expect(result.current.managedAgents).toHaveLength(1);
+    expect(result.current.managedAgents[0].pid).toBe(4243);
+  });
+
+  it("the reaper's agent_exited broadcast removes exactly the dead process", async () => {
+    const { result } = await mountOpen();
+    act(() => {
+      latest().emit(spawnedFrame("agent-1"));
+      latest().emit(spawnedFrame("agent-2", { pid: 5555 }));
+    });
+    expect(result.current.managedAgents).toHaveLength(2);
+
+    act(() => latest().emit({ type: "agent_exited", agent_id: "agent-1", exit_code: 0 }));
+    expect(result.current.managedAgents).toHaveLength(1);
+    expect(result.current.managedAgents[0].agent_id).toBe("agent-2");
+  });
+
+  it("an agent_list reply replaces the set wholesale (poll reconcile)", async () => {
+    const { result } = await mountOpen();
+    act(() => latest().emit(spawnedFrame("agent-stale")));
+
+    act(() =>
+      latest().emit({
+        type: "agent_list",
+        agents: [
+          {
+            agent_id: "agent-live",
+            agent_type: "codex",
+            pid: 7,
+            project: "/p",
+            started_at: "2026-07-18T12:01:00Z",
+          },
+        ],
+      }),
+    );
+    expect(result.current.managedAgents).toHaveLength(1);
+    expect(result.current.managedAgents[0].agent_id).toBe("agent-live");
+  });
+
+  it("queryManagedAgents sends list_agents, and is quiet while disconnected", async () => {
+    const { result } = await mountOpen();
+    act(() => result.current.queryManagedAgents());
+    expect(latest().sentMessages()).toContainEqual({ type: "list_agents" });
+
+    // Disconnected: the Agents-view poll must not spam the error banner.
+    const disconnected = renderHook(() => useWisphive());
+    await waitFor(() => expect(MockWebSocket.instances.length).toBeGreaterThan(1));
+    act(() => disconnected.result.current.queryManagedAgents());
+    expect(disconnected.result.current.errors).toHaveLength(0);
+  });
+});

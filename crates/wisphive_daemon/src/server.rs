@@ -2509,6 +2509,13 @@ async fn handle_agent_command(
             let queue = ctx.queue.clone();
             let home_dir = ctx.home_dir.clone();
             let response_tx = conn_tx.clone();
+            // Success is broadcast (itr#565): an approved launch used to be
+            // invisible — the decision resolved out of the queue and NOTHING
+            // announced the running process, so the web UI showed "Agents (0)"
+            // right after a genuinely successful spawn. `AgentExited` is
+            // already broadcast by the reaper (see run()); this is its start
+            // counterpart. The CLI deliberately skips the frame (itr#518).
+            let broadcast_tx = ctx.tui_tx.clone();
             // Carried into the worker so post-review failures (deny, expiry,
             // gate refusals, persistence fail-closed) stay bound to the
             // originating command for web-origin callers (itr#567).
@@ -2546,6 +2553,12 @@ async fn handle_agent_command(
                 .await;
                 settle_spawn_expiry(expiry, &expiry_started).await;
 
+                if let Ok(managed) = &result {
+                    // Every connected TUI/web client learns the process is
+                    // live; a lagging/full broadcast channel only costs the
+                    // push (clients reconcile via `list_agents`).
+                    let _ = broadcast_tx.send(ServerMessage::AgentSpawned(managed.clone()));
+                }
                 if let Err(e) = result {
                     match &e {
                         SpawnRunError::ChannelClosed => {
@@ -4722,6 +4735,151 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// itr#565: the spawn worker must BROADCAST `AgentSpawned` the moment an
+    /// approved managed launch execs — that push is the only immediate "your
+    /// agent is running" signal subscribed TUI/web clients get (the web
+    /// Agents view's `list_agents` poll is a reconcile, not the source).
+    /// Isolates the producer at server.rs's post-`run_after_spawn_approval`
+    /// success arm: deleting that broadcast leaves the child running but
+    /// every subscriber blind, and nothing else emits the frame — so this
+    /// test fails on that mutation while every other gate stays green.
+    #[tokio::test]
+    async fn approved_spawn_broadcasts_agent_spawned_to_subscribed_clients() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::time::Duration;
+
+        use tokio::net::UnixStream;
+        use wisphive_protocol::{AgentType, ClientMessage, ServerMessage};
+
+        // Isolated state home with a strict-valid kill switch (0700 tempdir,
+        // 0600 `mode` file reading `active`) so both mode gates pass.
+        let home = tempfile::tempdir().unwrap();
+        crate::config::write_mode_file_atomic(&home.path().join("mode"), "active").unwrap();
+        let config = crate::DaemonConfig::new(home.path().to_path_buf());
+        let server = super::Server::new(config).await.unwrap();
+
+        // Project that passes the managed-spawn hook gate: real daemon
+        // installer output. Under cargo test both the installer and the gate
+        // derive the same current_exe-relative `wisphive-hook` command, so
+        // installed == expected by construction.
+        let project = tempfile::tempdir().unwrap();
+        crate::hook_install::install_hooks_in_home(project.path(), home.path()).unwrap();
+
+        // Stub `claude` resolved via the child's overridden PATH — the exec
+        // really happens, without a real agent.
+        let stub_dir = home.path().join("stub-bin");
+        std::fs::create_dir_all(&stub_dir).unwrap();
+        let stub = stub_dir.join("claude");
+        std::fs::write(&stub, "#!/bin/sh\nsleep 5\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        server.process_registry.lock().await.test_child_env =
+            vec![("PATH".into(), stub_dir.into_os_string())];
+
+        let ctx = super::ConnectionContext {
+            queue: server.queue.clone(),
+            process_registry: server.process_registry.clone(),
+            agent_registry: server.agent_registry.clone(),
+            tui_tx: server.tui_tx.clone(),
+            state_db: server.state_db.clone(),
+            terminal_manager: server.terminal_manager.clone(),
+            reauth: server.reauth.clone(),
+            replay_gate: server.replay_gate.clone(),
+            bad_hello_gate: server.bad_hello_gate.clone(),
+            hook_timeout_secs: server.config.hook_timeout_secs,
+            // Never pop desktop notifications from a unit test.
+            notifications_enabled: false,
+            home_dir: server.config.home_dir.clone(),
+            audit_snapshot_limit: server.config.audit_snapshot_limit,
+        };
+
+        // Subscribe BEFORE the spawn so the queued decision and the launch
+        // broadcast both land on this receiver, like a connected TUI/web tab.
+        let mut events = server.tui_tx.subscribe();
+
+        let (server_stream, client_stream) = UnixStream::pair().unwrap();
+        let (_, mut writer) = server_stream.into_split();
+        // Keep the client half alive; the happy path writes nothing to it.
+        let _client = client_stream;
+        let (conn_tx, _conn_rx) = tokio::sync::mpsc::channel(8);
+
+        let req: wisphive_protocol::SpawnAgentRequest = serde_json::from_value(serde_json::json!({
+            "agent_type": "claude_code",
+            "project": project.path(),
+            "prompt": "prove the launch is announced",
+        }))
+        .unwrap();
+        super::handle_agent_command(
+            &mut writer,
+            &ctx,
+            None,
+            None,
+            ClientMessage::SpawnAgent(req),
+            &conn_tx,
+        )
+        .await
+        .unwrap();
+
+        // The enqueue broadcast names the decision awaiting approval.
+        let decision_id = loop {
+            let msg = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("queued spawn should broadcast its decision")
+                .unwrap();
+            if let ServerMessage::NewDecision(decision) = msg {
+                break decision.id;
+            }
+        };
+
+        // TUI-origin approve (device_id None bypasses the sudo gate) releases
+        // the worker, which validates, execs the stub, then must broadcast.
+        super::handle_decision_command(
+            &mut writer,
+            &ctx,
+            None,
+            ClientMessage::Approve {
+                id: decision_id,
+                message: None,
+                updated_input: None,
+                always_allow: false,
+                additional_context: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let managed = loop {
+            let msg = tokio::time::timeout(Duration::from_secs(10), events.recv())
+                .await
+                .expect("approved+exec'd spawn must broadcast agent_spawned to subscribers")
+                .unwrap();
+            if let ServerMessage::AgentSpawned(managed) = msg {
+                break managed;
+            }
+        };
+        assert!(
+            matches!(managed.agent_type, AgentType::ClaudeCode),
+            "broadcast should carry the launched agent's type, got {:?}",
+            managed.agent_type
+        );
+        assert_eq!(
+            managed.project,
+            std::fs::canonicalize(project.path()).unwrap(),
+            "broadcast should carry the validated (canonicalized) project"
+        );
+        assert!(managed.pid > 0, "broadcast should carry the live child pid");
+        // The registry really holds the exec'd child the broadcast announced.
+        assert!(
+            server
+                .process_registry
+                .lock()
+                .await
+                .list()
+                .iter()
+                .any(|a| a.agent_id == managed.agent_id),
+            "the announced agent must exist in the process registry"
+        );
     }
 
     #[tokio::test]

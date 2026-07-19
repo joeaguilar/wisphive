@@ -192,9 +192,9 @@ export type ServerMessage =
     }
   | { type: "agent_connected"; agent: AgentInfo }
   | { type: "agent_disconnected"; agent_id: string }
-  // Protocol-compat only (itr#518/#531): current daemons never send
-  // `agent_spawned` (spawns are queued for approval instead). Kept so frames
-  // from older daemons validate cleanly rather than logging as wire drift.
+  // Broadcast when an APPROVED managed spawn actually execs (itr#565) —
+  // the start counterpart of the reaper's `agent_exited`. (Formerly
+  // protocol-compat only; the pre-approval daemon path never sent it.)
   | { type: "agent_spawned"; agent: ManagedAgent }
   | { type: "agent_exited"; agent_id: string; exit_code?: number }
   // Correlated direct ack that a spawn was queued for approval (itr#567).
@@ -397,8 +397,8 @@ export function parseServerMessage(data: string): ServerMessage {
         agent_id: readField(message, "agent_id", readString, "message"),
       };
     case "agent_spawned":
-      // Protocol-compat only (itr#518/#531): never sent by current daemons;
-      // parsed so a legacy daemon's frame is ignored instead of warned about.
+      // Approved managed launch is live (itr#565); consumed by useWisphive's
+      // managedAgents state for the Agents view.
       return { type, agent: parseManagedAgent(message, "message") };
     case "agent_exited":
       return {
@@ -1136,6 +1136,7 @@ export type ClientMessage =
   | { type: "install_hooks"; project: string }
   | { type: "query_project_hook_status"; project: string }
   | { type: "reimport_events" }
+  | { type: "list_agents" }
   | { type: "spawn_agent" } & SpawnAgentRequest
   | { type: "search_history"; query?: string; tool_name?: string; agent_id?: string; limit?: number; request_id?: string }
   | { type: "term_create"; label?: string; command?: string; args?: string[]; cwd?: string; cols: number; rows: number; env?: Record<string, string> }

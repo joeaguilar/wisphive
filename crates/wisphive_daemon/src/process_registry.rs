@@ -2277,8 +2277,10 @@ pub struct ProcessRegistry {
     hook_timeout_secs: u64,
     /// Test-only: extra environment for spawned children, so the runtime
     /// proofs can isolate HOME/PATH without mutating the test process env.
+    /// `pub(crate)` so server.rs's spawn-worker broadcast test (itr#565) can
+    /// point the child's PATH at a stub `claude` through the shared registry.
     #[cfg(test)]
-    test_child_env: Vec<(String, OsString)>,
+    pub(crate) test_child_env: Vec<(String, OsString)>,
     /// Test-only: runs between the hook-inventory audit and the pre-spawn
     /// snapshot verification, so tests can deterministically land a config
     /// swap inside the TOCTOU window and prove the guard refuses.

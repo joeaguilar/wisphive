@@ -138,11 +138,13 @@ pub async fn start(req: SpawnAgentRequest) -> Result<()> {
     let response = send_and_recv(&ClientMessage::SpawnAgent(request))?;
 
     match response {
-        // `ServerMessage::AgentSpawned` is deliberately unhandled: since itr#518
-        // the daemon never sends it (every spawn is queued for approval), and
-        // even a legacy daemon's copy would be skipped by `send_and_recv`'s
-        // correlation filter (the variant carries no correlation_id). The wire
-        // variant survives in wisphive_protocol for protocol compat only.
+        // `ServerMessage::AgentSpawned` is deliberately unhandled here: since
+        // itr#565 the daemon BROADCASTS it to subscribed TUI/web clients when
+        // an approved spawn execs, but it is a broadcast frame carrying no
+        // correlation_id, so `send_and_recv`'s correlation filter skips it —
+        // and this ephemeral CLI has long exited by the time a human approves
+        // the queued decision anyway. The direct reply this loop consumes is
+        // `AgentSpawnQueued` (or a refusal `Error`), never `AgentSpawned`.
         ServerMessage::Error { message } => {
             anyhow::bail!("failed to start agent: {message}");
         }

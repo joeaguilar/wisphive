@@ -1,10 +1,15 @@
 import { useState } from "react";
-import type { AgentInfo, DecisionRequest, HistoryEntry } from "../types/protocol";
+import type { AgentInfo, DecisionRequest, HistoryEntry, ManagedAgent } from "../types/protocol";
 import { activate } from "./a11y";
 import { parseToolInput } from "./toolInput";
 
 interface AgentsProps {
   agents: AgentInfo[];
+  /** Daemon-managed spawned processes (itr#565): live from the moment an
+   * approved spawn execs — BEFORE the child's first gated tool call registers
+   * it as a connected session in `agents`. Without this section a successful
+   * "+ Spawn Agent" looked like nothing happened. */
+  managedAgents: ManagedAgent[];
   queue: DecisionRequest[];
   timeline: HistoryEntry[];
   selectedAgent: string | null;
@@ -48,7 +53,7 @@ function inputSummary(toolName: string, input: unknown): string {
   return "";
 }
 
-export function Agents({ agents, queue, timeline, selectedAgent, onSelectAgent, onLoadTimeline, onRefreshTimeline, onApprove, onDeny, onSpawn }: AgentsProps) {
+export function Agents({ agents, managedAgents, queue, timeline, selectedAgent, onSelectAgent, onLoadTimeline, onRefreshTimeline, onApprove, onDeny, onSpawn }: AgentsProps) {
   const [expandedEntry, setExpandedEntry] = useState<string | null>(null);
 
   // Drilldown view: agent's pending decisions + timeline
@@ -180,6 +185,41 @@ export function Agents({ agents, queue, timeline, selectedAgent, onSelectAgent, 
         <h2>Connected Agents ({agents.length})</h2>
         <button className="btn-secondary spawn-btn-inline" onClick={onSpawn}>+ Spawn</button>
       </div>
+
+      {/* Managed spawned processes (itr#565): visible from the moment the
+          approved launch execs, so a successful spawn is never silent. A row
+          moves into the connected list once its first gated tool call
+          registers the session; it leaves here on the reaper's agent_exited. */}
+      {managedAgents.length > 0 && (
+        <div className="agent-section" aria-label="Spawned agent processes">
+          <h3>Spawned Processes ({managedAgents.length})</h3>
+          <div className="agents-list">
+            {managedAgents.map((a) => (
+              <div
+                key={a.agent_id}
+                className="agent-card"
+                aria-label={`Spawned agent ${a.agent_id} — running (pid ${a.pid})`}
+              >
+                <div className="agent-card-header">
+                  <span className="status-indicator live" role="img" aria-label="running">●</span>
+                  <span className="agent-card-id">{a.agent_id}</span>
+                  <span className="agent-card-type">{a.agent_type}</span>
+                  <span className="time-ago">{timeAgo(a.started_at)}</span>
+                </div>
+                <div className="agent-card-meta">
+                  <span className="project-name">{a.project}</span>
+                  <span className="agent-card-times">pid {a.pid}</span>
+                  {a.model && <span className="agent-card-times">{a.model}</span>}
+                </div>
+                <div className="agent-card-current">
+                  <span className="agent-card-working">● Running — appears under Connected Agents after its first gated tool call</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {agents.length === 0 ? (
         <div className="history-empty">No agents connected</div>
       ) : (

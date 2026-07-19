@@ -7,6 +7,7 @@ import type {
   DecisionRequest,
   DiskAlertKind,
   HistoryEntry,
+  ManagedAgent,
   OutboundCommand,
   ProjectHookStatus,
   ProjectSummary,
@@ -23,6 +24,13 @@ export interface WisphiveState {
   connected: boolean;
   queue: DecisionRequest[];
   agents: AgentInfo[];
+  /** Daemon-managed spawned agent processes (itr#565). Pushed by the
+   * `agent_spawned` broadcast the moment an approved launch execs, pruned by
+   * the reaper's `agent_exited` broadcast, and reconciled wholesale by
+   * `agent_list` replies to `queryManagedAgents`. Distinct from `agents`
+   * (hook-registered live sessions): a managed child appears here at launch,
+   * and in `agents` only once its first gated tool call registers it. */
+  managedAgents: ManagedAgent[];
   history: HistoryEntry[];
   agentTimeline: HistoryEntry[];
   sessionTimeline: HistoryEntry[];
@@ -231,6 +239,7 @@ export function useWisphive() {
     connected: false,
     queue: [],
     agents: [],
+    managedAgents: [],
     history: [],
     agentTimeline: [],
     sessionTimeline: [],
@@ -437,6 +446,30 @@ export function useWisphive() {
                 ? prev.endedAgentIds
                 : [...prev.endedAgentIds, msg.agent_id],
             };
+
+          case "agent_spawned": {
+            // An approved managed launch is live (itr#565). Upsert by id so a
+            // broadcast racing an `agent_list` reconcile never duplicates.
+            const agent = msg.agent;
+            return {
+              ...prev,
+              managedAgents: [
+                ...prev.managedAgents.filter((a) => a.agent_id !== agent.agent_id),
+                agent,
+              ],
+            };
+          }
+
+          case "agent_exited":
+            // The reaper broadcast: the managed process is gone.
+            return {
+              ...prev,
+              managedAgents: prev.managedAgents.filter((a) => a.agent_id !== msg.agent_id),
+            };
+
+          case "agent_list":
+            // Authoritative registry snapshot answering `queryManagedAgents`.
+            return { ...prev, managedAgents: msg.agents };
 
           case "history_response": {
             const channel = msg.request_id ?? CHANNEL_HISTORY;
@@ -877,6 +910,14 @@ export function useWisphive() {
     send({ type: "query_projects" });
   }, [send]);
 
+  /** Reconcile the managed spawned-process list (itr#565): the daemon answers
+   * with `agent_list`. Quiet — this runs on a poll while the Agents view is
+   * open, and a disconnected socket is already surfaced by the status dot; a
+   * banner error per tick would just spam. */
+  const queryManagedAgents = useCallback(() => {
+    send({ type: "list_agents" }, { quiet: true });
+  }, [send]);
+
   /** Ask the daemon for a fresh read-only working-tree probe (itr#401). */
   const queryWorktrees = useCallback(() => {
     send({ type: "query_worktrees" });
@@ -1054,6 +1095,7 @@ export function useWisphive() {
     querySessionTimeline,
     querySessions,
     queryProjects,
+    queryManagedAgents,
     queryWorktrees,
     queryBurn,
     installHooks,

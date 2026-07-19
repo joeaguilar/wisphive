@@ -64,9 +64,9 @@ function App() {
 
 function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
   const {
-    connected, queue, agents, projects, worktrees, burnTouches, hookStatus, hookErrors, auditDecisions, endedAgentIds, history, agentTimeline, sessionTimeline, sessions, terminals,
+    connected, queue, agents, managedAgents, projects, worktrees, burnTouches, hookStatus, hookErrors, auditDecisions, endedAgentIds, history, agentTimeline, sessionTimeline, sessions, terminals,
     pendingReauth, diskAlerts, configAlerts, errors, spawn, approve, deny, dismissReauth, retryPendingApprove, dismissError,
-    spawnAgent, clearSpawnStatus, queryProjects, queryWorktrees, queryBurn, installHooks, queryProjectHookStatus, queryHistory, queryAgentTimeline, querySessionTimeline, searchHistory, querySessions,
+    spawnAgent, clearSpawnStatus, queryProjects, queryManagedAgents, queryWorktrees, queryBurn, installHooks, queryProjectHookStatus, queryHistory, queryAgentTimeline, querySessionTimeline, searchHistory, querySessions,
     termList, termCreate, termAttach, termDetach, termInput, termResize, termClose, termReplay, termSetGroup, termReorder, registerTerminalHandler,
   } = useWisphive();
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -180,6 +180,16 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
   useEffect(() => {
     if (showSpawn) queryProjects();
   }, [showSpawn, queryProjects]);
+
+  // Managed spawned processes (itr#565): reconcile while the Agents view is
+  // open. Starts/exits arrive push-style (`agent_spawned` / `agent_exited`
+  // broadcasts); the poll heals missed broadcasts and seeds the first render.
+  useEffect(() => {
+    if (view !== "agents") return;
+    queryManagedAgents();
+    const id = window.setInterval(queryManagedAgents, 5000);
+    return () => window.clearInterval(id);
+  }, [view, queryManagedAgents]);
 
   return (
     <div className="app">
@@ -310,6 +320,7 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
         {view === "agents" && (
           <Agents
             agents={agents}
+            managedAgents={managedAgents}
             queue={queue}
             timeline={agentTimeline}
             selectedAgent={agentDrilldown}
