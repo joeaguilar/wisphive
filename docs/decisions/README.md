@@ -32,6 +32,7 @@ alternatives, or (c) someone will later ask "why is it done this way." When in d
 | [0010](0010-fail-closed-everywhere-repair-via-messages.md) | Fail-closed everywhere is deliberate — repair channels are messages and scripts, not fail-open holes | Accepted | 2026-07-15 | #533, #535, #541 |
 | [0011](0011-authorized-gate-transfer-window.md) | A live-upgrade enforcement gap is permitted only if operator-authorized, surfaced, and audited | Proposed | 2026-07-17 | #588, #596, #599 |
 | [0012](0012-attach-scrollback-seed-behind-replay-acl.md) | Attach catchup seeds scrollback, gated by the existing replay ACL | Accepted | 2026-07-19 | #624, #284, #479, #623 |
+| [0013](0013-per-user-replay-identity-bound-to-device-revocation.md) | Terminal replay authorization is per-user, bound to live device revocation | Accepted | 2026-07-19 | #623, #624, #284 |
 
 ## Status lifecycle
 
