@@ -1,9 +1,9 @@
 # ADR-0001: Tiered fail posture for the hook decision path
 
-- **Status:** Accepted (amended 2026-07-18, itr#560)
+- **Status:** Accepted (amended 2026-07-18, itr#560; amended 2026-07-18, itr#562)
 - **Date:** 2026-06-14
 - **Deciders:** Josef (PO)
-- **itr:** #560 (amendment)
+- **itr:** #560, #562 (amendments)
 - **Related:** ADR-0002
 
 ## Context
@@ -35,6 +35,18 @@ Split the failure posture by failure *kind* rather than picking one global polic
   so a shed decision is distinguishable from a human one and never silent. Before this
   amendment the hook collapsed any pre-Welcome non-Welcome reply into daemon-unreachable,
   turning a saturated daemon's load-shed into a silent unaudited auto-approve.
+- **Unrecognized provider identity** (amendment 2026-07-18, itr#562): a set, **non-empty**
+  `WISPHIVE_AGENT_TYPE` that is not byte-exactly a provider the hook can serve (one with both an
+  `AgentType` variant *and* a response-formatter arm: `claude_code`/`claude`/`codex`) makes the
+  hook **refuse rather than guess**: response formatting branches on provider, and a guessed
+  (Claude-shaped) reply can be silently ignored by a provider that cannot parse it — an
+  unparseable deny is an effective allow. The refusal resolves per `fail-mode` (**default
+  `closed`**), is **audited** to events.jsonl as `decided_by: agent_type:unrecognized`, and is
+  emitted only through provider-agnostic channels: a deny is the bare exit 2 + stderr message,
+  an approve (`fail-mode=open`) is exit 0 with empty stdout. Absence or an empty-but-set
+  variable is the plain interactive case and keeps the payload-shape heuristic (Codex
+  `model`/`turn_id`) with the ClaudeCode default. Adding a provider means adding the variant
+  AND the formatter arm, then recognizing its value in `detect_agent_type_from_env`.
 - **Other runtime errors** (read/parse/protocol) honor `~/.wisphive/fail-mode`, which **defaults
   to `closed`** (deny). `fail-mode=open` is the explicit availability-first override.
 - **Oversized hook stdin** always denies (a DoS guard, independent of `fail-mode`).
@@ -80,7 +92,9 @@ decision anywhere) does not apply: the control plane is up, only this session wa
   daemon that shed the connection is alive and ingests it into `decision_log` and the TUI/web
   audit feed, and the accept loop `warn!`s each shed.
 - Anyone changing the fail-open/fail-closed default, the daemon-unreachable carve-out, the
-  oversized-stdin deny, or the PostToolUse approve is changing a security-critical default and
+  oversized-stdin deny, the PostToolUse approve, or the unrecognized-provider identity refusal
+  (itr#562: refuse-and-audit instead of guessing a provider's JSON dialect, including its
+  bare-channel formatting for pre-parse failures) is changing a security-critical default and
   must update this ADR + the "Key Design Decisions" section of `CLAUDE.md`/`AGENTS.md`.
 - The default is deny-on-error, which can surprise an operator who expected availability-first
   behavior; they must set `fail-mode=open` deliberately.

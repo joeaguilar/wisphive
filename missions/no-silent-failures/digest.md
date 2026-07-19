@@ -42,3 +42,14 @@ NEXT: claim 602/L1 (#567) lane A · claim 603/L1 (#560) lane B.
 - FILED: #604 two-stage admission (reserved interactive floor), #605 shed-storm latched alert, #606 dup-id operator visibility.
 - WATCH: 602/L1 review verdict pending — X-A1 wire.rs adjacency will be tested when 602's patch applies on top of fd2d3f9.
 - NEXT: land 602/L1 on green review → admit 602/L2 (#565 diagnosis).
+
+## Pulse — 2026-07-18 (2nd land + 2 councils)
+
+`WALK · landed 2/10→11 · burn n/a · lanes 2/2`
+
+- LANDED: 602#L1 itr#567 → cbe43be (error-surfacing substrate live: banner, correlated acks, true deny causes; CLI-hang regression caught in review, never reached main).
+- MOVED: 603/L2 (#562) built → review → rework #1 in flight (pre-parse exit-2 corner). CHAIN 603 EXTENDED lane-locally: new L2.5 = itr#607 (audit query layer drops non-enum agent_type rows — wisphive audit blind to the very refusals #562 creates; read-side fix, retroactive). Chain now 560✓→562→607→559→568→561. 602/L2 (#565 residual diagnosis) executing.
+- COUNCILS: 602/L1 (A-A3 contradicts) → 2-1 proceed. 603/L2 (audited-but-unqueryable) → 2-1 proceed + council-imposed B-A9: "audited" = end-to-end queryable, gates all remaining 603 links.
+- LEARNED: worktrees can spawn STALE (pre-L1 base observed) — lanes now verify base commit at start; daemon reply-shapes are shared with CLI (device_id-keyed splits only); read-path can silently undo a write-path guarantee.
+- WATCH ⚠ OPERATOR BRIEF: evidence seat dissented "rescope" in 2 consecutive councils — pattern claim: premises under-specify terrain (write-side verified, read-side assumed). Options: (1) DEFAULT — continue with B-A9 end-to-end gating absorbed into every remaining link review (cost: ~1 extra reviewer dimension per link); (2) freeze + rescope 603 into a successor chain with an end-to-end-audit premise (cost: council + re-formation overhead, same code lands). Default executes on silence.
+- NEXT: land 603/L2 after rework → claim 607 · land 602/L2 on its report → chain 602 terminal.

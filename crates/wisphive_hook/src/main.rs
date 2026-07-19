@@ -129,6 +129,18 @@ enum HookFailureKind {
     /// not apply. Resolves per `fail-mode` (default closed) and is audited to
     /// events.jsonl so a shed decision is never silent.
     DaemonRejected,
+    /// `WISPHIVE_AGENT_TYPE` named a provider this hook cannot serve
+    /// (itr#562): set, non-empty, and not byte-exactly one of the values with
+    /// a response-formatter arm (`claude_code`/`claude`/`codex`). Response
+    /// FORMATTING branches on provider, so no JSON shape is safe to emit — a
+    /// guessed (Claude-shaped) deny can be ignored by an unknown provider and
+    /// become an effective allow. Resolves per `fail-mode` (default closed)
+    /// through [`response_for_failure`], is audited to events.jsonl as
+    /// `agent_type:unrecognized`, and is formatted ONLY through the
+    /// provider-agnostic channels: a deny surfaces via the [`PreParseDeny`]
+    /// bare-exit channel (exit 2 + stderr), an approve as exit 0 with empty
+    /// stdout. See [`resolve_unrecognized_provider`].
+    UnrecognizedProvider,
 }
 
 #[derive(Debug, Clone)]
@@ -137,9 +149,11 @@ struct HookFailure {
     message: String,
     event_type: HookEventType,
     agent_type: AgentType,
-    /// Audit attribution for [`HookFailureKind::DaemonRejected`] (itr#560):
-    /// the `decided_by` rule name written to events.jsonl, e.g.
-    /// `daemon_overloaded:capacity`. `None` for every other failure kind.
+    /// Audit attribution for [`HookFailureKind::DaemonRejected`] (itr#560)
+    /// and [`HookFailureKind::UnrecognizedProvider`] (itr#562): the
+    /// `decided_by` rule name written to events.jsonl, e.g.
+    /// `daemon_overloaded:capacity` / `agent_type:unrecognized`. `None` for
+    /// every other failure kind.
     decided_by: Option<&'static str>,
 }
 
@@ -149,7 +163,7 @@ impl HookFailure {
             kind: HookFailureKind::Runtime,
             message: message.into(),
             event_type: HookEventType::PreToolUse,
-            agent_type: detect_agent_type(&serde_json::Value::Null),
+            agent_type: pre_parse_agent_type(),
             decided_by: None,
         }
     }
@@ -162,7 +176,7 @@ impl HookFailure {
                 format_byte_limit(max_bytes)
             ),
             event_type: HookEventType::PreToolUse,
-            agent_type: detect_agent_type(&serde_json::Value::Null),
+            agent_type: pre_parse_agent_type(),
             decided_by: None,
         }
     }
@@ -246,6 +260,27 @@ impl HookFailure {
         }
     }
 
+    /// `WISPHIVE_AGENT_TYPE` named a provider without a formatter arm
+    /// (itr#562). The `agent_type` field is a PLACEHOLDER that is never
+    /// formatter-visible: `run()` converts this kind to the provider-agnostic
+    /// bare channels ([`PreParseDeny`] on deny, empty-stdout approve on open)
+    /// before `format_and_exit` could shape anything with it. The message
+    /// carries the offending value and the way out, per the ADR-0010 style.
+    fn unrecognized_provider(raw_value: &str, event_type: HookEventType) -> Self {
+        Self {
+            kind: HookFailureKind::UnrecognizedProvider,
+            message: format!(
+                "Wisphive refused this hook: WISPHIVE_AGENT_TYPE={raw_value:?} is not a provider this hook can serve.\n\
+                 Recognized values (byte-exact, case-sensitive): \"claude_code\", \"claude\", \"codex\". Unset the variable (or set it empty) to use payload-shape detection.\n\
+                 Wisphive refuses to emit a response shaped for a provider it cannot identify — an unparseable deny can be silently ignored and become an effective allow.\n\
+                 Adding a provider requires an AgentType variant AND a response-formatter arm in wisphive-hook; until both exist the hook refuses rather than guesses."
+            ),
+            event_type,
+            agent_type: AgentType::ClaudeCode,
+            decided_by: Some("agent_type:unrecognized"),
+        }
+    }
+
     fn deny_response(&self) -> HookResponse {
         let mut response =
             HookResponse::new(Decision::Deny, self.event_type, self.agent_type.clone());
@@ -298,28 +333,68 @@ impl HookResponse {
     }
 }
 
-fn detect_agent_type(hook_event: &serde_json::Value) -> AgentType {
+fn detect_agent_type(hook_event: &serde_json::Value) -> Option<AgentType> {
     let env_value = std::env::var("WISPHIVE_AGENT_TYPE").ok();
     detect_agent_type_from_env(env_value.as_deref(), hook_event)
 }
 
+/// Provider identity for failures that occur BEFORE stdin parses (oversized or
+/// unreadable input): the payload heuristic is unavailable, so this is the env
+/// mapping with a ClaudeCode fallback when the env value is unrecognized. The
+/// fallback never chooses emitted bytes — it is inert with respect to exactly
+/// the two outcomes these failures can format as: (a) a DENY with an
+/// unidentified provider never reaches the provider-shaped formatter, because
+/// `run()` reroutes it through the bare exit-2 [`PreParseDeny`] channel
+/// (itr#562); (b) the fail-open APPROVE carries no extras and formats as
+/// exit 0 with empty stdout on every formatter arm. With a recognized-or-unset
+/// env the value is simply the correct detection. Do NOT reuse this fallback
+/// anywhere a response with extras (Ask / `updatedInput` /
+/// `additionalContext`) could be built — there it would pick a dialect.
+fn pre_parse_agent_type() -> AgentType {
+    detect_agent_type(&serde_json::Value::Null).unwrap_or(AgentType::ClaudeCode)
+}
+
+/// Resolve the provider identity for this hook invocation (itr#562).
+///
+/// A set, NON-EMPTY `WISPHIVE_AGENT_TYPE` is authoritative and matched
+/// byte-exactly (case-sensitive, no trimming) against the providers this hook
+/// can actually SERVE — the ones with both an [`AgentType`] variant AND a
+/// response-formatter arm: `"claude_code"` / `"claude"` → ClaudeCode,
+/// `"codex"` → Codex. Every other non-empty value — case variants
+/// (`"CLAUDE_CODE"`), padded values (`" codex "`), and [`AgentType`] variants
+/// with no formatter arm yet (`"red"`, `"local_llm"`) — returns `None`, and
+/// the caller must REFUSE per the tiered fail posture (ADR-0001) rather than
+/// guess: response formatting branches on provider, and a guessed
+/// (Claude-shaped) reply can be silently ignored by a provider that cannot
+/// parse it — an unparseable deny is an effective allow. Adding a provider
+/// therefore means adding the [`AgentType`] variant AND its formatter arm(s),
+/// then recognizing its value here; until both exist the hook refuses.
+///
+/// An ABSENT or EMPTY-BUT-SET variable is the plain interactive session (the
+/// common case), not an error: detection falls through to the payload-shape
+/// heuristic (Codex payloads carry `model`/`turn_id`) and defaults to
+/// ClaudeCode. Only an unrecognized non-empty VALUE is unknown.
 fn detect_agent_type_from_env(
     env_value: Option<&str>,
     hook_event: &serde_json::Value,
-) -> AgentType {
+) -> Option<AgentType> {
     if let Some(value) = env_value {
         match value {
-            "codex" => return AgentType::Codex,
-            "claude_code" | "claude" => return AgentType::ClaudeCode,
-            _ => {}
+            "codex" => return Some(AgentType::Codex),
+            "claude_code" | "claude" => return Some(AgentType::ClaudeCode),
+            // Empty-but-set is the shell idiom for "unset" (e.g. a wrapper
+            // clearing an inherited value): fall through to the heuristic.
+            "" => {}
+            // Set, non-empty, and not a provider this hook can serve.
+            _ => return None,
         }
     }
 
     if hook_event.get("model").is_some() || hook_event.get("turn_id").is_some() {
-        return AgentType::Codex;
+        return Some(AgentType::Codex);
     }
 
-    AgentType::ClaudeCode
+    Some(AgentType::ClaudeCode)
 }
 
 fn agent_id_prefix(agent_type: &AgentType) -> &'static str {
@@ -659,9 +734,12 @@ fn mode_failure(error: &std::io::Error, wisphive_dir: &Path) -> PreParseDeny {
     }
 }
 
-/// A mode failure happens before stdin is parsed, so no event-specific JSON
-/// shape is safe to emit. Exit 2 with stderr feedback is understood by both
-/// Claude Code and Codex and cannot be mistaken for another hook event.
+/// The provider-agnostic bare-exit deny channel: exit 2 with stderr feedback
+/// is understood by both Claude Code and Codex and cannot be mistaken for any
+/// event- or provider-specific JSON dialect. Used when no such dialect is safe
+/// to emit: a mode failure happens before stdin is parsed (no event shape),
+/// and an unrecognized-provider refusal (itr#562) has no provider whose
+/// dialect the hook could speak (no provider shape).
 fn format_pre_parse_deny<W: Write>(failure: &PreParseDeny, stderr: &mut W) -> i32 {
     let _ = writeln!(stderr, "{}", failure.message);
     2
@@ -1083,7 +1161,10 @@ fn run() -> Result<HookResponse, PreParseDeny> {
             return Ok(HookResponse::new(
                 Decision::Approve,
                 HookEventType::PreToolUse,
-                detect_agent_type(&serde_json::Value::Null),
+                // Gating is off: this approve carries no extras, so it formats
+                // as exit 0 with empty stdout for EVERY provider — the
+                // fallback is format-inert (itr#562).
+                pre_parse_agent_type(),
             ));
         }
         Err(error) => {
@@ -1097,10 +1178,55 @@ fn run() -> Result<HookResponse, PreParseDeny> {
     }
 
     let fail_mode = read_fail_mode(&wisphive_dir);
-    Ok(match run_active(&wisphive_dir) {
-        Ok(response) => response,
-        Err(failure) => response_for_failure(&failure, fail_mode),
-    })
+    match run_active(&wisphive_dir) {
+        Ok(response) => Ok(response),
+        // An unrecognized provider (itr#562) was already resolved per the
+        // tiered fail posture AND audited inside `run_active` (see
+        // `resolve_unrecognized_provider`); only a DENY propagates as this
+        // kind, and it must use the provider-agnostic bare-exit channel
+        // (exit 2 + stderr) — no provider-shaped JSON is safe to emit for a
+        // provider the hook cannot identify.
+        Err(failure) if failure.kind == HookFailureKind::UnrecognizedProvider => {
+            Err(PreParseDeny {
+                message: failure.message,
+            })
+        }
+        Err(failure) => {
+            let response = response_for_failure(&failure, fail_mode);
+            // Pre-parse corner of the itr#562 refusal: failures constructed
+            // BEFORE stdin parses (oversized / unreadable / invalid-UTF-8
+            // input) never reach the run_active detection gate, so they carry
+            // the ClaudeCode fallback. When WISPHIVE_AGENT_TYPE is
+            // present-and-unrecognized (detection on a Null payload is None —
+            // the heuristic path always resolves), a Claude-shaped deny would
+            // go to a provider that may ignore what it cannot parse,
+            // degrading even the absolute oversized-stdin deny into an
+            // effective allow. No provider dialect is safe, so audit the
+            // resolution (minimal record — no tool context exists yet) and
+            // reroute a DENY through the bare exit-2 channel. Post-parse
+            // failures (daemon-unreachable/-rejected, invalid identity, tool
+            // runtime errors) can only exist AFTER the gate accepted the
+            // provider, so this reroute cannot touch them — the
+            // daemon-unreachable fail-open is unchanged.
+            if detect_agent_type(&serde_json::Value::Null).is_none() {
+                audit_unrecognized_pre_parse(&wisphive_dir, &failure, &response);
+                if response.decision == Decision::Deny {
+                    let raw_value = std::env::var("WISPHIVE_AGENT_TYPE").unwrap_or_default();
+                    return Err(PreParseDeny {
+                        message: format!(
+                            "{}\nWISPHIVE_AGENT_TYPE={raw_value:?} is also not a provider this hook can serve \
+                             (recognized: \"claude_code\", \"claude\", \"codex\"), so this denial uses the \
+                             provider-agnostic exit-2 channel instead of provider-shaped JSON.",
+                            failure.message
+                        ),
+                    });
+                }
+                // A fail-open approve is already bare: no extras, so it
+                // formats as exit 0 with empty stdout on every arm.
+            }
+            Ok(response)
+        }
+    }
 }
 
 /// Classify a payload as PostToolUse telemetry (auto-approved, result
@@ -1138,7 +1264,15 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
         .parse()
         .unwrap_or_default();
 
-    let agent_type = detect_agent_type(&hook_event);
+    // Provider identity gate (itr#562): if WISPHIVE_AGENT_TYPE names a
+    // provider this hook has no formatter arm for, refuse rather than guess a
+    // response shape — resolved per the tiered fail posture and audited
+    // inline (mirrors `gate_decision_with_audit`) while the tool context
+    // still exists for the events.jsonl record.
+    let Some(agent_type) = detect_agent_type(&hook_event) else {
+        let raw_value = std::env::var("WISPHIVE_AGENT_TYPE").unwrap_or_default();
+        return resolve_unrecognized_provider(wisphive_dir, &raw_value, &hook_event, event_type);
+    };
 
     // PostToolUse detection: fire-and-forget result to daemon
     if is_post_tool_use(event_type, &hook_event) {
@@ -1283,7 +1417,7 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
                     tool_name: &tool_name,
                     tool_input: &tool_input,
                     event_type,
-                    agent_type: &agent_type,
+                    agent_type: agent_type.to_string(),
                     event,
                     decided_by: &decided_by,
                 },
@@ -1326,7 +1460,7 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
                 tool_name: &tool_name,
                 tool_input: &log_input,
                 event_type,
-                agent_type: &agent_type,
+                agent_type: agent_type.to_string(),
                 event: "auto_approved",
                 decided_by: &format!("event_toggle:{toggle_key}"),
             },
@@ -1355,7 +1489,7 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
                 tool_name: &tool_name,
                 tool_input: &tool_input,
                 event_type,
-                agent_type: &agent_type,
+                agent_type: agent_type.to_string(),
                 event: "auto_approved",
                 decided_by: &decided_by,
             },
@@ -1435,7 +1569,7 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
                 tool_name: &audit_tool_name,
                 tool_input: &audit_tool_input,
                 event_type,
-                agent_type: &agent_type,
+                agent_type: agent_type.to_string(),
                 event: "denied",
                 decided_by: "codex_ask_fail_closed:daemon_ask",
             },
@@ -1482,7 +1616,7 @@ fn gate_decision_with_audit(
                     tool_name: &tool_name,
                     tool_input: &tool_input,
                     event_type,
-                    agent_type: &agent_type,
+                    agent_type: agent_type.to_string(),
                     event: if resolution.decision == Decision::Deny {
                         "denied"
                     } else {
@@ -1497,6 +1631,140 @@ fn gate_decision_with_audit(
             Ok(resolution)
         }
         Err(failure) => Err(failure),
+    }
+}
+
+/// Honest audit label for an unrecognized `WISPHIVE_AGENT_TYPE` value:
+/// `unrecognized:<value>`, with the value clamped to
+/// `MAX_AGENT_ID_SUFFIX_BYTES` **bytes** (backing up to a char boundary) so an
+/// absurd env value cannot bloat the append-only log. The full value is
+/// echoed on the ephemeral stderr channel; the durable record keeps enough to
+/// identify any legitimate typo.
+fn unrecognized_provider_label(raw_value: &str) -> String {
+    let mut end = raw_value.len().min(MAX_AGENT_ID_SUFFIX_BYTES);
+    while !raw_value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("unrecognized:{}", &raw_value[..end])
+}
+
+/// Minimal events.jsonl record for the pre-parse corner of the itr#562
+/// refusal (oversized / unreadable / unparseable stdin under an unrecognized
+/// `WISPHIVE_AGENT_TYPE`): the failure fired before any payload existed, so
+/// there is no tool context to attribute — `tool_name` records the
+/// `"pre-parse"` context and `tool_input` carries the failure cause instead,
+/// keeping the resolution non-silent with the same
+/// `decided_by: agent_type:unrecognized` attribution as the main path.
+fn audit_unrecognized_pre_parse(
+    wisphive_dir: &Path,
+    failure: &HookFailure,
+    resolution: &HookResponse,
+) {
+    let raw_value = std::env::var("WISPHIVE_AGENT_TYPE").unwrap_or_default();
+    let cause = serde_json::json!({ "pre_parse_failure": failure.message });
+    log_auto_approved(
+        wisphive_dir,
+        AutoApprovedLog {
+            tool_use_id: &None,
+            agent_id: "unknown",
+            project: Path::new(""),
+            tool_name: "pre-parse",
+            tool_input: &cause,
+            event_type: failure.event_type,
+            agent_type: unrecognized_provider_label(&raw_value),
+            event: if resolution.decision == Decision::Deny {
+                "denied"
+            } else {
+                "auto_approved"
+            },
+            decided_by: "agent_type:unrecognized",
+        },
+    );
+}
+
+/// Refuse a hook invocation whose `WISPHIVE_AGENT_TYPE` names a provider this
+/// hook cannot serve (itr#562), resolving per the tiered fail posture through
+/// [`response_for_failure`] and auditing the resolution to events.jsonl
+/// (`decided_by: agent_type:unrecognized`, via the itr#560 attribution
+/// machinery) while the tool context still exists — mirrors
+/// [`gate_decision_with_audit`]. The response is provider-AGNOSTIC by
+/// construction, since a provider-shaped guess is exactly what this path
+/// refuses to emit:
+///
+/// - `Err(failure)` when the posture resolves DENY (`fail-mode` default
+///   closed): `run()` maps this kind to the [`PreParseDeny`] bare-exit
+///   channel — exit 2 + stderr message, understood by every provider and
+///   mistakable for no hook-event JSON dialect.
+/// - `Ok(response)` when the posture resolves APPROVE (`fail-mode=open`, or
+///   PostToolUse telemetry which never blocks an already-ran tool): a bare
+///   approve pinned to the PreToolUse-no-extras shape, which formats as
+///   exit 0 with EMPTY stdout for every provider.
+fn resolve_unrecognized_provider(
+    wisphive_dir: &Path,
+    raw_value: &str,
+    hook_event: &serde_json::Value,
+    event_type: HookEventType,
+) -> Result<HookResponse, HookFailure> {
+    let failure = HookFailure::unrecognized_provider(raw_value, event_type);
+    let resolution = response_for_failure(&failure, read_fail_mode(wisphive_dir));
+
+    // Audit context straight off the parsed payload — the normal derivation
+    // (agent-prefixed id, per-agent project env) needs the provider identity
+    // this failure is about, so the record carries honest unknowns instead.
+    let tool_use_id = hook_event
+        .get("tool_use_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let tool_name = hook_event
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| event_type.to_string());
+    let tool_input = hook_event
+        .get("tool_input")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let project = hook_event
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    // The offending value is the whole story of this record; keep it in the
+    // durable trail (stderr is ephemeral), clamped by
+    // `unrecognized_provider_label`. Guaranteed non-empty: empty-but-set is
+    // treated as unset and never reaches this path.
+    log_auto_approved(
+        wisphive_dir,
+        AutoApprovedLog {
+            tool_use_id: &tool_use_id,
+            agent_id: "unknown",
+            project: &project,
+            tool_name: &tool_name,
+            tool_input: &tool_input,
+            event_type,
+            agent_type: unrecognized_provider_label(raw_value),
+            event: if resolution.decision == Decision::Deny {
+                "denied"
+            } else {
+                // fail-mode=open (or PostToolUse telemetry): the approve is
+                // still audited and attributed, never silent.
+                "auto_approved"
+            },
+            decided_by: "agent_type:unrecognized",
+        },
+    );
+
+    if resolution.decision == Decision::Deny {
+        Err(failure)
+    } else {
+        // Provider-agnostic approve: PreToolUse shape with no extras formats
+        // as exit 0 + empty stdout on every formatter arm, so the placeholder
+        // agent type is format-inert.
+        Ok(HookResponse::new(
+            Decision::Approve,
+            HookEventType::PreToolUse,
+            AgentType::ClaudeCode,
+        ))
     }
 }
 
@@ -2162,7 +2430,12 @@ struct AutoApprovedLog<'a> {
     tool_name: &'a str,
     tool_input: &'a serde_json::Value,
     event_type: HookEventType,
-    agent_type: &'a AgentType,
+    /// Provider label for the record. Usually `AgentType::to_string()`; the
+    /// unrecognized-provider refusal (itr#562) writes `unrecognized:<value>`
+    /// here because the offending value has no [`AgentType`] variant — an
+    /// owned String so the trail can stay honest instead of guessing a
+    /// variant.
+    agent_type: String,
     /// Record kind: "auto_approved" (default), "deferred", or "denied".
     event: &'a str,
     /// The layer/rule that made the decision (itr#397), e.g. "level:all",
@@ -2177,7 +2450,7 @@ fn log_auto_approved(wisphive_dir: &std::path::Path, log: AutoApprovedLog<'_>) {
         "hook_event_name": log.event_type.to_string(),
         "tool_use_id": log.tool_use_id,
         "agent_id": log.agent_id,
-        "agent_type": log.agent_type.to_string(),
+        "agent_type": log.agent_type,
         "project": log.project,
         "tool_name": log.tool_name,
         // events.jsonl is durable (ingested into decision_log, archived) —
@@ -3325,7 +3598,7 @@ mod tests {
         let event = json!({"hook_event_name": "PreToolUse"});
         assert_eq!(
             detect_agent_type_from_env(Some("codex"), &event),
-            AgentType::Codex
+            Some(AgentType::Codex)
         );
     }
 
@@ -3334,23 +3607,206 @@ mod tests {
         let event = json!({"hook_event_name": "PreToolUse", "model": "gpt-5.4"});
         assert_eq!(
             detect_agent_type_from_env(Some("claude_code"), &event),
-            AgentType::ClaudeCode
+            Some(AgentType::ClaudeCode)
         );
     }
 
     #[test]
     fn detects_codex_from_codex_fields() {
         let event = json!({"hook_event_name": "PreToolUse", "turn_id": "turn-1"});
-        assert_eq!(detect_agent_type_from_env(None, &event), AgentType::Codex);
+        assert_eq!(
+            detect_agent_type_from_env(None, &event),
+            Some(AgentType::Codex)
+        );
     }
 
     #[test]
     fn defaults_to_claude_without_codex_signal() {
+        // The corrected contract (itr#562): ABSENCE of WISPHIVE_AGENT_TYPE is
+        // the plain interactive session and still resolves ClaudeCode via the
+        // payload heuristic — only an unrecognized NON-EMPTY value is unknown.
         let event = json!({"hook_event_name": "PreToolUse"});
         assert_eq!(
             detect_agent_type_from_env(None, &event),
-            AgentType::ClaudeCode
+            Some(AgentType::ClaudeCode)
         );
+        // Empty-but-set is the shell idiom for "unset" (a real operator
+        // state, e.g. a wrapper clearing an inherited value): identical to
+        // absence, never a refusal.
+        assert_eq!(
+            detect_agent_type_from_env(Some(""), &event),
+            Some(AgentType::ClaudeCode)
+        );
+    }
+
+    #[test]
+    fn empty_env_value_is_unset_not_unrecognized() {
+        // Empty-but-set falls through to the same payload heuristic as
+        // absence — including the Codex branch.
+        let codex_event = json!({"hook_event_name": "PreToolUse", "turn_id": "turn-9"});
+        assert_eq!(
+            detect_agent_type_from_env(Some(""), &codex_event),
+            Some(AgentType::Codex)
+        );
+    }
+
+    #[test]
+    fn unrecognized_provider_value_yields_none() {
+        // itr#562: a set, non-empty WISPHIVE_AGENT_TYPE that is not
+        // byte-exactly a servable provider must NOT silently become
+        // ClaudeCode. Matching is case-sensitive with no trimming: the only
+        // legitimate writers (the daemon spawn env and the Codex hook
+        // command) emit exact lowercase tokens, so any variant is a
+        // misconfiguration to refuse loudly, not a spelling to guess at.
+        let event = json!({"hook_event_name": "PreToolUse"});
+        for value in [
+            "gemini",
+            "CLAUDE_CODE",
+            "Codex",
+            " codex ",
+            "claude-code",
+            "codex\n",
+            " ",
+        ] {
+            assert_eq!(
+                detect_agent_type_from_env(Some(value), &event),
+                None,
+                "{value:?} must not be guessed into a provider"
+            );
+        }
+        // AgentType variants WITHOUT a formatter arm are refused too:
+        // recognizing them here would hand them Claude-shaped JSON — the
+        // exact unparseable-deny-becomes-allow hazard this contract closes.
+        // Nothing legitimate emits these values today: the daemon cannot
+        // spawn Red/LocalLlm (process_registry's build_command bails on them
+        // before the WISPHIVE_AGENT_TYPE export), so any such value is
+        // misconfiguration until both the spawn path and formatter arms exist.
+        for value in ["red", "local_llm"] {
+            assert_eq!(
+                detect_agent_type_from_env(Some(value), &event),
+                None,
+                "{value:?} has no formatter arm and must be refused"
+            );
+        }
+        // The payload heuristic must not resurrect a refused value.
+        let codex_shaped = json!({"hook_event_name": "PreToolUse", "turn_id": "t"});
+        assert_eq!(
+            detect_agent_type_from_env(Some("gemini"), &codex_shaped),
+            None
+        );
+    }
+
+    #[test]
+    fn unrecognized_provider_resolves_per_tiered_fail_posture() {
+        // itr#562 AC#2: the refusal routes through response_for_failure —
+        // fail-mode tiered (default closed), with the PostToolUse telemetry
+        // rule still winning (an already-ran tool is never blocked).
+        let failure = HookFailure::unrecognized_provider("gemini", HookEventType::PreToolUse);
+        assert_eq!(failure.kind, HookFailureKind::UnrecognizedProvider);
+        assert_eq!(failure.decided_by, Some("agent_type:unrecognized"));
+        assert_eq!(
+            response_for_failure(&failure, FailMode::Closed).decision,
+            Decision::Deny
+        );
+        assert_eq!(
+            response_for_failure(&failure, FailMode::Open).decision,
+            Decision::Approve
+        );
+        let post = HookFailure::unrecognized_provider("gemini", HookEventType::PostToolUse);
+        assert_eq!(
+            response_for_failure(&post, FailMode::Closed).decision,
+            Decision::Approve,
+            "PostToolUse is telemetry only, even for an unknown provider"
+        );
+    }
+
+    #[test]
+    fn unrecognized_provider_refusal_is_bare_and_audited() {
+        // itr#562 AC#4: an unrecognized value must NOT produce Claude-shaped
+        // JSON, and the resolution must land in events.jsonl. Default
+        // fail-mode (no fail-mode file) = closed → deny.
+        let dir = tempfile::tempdir().unwrap();
+        let event = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "export API_KEY=sk-abc123def456"},
+            "tool_use_id": "unrec-1",
+            "cwd": "/tmp/p"
+        });
+        let failure =
+            resolve_unrecognized_provider(dir.path(), "gemini", &event, HookEventType::PreToolUse)
+                .expect_err("default fail-mode=closed must refuse an unrecognized provider");
+        assert_eq!(failure.kind, HookFailureKind::UnrecognizedProvider);
+        assert!(
+            failure.message.contains("\"gemini\""),
+            "the refusal must name the offending value"
+        );
+
+        // The deny surfaces through run()'s PreParseDeny mapping — the
+        // provider-agnostic bare channel: exit 2 + stderr, NO stdout JSON of
+        // any provider's dialect.
+        let mut stderr = Vec::new();
+        let code = format_pre_parse_deny(
+            &PreParseDeny {
+                message: failure.message.clone(),
+            },
+            &mut stderr,
+        );
+        assert_eq!(code, 2, "the refusal is a bare-exit deny");
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.contains("WISPHIVE_AGENT_TYPE"));
+        assert!(
+            !stderr.contains("hookSpecificOutput"),
+            "the refusal channel must not carry Claude-shaped JSON"
+        );
+
+        // Audited via the itr#560 machinery, never silent.
+        let events = std::fs::read_to_string(dir.path().join("events.jsonl"))
+            .expect("the refusal must write an events.jsonl audit record");
+        let record: serde_json::Value =
+            serde_json::from_str(events.lines().next().unwrap()).unwrap();
+        assert_eq!(record["event"], "denied");
+        assert_eq!(record["decided_by"], "agent_type:unrecognized");
+        assert_eq!(record["agent_type"], "unrecognized:gemini");
+        assert_eq!(record["tool_name"], "Bash");
+        assert_eq!(record["tool_use_id"], "unrec-1");
+        // The record rides the shared redaction path (itr#89).
+        let logged_command = record["tool_input"]["command"].as_str().unwrap();
+        assert!(!logged_command.contains("sk-abc123def456"));
+        assert!(logged_command.contains("***REDACTED***"));
+    }
+
+    #[test]
+    fn unrecognized_provider_fail_open_is_bare_approve_and_audited() {
+        // itr#562 AC#2: fail-mode=open resolves as the bare approve — exit 0
+        // with EMPTY stdout (no provider-shaped JSON) — and is still audited.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("fail-mode"), "open").unwrap();
+        let event = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "echo hi"},
+            "tool_use_id": "unrec-2",
+            "cwd": "/tmp/p"
+        });
+        let response =
+            resolve_unrecognized_provider(dir.path(), "gemini", &event, HookEventType::PreToolUse)
+                .expect("fail-mode=open resolves the refusal as an approve");
+        assert_eq!(response.decision, Decision::Approve);
+        let (json_out, code) = pre_tool_use_stdout(&response);
+        assert_eq!(code, 0);
+        assert!(
+            json_out.is_none(),
+            "the fail-open approve must be bare: empty stdout, no guessed provider dialect"
+        );
+
+        let events = std::fs::read_to_string(dir.path().join("events.jsonl"))
+            .expect("the fail-open approve must still be audited");
+        let record: serde_json::Value =
+            serde_json::from_str(events.lines().next().unwrap()).unwrap();
+        assert_eq!(record["event"], "auto_approved");
+        assert_eq!(record["decided_by"], "agent_type:unrecognized");
+        assert_eq!(record["agent_type"], "unrecognized:gemini");
     }
 
     #[test]
