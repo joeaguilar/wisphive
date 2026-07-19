@@ -554,8 +554,15 @@ fn try_acquire_connection_permit(permits: &Arc<Semaphore>) -> Option<OwnedSemaph
 /// Send a bounded, protocol-shaped overload response directly from the accept
 /// loop. This deliberately avoids constructing a [`ConnectionContext`] or
 /// spawning a handler for a client that cannot be admitted.
+///
+/// The rejection is the typed [`ServerMessage::Overloaded`] (itr#560), not a
+/// bare `Error`: a hook reading it at the Welcome position must classify a
+/// deliberate load-shed by a LIVE daemon (resolve per fail-mode, default
+/// closed, audited) — never `DaemonUnreachable` fail-open. Old hooks that
+/// predate the variant fail to decode it and keep their historical fail-open
+/// behavior, so the typed variant is safe mid-upgrade.
 async fn reject_connection_at_capacity(mut stream: UnixStream) -> Result<()> {
-    let encoded = encode(&ServerMessage::Error {
+    let encoded = encode(&ServerMessage::Overloaded {
         message: CONNECTION_LIMIT_ERROR.into(),
     })?;
     stream.write_all(encoded.as_bytes()).await?;
@@ -5017,10 +5024,12 @@ mod tests {
         assert!(reader.read_line(&mut line).await.unwrap() > 0);
         let message: wisphive_protocol::ServerMessage = wisphive_protocol::decode(&line).unwrap();
         match message {
-            wisphive_protocol::ServerMessage::Error { message } => {
+            // Typed rejection (itr#560): the hook must be able to tell "live
+            // daemon at capacity" from a generic error without string-matching.
+            wisphive_protocol::ServerMessage::Overloaded { message } => {
                 assert_eq!(message, CONNECTION_LIMIT_ERROR);
             }
-            other => panic!("expected capacity error, got {other:?}"),
+            other => panic!("expected typed capacity rejection, got {other:?}"),
         }
     }
 

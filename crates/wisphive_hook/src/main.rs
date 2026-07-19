@@ -120,6 +120,15 @@ enum HookFailureKind {
     /// crashed daemon must never brick every agent, so it always fails open
     /// regardless of `fail-mode`. Runtime parse/protocol errors stay fail-closed.
     DaemonUnreachable,
+    /// A LIVE daemon answered the handshake with a deliberate protocol-level
+    /// rejection instead of a Welcome (itr#560): the typed
+    /// `ServerMessage::Overloaded` capacity shed, or any other well-formed
+    /// non-Welcome reply at the Welcome position (a legacy daemon's bare
+    /// `Error` — capacity, version skew, handshake refusal). The daemon
+    /// answered, so it is NOT absent — ADR-0001's unreachable-fails-open does
+    /// not apply. Resolves per `fail-mode` (default closed) and is audited to
+    /// events.jsonl so a shed decision is never silent.
+    DaemonRejected,
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +137,10 @@ struct HookFailure {
     message: String,
     event_type: HookEventType,
     agent_type: AgentType,
+    /// Audit attribution for [`HookFailureKind::DaemonRejected`] (itr#560):
+    /// the `decided_by` rule name written to events.jsonl, e.g.
+    /// `daemon_overloaded:capacity`. `None` for every other failure kind.
+    decided_by: Option<&'static str>,
 }
 
 impl HookFailure {
@@ -137,6 +150,7 @@ impl HookFailure {
             message: message.into(),
             event_type: HookEventType::PreToolUse,
             agent_type: detect_agent_type(&serde_json::Value::Null),
+            decided_by: None,
         }
     }
 
@@ -149,6 +163,7 @@ impl HookFailure {
             ),
             event_type: HookEventType::PreToolUse,
             agent_type: detect_agent_type(&serde_json::Value::Null),
+            decided_by: None,
         }
     }
 
@@ -162,6 +177,7 @@ impl HookFailure {
             message: message.into(),
             event_type,
             agent_type: agent_type.clone(),
+            decided_by: None,
         }
     }
 
@@ -188,6 +204,7 @@ impl HookFailure {
             message: message.into(),
             event_type,
             agent_type: agent_type.clone(),
+            decided_by: None,
         }
     }
 
@@ -204,6 +221,28 @@ impl HookFailure {
             message: format!("{}: {error}", context.as_ref()),
             event_type,
             agent_type: agent_type.clone(),
+            decided_by: None,
+        }
+    }
+
+    /// A live daemon's deliberate protocol-level rejection at the Welcome
+    /// position (itr#560). Tagged [`HookFailureKind::DaemonRejected`]: the
+    /// daemon answered, so this resolves per `fail-mode` (default closed) —
+    /// never the unreachable fail-open — and `decided_by` names the rejection
+    /// for the events.jsonl audit record.
+    fn daemon_rejected(
+        context: impl AsRef<str>,
+        error: impl fmt::Display,
+        decided_by: &'static str,
+        event_type: HookEventType,
+        agent_type: &AgentType,
+    ) -> Self {
+        Self {
+            kind: HookFailureKind::DaemonRejected,
+            message: format!("{}: {error}", context.as_ref()),
+            event_type,
+            agent_type: agent_type.clone(),
+            decided_by: Some(decided_by),
         }
     }
 
@@ -674,8 +713,11 @@ fn response_for_failure(failure: &HookFailure, fail_mode: FailMode) -> HookRespo
         return approve();
     }
 
-    // Other runtime failures (parse/protocol/IO) honor `fail-mode`, which
-    // defaults to closed (deny) per the security posture in AGENTS.md.
+    // Other runtime failures (parse/protocol/IO) — and a live daemon's
+    // deliberate rejection (`DaemonRejected`, itr#560: capacity load-shed /
+    // version skew, where the daemon ANSWERED and is therefore not absent) —
+    // honor `fail-mode`, which defaults to closed (deny) per the security
+    // posture in AGENTS.md.
     if fail_mode == FailMode::Closed {
         failure.deny_response()
     } else {
@@ -1372,9 +1414,10 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
     // Layer 4: connect to the daemon and block for a human decision. The whole
     // transport (connect → handshake → request → response) lives in
     // `request_decision` so the connect-vs-handshake-vs-live-daemon failure
-    // boundary is testable against a socket harness (itr#337).
-    let socket_path = wisphive_dir.join("wisphive.sock");
-    let response = request_decision(&socket_path, request, event_type, agent_type.clone())?;
+    // boundary is testable against a socket harness (itr#337); the
+    // live-rejection resolution + audit write live in
+    // `gate_decision_with_audit` so the events.jsonl branch is testable too.
+    let response = gate_decision_with_audit(wisphive_dir, request, event_type, agent_type.clone())?;
 
     // A daemon-resolved Ask on the Codex PreToolUse path is a fail-closed deny
     // (itr#366); that non-human outcome must reach the audit trail (itr#397) —
@@ -1401,17 +1444,77 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
     Ok(response)
 }
 
+/// Request a daemon decision for `request`, resolving a live daemon's
+/// deliberate pre-Welcome rejection ([`HookFailureKind::DaemonRejected`],
+/// itr#560) inline: per `fail-mode` (default closed), with an events.jsonl
+/// audit record written while the tool context still exists — `decided_by`
+/// names the rejection (e.g. `daemon_overloaded:capacity`) so a capacity
+/// resolution is distinguishable from a human one and never silent. The
+/// daemon that shed the connection is alive and ingests the record into
+/// decision_log / the TUI-web audit feed. Every other failure propagates
+/// unchanged to [`response_for_failure`] via the caller. Extracted from
+/// [`run_active`] so the audit-write branch is testable against a socket
+/// harness.
+fn gate_decision_with_audit(
+    wisphive_dir: &Path,
+    request: DecisionRequest,
+    event_type: HookEventType,
+    agent_type: AgentType,
+) -> Result<HookResponse, HookFailure> {
+    // Audit context must survive the move of `request` into the transport.
+    let tool_use_id = request.tool_use_id.clone();
+    let agent_id = request.agent_id.clone();
+    let project = request.project.clone();
+    let tool_name = request.tool_name.clone();
+    let tool_input = request.tool_input.clone();
+
+    let socket_path = wisphive_dir.join("wisphive.sock");
+    match request_decision(&socket_path, request, event_type, agent_type.clone()) {
+        Ok(response) => Ok(response),
+        Err(failure) if failure.kind == HookFailureKind::DaemonRejected => {
+            let resolution = response_for_failure(&failure, read_fail_mode(wisphive_dir));
+            log_auto_approved(
+                wisphive_dir,
+                AutoApprovedLog {
+                    tool_use_id: &tool_use_id,
+                    agent_id: &agent_id,
+                    project: &project,
+                    tool_name: &tool_name,
+                    tool_input: &tool_input,
+                    event_type,
+                    agent_type: &agent_type,
+                    event: if resolution.decision == Decision::Deny {
+                        "denied"
+                    } else {
+                        // fail-mode=open: the operator explicitly chose
+                        // availability; the approval is still audited and
+                        // attributed to the rejection rule, never silent.
+                        "auto_approved"
+                    },
+                    decided_by: failure.decided_by.unwrap_or("daemon_rejected:unknown"),
+                },
+            );
+            Ok(resolution)
+        }
+        Err(failure) => Err(failure),
+    }
+}
+
 /// Connect to the daemon, handshake, send the decision request, and read the
 /// response. Extracted from [`run_active`] so the connect-vs-handshake-vs-live-
 /// daemon failure boundary is testable against a socket harness (itr#337).
 ///
-/// Failure classification (consumed by [`response_for_failure`]): every
-/// transport step up to and including an EOF/garbled *welcome* is
-/// [`HookFailureKind::DaemonUnreachable`] — no session with a live daemon was
-/// ever established, so it fails **open**. Only AFTER a valid `Welcome` is the
-/// daemon "up and answering": an EOF-before-decision still fails open (the
-/// common crash-brick), but a well-formed `Error` or an unexpected/garbage
-/// message is honored fail-**closed** per `fail-mode`.
+/// Failure classification (consumed by [`response_for_failure`]): a refused/
+/// absent socket and an EOF/garbled *welcome* are
+/// [`HookFailureKind::DaemonUnreachable`] — no well-formed reply from a live
+/// daemon ever arrived, so it fails **open** (ADR-0001). A WELL-FORMED
+/// non-Welcome reply at the Welcome position (typed `Overloaded` capacity
+/// shed, or a legacy bare `Error`) is [`HookFailureKind::DaemonRejected`]
+/// (itr#560): the daemon answered, so it resolves per `fail-mode` (default
+/// **closed**) and is audited. AFTER a valid `Welcome` the daemon is "up and
+/// answering": an EOF-before-decision still fails open (the common
+/// crash-brick), but a well-formed `Error` or an unexpected/garbage message
+/// is honored fail-**closed** per `fail-mode`.
 fn request_decision(
     socket_path: &Path,
     request: DecisionRequest,
@@ -1462,10 +1565,12 @@ fn request_decision(
     let mut writer = stream;
 
     // Handshake. Encoding our own Hello is a local concern (keep Runtime), but
-    // every transport step below — and a peer-closed/empty/garbled welcome —
-    // means we never established a working session with a live daemon, so it
-    // fails open. Only AFTER a valid Welcome do we treat the daemon as "up and
-    // answering", where a refusal/garbage response is honored fail-closed.
+    // a peer-closed/empty/garbled welcome means we never got a well-formed
+    // reply from a live daemon, so it fails open. A WELL-FORMED non-Welcome
+    // reply (Overloaded / legacy Error) is a live daemon's deliberate
+    // rejection → DaemonRejected, per fail-mode (itr#560). After a valid
+    // Welcome the daemon is "up and answering", where a refusal/garbage
+    // response is honored fail-closed.
     let hello = wisphive_protocol::encode(&ClientMessage::Hello {
         client: ClientType::Hook,
         version: PROTOCOL_VERSION,
@@ -1510,13 +1615,45 @@ fn request_decision(
             &agent_type,
         )
     })?;
-    if !matches!(welcome, ServerMessage::Welcome { .. }) {
-        return Err(HookFailure::unreachable(
-            "Wisphive daemon sent an unexpected welcome response",
-            "handshake did not complete",
-            event_type,
-            &agent_type,
-        ));
+    // A WELL-FORMED non-Welcome reply proves a live daemon deliberately
+    // rejected this session (itr#560) — connection-capacity load-shed,
+    // version skew, handshake refusal. That is NOT control-plane absence:
+    // classify DaemonRejected (fail-mode, default closed, audited), never
+    // DaemonUnreachable fail-open. Only refused/absent sockets and
+    // EOF/garble — where no well-formed reply ever arrived — stay
+    // unreachable/fail-open per ADR-0001.
+    match welcome {
+        ServerMessage::Welcome { .. } => {}
+        ServerMessage::Overloaded { message } => {
+            return Err(HookFailure::daemon_rejected(
+                "Wisphive daemon is at connection capacity and shed this decision",
+                message,
+                "daemon_overloaded:capacity",
+                event_type,
+                &agent_type,
+            ));
+        }
+        // Legacy daemon (pre-Overloaded): a bare Error at the Welcome
+        // position is still a live rejection — belt-and-braces so an old
+        // daemon + new hook mid-upgrade cannot silently fail open.
+        ServerMessage::Error { message } => {
+            return Err(HookFailure::daemon_rejected(
+                "Wisphive daemon rejected the connection during handshake",
+                message,
+                "daemon_rejected:handshake_error",
+                event_type,
+                &agent_type,
+            ));
+        }
+        _ => {
+            return Err(HookFailure::daemon_rejected(
+                "Wisphive daemon sent an unexpected welcome response",
+                "handshake did not complete",
+                "daemon_rejected:unexpected_welcome",
+                event_type,
+                &agent_type,
+            ));
+        }
     }
 
     // Send decision request
@@ -2423,6 +2560,7 @@ mod tests {
             message: "too large".into(),
             event_type: HookEventType::PostToolUse,
             agent_type: AgentType::ClaudeCode,
+            decided_by: None,
         };
         let resp = response_for_failure(&failure, FailMode::Open);
         assert_eq!(resp.decision, Decision::Deny);
@@ -3766,6 +3904,160 @@ mod tests {
             response_for_failure(&err, FailMode::Closed).decision,
             Decision::Deny,
             "garbage response must fail closed under fail-mode=closed"
+        );
+    }
+
+    // ---- itr#560: a live daemon's pre-Welcome rejection is NOT absence ----
+
+    #[test]
+    fn pre_welcome_overloaded_is_live_rejection_fails_closed() {
+        // (e) the daemon accepted, then shed the connection at capacity with
+        // the typed Overloaded at the Welcome position. The daemon ANSWERED —
+        // this must never be classified DaemonUnreachable/fail-open.
+        let err = socket_scenario(|stream| {
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+            drain_line(&mut reader); // Hello
+            let msg = wisphive_protocol::encode(&ServerMessage::Overloaded {
+                message: "daemon connection capacity reached; retry later".into(),
+            })
+            .unwrap();
+            let _ = writer.write_all(msg.as_bytes());
+            linger_until_hook_eof(writer);
+        });
+        assert_eq!(err.kind, HookFailureKind::DaemonRejected);
+        assert_eq!(
+            err.decided_by,
+            Some("daemon_overloaded:capacity"),
+            "the audit attribution must name capacity, not a generic error"
+        );
+        assert_eq!(
+            response_for_failure(&err, FailMode::Closed).decision,
+            Decision::Deny,
+            "a capacity shed by a live daemon must fail closed by default"
+        );
+        assert_eq!(
+            response_for_failure(&err, FailMode::Open).decision,
+            Decision::Approve,
+            "…and fail open only when the operator chose fail-mode=open"
+        );
+    }
+
+    #[test]
+    fn pre_welcome_bare_error_is_live_rejection_fails_closed() {
+        // (f) belt-and-braces (itr#560 AC#2): an OLD daemon that predates the
+        // typed Overloaded variant sheds with a bare Error at the Welcome
+        // position. Old daemon + new hook coexist mid-upgrade — the bare Error
+        // must also classify as a live rejection, not DaemonUnreachable.
+        let err = socket_scenario(|stream| {
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+            drain_line(&mut reader); // Hello
+            let msg = wisphive_protocol::encode(&ServerMessage::Error {
+                message: "daemon connection capacity reached; retry later".into(),
+            })
+            .unwrap();
+            let _ = writer.write_all(msg.as_bytes());
+            linger_until_hook_eof(writer);
+        });
+        assert_eq!(err.kind, HookFailureKind::DaemonRejected);
+        assert_eq!(err.decided_by, Some("daemon_rejected:handshake_error"));
+        assert_eq!(
+            response_for_failure(&err, FailMode::Closed).decision,
+            Decision::Deny,
+            "a legacy pre-Welcome Error must fail closed by default"
+        );
+    }
+
+    #[test]
+    fn absent_socket_still_fails_open() {
+        // (g) B-A8 regression guard: the sacred ADR-0001 carve-out. A
+        // refused/absent socket is control-plane ABSENCE — it must keep
+        // failing open even under fail-mode=closed, unchanged by the
+        // DaemonRejected classification above.
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("no-daemon-here.sock");
+        let err = request_decision(
+            &socket_path,
+            harness_request(),
+            HookEventType::PreToolUse,
+            AgentType::ClaudeCode,
+        )
+        .expect_err("connecting to an absent socket must fail");
+        assert_eq!(err.kind, HookFailureKind::DaemonUnreachable);
+        assert_eq!(
+            response_for_failure(&err, FailMode::Closed).decision,
+            Decision::Approve,
+            "a down control plane must never brick agents (ADR-0001)"
+        );
+    }
+
+    #[test]
+    fn capacity_rejection_writes_denied_audit_record() {
+        // itr#560 AC#3, via the run_active-level path: `gate_decision_with_audit`
+        // is the branch that resolves a live rejection AND writes the
+        // events.jsonl audit record. The socket_scenario tests above call
+        // request_decision directly and bypass that write — this test fails if
+        // the audit write is dropped.
+        use std::os::unix::net::UnixListener;
+        // The tempdir doubles as the isolated state HOME (`~/.wisphive`
+        // equivalent): the socket lives at <dir>/wisphive.sock and the audit
+        // record must land at <dir>/events.jsonl. Short path per SUN_LEN.
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("wisphive.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let handle = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut writer = stream;
+                drain_line(&mut reader); // Hello
+                let msg = wisphive_protocol::encode(&ServerMessage::Overloaded {
+                    message: "daemon connection capacity reached; retry later".into(),
+                })
+                .unwrap();
+                let _ = writer.write_all(msg.as_bytes());
+                linger_until_hook_eof(writer);
+            }
+        });
+
+        let mut request = harness_request();
+        request.tool_use_id = Some("cap-audit-1".into());
+        // The itr#89 acceptance example — must be scrubbed in the record.
+        request.tool_input = serde_json::json!({"command": "export API_KEY=sk-abc123def456"});
+
+        let response = gate_decision_with_audit(
+            dir.path(),
+            request,
+            HookEventType::PreToolUse,
+            AgentType::ClaudeCode,
+        )
+        .expect("a live rejection resolves inline, never propagates as a failure");
+        let _ = handle.join();
+
+        // (a) default fail-mode (no fail-mode file) = closed → deny.
+        assert_eq!(
+            response.decision,
+            Decision::Deny,
+            "default fail-mode=closed must deny a capacity shed"
+        );
+
+        // (b) the audit record exists, names capacity, and is redacted.
+        let events = std::fs::read_to_string(dir.path().join("events.jsonl"))
+            .expect("the capacity resolution must write an events.jsonl audit record");
+        let record: serde_json::Value =
+            serde_json::from_str(events.lines().next().unwrap()).unwrap();
+        assert_eq!(record["event"], "denied");
+        assert_eq!(record["decided_by"], "daemon_overloaded:capacity");
+        assert_eq!(record["tool_name"], "Bash");
+        assert_eq!(record["tool_use_id"], "cap-audit-1");
+        let logged_command = record["tool_input"]["command"].as_str().unwrap();
+        assert!(
+            !logged_command.contains("sk-abc123def456"),
+            "the audit record must not leak the cleartext secret"
+        );
+        assert!(
+            logged_command.contains("***REDACTED***"),
+            "the audit record must carry the redacted tool_input"
         );
     }
 }

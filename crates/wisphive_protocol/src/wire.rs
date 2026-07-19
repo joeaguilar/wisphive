@@ -509,6 +509,15 @@ pub enum ServerMessage {
     #[serde(rename = "error")]
     Error { message: String },
 
+    /// Deliberate connection load-shed, sent at the Welcome position when the
+    /// daemon is at its connection-capacity limit (itr#560). Typed — rather
+    /// than a bare [`ServerMessage::Error`] — so a hook can classify "a live
+    /// daemon shed me" without string-matching and resolve per `fail-mode`
+    /// (default closed) instead of misreading a reachable-but-full daemon as
+    /// a control-plane outage (which fails open per ADR-0001).
+    #[serde(rename = "overloaded")]
+    Overloaded { message: String },
+
     // ── Web UI auth events ────────────────────────────────────────────
     /// A web login attempt failed. Broadcast to TUI clients so humans can
     /// see suspicious activity on the host. `attempt_count` is the running
@@ -860,6 +869,23 @@ mod tests {
         let decoded: ServerMessage = decode(&encoded).unwrap();
         match decoded {
             ServerMessage::Error { message } => assert_eq!(message, "something went wrong"),
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_overloaded() {
+        let msg = ServerMessage::Overloaded {
+            message: "daemon connection capacity reached; retry later".into(),
+        };
+        let encoded = encode(&msg).unwrap();
+        // The wire tag is the machine signal hooks classify on (itr#560).
+        assert!(encoded.contains("\"type\":\"overloaded\""));
+        let decoded: ServerMessage = decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::Overloaded { message } => {
+                assert_eq!(message, "daemon connection capacity reached; retry later");
+            }
             _ => panic!("unexpected variant"),
         }
     }

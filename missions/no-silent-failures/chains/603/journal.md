@@ -1,2 +1,14 @@
 # Chain 603 journal
 facts-cursor: 2026-07-19T00:23:29Z
+
+## L1/decision — 2026-07-19T00:25:01Z
+Claimed itr#560 (lane B). DoD frozen at claim incl. intake correction: PRIMARY fix hook-side (pre-Welcome Error = live rejection, fail-closed per fail-mode); typed daemon variant secondary; backward-compat bare-Error classification required; B-A8 socket-down fail-open regression guard mandatory in tests. AC#5 (reserved permits) = analyze-and-recommend only.
+
+## L1/discovery — 2026-07-19T00:41:20Z
+Link agent report in, gate green, probe evidence: 257th conn gets typed Overloaded; hook at capacity returns DENY with reason; events.jsonl denied record decided_by=daemon_overloaded:capacity; socket-absent still fail-open (runtime step 6). ESCALATED unmatched findings: (1) reclassification widens to ALL well-formed pre-Welcome replies — protocol-version skew now denies (consistent w/ ADR-0010 repair-via-message, needs conscious accept + reviewer verdict); (2) old-hook/new-daemon decode failure keeps historical fail-open (benign); (3) fresh worktrees can't build wisphive_web without frontend/dist (rust-embed) — env constraint for all lanes; (4) CLAUDE.md fail-posture wording to be folded in at landing (orchestrator-owned); (5) AC#5 recommendation: two-stage admission w/ interactive-class reserved floor — file as follow-up ticket at landing. Adversarial reviewer spawned.
+
+## L1/review — 2026-07-19T00:47:44Z
+Reviewer: implementation_conforms=TRUE, oracle_adequate=FALSE. premise_verdicts: B-A1 supports, B-A2 supports, B-A8 supports (absent-socket test proven non-vacuous; EOF fail-open tests intact). No workarounds. Pre-Welcome enumeration: no legitimate healthy-pair message newly denied; version-skew deny judged consistent w/ ADR-0001/0010. SHOULD-FIX x2: (1) run_active DaemonRejected audit-write branch (main.rs:1427-1452) untested — regression could silently drop the events.jsonl record; (2) AC#5 analysis not an artifact. NOTEs: bad-Hello throttle carve-out (10/60s then EOF->fail-open alternation, undocumented in ADR amendment); PostToolUse shed rows inflate auto-answered count; no latched shed-storm alert; double fail-mode read. Rework #1 dispatched to lane agent (audit-write test + ADR throttle sentence). AC#5 analysis to be captured as itr note by orchestrator at landing; follow-up tickets at landing: two-stage admission design, shed-storm latched alert.
+
+## L1/decision — 2026-07-19T00:54:47Z (LANDED)
+Rework verified (mutation-proofed audit test; ADR throttle carve-out). Patch applied clean to main; integration gate land-603-L1 EXIT 0 (fmt+clippy+workspace tests). CLAUDE.md posture bullet updated at landing (orchestrator). Follow-ups filed: #604 two-stage admission, #605 shed-storm alert, #606 dup-id visibility (chain-A finding, daemon territory). Landing commit next; itr#560 closes after commit verified.
