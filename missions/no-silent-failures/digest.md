@@ -85,3 +85,15 @@ NEXT: claim 602/L1 (#567) lane A · claim 603/L1 (#560) lane B.
 - LEARNED: reviewer sweep proved the headless markers leak into no interactive path; block-shaped-event Deny inversion caught pre-land (Stop-deny = keep working); Terminals view had zero e2e coverage repo-wide.
 - WATCH: 603's 5-landed-links council fires at #561's landing (next after #568). Then both chains terminal → closure oracles.
 - NEXT: #568 report → review → land → claim #561 (5-link council) · #591 report → review → land → seal 588 → closure.
+
+## Pulse — 2026-07-19 (thaw · 10 landed · 2 unanimous councils)
+
+`WALK · landed 10/11 · burn n/a · lanes 2/2`
+
+- LANDED: 603#L4 itr#568 → 3cd565f (reaper exempts agents blocked on pending decisions — no false disconnect at 300s; review-caught resolve-instant race closed pre-land; queue-lock-across-reap verified deadlock-free by independent audit).
+- MOVED: mission THAWED cleanly; both frozen builds reviewed. 603/L5 (#561 process-group stop — final link) claimed, walking lane B. 588/L3 (#591) review returned conforms + value-claim SUPPORTS (falsifier failed: respawned session is a LIVE shell — tmux-resurrect-class value); rework #1 in flight (MUST-FIX: malformed spec silently fabricates a command line; + seed-read silence, e2e flake, honesty nits).
+- COUNCILS: 2, both UNANIMOUS proceed (first of the mission) — L4 B-A5 contradicts (map undercount, conclusion survived) and the 5-landed-links tick (fired at #568 per count correction: #607 extension made #568 the 5th). Evidence-seat rescope streak broken; its condition absorbed: #561's review MUST independently re-enumerate all process-lifecycle sites.
+- LEARNED: last_seen has FOUR refresh sites (FACTS corrected twice now — builder-blind map errors are this mission's one systemic failure, neutralized by mandated re-counts); #591's "kill -9 gate re-entry PROVEN" claim was withdrawn in journal (no such oracle in tree; structural argument judged adequate); frontend production build was silently broken at base for two landings (verify-frontend never typechecks).
+- FILED: #616 (HIGH — tsc sub-gate for verify-frontend + e2e-outside-tsconfig), #617 (respawn log level), #618 (resize dims), #619 (respawn/pin observability residue: web_audit has no read surface, set_pinned refusals unaudited).
+- WATCH: 588/L3 rework must re-run full e2e; #561 is the highest-blast-radius link (destructive-at-runtime failure mode) — council chose the re-count control over halting.
+- NEXT: #591 rework → land → SEAL 588 · #561 report → review (terrain re-count) → land → 603 terminal → closure oracles.
