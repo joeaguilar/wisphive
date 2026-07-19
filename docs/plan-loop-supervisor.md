@@ -128,6 +128,25 @@ Idle → Spawned → Running → Stopped → Verifying ─green→ Complete│
    exempts agents with a live pending decision (itr#568), which keeps the
    registry honest for this case — but the constraint stands independently: a cap
    must not silently inherit whatever pruning policy the reaper has.
+7. **Stopping an agent means stopping its process TREE** (recorded constraint,
+   itr#561): managed agents spawn into their own process group
+   (`process_group(0)` — deliberately not `setsid`, which would drop the
+   terminal-SIGHUP backstop), and `stop_agent` reports success only after the
+   whole group is confirmed gone (SIGTERM-to-group → bounded grace →
+   SIGKILL-to-group → `killpg(pgid, 0)` ESRCH). Any supervisor stop/abort path
+   and any future "stop the wave" control must aggregate ONLY these per-agent
+   verdicts — an `Err` from the stop ladder means survivors may remain and must
+   surface loudly, never be folded into a green wave result. Three residuals
+   stand: the SIGTERM grace is a window a hostile same-UID child (ADR-0008) can
+   use to `setsid` out of the group unseen, so the ladder is containment for
+   cooperating trees, not a jail; an agent's NATURAL exit still reaps only
+   the direct child — a deliberately backgrounded grandchild survives normal
+   completion, which an iteration-boundary supervisor must not mistake for
+   "workspace quiesced"; and under the shipped default `auto_approve_level=all`
+   (both posture presets) the same grace is a window in which the agent being
+   stopped still gets tool calls auto-approved unsupervised — "stop" means
+   "keep running ungated for up to 2 s" until the two-control emergency stop
+   (itr#620) closes it.
 
 ### Surface (shape only; names may shift at implementation)
 

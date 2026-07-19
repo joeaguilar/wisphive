@@ -2765,9 +2765,19 @@ async fn handle_agent_command(
             }
         }
         ClientMessage::StopAgent { ref agent_id } => {
-            let result = {
+            // Take the process out under the registry lock, then run the
+            // SIGTERM→grace→SIGKILL group ladder with the lock RELEASED:
+            // the ladder legitimately blocks for seconds, and holding the
+            // registry lock across it would freeze spawn/list/reap for
+            // every other client (registry guards stay block-scoped,
+            // itr#561).
+            let taken = {
                 let mut pr = ctx.process_registry.lock().await;
-                pr.stop_agent(agent_id).await
+                pr.take_for_stop(agent_id)
+            };
+            let result = match taken {
+                Ok(proc) => ProcessRegistry::stop_managed(proc).await,
+                Err(error) => Err(error),
             };
             write_msg(writer, &stop_agent_reply(agent_id, result, correlation_id)).await?;
         }

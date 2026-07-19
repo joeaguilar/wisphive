@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -2262,6 +2263,16 @@ fn build_agent_command(
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
+    // itr#561: spawn the agent into its OWN process group (pgid = its PID)
+    // so the whole tree — including tool subprocesses the agent forks — is
+    // addressable by `killpg` in the stop ladder. Deliberately
+    // `process_group(0)` and NOT `setsid` (docs/research/t3code-recon.md
+    // §L6): setsid would detach the child from the daemon's controlling
+    // terminal and destroy the terminal-SIGHUP backstop in the one path the
+    // in-memory registry cannot cover (daemon SIGKILL/OOM/panic), while a
+    // fresh process group alone keeps that backstop AND yields a killable
+    // group id.
+    cmd.process_group(0);
     Ok(cmd)
 }
 
@@ -2307,9 +2318,97 @@ pub struct ProcessRegistry {
     test_post_spawn_mutation: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
-struct ManagedProcess {
+pub(crate) struct ManagedProcess {
     child: Child,
     info: ManagedAgent,
+    /// The child's process-group id — equal to its own PID, because
+    /// `build_agent_command` places every managed agent into a fresh group
+    /// via `process_group(0)`. Stored so the stop ladder can signal the
+    /// WHOLE tree (`killpg`), never just the direct PID.
+    pgid: i32,
+}
+
+/// Grace between SIGTERM-to-group and SIGKILL-to-group in the stop ladder.
+///
+/// 2 s mirrors Codex's own `forceKillAfter` and doubles opencode's 1 s
+/// killpg ladder (docs/research/t3code-recon.md §L6): long enough for
+/// `claude -p` / `codex exec` to flush session state on SIGTERM, short
+/// enough that an operator's stop still lands "now". SIGTERM is catchable,
+/// so this grace is also a window in which a hostile child could `setsid`
+/// out of its group and dodge the group-scoped confirmation below — the
+/// same-UID escape ADR-0008 explicitly declines to arms-race. The ladder is
+/// reliable containment for cooperating process trees plus a loud failure
+/// when the group cannot be confirmed dead; it is not a jail. A second
+/// residual rides the same window: under the shipped default
+/// `auto_approve_level=all` (both posture presets), the agent being stopped
+/// still gets tool calls auto-approved unsupervised until the grace lapses —
+/// "stop" means "keep running ungated for up to 2 s" until the two-control
+/// emergency stop (itr#620) closes it.
+const STOP_TERM_GRACE: Duration = Duration::from_secs(2);
+
+/// How long after SIGKILL-to-group the stop keeps polling for the group to
+/// vanish before reporting failure. SIGKILL cannot be caught, but death is
+/// asynchronous — orphaned grandchildren must be reaped by init/launchd
+/// before `killpg(pgid, 0)` reports ESRCH, and a member wedged in
+/// uninterruptible I/O dies only when the kernel releases it. 2 s is orders
+/// of magnitude beyond the normal few-ms path, and it keeps the worst-case
+/// ladder (2 s grace + 2 s confirm) under the CLI's 5 s socket read timeout
+/// (`SOCKET_TIMEOUT`, crates/wisphive_cli/src/commands/agent.rs), so
+/// `wisphive agent stop` surfaces a wedged tree as the daemon's explicit
+/// Error reply instead of a client-side timeout racing the verdict.
+const STOP_KILL_CONFIRM: Duration = Duration::from_secs(2);
+
+// Compile-time budget pin: the worst-case ladder (grace + confirm) must stay
+// within 4 s, under the CLI's 5 s `SOCKET_TIMEOUT`
+// (crates/wisphive_cli/src/commands/agent.rs) that bounds how long
+// `wisphive agent stop` waits for the daemon's verdict. The CLI crate is not
+// a dependency of this one, so the coupling is pinned here on the daemon-side
+// budget: a grace/confirm bump past this line would silently turn every
+// wedged-tree Error verdict into a client-side timeout racing the reply —
+// raise the CLI timeout in the same change instead.
+const _: () = assert!(
+    STOP_TERM_GRACE.as_millis() + STOP_KILL_CONFIRM.as_millis()
+        <= Duration::from_secs(4).as_millis(),
+    "stop-ladder budget (STOP_TERM_GRACE + STOP_KILL_CONFIRM) exceeds 4s: raise the CLI \
+     SOCKET_TIMEOUT (crates/wisphive_cli/src/commands/agent.rs) in the same change"
+);
+
+/// Poll cadence for the stop-confirmation loop: fine-grained enough that
+/// the common case (the group dies within a few ms of SIGTERM) returns
+/// almost immediately, coarse enough not to busy-spin the runtime.
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Send `signal` to process group `pgid`, refusing ids that are not a
+/// plausible managed-agent group. pgid 0 would signal the DAEMON's own
+/// group, 1 targets init's, and negative values reach arbitrary or (as
+/// `kill(-1)`-style wildcards) unbounded targets — a corrupted stored pgid
+/// must fail loudly here, never widen the blast radius to the operator's
+/// session.
+fn signal_group(pgid: i32, signal: libc::c_int) -> std::io::Result<()> {
+    if pgid <= 1 {
+        return Err(std::io::Error::other(format!(
+            "refusing to signal process group {pgid}: not a managed-agent group id"
+        )));
+    }
+    // SAFETY: plain syscall wrapper; the guard above pins pgid to a
+    // positive, non-reserved group id and no memory is passed.
+    if unsafe { libc::killpg(pgid, signal) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// `true` once NO member of process group `pgid` remains (the signal-0
+/// probe reports ESRCH). An un-reaped zombie member keeps a group alive, so
+/// the stop ladder reaps the direct child before trusting this. Every other
+/// outcome — a live member, EPERM, the guard refusal — counts as "still
+/// present": tree death must be proven, never assumed.
+fn process_group_gone(pgid: i32) -> bool {
+    matches!(
+        signal_group(pgid, 0),
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH)
+    )
 }
 
 impl ProcessRegistry {
@@ -2541,6 +2640,11 @@ impl ProcessRegistry {
                 agent_type
             )
         })?;
+        // `process_group(0)` (set in `build_agent_command`) runs in the child
+        // before exec, and spawn reports exec success back through std's
+        // CLOEXEC pipe before returning — so by this point the child's pgid
+        // equals its own PID and the group is addressable for `killpg`.
+        let pid_at_spawn = child.id();
 
         #[cfg(test)]
         if let Some(mutate) = &self.test_post_spawn_mutation {
@@ -2550,11 +2654,26 @@ impl ProcessRegistry {
         if let Some((snapshot, plugin_home)) = &audit_state
             && let Err(error) = snapshot.verify_unchanged(plugin_home.as_deref())
         {
-            return match child.start_kill() {
+            // Kill the GROUP, not just the direct PID: in the racing window
+            // this abort path exists for, the child may already have forked
+            // helpers. `killpg` runs before any reap, so the un-reaped
+            // leader pins the pgid against reuse; `start_kill` additionally
+            // covers the direct child even if the group signal failed.
+            let group_kill = match pid_at_spawn {
+                Some(pid) => match signal_group(pid as i32, libc::SIGKILL) {
+                    // ESRCH means the whole group is already gone — the goal.
+                    Err(e) if e.raw_os_error() != Some(libc::ESRCH) => Err(e),
+                    _ => Ok(()),
+                },
+                // No PID: the child has already been fully reaped.
+                None => Ok(()),
+            };
+            let direct_kill = child.start_kill();
+            return match group_kill.and(direct_kill) {
                 Ok(()) => Err(error.context(format!(
                     "audited hook configuration changed while spawning agent {agent_id}; \
-                     force-termination was requested for the child immediately (`SIGKILL` on \
-                     Unix)"
+                     force-termination was requested for the child's process group \
+                     immediately (`SIGKILL` on Unix)"
                 ))),
                 Err(kill_error) => Err(error.context(format!(
                     "audited hook configuration changed while spawning agent {agent_id}, and \
@@ -2564,7 +2683,7 @@ impl ProcessRegistry {
             };
         }
 
-        let pid = child.id().context("could not get PID of spawned process")?;
+        let pid = pid_at_spawn.context("could not get PID of spawned process")?;
 
         let managed = ManagedAgent {
             agent_id: agent_id.clone(),
@@ -2592,30 +2711,133 @@ impl ProcessRegistry {
             ManagedProcess {
                 child,
                 info: managed.clone(),
+                pgid: pid as i32,
             },
         );
 
         Ok(managed)
     }
 
-    /// Stop an agent process by sending SIGTERM.
+    /// Stop an agent by signalling its whole process GROUP, never just the
+    /// direct PID: SIGTERM to the group, a bounded grace
+    /// ([`STOP_TERM_GRACE`]), then SIGKILL to the group — so tool
+    /// subprocesses (grandchildren) verifiably die with the agent instead
+    /// of surviving as orphans mid-write (itr#561). Returns `Ok` only once
+    /// the direct child is reaped AND `killpg(pgid, 0)` confirms no group
+    /// member survives; a tree that cannot be confirmed dead is an `Err`,
+    /// never a silent success.
+    ///
+    /// Convenience wrapper over [`Self::take_for_stop`] +
+    /// [`Self::stop_managed`]; callers holding a shared registry lock should
+    /// use the split so the (slow) ladder runs with the lock released.
     pub async fn stop_agent(&mut self, agent_id: &str) -> Result<Option<i32>> {
-        let Some(mut proc) = self.processes.remove(agent_id) else {
-            anyhow::bail!("no managed agent with id: {agent_id}");
-        };
+        let proc = self.take_for_stop(agent_id)?;
+        Self::stop_managed(proc).await
+    }
 
-        info!(agent_id = %agent_id, "stopping agent process");
+    /// Remove `agent_id` from the registry, handing its process to the
+    /// caller for [`Self::stop_managed`]. Synchronous so callers holding
+    /// the shared registry lock can take the process out and run the stop
+    /// ladder with the lock RELEASED — the ladder legitimately blocks for
+    /// up to `STOP_TERM_GRACE + STOP_KILL_CONFIRM`, and holding the
+    /// registry lock that long would freeze spawn/list/reap for every other
+    /// client.
+    pub(crate) fn take_for_stop(&mut self, agent_id: &str) -> Result<ManagedProcess> {
+        self.processes
+            .remove(agent_id)
+            .ok_or_else(|| anyhow::anyhow!("no managed agent with id: {agent_id}"))
+    }
 
-        // Try graceful kill first
-        if let Err(e) = proc.child.kill().await {
-            warn!(agent_id = %agent_id, "kill failed: {e}");
+    /// The stop ladder itself: SIGTERM-to-group → bounded grace →
+    /// SIGKILL-to-group → confirm the group is empty.
+    ///
+    /// Ordering is load-bearing (docs/research/t3code-recon.md §L6): every
+    /// escalation `killpg` fires while the direct child is still un-reaped
+    /// whenever it has not exited, because the un-reaped zombie leader is
+    /// what pins the pgid against OS reuse. Success requires BOTH checks in
+    /// order — `killpg(pgid, 0)` cannot report ESRCH while the zombie
+    /// leader exists, so the leader is reaped first, after which ESRCH
+    /// means exactly "no descendant remains".
+    pub(crate) async fn stop_managed(mut proc: ManagedProcess) -> Result<Option<i32>> {
+        let agent_id = proc.info.agent_id.clone();
+        let pgid = proc.pgid;
+
+        info!(agent_id = %agent_id, pgid, "stopping agent process group");
+
+        // Rung 1: graceful — SIGTERM the whole group so every descendant
+        // sees the same shutdown request. ESRCH (already gone) is fine; any
+        // other failure falls through to the SIGKILL rung below.
+        if let Err(error) = signal_group(pgid, libc::SIGTERM)
+            && error.raw_os_error() != Some(libc::ESRCH)
+        {
+            warn!(agent_id = %agent_id, pgid, "SIGTERM to process group failed: {error}");
         }
 
-        let status = proc.child.wait().await?;
-        let code = status.code();
+        let grace_deadline = Instant::now() + STOP_TERM_GRACE;
+        let mut kill_deadline: Option<Instant> = None;
+        let mut exit_code: Option<Option<i32>> = None;
 
-        info!(agent_id = %agent_id, exit_code = ?code, "agent process stopped");
-        Ok(code)
+        loop {
+            // Reap the leader as soon as it exits so the group probe below
+            // can observe ESRCH (a zombie member keeps the group alive).
+            if exit_code.is_none() {
+                match proc.child.try_wait() {
+                    Ok(Some(status)) => exit_code = Some(status.code()),
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(agent_id = %agent_id, "error polling stopped agent: {error}");
+                    }
+                }
+            }
+
+            // Success = leader reaped AND no group member left, in that
+            // order (see the method comment).
+            if let Some(code) = exit_code
+                && process_group_gone(pgid)
+            {
+                info!(agent_id = %agent_id, exit_code = ?code, "agent process group stopped");
+                return Ok(code);
+            }
+
+            let now = Instant::now();
+            match kill_deadline {
+                // Rung 2: the grace lapsed with survivors — SIGKILL the
+                // group. The leader, if still alive, is un-reaped here,
+                // pinning the pgid against reuse; `start_kill` additionally
+                // covers the direct child if the group signal failed.
+                None if now >= grace_deadline => {
+                    if let Err(error) = signal_group(pgid, libc::SIGKILL)
+                        && error.raw_os_error() != Some(libc::ESRCH)
+                    {
+                        warn!(
+                            agent_id = %agent_id,
+                            pgid,
+                            "SIGKILL to process group failed: {error}"
+                        );
+                    }
+                    if exit_code.is_none()
+                        && let Err(error) = proc.child.start_kill()
+                    {
+                        warn!(agent_id = %agent_id, "direct SIGKILL failed: {error}");
+                    }
+                    kill_deadline = Some(now + STOP_KILL_CONFIRM);
+                }
+                // Rung 3: even SIGKILL could not be confirmed in time. A
+                // stop that cannot prove the tree dead must say so loudly —
+                // the caller's per-agent result turns into an Error reply,
+                // never a false "stopped".
+                Some(deadline) if now >= deadline => {
+                    anyhow::bail!(
+                        "stop of agent {agent_id} could not confirm its process group \
+                         (pgid {pgid}) fully exited within {STOP_KILL_CONFIRM:?} after \
+                         SIGKILL; survivors may remain — inspect with `pgrep -g {pgid}`"
+                    );
+                }
+                _ => {}
+            }
+
+            tokio::time::sleep(STOP_POLL_INTERVAL).await;
+        }
     }
 
     /// List all managed agent processes.
@@ -2647,12 +2869,25 @@ impl ProcessRegistry {
         exited
     }
 
-    /// Kill all managed processes. Called during daemon shutdown.
+    /// Stop every managed process tree. Called during daemon shutdown.
+    ///
+    /// The stop ladders run CONCURRENTLY: each one can legitimately take
+    /// the full grace + confirm window, and N agents × a serial grace would
+    /// stall daemon teardown (docs/research/t3code-recon.md §L6).
     pub async fn shutdown_all(&mut self) {
-        let ids: Vec<String> = self.processes.keys().cloned().collect();
-        for id in ids {
-            if let Err(e) = self.stop_agent(&id).await {
-                warn!(agent_id = %id, "error stopping agent during shutdown: {e}");
+        let procs: Vec<ManagedProcess> = self.processes.drain().map(|(_, proc)| proc).collect();
+        let mut stops = tokio::task::JoinSet::new();
+        for proc in procs {
+            stops.spawn(async move {
+                let agent_id = proc.info.agent_id.clone();
+                if let Err(error) = Self::stop_managed(proc).await {
+                    warn!(agent_id = %agent_id, "error stopping agent during shutdown: {error}");
+                }
+            });
+        }
+        while let Some(result) = stops.join_next().await {
+            if let Err(error) = result {
+                warn!("agent shutdown stop task failed: {error}");
             }
         }
     }
@@ -5648,5 +5883,314 @@ printf '{"kind":"auto_approved","decided_by":"offline-proof-shim"}\n' >> "$HOME/
             .stop_agent(&managed.agent_id)
             .await
             .expect("proof child should be stopped");
+    }
+
+    // ══ itr#561: stop the whole process tree, not just the direct PID ══
+
+    /// Shared fixture for the tree-stop proofs: a Claude project whose stub
+    /// `claude` binary runs `script`, with the tempdir path published to the
+    /// child as `WISPHIVE_TEST_PID_FILE` for atomic PID handoff.
+    fn tree_stop_registry(
+        proj: &std::path::Path,
+        bin_dir: &std::path::Path,
+        pid_file: &std::path::Path,
+        script: &str,
+    ) -> ProcessRegistry {
+        write_claude_settings(
+            proj,
+            serde_json::json!({"hooks": {"PreToolUse": [
+                timed_rule(&expected_hook_command(HookSettingsKind::Claude)),
+            ]}}),
+        );
+        let mut registry = registry_with_active_mode(proj);
+        write_executable(&bin_dir.join("claude"), script);
+        registry.test_child_env = vec![
+            (
+                "PATH".into(),
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                )
+                .into(),
+            ),
+            (
+                "WISPHIVE_TEST_PID_FILE".into(),
+                pid_file.to_path_buf().into_os_string(),
+            ),
+        ];
+        registry
+    }
+
+    /// Probe `pid` with signal 0, returning the errno on failure. `Ok(())`
+    /// means the process (or its zombie) still exists.
+    fn probe_pid(pid: i32) -> std::result::Result<(), Option<i32>> {
+        assert!(pid > 1, "test must never signal-probe a reserved pid");
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error().raw_os_error())
+        }
+    }
+
+    /// itr#561 AC-1/AC-2/AC-4: a managed agent's tool subprocesses
+    /// (grandchildren) must die with it. The stub `claude` launches a
+    /// long-running grandchild inside the agent's own process group;
+    /// `stop_agent` must return `Ok` only after the WHOLE group is
+    /// confirmed gone — the grandchild is dead, not merely reparented.
+    #[tokio::test]
+    async fn stop_agent_kills_grandchild_not_just_direct_child() {
+        let proj = tempfile::tempdir().unwrap();
+        let bin_dir = tempfile::tempdir().unwrap();
+        let pid_file = proj.path().join("grandchild-pid");
+        // Publish the grandchild PID via write + rename so the test never
+        // parses a half-written file, then stay alive in `wait`.
+        let mut registry = tree_stop_registry(
+            proj.path(),
+            bin_dir.path(),
+            &pid_file,
+            r#"#!/bin/sh
+sleep 300 &
+echo $! > "$WISPHIVE_TEST_PID_FILE.tmp"
+mv "$WISPHIVE_TEST_PID_FILE.tmp" "$WISPHIVE_TEST_PID_FILE"
+wait
+"#,
+        );
+
+        let managed = registry
+            .spawn_agent(claude_req(proj.path()))
+            .expect("stub claude should spawn");
+        wait_for("the stub to publish its grandchild PID", || {
+            pid_file.exists()
+        })
+        .await;
+        let grandchild: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .expect("grandchild pid file should hold a PID");
+        // AC-1: the tree lives in the agent's OWN process group (== its PID).
+        assert_eq!(
+            unsafe { libc::getpgid(grandchild) },
+            managed.pid as i32,
+            "managed spawn must place its tree in its own process group"
+        );
+        probe_pid(grandchild).expect("sanity: grandchild must be alive before the stop");
+
+        registry
+            .stop_agent(&managed.agent_id)
+            .await
+            .expect("stop must confirm the whole tree gone");
+
+        // GONE, not reparented: the signal-0 probe must fail with ESRCH.
+        // `stop_agent` only returns Ok after killpg(pgid, 0) reported ESRCH,
+        // so no polling is needed here.
+        assert_eq!(
+            probe_pid(grandchild).expect_err("grandchild must be dead after stop"),
+            Some(libc::ESRCH),
+            "grandchild probe must report ESRCH (gone), not another error"
+        );
+        assert!(registry.is_empty());
+    }
+
+    /// itr#561 AC-2 escalation rung: a tree that ignores SIGTERM must still
+    /// die — after the bounded grace the ladder SIGKILLs the group, and it
+    /// still refuses to report success until the group is confirmed gone.
+    #[tokio::test]
+    async fn stop_agent_escalates_to_sigkill_when_tree_ignores_sigterm() {
+        let proj = tempfile::tempdir().unwrap();
+        let bin_dir = tempfile::tempdir().unwrap();
+        let pid_file = proj.path().join("grandchild-pid");
+        // Both the leader and the grandchild shell ignore SIGTERM (the
+        // grandchild's transient `sleep` children die, but its loop
+        // respawns them), so only the SIGKILL rung can end this tree.
+        let mut registry = tree_stop_registry(
+            proj.path(),
+            bin_dir.path(),
+            &pid_file,
+            r#"#!/bin/sh
+trap '' TERM
+sh -c 'trap "" TERM; while :; do sleep 5; done' &
+echo $! > "$WISPHIVE_TEST_PID_FILE.tmp"
+mv "$WISPHIVE_TEST_PID_FILE.tmp" "$WISPHIVE_TEST_PID_FILE"
+wait
+"#,
+        );
+
+        let managed = registry
+            .spawn_agent(claude_req(proj.path()))
+            .expect("stub claude should spawn");
+        wait_for("the stub to publish its grandchild PID", || {
+            pid_file.exists()
+        })
+        .await;
+        let grandchild: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .expect("grandchild pid file should hold a PID");
+        probe_pid(grandchild).expect("sanity: grandchild must be alive before the stop");
+
+        let exit = registry
+            .stop_agent(&managed.agent_id)
+            .await
+            .expect("stop must escalate to SIGKILL and confirm the tree gone");
+
+        // The leader died to a signal, not an orderly exit.
+        assert_eq!(exit, None, "a SIGKILLed leader reports no exit code");
+        assert_eq!(
+            probe_pid(grandchild).expect_err("grandchild must be dead after escalation"),
+            Some(libc::ESRCH),
+            "grandchild probe must report ESRCH (gone), not another error"
+        );
+        assert!(registry.is_empty());
+    }
+
+    /// itr#561 hard guard: a stored pgid of 0, 1, or any negative value must
+    /// be refused outright — killpg on those would target the daemon's own
+    /// group, init's, or wildcard/arbitrary targets — and an unverifiable
+    /// group must never be reported gone.
+    #[test]
+    fn signal_group_refuses_non_managed_group_ids() {
+        for pgid in [0, 1, -1, i32::MIN] {
+            let error =
+                signal_group(pgid, 0).expect_err("reserved/non-positive pgids must be refused");
+            assert!(
+                error
+                    .to_string()
+                    .contains("refusing to signal process group"),
+                "guard must refuse pgid {pgid} before any syscall, got: {error}"
+            );
+            assert!(
+                !process_group_gone(pgid),
+                "an unverifiable group (pgid {pgid}) must never be reported gone"
+            );
+        }
+    }
+
+    /// itr#561 AC-6 confirmation gate, asymmetric tree: the LEADER takes
+    /// SIGTERM's default disposition and dies at rung 1, while its
+    /// grandchild sub-shell re-establishes TERM-immunity (`trap "" TERM` =
+    /// SIG_IGN, which persists across fork+exec into its `sleep` children).
+    /// A ladder whose success condition trusted leader death alone would
+    /// report Ok here with the grandchild still alive — `stop_agent` must
+    /// keep escalating until `killpg(pgid, 0)` proves the WHOLE group gone.
+    #[tokio::test]
+    async fn stop_agent_confirms_grandchild_death_when_leader_dies_gracefully() {
+        let proj = tempfile::tempdir().unwrap();
+        let bin_dir = tempfile::tempdir().unwrap();
+        let pid_file = proj.path().join("grandchild-pid");
+        // No trap in the leader: rung-1 SIGTERM kills it. Only the
+        // grandchild ignores TERM, so the group stays alive until SIGKILL.
+        let mut registry = tree_stop_registry(
+            proj.path(),
+            bin_dir.path(),
+            &pid_file,
+            r#"#!/bin/sh
+sh -c 'trap "" TERM; while :; do sleep 5; done' &
+echo $! > "$WISPHIVE_TEST_PID_FILE.tmp"
+mv "$WISPHIVE_TEST_PID_FILE.tmp" "$WISPHIVE_TEST_PID_FILE"
+wait
+"#,
+        );
+
+        let managed = registry
+            .spawn_agent(claude_req(proj.path()))
+            .expect("stub claude should spawn");
+        wait_for("the stub to publish its grandchild PID", || {
+            pid_file.exists()
+        })
+        .await;
+        let grandchild: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .expect("grandchild pid file should hold a PID");
+        probe_pid(grandchild).expect("sanity: grandchild must be alive before the stop");
+
+        let exit = registry
+            .stop_agent(&managed.agent_id)
+            .await
+            .expect("stop must outlive the leader's early death and confirm the group gone");
+
+        // Sanity on the asymmetry itself: the leader died to a signal (no
+        // orderly exit code), i.e. before the group could be confirmed gone.
+        assert_eq!(exit, None, "the leader must die to rung-1 SIGTERM");
+        // The confirmation gate, not leader death, is what released Ok: the
+        // TERM-immune grandchild must be GONE, which only the SIGKILL rung
+        // plus the `process_group_gone` conjunct can guarantee.
+        assert_eq!(
+            probe_pid(grandchild).expect_err("grandchild must be dead after stop"),
+            Some(libc::ESRCH),
+            "grandchild probe must report ESRCH (gone), not another error"
+        );
+        assert!(registry.is_empty());
+    }
+
+    /// itr#561 graceful-rung pin: rung 1 must actually deliver SIGTERM and
+    /// let the tree act on it. A "ladder" that jumps straight to SIGKILL
+    /// still passes every whole-group-death check while silently deleting
+    /// the flush-session-state grace the rung promises — the exact
+    /// comment-says-graceful/code-SIGKILLs regression class that spawned
+    /// itr#561. The leader's TERM handler writes a marker file and exits 0;
+    /// both are impossible under an immediate SIGKILL.
+    #[tokio::test]
+    async fn stop_agent_delivers_sigterm_before_any_sigkill() {
+        let proj = tempfile::tempdir().unwrap();
+        let bin_dir = tempfile::tempdir().unwrap();
+        let pid_file = proj.path().join("leader-pid");
+        let marker = proj.path().join("leader-pid.term-marker");
+        // The PID file is published only after the TERM trap is armed, so
+        // once it exists the stop's SIGTERM is guaranteed to be handled.
+        let mut registry = tree_stop_registry(
+            proj.path(),
+            bin_dir.path(),
+            &pid_file,
+            r#"#!/bin/sh
+trap 'echo handled > "$WISPHIVE_TEST_PID_FILE.term-marker.tmp"; mv "$WISPHIVE_TEST_PID_FILE.term-marker.tmp" "$WISPHIVE_TEST_PID_FILE.term-marker"; exit 0' TERM
+echo $$ > "$WISPHIVE_TEST_PID_FILE.tmp"
+mv "$WISPHIVE_TEST_PID_FILE.tmp" "$WISPHIVE_TEST_PID_FILE"
+sleep 300 &
+wait
+"#,
+        );
+
+        let managed = registry
+            .spawn_agent(claude_req(proj.path()))
+            .expect("stub claude should spawn");
+        wait_for("the stub to arm its TERM trap and publish its PID", || {
+            pid_file.exists()
+        })
+        .await;
+        let leader: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .expect("leader pid file should hold a PID");
+        assert_eq!(leader, managed.pid as i32, "the stub publishes its own PID");
+
+        let exit = registry
+            .stop_agent(&managed.agent_id)
+            .await
+            .expect("a cooperating tree must stop cleanly at the graceful rung");
+
+        // SIGTERM was delivered AND the handler got to run before death: a
+        // rung swapped to immediate SIGKILL yields no marker and no orderly
+        // exit code.
+        assert!(
+            marker.exists(),
+            "the leader's TERM handler must have run before death — rung 1 must be SIGTERM"
+        );
+        assert_eq!(
+            exit,
+            Some(0),
+            "a leader that handles SIGTERM exits through its own trap, not by signal"
+        );
+        assert_eq!(
+            probe_pid(leader).expect_err("leader must be dead after stop"),
+            Some(libc::ESRCH),
+            "leader probe must report ESRCH (gone), not another error"
+        );
+        assert!(registry.is_empty());
     }
 }
