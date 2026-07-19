@@ -116,6 +116,18 @@ Idle → Spawned → Running → Stopped → Verifying ─green→ Complete│
    deliberately with ADR-0001's hook fail-open, whose rationale (don't brick every agent
    when the control plane dies) protects *interactive* sessions. A loop has no human at
    the keyboard to notice; stopped-and-loud beats running-and-blind.
+6. **Admission caps must not key on the reaper-pruned agent registry** (recorded
+   constraint, itr#568): any future running-agent / running-loop cap must count
+   blocked-on-human agents — key it on the decision queue (or queue ∪ registry),
+   never on `AgentRegistry` contents alone. An agent whose hook is blocked on a
+   human decision produces no traffic for the entire wait (up to
+   `hook_timeout_secs`, 12x the default `agent_timeout_secs`), which is exactly
+   when the registry is at its least trustworthy: a cap that admits new agents
+   because reaped-while-blocked rows made the registry look empty **fails open on
+   admission at peak human latency**. The daemon-side reaper now structurally
+   exempts agents with a live pending decision (itr#568), which keeps the
+   registry honest for this case — but the constraint stands independently: a cap
+   must not silently inherit whatever pruning policy the reaper has.
 
 ### Surface (shape only; names may shift at implementation)
 
@@ -149,6 +161,16 @@ Run ≥2 real campaigns (blitz or proof-campaign) gated by wisphive; mine the au
    (Cost, drift, and context-poisoning trade-offs cut both ways.)
 3. **Stop-vs-stall detection** — is the Stop hook event reliable enough across
    claude_code/codex, or does the supervisor need an idle-timeout heuristic?
+   > **Recorded constraint (itr#568).** An idle-timeout heuristic must NOT key
+   > on the registry's `last_seen` while the blocked-on-human asymmetry exists:
+   > `last_seen` is touched only at decision enqueue and at resolution, never
+   > *during* a hook's blocking wait, so an agent 40 minutes into a legitimate
+   > human-review wait is indistinguishable from a stalled one by `last_seen`
+   > alone. Any stall detector must first subtract agents with a live pending
+   > decision (`DecisionQueue::pending_agent_ids()` — the same keep-alive set
+   > the itr#568 reaper exemption uses), or key on a signal that keeps flowing
+   > while blocked. Reaping/aborting on raw `last_seen` re-creates the false
+   > AgentDisconnected bug at supervisor level, at exactly peak human latency.
    > **Codex gating constraint (proved 2026-07-04, itr#467).** A loop that drives
    > Codex must spawn it such that the Wisphive hook actually runs. Codex
    > *silently skips* hooks it has not been granted persisted trust for (via an

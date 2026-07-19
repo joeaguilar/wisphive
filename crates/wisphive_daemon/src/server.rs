@@ -279,6 +279,77 @@ impl Server {
         }
     }
 
+    /// Reap agents whose `last_seen` is older than `agent_timeout`, EXCEPT
+    /// agents with a live pending decision (itr#568).
+    ///
+    /// A hook blocked on a human decision sends no traffic for the entire
+    /// wait — up to `hook_timeout_secs` (default 3600s), 12x the default
+    /// `agent_timeout_secs` (300s) — and `last_seen` refreshes only at the
+    /// hook handlers' touch points: the `register` call at enqueue, the
+    /// post-wait touch the DecisionRequest handler stamps the moment its
+    /// select! resolves (before any awaited SQLite write, itr#568 rework),
+    /// and the ToolResult / AgentRegister handler touches. Without the
+    /// exemption the reaper falsely removes the agent at ~305s: the agents
+    /// panel says "gone" while the decision queue still shows its pending
+    /// call, the session marker is unlinked, and the next hook re-registers
+    /// with a reset `connected_at`. The exemption makes the invariant
+    /// structural for the whole wait: an agent with a live pending decision
+    /// is never reaped. At resolution the exemption lapses with the queue
+    /// entry; the pre-await touch keeps that handoff tight — a local
+    /// finalization (timeout / channel-dropped) touches before the entry is
+    /// removed, closing the window outright, while a human resolution
+    /// leaves only the scheduler gap between the resolver's queue removal
+    /// and the woken handler's touch, with no I/O inside it.
+    ///
+    /// Lock discipline: the queue lock is HELD across the registry reap so
+    /// no decision can be enqueued between computing the keep-alive set and
+    /// removing rows (the reaper-vs-enqueue race). Nesting queue→registry
+    /// here is deadlock-free: no other path holds the registry lock while
+    /// acquiring the queue lock (all registry guards are block-scoped and
+    /// dropped first — see the DecisionRequest handler and the
+    /// QuerySessions/QueryProjects arms).
+    ///
+    /// Genuine disconnects still reap on time: a dead hook resolves its
+    /// pending decision immediately as a deny (itr#363), which removes the
+    /// queue entry, so the exemption lapses and the stale row is reaped on
+    /// the next 5s tick — no zombie rows.
+    async fn reap_inactive_agents(&self, agent_timeout: Duration) {
+        let queue = self.queue.lock().await;
+        let keep_alive = queue.pending_agent_ids();
+        let reaped = {
+            let mut reg = self.agent_registry.lock().await;
+            reg.reap_inactive(agent_timeout, &keep_alive)
+        };
+        drop(queue);
+        for agent_id in reaped {
+            // Validate again at the marker-filesystem sink. The
+            // registry normally contains only validated hook ids,
+            // but this prevents future ingress paths from turning
+            // a stored identity into traversal.
+            if is_valid_hook_agent_id(&agent_id) {
+                let marker = self.config.home_dir.join("sessions").join(&agent_id);
+                if let Err(error) = std::fs::remove_file(&marker) {
+                    // Marker cleanup is best-effort: a concurrent
+                    // hook or cleanup may have changed the path.
+                    info!(
+                        path = %marker.display(),
+                        %error,
+                        "session marker cleanup skipped"
+                    );
+                }
+            } else {
+                warn!(
+                    security_event = "invalid_agent_marker_rejected",
+                    agent_id = %sanitize_for_log(&agent_id),
+                    "refusing to remove a marker for an invalid agent id"
+                );
+            }
+            let _ = self
+                .tui_tx
+                .send(ServerMessage::AgentDisconnected { agent_id });
+        }
+    }
+
     /// Start listening for connections. Runs until shutdown signal.
     pub async fn run(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
         // Clean up stale runtime state from a prior daemon process
@@ -383,36 +454,10 @@ impl Server {
                     }
                     drop(pr);
 
-                    // Reap agents inactive beyond timeout
-                    let agent_timeout = Duration::from_secs(self.config.agent_timeout_secs);
-                    let mut reg = self.agent_registry.lock().await;
-                    let reaped = reg.reap_inactive(agent_timeout);
-                    drop(reg);
-                    for agent_id in reaped {
-                        // Validate again at the marker-filesystem sink. The
-                        // registry normally contains only validated hook ids,
-                        // but this prevents future ingress paths from turning
-                        // a stored identity into traversal.
-                        if is_valid_hook_agent_id(&agent_id) {
-                            let marker = self.config.home_dir.join("sessions").join(&agent_id);
-                            if let Err(error) = std::fs::remove_file(&marker) {
-                                // Marker cleanup is best-effort: a concurrent
-                                // hook or cleanup may have changed the path.
-                                info!(
-                                    path = %marker.display(),
-                                    %error,
-                                    "session marker cleanup skipped"
-                                );
-                            }
-                        } else {
-                            warn!(
-                                security_event = "invalid_agent_marker_rejected",
-                                agent_id = %sanitize_for_log(&agent_id),
-                                "refusing to remove a marker for an invalid agent id"
-                            );
-                        }
-                        let _ = self.tui_tx.send(ServerMessage::AgentDisconnected { agent_id });
-                    }
+                    // Reap agents inactive beyond timeout (exempting agents
+                    // with a live pending decision, itr#568).
+                    self.reap_inactive_agents(Duration::from_secs(self.config.agent_timeout_secs))
+                        .await;
                 }
                 // Periodic retention: archive decision_log + prune terminal_events,
                 // checkpoint the WAL, and size-guarded VACUUM. Skipped if the
@@ -794,7 +839,14 @@ async fn handle_hook(
 
             let agent_id = req.agent_id.clone();
 
-            // Register agent and broadcast to TUI clients (only if new)
+            // Register agent and broadcast to TUI clients (only if new).
+            // For an already-registered agent this register() call IS the
+            // enqueue-time last_seen touch (itr#568): it stamps activity
+            // before the hook starts its potentially hour-long blocking
+            // wait, and it is what closes the reaper-vs-enqueue race — a
+            // decision enqueued after the reaper snapshots the keep-alive
+            // set belongs to an agent touched here moments earlier, which
+            // can therefore never be past the reap cutoff.
             let (agent_info, is_new) = {
                 let mut reg = ctx.agent_registry.lock().await;
                 reg.register(
@@ -871,6 +923,26 @@ async fn handle_hook(
                 }
             };
 
+            // Touch `last_seen` the moment the wait ends, BEFORE the awaited
+            // SQLite bookkeeping below (itr#568 rework). Once the decision
+            // leaves the queue — `resolve` in the resolver's task for a
+            // human answer, or `finalize_local` in the arms below — the
+            // reaper's keep-alive exemption has lapsed, so a stale
+            // `last_seen` plus a reap tick landing in the resolve-to-touch
+            // gap would falsely reap the agent at the exact moment of
+            // resolution. Touching here closes the local-finalization
+            // window outright (the queue entry is still live, so the
+            // exemption still covers the agent) and shrinks the
+            // human-resolution gap to task wakeup plus this lock — no I/O.
+            // A disconnected hook is deliberately NOT touched: its agent is
+            // genuinely gone and must stay reapable on time (itr#363). The
+            // guard is block-scoped and dropped before any await; no other
+            // lock is held here, so no queue↔registry ordering is involved.
+            if !matches!(waited, Waited::Disconnected) {
+                let mut reg = ctx.agent_registry.lock().await;
+                reg.touch(&agent_id);
+            }
+
             let (rich, decided_by) = match waited {
                 Waited::Resolved(rich) => {
                     // Attribute the resolution to the identified client
@@ -932,12 +1004,6 @@ async fn handle_hook(
                 ctx.state_db
                     .resolve_pending_by(id, rich.decision, &decided_by)
                     .await?;
-            }
-
-            // Touch last_seen (agent stays registered, reaped on inactivity)
-            {
-                let mut reg = ctx.agent_registry.lock().await;
-                reg.touch(&agent_id);
             }
 
             // Send rich response to hook
@@ -4635,6 +4701,240 @@ mod tests {
         let (gated, allowed) = partition_sudo_gated(true, vec![spawn.clone()]);
         assert!(gated.is_empty());
         assert_eq!(ids(&allowed), vec![spawn.0]);
+    }
+
+    /// itr#568 AC4: an agent whose hook is blocked on a live pending decision
+    /// must survive the inactivity reaper — no AgentDisconnected broadcast,
+    /// registry row (and `connected_at`) intact — while the same agent IS
+    /// reaped once the pending decision resolves (hook-death deny, itr#363).
+    ///
+    /// Timing is deterministic: instead of waiting out a real
+    /// `agent_timeout_secs`, the reap step is invoked directly with a ZERO
+    /// timeout, which makes every registered agent stale by construction
+    /// (cutoff == now; `last_seen` was stamped strictly earlier, enforced by
+    /// the 5ms sleep). No interval ticks, no wall-clock races.
+    #[tokio::test]
+    async fn blocked_agent_with_live_pending_decision_survives_reaper() {
+        use std::time::Duration;
+
+        use wisphive_protocol::QUEUE_MAKE_REQUEST as make_request;
+        use wisphive_protocol::{AgentType, Decision, ServerMessage};
+
+        let home = tempfile::tempdir().unwrap();
+        let config = crate::DaemonConfig::new(home.path().to_path_buf());
+        let server = super::Server::new(config).await.unwrap();
+
+        // The agent registers (as the DecisionRequest handler does) and its
+        // hook enqueues a decision that stays unresolved — blocked on the
+        // human. The receiver is held like the blocked hook holds it.
+        let (info, is_new) = server.agent_registry.lock().await.register(
+            "cc-blocked".into(),
+            AgentType::ClaudeCode,
+            "/proj".into(),
+        );
+        assert!(is_new);
+        let connected_at = info.connected_at;
+
+        let req = make_request("Bash", "cc-blocked", "/proj");
+        let decision_id = req.id;
+        let _hook_rx = server
+            .queue
+            .lock()
+            .await
+            .enqueue(req)
+            .expect("decision should enqueue");
+
+        // Subscribe after the enqueue so NewDecision isn't in the stream.
+        let mut tui_rx = server.tui_tx.subscribe();
+
+        // Let the clock advance past last_seen, then reap with a ZERO
+        // timeout: the agent is stale by construction, exactly as if
+        // agent_timeout_secs had elapsed mid-wait.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        server.reap_inactive_agents(Duration::ZERO).await;
+
+        let survivor = {
+            let reg = server.agent_registry.lock().await;
+            reg.get("cc-blocked").cloned()
+        };
+        let survivor = survivor.expect("agent with a live pending decision must not be reaped");
+        assert_eq!(
+            survivor.connected_at, connected_at,
+            "session uptime survives the wait — no spurious re-registration"
+        );
+        while let Ok(msg) = tui_rx.try_recv() {
+            assert!(
+                !matches!(msg, ServerMessage::AgentDisconnected { .. }),
+                "no AgentDisconnected may fire while the hook is blocked on a live decision"
+            );
+        }
+
+        // The hook dies: its decision resolves as a deny immediately
+        // (itr#363) — the exemption lapses and the next reap pass removes
+        // the genuinely inactive agent on time. No zombie rows.
+        assert!(
+            server
+                .queue
+                .lock()
+                .await
+                .finalize_local(decision_id, Decision::Deny)
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        server.reap_inactive_agents(Duration::ZERO).await;
+
+        assert!(
+            server
+                .agent_registry
+                .lock()
+                .await
+                .get("cc-blocked")
+                .is_none(),
+            "once the pending decision resolved, the stale agent is reaped"
+        );
+        let mut saw_disconnect = false;
+        while let Ok(msg) = tui_rx.try_recv() {
+            if matches!(
+                &msg,
+                ServerMessage::AgentDisconnected { agent_id } if agent_id == "cc-blocked"
+            ) {
+                saw_disconnect = true;
+            }
+        }
+        assert!(
+            saw_disconnect,
+            "genuine inactivity after resolution must still broadcast AgentDisconnected"
+        );
+    }
+
+    /// itr#568 rework (post-resolution race): the DecisionRequest handler
+    /// must refresh the agent's `last_seen` when its blocking wait resolves
+    /// — the reaper's keep-alive exemption lapses the instant the queue
+    /// entry is removed, so the resolution touch is what carries the agent
+    /// to its next activity. Drives the REAL handler over a socketpair:
+    /// enqueue via `handle_hook`, resolve as a human approve, await the
+    /// hook's DecisionResponse, then assert `last_seen` advanced past the
+    /// enqueue-time stamp (the only earlier touch for this agent).
+    /// Deterministic: the response await is the ordering barrier — in
+    /// handler program order the touch precedes the response write — and
+    /// the 5ms sleep only guarantees strict timestamp inequality. No reap
+    /// ticks, no wall-clock timeouts. The statement-level property "touch
+    /// precedes the SQLite awaits" is not observable from the public
+    /// surface without a lock-step StateDb double; this pins the touch's
+    /// existence on the resolution path (the sole remaining touch site
+    /// after the rework moved it) plus its ordering before the response.
+    #[tokio::test]
+    async fn decision_resolution_touches_last_seen_before_response() {
+        use std::time::Duration;
+
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::UnixStream;
+        use wisphive_protocol::QUEUE_MAKE_REQUEST as make_request;
+        use wisphive_protocol::{ClientMessage, Decision, RichDecision, ServerMessage};
+
+        let home = tempfile::tempdir().unwrap();
+        crate::config::write_mode_file_atomic(&home.path().join("mode"), "active").unwrap();
+        let config = crate::DaemonConfig::new(home.path().to_path_buf());
+        let server = super::Server::new(config).await.unwrap();
+        let ctx = super::ConnectionContext {
+            queue: server.queue.clone(),
+            process_registry: server.process_registry.clone(),
+            agent_registry: server.agent_registry.clone(),
+            tui_tx: server.tui_tx.clone(),
+            state_db: server.state_db.clone(),
+            terminal_manager: server.terminal_manager.clone(),
+            reauth: server.reauth.clone(),
+            replay_gate: server.replay_gate.clone(),
+            bad_hello_gate: server.bad_hello_gate.clone(),
+            hook_timeout_secs: server.config.hook_timeout_secs,
+            notifications_enabled: false,
+            home_dir: server.config.home_dir.clone(),
+            audit_snapshot_limit: server.config.audit_snapshot_limit,
+        };
+
+        let req = make_request("Bash", "cc-touch", "/proj");
+        let decision_id = req.id;
+        let (server_stream, client_stream) = UnixStream::pair().unwrap();
+        let (server_read, server_write) = server_stream.into_split();
+        let handler = tokio::spawn(async move {
+            super::handle_hook(BufReader::new(server_read), server_write, &ctx).await
+        });
+
+        let (client_read, mut client_write) = client_stream.into_split();
+        let mut responses = BufReader::new(client_read).lines();
+        let line = wisphive_protocol::encode(&ClientMessage::DecisionRequest(req)).unwrap();
+        client_write.write_all(line.as_bytes()).await.unwrap();
+
+        // Barrier 1: the handler has registered the agent and enqueued the
+        // decision (a wait-until, not a timing assertion).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if server
+                .queue
+                .lock()
+                .await
+                .pending_agent_ids()
+                .contains("cc-touch")
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "decision was never enqueued"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let enqueue_seen = server
+            .agent_registry
+            .lock()
+            .await
+            .get("cc-touch")
+            .expect("agent registers at enqueue")
+            .last_seen;
+
+        // Let the clock advance so the resolution touch is distinguishable
+        // from the enqueue-time register stamp.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(
+            server
+                .queue
+                .lock()
+                .await
+                .resolve(decision_id, RichDecision::approve())
+        );
+
+        // Barrier 2: the DecisionResponse arrives — the touch precedes this
+        // write in handler program order, so it has happened by now.
+        let line = tokio::time::timeout(Duration::from_secs(5), responses.next_line())
+            .await
+            .expect("hook should receive its DecisionResponse")
+            .unwrap()
+            .unwrap();
+        match wisphive_protocol::decode::<ServerMessage>(&line).unwrap() {
+            ServerMessage::DecisionResponse { id, decision, .. } => {
+                assert_eq!(id, decision_id);
+                assert_eq!(decision, Decision::Approve);
+            }
+            other => panic!("expected DecisionResponse, got {other:?}"),
+        }
+
+        let resolved_seen = server
+            .agent_registry
+            .lock()
+            .await
+            .get("cc-touch")
+            .expect("resolution must not deregister the agent")
+            .last_seen;
+        assert!(
+            resolved_seen > enqueue_seen,
+            "resolution must refresh last_seen before the response is sent \
+             (enqueue={enqueue_seen}, resolved={resolved_seen})"
+        );
+
+        drop(client_write);
+        handler
+            .await
+            .expect("handler task must not panic")
+            .expect("handler must exit cleanly after responding");
     }
 
     /// itr#510 review fix: the live-daemon InstallHooks handler must derive

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -67,12 +67,30 @@ impl AgentRegistry {
 
     /// Reap agents inactive longer than the given timeout.
     /// Returns the agent_ids that were removed.
-    pub fn reap_inactive(&mut self, timeout: Duration) -> Vec<String> {
+    ///
+    /// `keep_alive` must contain every agent id that currently has a live
+    /// pending decision (itr#568). A hook blocked on a human decision sends
+    /// no traffic for the entire wait — up to `hook_timeout_secs` (3600s),
+    /// 12x the default `agent_timeout_secs` (300s) — so `last_seen` alone
+    /// cannot distinguish "waiting on the human" from "gone". The exemption
+    /// makes the invariant structural: an agent with a live pending decision
+    /// is NEVER reaped, so the agents panel and the decision queue cannot
+    /// disagree about the agent's existence, and any future admission cap
+    /// reading this registry cannot fail open at peak human latency. The
+    /// exemption lapses with the pending row — including a hook-death deny
+    /// (itr#363) — so a genuinely dead agent is still reaped on time.
+    pub fn reap_inactive(
+        &mut self,
+        timeout: Duration,
+        keep_alive: &HashSet<String>,
+    ) -> Vec<String> {
         let cutoff = Utc::now() - chrono::Duration::from_std(timeout).unwrap_or_default();
         let expired: Vec<String> = self
             .agents
             .iter()
-            .filter(|(_, entry)| entry.info.last_seen < cutoff)
+            .filter(|(id, entry)| {
+                entry.info.last_seen < cutoff && !keep_alive.contains(id.as_str())
+            })
             .map(|(id, _)| id.clone())
             .collect();
 
@@ -275,7 +293,7 @@ mod tests {
 
         // Duration::ZERO means cutoff = now, so any agent with last_seen < now is reaped
         thread::sleep(Duration::from_millis(2));
-        let removed = reg.reap_inactive(Duration::ZERO);
+        let removed = reg.reap_inactive(Duration::ZERO, &HashSet::new());
 
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0], "old-agent");
@@ -288,7 +306,7 @@ mod tests {
         reg.register("fresh-agent".into(), AgentType::ClaudeCode, test_project());
 
         // Large timeout means cutoff is far in the past — agent is "active"
-        let removed = reg.reap_inactive(Duration::from_secs(3600));
+        let removed = reg.reap_inactive(Duration::from_secs(3600), &HashSet::new());
         assert!(removed.is_empty());
         assert_eq!(reg.len(), 1);
     }
@@ -301,7 +319,7 @@ mod tests {
         reg.register("c".into(), AgentType::LocalLlm, test_project());
 
         thread::sleep(Duration::from_millis(2));
-        let mut removed = reg.reap_inactive(Duration::ZERO);
+        let mut removed = reg.reap_inactive(Duration::ZERO, &HashSet::new());
         removed.sort();
 
         assert_eq!(removed, vec!["a", "b", "c"]);
@@ -311,8 +329,54 @@ mod tests {
     #[test]
     fn reap_empty_registry() {
         let mut reg = AgentRegistry::new();
-        let removed = reg.reap_inactive(Duration::ZERO);
+        let removed = reg.reap_inactive(Duration::ZERO, &HashSet::new());
         assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn reap_exempts_keep_alive_agents_even_when_stale() {
+        // itr#568: an agent whose hook is blocked on a human decision has a
+        // stale last_seen but a live pending decision — it must survive the
+        // reaper while an agent with no pending decision is reaped on time.
+        let mut reg = AgentRegistry::new();
+        reg.register("blocked".into(), AgentType::ClaudeCode, test_project());
+        reg.register("dead".into(), AgentType::ClaudeCode, test_project());
+        let connected_at = reg.get("blocked").unwrap().connected_at;
+
+        thread::sleep(Duration::from_millis(2));
+        let keep_alive: HashSet<String> = ["blocked".to_string()].into_iter().collect();
+        let removed = reg.reap_inactive(Duration::ZERO, &keep_alive);
+
+        assert_eq!(
+            removed,
+            vec!["dead"],
+            "only the agent without a pending decision is reaped"
+        );
+        let survivor = reg
+            .get("blocked")
+            .expect("blocked agent must survive the reaper");
+        assert_eq!(
+            survivor.connected_at, connected_at,
+            "session uptime survives the wait — no re-registration"
+        );
+    }
+
+    #[test]
+    fn reap_exemption_lapses_with_the_pending_decision() {
+        // itr#363 semantics preserved: once the pending decision resolves
+        // (e.g. hook-death deny), the exemption lapses and a genuinely stale
+        // agent is reaped on the next pass — no zombie rows.
+        let mut reg = AgentRegistry::new();
+        reg.register("blocked".into(), AgentType::ClaudeCode, test_project());
+
+        thread::sleep(Duration::from_millis(2));
+        let keep_alive: HashSet<String> = ["blocked".to_string()].into_iter().collect();
+        assert!(reg.reap_inactive(Duration::ZERO, &keep_alive).is_empty());
+
+        // Pending decision resolved → exemption gone → reaped.
+        let removed = reg.reap_inactive(Duration::ZERO, &HashSet::new());
+        assert_eq!(removed, vec!["blocked"]);
+        assert!(reg.is_empty());
     }
 
     // --- Default ---

@@ -231,6 +231,21 @@ impl DecisionQueue {
         snapshot
     }
 
+    /// Agent ids that currently have a live pending decision (queued or
+    /// claimed-but-unreleased). The agent reaper passes this set as its
+    /// keep-alive exemption (itr#568): a hook blocked on a human decision is
+    /// waiting, not dead, and its agent must never be reaped while the
+    /// decision is live — otherwise the agents panel and the decision queue
+    /// disagree about the agent's existence, and a future admission cap
+    /// keyed on the registry would fail open at peak human latency.
+    pub fn pending_agent_ids(&self) -> HashSet<String> {
+        self.pending_items
+            .iter()
+            .chain(self.claimed_items.values())
+            .map(|req| req.agent_id.clone())
+            .collect()
+    }
+
     /// Look up a pending request by id without removing it. Used by the
     /// sudo gate, which needs to see a decision's tool_name before deciding
     /// whether to let an approve through — if the decision has already been
@@ -611,6 +626,38 @@ mod tests {
         let mut q = make_queue();
         let ids = q.resolve_all(&None, Decision::Approve, None);
         assert!(ids.is_empty());
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // Pending agent ids (reaper keep-alive set, itr#568)
+    // ════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn pending_agent_ids_covers_queued_and_claimed_and_lapses_on_resolve() {
+        let mut q = make_queue();
+        let bash = make_request("Bash", "cc-blocked", "/muse");
+        let bash_id = bash.id;
+        let rx = q.enqueue(bash).unwrap();
+        let spawn = make_request("SpawnAgent", "wisphive-daemon:spawn", "/muse");
+        let spawn_id = spawn.id;
+        let _spawn_rx = q.enqueue_managed_spawn(spawn).unwrap();
+        let claim = q.claim(spawn_id).unwrap();
+
+        let ids = q.pending_agent_ids();
+        assert!(
+            ids.contains("cc-blocked"),
+            "queued decision exempts its agent"
+        );
+        assert!(
+            ids.contains("wisphive-daemon:spawn"),
+            "claimed-but-unreleased decision still exempts its agent"
+        );
+
+        // Resolution removes the exemption — no zombie keep-alives.
+        assert!(q.resolve(bash_id, RichDecision::approve()));
+        assert_eq!(rx.await.unwrap().decision, Decision::Approve);
+        assert!(q.complete_claim(claim, RichDecision::deny()));
+        assert!(q.pending_agent_ids().is_empty());
     }
 
     // ════════════════════════════════════════════════════════════
