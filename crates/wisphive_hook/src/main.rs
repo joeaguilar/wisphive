@@ -2086,6 +2086,17 @@ fn register_agent_once(
     let sessions_dir = wisphive_dir.join("sessions");
     let marker = sessions_dir.join(agent_id);
 
+    // Fast path: this session already registered, so there is nothing to send.
+    // Checking before dialing avoids opening a socket, completing the Hello /
+    // Welcome handshake, and then closing without a request — which the daemon
+    // (correctly) reports as "hook disconnected before sending request" on
+    // every subsequent hook event of the session. The authoritative
+    // once-per-session claim is still the `create_new` below; this is only an
+    // optimization and races benignly with it.
+    if marker.exists() {
+        return Ok(());
+    }
+
     // The caller intentionally swallows transport errors to preserve
     // registration's fail-open behavior. Returning them keeps validation and
     // marker-write failures directly testable.
