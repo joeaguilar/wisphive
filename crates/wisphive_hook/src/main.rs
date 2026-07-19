@@ -15,6 +15,19 @@ const MAX_STDIN_BYTES: usize = 8 * 1024 * 1024;
 const MAX_AGENT_ID_SUFFIX_BYTES: usize = 64;
 const MODE_FILE_MAX_BYTES: u64 = 64;
 
+/// Reason for a Codex PreToolUse `ask` that cannot defer (itr#366) — shared
+/// by the guard resolution ([`resolve_always_defer`],
+/// [`convert_promptless_daemon_ask`]) and the [`pre_tool_use_stdout`]
+/// formatter backstop so the operator-visible message cannot drift between
+/// the layers.
+const CODEX_NO_NATIVE_PROMPT_REASON: &str = "Wisphive cannot defer to a native prompt on Codex; re-run after explicit approval in the Wisphive TUI/web UI.";
+
+/// Marker env var a daemon-managed spawn sets on its children naming the
+/// prompt surface an always-defer `ask` would land on (itr#559). Written by
+/// `build_agent_command` in `wisphive_daemon::process_registry` (value
+/// `headless` today) — the two literals must stay in sync.
+const PROMPT_SURFACE_ENV: &str = "WISPHIVE_PROMPT_SURFACE";
+
 /// Maximum bytes a single newline-delimited response line from the daemon may
 /// occupy before the hook rejects it (itr#83). Without a cap, a misbehaving or
 /// hostile daemon peer that streams bytes with no newline would grow the hook's
@@ -852,12 +865,16 @@ fn pre_tool_use_stdout(resp: &HookResponse) -> (Option<serde_json::Value>, i32) 
                 // Codex has no native PreToolUse prompt to defer to (it uses
                 // PermissionRequest for native approvals), so "ask" cannot be
                 // expressed — and exit 0 with empty stdout would be a silent
-                // approve. Fail closed with a reason instead (itr#366).
+                // approve. Fail closed with a reason instead (itr#366). Kept
+                // as a formatter backstop even though `run_active` now
+                // resolves promptless asks upstream via
+                // [`native_prompt_exists`] (itr#559): no Codex PreToolUse Ask
+                // may ever slip through as silence.
                 let json = serde_json::json!({
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
                         "permissionDecision": "deny",
-                        "permissionDecisionReason": "Wisphive cannot defer to a native prompt on Codex; re-run after explicit approval in the Wisphive TUI/web UI."
+                        "permissionDecisionReason": CODEX_NO_NATIVE_PROMPT_REASON
                     }
                 });
                 return (Some(json), 0);
@@ -1374,56 +1391,29 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
     // (the old `!is_permission_request` guard) auto-resolved the prompt with no
     // selection — "Allowed by PermissionRequest hook" → "did not answer". See
     // itr#388 (regression on the itr#380 / ADR-0002 always-defer work).
+    //
+    // WHERE the ask would land is classified first (itr#559): a native prompt
+    // only exists on an interactive surface, so the resolution is
+    // surface-aware — a managed headless spawn gets a deterministic audited
+    // deny instead of an `ask` with no prompt to receive it. See
+    // [`PromptSurface`] / [`native_prompt_exists`] / [`resolve_always_defer`].
+    let surface = prompt_surface_from_env();
     let defer_class = always_defer_classification(&tool_name, wisphive_dir);
     if matches!(defer_class, DeferClass::Intrinsic | DeferClass::Operator) {
-        // A Claude Code PermissionRequest for an always-defer tool is a DUPLICATE
-        // of the PreToolUse defer that already fired for the same call — Claude
-        // Code emits BOTH events for AskUserQuestion / ExitPlanMode. Crucially the
-        // PermissionRequest carries a NULL tool_use_id, so the answered-signal
-        // (PostToolUse ToolResult correlated by tool_use_id, itr#461) can never
-        // match it: the inbox row it spawns is structurally unresolvable and sticks
-        // in "waiting in your terminal" forever. The itr#440 epic cleared only the
-        // resolvable PreToolUse twin, leaving this orphan behind (the live bug the
-        // green tests missed — they never modeled the null-id PermissionRequest
-        // duplicate). We STILL return Decision::Ask (Claude's native dialog must
-        // render and capture the selection — itr#388), but skip the duplicate audit
-        // record so no orphan inbox row is created; the PreToolUse record remains
-        // the canonical, resolvable audit entry. Codex is unchanged: its
-        // PermissionRequest IS the native-approval path (its PreToolUse fail-closed
-        // denies, itr#366), so for Codex that record is the canonical one to keep.
-        let is_duplicate_permission_request =
-            is_permission_request && agent_type == AgentType::ClaudeCode;
-        if !is_duplicate_permission_request {
-            // Audit the deferral (itr#397): this decision was made by policy, not
-            // a human, and used to leave no trace anywhere. On the Codex PreToolUse
-            // path Ask cannot defer (itr#366) — the real effect is a fail-closed
-            // deny, and the audit record says so.
-            let base = match defer_class {
-                DeferClass::Intrinsic => "always_ask:intrinsic",
-                _ => "always_ask:operator",
-            };
-            let (event, decided_by) =
-                if agent_type == AgentType::Codex && event_type == HookEventType::PreToolUse {
-                    ("denied", format!("codex_ask_fail_closed:{base}"))
-                } else {
-                    ("deferred", base.to_string())
-                };
-            log_auto_approved(
-                wisphive_dir,
-                AutoApprovedLog {
-                    tool_use_id: &tool_use_id,
-                    agent_id: &agent_id,
-                    project: &project,
-                    tool_name: &tool_name,
-                    tool_input: &tool_input,
-                    event_type,
-                    agent_type: agent_type.to_string(),
-                    event,
-                    decided_by: &decided_by,
-                },
-            );
-        }
-        return Ok(HookResponse::new(Decision::Ask, event_type, agent_type));
+        return Ok(resolve_always_defer(
+            wisphive_dir,
+            &surface,
+            &defer_class,
+            &AlwaysDeferContext {
+                tool_use_id: &tool_use_id,
+                agent_id: &agent_id,
+                project: &project,
+                tool_name: &tool_name,
+                tool_input: &tool_input,
+                event_type,
+                agent_type: agent_type.clone(),
+            },
+        ));
     }
 
     // Control-plane self-protection (itr#425, ADR-0005 I9): a Write/Edit/Bash
@@ -1553,29 +1543,25 @@ fn run_active(wisphive_dir: &Path) -> Result<HookResponse, HookFailure> {
     // `gate_decision_with_audit` so the events.jsonl branch is testable too.
     let response = gate_decision_with_audit(wisphive_dir, request, event_type, agent_type.clone())?;
 
-    // A daemon-resolved Ask on the Codex PreToolUse path is a fail-closed deny
-    // (itr#366); that non-human outcome must reach the audit trail (itr#397) —
-    // the daemon skips logging Ask resolutions, so this record is its only trace.
-    if response.decision == Decision::Ask
-        && agent_type == AgentType::Codex
-        && event_type == HookEventType::PreToolUse
-    {
-        log_auto_approved(
-            wisphive_dir,
-            AutoApprovedLog {
-                tool_use_id: &tool_use_id,
-                agent_id: &audit_agent_id,
-                project: &audit_project,
-                tool_name: &audit_tool_name,
-                tool_input: &audit_tool_input,
-                event_type,
-                agent_type: agent_type.to_string(),
-                event: "denied",
-                decided_by: "codex_ask_fail_closed:daemon_ask",
-            },
-        );
-    }
-    Ok(response)
+    // A daemon-resolved Ask can only defer where a native prompt exists to
+    // receive it (itr#366 Codex PreToolUse; itr#559 managed headless): on a
+    // promptless origin it converts to the deterministic audited deny — the
+    // daemon skips logging Ask resolutions, so that record is its only trace
+    // (itr#397). Asks bound for a real native prompt pass through untouched.
+    Ok(convert_promptless_daemon_ask(
+        wisphive_dir,
+        &surface,
+        response,
+        &AlwaysDeferContext {
+            tool_use_id: &tool_use_id,
+            agent_id: &audit_agent_id,
+            project: &audit_project,
+            tool_name: &audit_tool_name,
+            tool_input: &audit_tool_input,
+            event_type,
+            agent_type: agent_type.clone(),
+        },
+    ))
 }
 
 /// Request a daemon decision for `request`, resolving a live daemon's
@@ -2220,6 +2206,107 @@ fn trusted_config_json(path: &std::path::Path) -> Option<serde_json::Value> {
         .and_then(|contents| serde_json::from_str(&contents).ok())
 }
 
+/// Where a `Decision::Ask` would land for this hook invocation (itr#559).
+///
+/// ADR-0002's always-defer contract silently presumed a native prompt: `ask`
+/// only "defers to the human" when something can render the question and
+/// carry the answer back. A daemon-managed headless spawn (`claude -p` /
+/// `codex exec`, stdio nulled) has no such surface — the itr#559 probe
+/// (docs/research/headless-ask-probe/) showed an `ask` there is a SILENT
+/// BLOCK: the tool never runs, no PostToolUse fires, and the spawn burns its
+/// run invisibly. Classification-before-behavior: name the surface first,
+/// then decide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PromptSurface {
+    /// A user-launched session. A native prompt exists (per provider/event —
+    /// see [`native_prompt_exists`]); the ADR-0002 unconditional defer is
+    /// unchanged here.
+    Interactive,
+    /// A daemon-managed unattended headless spawn — today's only real managed
+    /// surface. No native prompt exists for ANY provider or event; an
+    /// always-defer tool resolves deterministically fail-closed with an
+    /// operator-readable reason instead of blocking silently.
+    ManagedHeadless,
+    /// A managed origin declaring a surface this hook build does not
+    /// implement. THE SEAM (itr#559 scope note): a future ATTENDED managed
+    /// surface (the itr#564 Chat spike — headless-shaped but attended, with
+    /// the Wisphive Inbox as its native gate) adds a recognized
+    /// `WISPHIVE_PROMPT_SURFACE` value and a variant here whose routing sends
+    /// intrinsic asks to that surface. Until a build implements the declared
+    /// value, always-defer tools fail closed — an unknown surface must never
+    /// be presumed interactive.
+    UnrecognizedManaged(String),
+}
+
+/// Pure classification behind [`prompt_surface_from_env`], parameterized for
+/// tests (env is process-global; unit tests must not mutate it).
+///
+/// `marker` is `WISPHIVE_PROMPT_SURFACE`; `managed_agent_id` is
+/// `WISPHIVE_AGENT_ID`. An absent/empty marker WITH a managed agent id still
+/// classifies as [`PromptSurface::ManagedHeadless`]: only a pre-marker daemon
+/// spawns children that way, and every managed spawn such a daemon produces
+/// is unattended headless — version skew must not resurrect the silent block.
+fn classify_prompt_surface(marker: Option<&str>, managed_agent_id: Option<&str>) -> PromptSurface {
+    match marker.map(str::trim) {
+        Some("headless") => PromptSurface::ManagedHeadless,
+        Some("") | None => {
+            if managed_agent_id.is_some_and(|id| !id.trim().is_empty()) {
+                PromptSurface::ManagedHeadless
+            } else {
+                PromptSurface::Interactive
+            }
+        }
+        Some(other) => PromptSurface::UnrecognizedManaged(other.to_string()),
+    }
+}
+
+fn prompt_surface_from_env() -> PromptSurface {
+    classify_prompt_surface(
+        std::env::var(PROMPT_SURFACE_ENV).ok().as_deref(),
+        std::env::var("WISPHIVE_AGENT_ID").ok().as_deref(),
+    )
+}
+
+/// THE always-defer predicate (itr#559): does a native prompt exist to
+/// receive a `Decision::Ask` for this (surface, provider, event)
+/// combination? Generalizes the former `agent_type == Codex && event_type ==
+/// PreToolUse` special case (itr#366): Codex's promptless PreToolUse was
+/// simply the first discovered member of the promptless class; managed
+/// headless spawns are the second (for EVERY provider and event). When this
+/// returns false, `ask` is not a defer — it is a silent failure — and the
+/// caller must resolve deterministically instead (fail-closed deny with a
+/// reason, audited).
+fn native_prompt_exists(
+    surface: &PromptSurface,
+    agent_type: &AgentType,
+    event_type: HookEventType,
+) -> bool {
+    if *surface != PromptSurface::Interactive {
+        return false;
+    }
+    // Codex has no native PreToolUse prompt even interactively — its native
+    // approval path is PermissionRequest (itr#366).
+    !(*agent_type == AgentType::Codex && event_type == HookEventType::PreToolUse)
+}
+
+/// Is `Decision::Ask` PROMPT-CONSUMING for this event (itr#559 review)?
+///
+/// The promptless fail-closed conversion only makes sense where an `ask`
+/// would have handed the call to a native prompt: `PreToolUse` (Claude's
+/// permission prompt), `PermissionRequest` (the native dialog itself), and
+/// `Elicitation` (the native elicitation UI). On block-shaped events (Stop /
+/// UserPromptSubmit / ConfigChange / ...) an Ask has always been an inert
+/// exit-0 pass-through — converting it to a Deny would INVERT semantics
+/// (Stop-deny = `{"decision":"block"}` = keep working; UserPromptSubmit-deny
+/// blocks the spawn's own prompt), so those keep the pass-through even on a
+/// promptless surface.
+fn prompt_shaped_event(event_type: HookEventType) -> bool {
+    matches!(
+        event_type,
+        HookEventType::PreToolUse | HookEventType::PermissionRequest | HookEventType::Elicitation
+    )
+}
+
 /// How the always-defer classification resolved for a tool (itr#397 audit).
 #[derive(Debug, PartialEq, Eq)]
 enum DeferClass {
@@ -2283,6 +2370,205 @@ fn always_defer_classification(tool_name: &str, wisphive_dir: &std::path::Path) 
         (true, false) => DeferClass::Operator,
         (false, _) => DeferClass::No,
     }
+}
+
+/// Audit/response context for the always-defer resolution (itr#559),
+/// extracted from [`run_active`] so the promptless fail-closed branch is
+/// testable without a daemon or stdin.
+struct AlwaysDeferContext<'a> {
+    tool_use_id: &'a Option<String>,
+    agent_id: &'a str,
+    project: &'a std::path::Path,
+    tool_name: &'a str,
+    tool_input: &'a serde_json::Value,
+    event_type: HookEventType,
+    agent_type: AgentType,
+}
+
+/// Resolve an always-defer classified tool for the given prompt surface
+/// (itr#559; ADR-0002 amendment 3).
+///
+/// With a native prompt ([`native_prompt_exists`]): defer (`Decision::Ask`),
+/// audited `deferred` — the unconditional ADR-0002 contract, unchanged for
+/// interactive sessions. Without one, `ask` would be a silent block (probe:
+/// docs/research/headless-ask-probe/), so the resolution is a DETERMINISTIC
+/// fail-closed deny with an operator-readable reason (ADR-0010
+/// repair-via-message), audited `denied` with a `decided_by` naming the
+/// promptless class so it reaches `wisphive audit` (itr#397).
+fn resolve_always_defer(
+    wisphive_dir: &Path,
+    surface: &PromptSurface,
+    defer_class: &DeferClass,
+    ctx: &AlwaysDeferContext<'_>,
+) -> HookResponse {
+    let class = match defer_class {
+        DeferClass::Intrinsic => "intrinsic",
+        _ => "operator",
+    };
+
+    // The fail-closed conversion below only applies where the ask would have
+    // been prompt-consuming; on block-shaped events (an operator `always_ask`
+    // entry naming e.g. Stop) an Ask has always been an inert exit-0
+    // pass-through, and a Deny there would invert semantics — see
+    // [`prompt_shaped_event`].
+    if native_prompt_exists(surface, &ctx.agent_type, ctx.event_type)
+        || !prompt_shaped_event(ctx.event_type)
+    {
+        // A Claude Code PermissionRequest for an always-defer tool is a DUPLICATE
+        // of the PreToolUse defer that already fired for the same call — Claude
+        // Code emits BOTH events for AskUserQuestion / ExitPlanMode. Crucially the
+        // PermissionRequest carries a NULL tool_use_id, so the answered-signal
+        // (PostToolUse ToolResult correlated by tool_use_id, itr#461) can never
+        // match it: the inbox row it spawns is structurally unresolvable and sticks
+        // in "waiting in your terminal" forever. The itr#440 epic cleared only the
+        // resolvable PreToolUse twin, leaving this orphan behind (the live bug the
+        // green tests missed — they never modeled the null-id PermissionRequest
+        // duplicate). We STILL return Decision::Ask (Claude's native dialog must
+        // render and capture the selection — itr#388), but skip the duplicate audit
+        // record so no orphan inbox row is created; the PreToolUse record remains
+        // the canonical, resolvable audit entry. Codex is unchanged: its
+        // PermissionRequest IS the native-approval path (its PreToolUse fail-closed
+        // denies, itr#366), so for Codex that record is the canonical one to keep.
+        let is_duplicate_permission_request = ctx.event_type == HookEventType::PermissionRequest
+            && ctx.agent_type == AgentType::ClaudeCode;
+        if !is_duplicate_permission_request {
+            // Audit the deferral (itr#397): this decision was made by policy,
+            // not a human, and used to leave no trace anywhere.
+            log_auto_approved(
+                wisphive_dir,
+                AutoApprovedLog {
+                    tool_use_id: ctx.tool_use_id,
+                    agent_id: ctx.agent_id,
+                    project: ctx.project,
+                    tool_name: ctx.tool_name,
+                    tool_input: ctx.tool_input,
+                    event_type: ctx.event_type,
+                    agent_type: ctx.agent_type.to_string(),
+                    event: "deferred",
+                    decided_by: &format!("always_ask:{class}"),
+                },
+            );
+        }
+        return HookResponse::new(Decision::Ask, ctx.event_type, ctx.agent_type.clone());
+    }
+
+    // No native prompt exists for this ask (itr#559): resolve
+    // deterministically fail-closed instead of emitting an `ask` that would
+    // block silently (managed headless — the probe-verified defect) or that
+    // only the formatter backstop rescues (interactive Codex PreToolUse,
+    // itr#366 — previously the agent_type-keyed special case this predicate
+    // generalizes).
+    let (decided_by, reason) = match surface {
+        PromptSurface::Interactive => (
+            // Interactive-with-no-prompt = the Codex PreToolUse member; keep
+            // its established attribution and formatter-identical reason.
+            format!("codex_ask_fail_closed:always_ask:{class}"),
+            CODEX_NO_NATIVE_PROMPT_REASON.to_string(),
+        ),
+        PromptSurface::ManagedHeadless => (
+            format!("always_ask:headless_no_prompt:{class}"),
+            format!(
+                "Wisphive denied {tool}: it is an interactive prompt (always-defer, ADR-0002), and this agent is a Wisphive-managed HEADLESS spawn — no native prompt exists to render it, so an 'ask' would block silently and burn the run (itr#559). \
+                 Restructure the spawn so it never needs {tool} (a permission_mode='plan' spawn calls ExitPlanMode by construction — prefer 'default' and put the plan or question in the prompt), or run this work in an attended interactive session. \
+                 If this actually IS an attended interactive session (e.g. a shell or tmux server inherited from a managed spawn), unset WISPHIVE_PROMPT_SURFACE and WISPHIVE_AGENT_ID to restore the native prompt.",
+                tool = ctx.tool_name
+            ),
+        ),
+        PromptSurface::UnrecognizedManaged(value) => (
+            format!("always_ask:unrecognized_surface:{class}"),
+            format!(
+                "Wisphive denied {tool}: it is an interactive prompt (always-defer, ADR-0002), and WISPHIVE_PROMPT_SURFACE={value:?} names a prompt surface this wisphive-hook build does not implement — no native prompt can be presumed to exist (itr#559). \
+                 Recognized values: \"headless\" (managed unattended spawns; unset = interactive). Upgrade wisphive-hook to a build implementing this surface, or unset the variable for interactive sessions.",
+                tool = ctx.tool_name
+            ),
+        ),
+    };
+    log_auto_approved(
+        wisphive_dir,
+        AutoApprovedLog {
+            tool_use_id: ctx.tool_use_id,
+            agent_id: ctx.agent_id,
+            project: ctx.project,
+            tool_name: ctx.tool_name,
+            tool_input: ctx.tool_input,
+            event_type: ctx.event_type,
+            agent_type: ctx.agent_type.to_string(),
+            event: "denied",
+            decided_by: &decided_by,
+        },
+    );
+    let mut response = HookResponse::new(Decision::Deny, ctx.event_type, ctx.agent_type.clone());
+    response.message = Some(reason);
+    response
+}
+
+/// A daemon-resolved `Ask` reaching a promptless origin is the same silent
+/// failure the always-defer guard resolves (itr#559): for interactive Codex
+/// PreToolUse the formatter already denied it (itr#366) but the audit record
+/// was previously written by an `agent_type == Codex` arm in [`run_active`];
+/// for a managed headless spawn the `ask` would have gone out as
+/// Claude-shaped `"ask"` JSON and blocked silently. Convert it to the
+/// deterministic message-bearing deny (byte-identical stdout on the Codex
+/// arm) and audit it — the daemon skips logging Ask resolutions, so this
+/// record is the only trace (itr#397). Asks bound for a real native prompt
+/// pass through untouched, as do asks on block-shaped events (where Ask has
+/// always been an inert pass-through and a deny would invert semantics — see
+/// [`prompt_shaped_event`]).
+fn convert_promptless_daemon_ask(
+    wisphive_dir: &Path,
+    surface: &PromptSurface,
+    response: HookResponse,
+    ctx: &AlwaysDeferContext<'_>,
+) -> HookResponse {
+    if response.decision != Decision::Ask
+        || native_prompt_exists(surface, &ctx.agent_type, ctx.event_type)
+        // On block-shaped events (Stop / UserPromptSubmit / ...) an Ask has
+        // always been an inert exit-0 pass-through — a Deny there would
+        // INVERT semantics (Stop-deny = keep working; UserPromptSubmit-deny
+        // blocks the spawn's own prompt). Only prompt-consuming asks convert;
+        // see [`prompt_shaped_event`] (itr#559 review).
+        || !prompt_shaped_event(ctx.event_type)
+    {
+        return response;
+    }
+    let (decided_by, reason) = match surface {
+        PromptSurface::Interactive => (
+            "codex_ask_fail_closed:daemon_ask".to_string(),
+            CODEX_NO_NATIVE_PROMPT_REASON.to_string(),
+        ),
+        PromptSurface::ManagedHeadless => (
+            "headless_no_prompt:daemon_ask".to_string(),
+            format!(
+                "Wisphive denied {}: the daemon resolved this call as 'ask' (defer to the native prompt), but this agent is a Wisphive-managed HEADLESS spawn with no native prompt — the ask would block silently (itr#559). Approve or deny the call explicitly in the Wisphive TUI/web UI instead. \
+                 If this actually IS an attended interactive session (e.g. a shell or tmux server inherited from a managed spawn), unset WISPHIVE_PROMPT_SURFACE and WISPHIVE_AGENT_ID to restore the native prompt.",
+                ctx.tool_name
+            ),
+        ),
+        PromptSurface::UnrecognizedManaged(value) => (
+            "unrecognized_surface:daemon_ask".to_string(),
+            format!(
+                "Wisphive denied {}: the daemon resolved this call as 'ask' (defer to the native prompt), but WISPHIVE_PROMPT_SURFACE={value:?} names a prompt surface this wisphive-hook build does not implement, so no native prompt can be presumed to exist (itr#559).",
+                ctx.tool_name
+            ),
+        ),
+    };
+    log_auto_approved(
+        wisphive_dir,
+        AutoApprovedLog {
+            tool_use_id: ctx.tool_use_id,
+            agent_id: ctx.agent_id,
+            project: ctx.project,
+            tool_name: ctx.tool_name,
+            tool_input: ctx.tool_input,
+            event_type: ctx.event_type,
+            agent_type: ctx.agent_type.to_string(),
+            event: "denied",
+            decided_by: &decided_by,
+        },
+    );
+    let mut deny = HookResponse::new(Decision::Deny, ctx.event_type, ctx.agent_type.clone());
+    deny.message = Some(reason);
+    deny
 }
 
 /// Boolean view of [`always_defer_classification`].
@@ -3038,6 +3324,488 @@ mod tests {
             "always_ask": ["Bash"],
         }));
         assert!(is_always_deferred("Bash", dir.path()));
+    }
+
+    // ---- itr#559: prompt-surface classification & promptless always-defer ----
+
+    /// Build an [`AlwaysDeferContext`] for the itr#559 tests.
+    fn defer_ctx<'a>(
+        tool_name: &'a str,
+        tool_input: &'a serde_json::Value,
+        tool_use_id: &'a Option<String>,
+        event_type: HookEventType,
+        agent_type: AgentType,
+    ) -> AlwaysDeferContext<'a> {
+        AlwaysDeferContext {
+            tool_use_id,
+            agent_id: "agent-559",
+            project: std::path::Path::new("/tmp/p"),
+            tool_name,
+            tool_input,
+            event_type,
+            agent_type,
+        }
+    }
+
+    /// Read the single events.jsonl record a resolution wrote.
+    fn sole_audit_record(dir: &std::path::Path) -> serde_json::Value {
+        let events = std::fs::read_to_string(dir.join("events.jsonl"))
+            .expect("the resolution must write an events.jsonl audit record");
+        let mut lines = events.lines();
+        let record = serde_json::from_str(lines.next().expect("one audit record")).unwrap();
+        assert_eq!(lines.next(), None, "exactly one audit record expected");
+        record
+    }
+
+    #[test]
+    fn prompt_surface_classification_covers_managed_origins() {
+        use PromptSurface::*;
+        // Interactive: no marker, no managed agent id — the real terminal.
+        assert_eq!(classify_prompt_surface(None, None), Interactive);
+        assert_eq!(classify_prompt_surface(Some(""), None), Interactive);
+        // The marker names today's managed headless surface.
+        assert_eq!(
+            classify_prompt_surface(Some("headless"), None),
+            ManagedHeadless
+        );
+        assert_eq!(
+            classify_prompt_surface(Some(" headless \n"), Some("agent-1")),
+            ManagedHeadless
+        );
+        // Version skew: a pre-marker daemon still sets WISPHIVE_AGENT_ID, and
+        // every managed spawn such a daemon produces is unattended headless —
+        // the silent block must not come back through skew.
+        assert_eq!(
+            classify_prompt_surface(None, Some("agent-42")),
+            ManagedHeadless
+        );
+        assert_eq!(
+            classify_prompt_surface(Some(""), Some("agent-42")),
+            ManagedHeadless
+        );
+        // The seam: an unimplemented surface value is NEVER presumed interactive.
+        assert_eq!(
+            classify_prompt_surface(Some("inbox"), Some("agent-42")),
+            UnrecognizedManaged("inbox".into())
+        );
+    }
+
+    #[test]
+    fn native_prompt_exists_is_surface_and_provider_aware() {
+        use HookEventType::*;
+        let interactive = PromptSurface::Interactive;
+        let headless = PromptSurface::ManagedHeadless;
+        // Interactive Claude has native prompts everywhere the guard fires.
+        assert!(native_prompt_exists(
+            &interactive,
+            &AgentType::ClaudeCode,
+            PreToolUse
+        ));
+        assert!(native_prompt_exists(
+            &interactive,
+            &AgentType::ClaudeCode,
+            PermissionRequest
+        ));
+        // Codex PreToolUse is the promptless member even interactively (itr#366)...
+        assert!(!native_prompt_exists(
+            &interactive,
+            &AgentType::Codex,
+            PreToolUse
+        ));
+        // ...but its PermissionRequest IS its native approval path.
+        assert!(native_prompt_exists(
+            &interactive,
+            &AgentType::Codex,
+            PermissionRequest
+        ));
+        // A managed headless spawn has no native prompt for ANY provider/event.
+        assert!(!native_prompt_exists(
+            &headless,
+            &AgentType::ClaudeCode,
+            PreToolUse
+        ));
+        assert!(!native_prompt_exists(
+            &headless,
+            &AgentType::ClaudeCode,
+            PermissionRequest
+        ));
+        assert!(!native_prompt_exists(
+            &headless,
+            &AgentType::Codex,
+            PermissionRequest
+        ));
+        // Unknown surfaces are never presumed interactive.
+        assert!(!native_prompt_exists(
+            &PromptSurface::UnrecognizedManaged("inbox".into()),
+            &AgentType::ClaudeCode,
+            PreToolUse
+        ));
+    }
+
+    #[test]
+    fn headless_managed_spawn_intrinsic_defer_fails_closed_and_audited() {
+        // itr#559 AC3/AC4: a managed-origin PreToolUse for an intrinsic
+        // always-defer tool must resolve a DETERMINISTIC fail-closed deny —
+        // never an `ask` with no prompt to land on (the probe-verified silent
+        // block, docs/research/headless-ask-probe/) — with the events.jsonl
+        // record naming the promptless class. Both managed-origin signals are
+        // covered: the explicit marker and the WISPHIVE_AGENT_ID-only skew leg.
+        for (marker, managed_id) in [(Some("headless"), None), (None, Some("agent-x1"))] {
+            let surface = classify_prompt_surface(marker, managed_id);
+            for tool in ["ExitPlanMode", "AskUserQuestion"] {
+                let dir = tempfile::tempdir().unwrap();
+                let input = serde_json::json!({"question": "pick one"});
+                let id = Some(format!("use-{tool}"));
+                let response = resolve_always_defer(
+                    dir.path(),
+                    &surface,
+                    &DeferClass::Intrinsic,
+                    &defer_ctx(
+                        tool,
+                        &input,
+                        &id,
+                        HookEventType::PreToolUse,
+                        AgentType::ClaudeCode,
+                    ),
+                );
+                assert_eq!(response.decision, Decision::Deny, "{tool} must fail closed");
+                let msg = response
+                    .message
+                    .as_deref()
+                    .expect("the deny must carry an operator-readable reason");
+                assert!(msg.contains(tool), "the reason must name the tool");
+                assert!(
+                    msg.contains("HEADLESS"),
+                    "the reason must name the promptless origin"
+                );
+
+                // Formats as an explicit deny-with-reason, never "ask".
+                let (json_out, code) = pre_tool_use_stdout(&response);
+                assert_eq!(code, 0);
+                assert_eq!(
+                    json_out.unwrap()["hookSpecificOutput"]["permissionDecision"],
+                    "deny"
+                );
+
+                let record = sole_audit_record(dir.path());
+                assert_eq!(record["event"], "denied");
+                assert_eq!(
+                    record["decided_by"],
+                    "always_ask:headless_no_prompt:intrinsic"
+                );
+                assert_eq!(record["tool_name"], tool);
+                assert_eq!(record["hook_event_name"], "PreToolUse");
+                assert_eq!(record["tool_use_id"], format!("use-{tool}"));
+            }
+        }
+    }
+
+    #[test]
+    fn headless_operator_defer_and_unrecognized_surface_fail_closed() {
+        // Operator `always_ask` additions have no prompt under headless either.
+        let input = serde_json::Value::Null;
+        let none_id: Option<String> = None;
+        let dir = tempfile::tempdir().unwrap();
+        let response = resolve_always_defer(
+            dir.path(),
+            &PromptSurface::ManagedHeadless,
+            &DeferClass::Operator,
+            &defer_ctx(
+                "Bash",
+                &input,
+                &none_id,
+                HookEventType::PreToolUse,
+                AgentType::ClaudeCode,
+            ),
+        );
+        assert_eq!(response.decision, Decision::Deny);
+        assert_eq!(
+            sole_audit_record(dir.path())["decided_by"],
+            "always_ask:headless_no_prompt:operator"
+        );
+
+        // The seam: an unimplemented surface value fails closed too, naming
+        // the value — never presumed interactive (itr#564 Chat must add a
+        // recognized value + Inbox routing before attended managed asks exist).
+        let dir = tempfile::tempdir().unwrap();
+        let response = resolve_always_defer(
+            dir.path(),
+            &PromptSurface::UnrecognizedManaged("inbox".into()),
+            &DeferClass::Intrinsic,
+            &defer_ctx(
+                "AskUserQuestion",
+                &input,
+                &none_id,
+                HookEventType::PreToolUse,
+                AgentType::ClaudeCode,
+            ),
+        );
+        assert_eq!(response.decision, Decision::Deny);
+        assert!(response.message.as_deref().unwrap().contains("\"inbox\""));
+        let record = sole_audit_record(dir.path());
+        assert_eq!(record["event"], "denied");
+        assert_eq!(
+            record["decided_by"],
+            "always_ask:unrecognized_surface:intrinsic"
+        );
+    }
+
+    #[test]
+    fn interactive_defer_contract_unchanged_by_surface_guard() {
+        // ADR-0002 for real prompts is untouched by itr#559: interactive
+        // Claude defers (Ask + "deferred" audit), the duplicate
+        // PermissionRequest twin stays unaudited (itr#440), and interactive
+        // Codex PermissionRequest defers with its canonical audit record.
+        let input = serde_json::json!({"plan": "x"});
+        let id = Some("use-1".to_string());
+
+        let dir = tempfile::tempdir().unwrap();
+        let response = resolve_always_defer(
+            dir.path(),
+            &PromptSurface::Interactive,
+            &DeferClass::Intrinsic,
+            &defer_ctx(
+                "ExitPlanMode",
+                &input,
+                &id,
+                HookEventType::PreToolUse,
+                AgentType::ClaudeCode,
+            ),
+        );
+        assert_eq!(response.decision, Decision::Ask);
+        let record = sole_audit_record(dir.path());
+        assert_eq!(record["event"], "deferred");
+        assert_eq!(record["decided_by"], "always_ask:intrinsic");
+
+        // Claude PermissionRequest duplicate: Ask, and NO audit record.
+        let dir = tempfile::tempdir().unwrap();
+        let response = resolve_always_defer(
+            dir.path(),
+            &PromptSurface::Interactive,
+            &DeferClass::Intrinsic,
+            &defer_ctx(
+                "ExitPlanMode",
+                &input,
+                &id,
+                HookEventType::PermissionRequest,
+                AgentType::ClaudeCode,
+            ),
+        );
+        assert_eq!(response.decision, Decision::Ask);
+        assert!(!dir.path().join("events.jsonl").exists());
+
+        // Codex PermissionRequest IS its native approval path — defers, audited.
+        let dir = tempfile::tempdir().unwrap();
+        let response = resolve_always_defer(
+            dir.path(),
+            &PromptSurface::Interactive,
+            &DeferClass::Intrinsic,
+            &defer_ctx(
+                "AskUserQuestion",
+                &input,
+                &id,
+                HookEventType::PermissionRequest,
+                AgentType::Codex,
+            ),
+        );
+        assert_eq!(response.decision, Decision::Ask);
+        let record = sole_audit_record(dir.path());
+        assert_eq!(record["event"], "deferred");
+        assert_eq!(record["decided_by"], "always_ask:intrinsic");
+    }
+
+    #[test]
+    fn interactive_codex_pretooluse_defer_denies_with_formatter_identical_reason() {
+        // The itr#366 Codex arm, generalized into the predicate (itr#559 AC2):
+        // same audit attribution (codex_ask_fail_closed:always_ask:intrinsic),
+        // same stdout bytes (deny + the shared reason) — now produced as an
+        // explicit Decision::Deny instead of relying on the formatter mapping
+        // alone.
+        let dir = tempfile::tempdir().unwrap();
+        let input = serde_json::Value::Null;
+        let id: Option<String> = None;
+        let response = resolve_always_defer(
+            dir.path(),
+            &PromptSurface::Interactive,
+            &DeferClass::Intrinsic,
+            &defer_ctx(
+                "AskUserQuestion",
+                &input,
+                &id,
+                HookEventType::PreToolUse,
+                AgentType::Codex,
+            ),
+        );
+        assert_eq!(response.decision, Decision::Deny);
+        assert_eq!(
+            response.message.as_deref(),
+            Some(CODEX_NO_NATIVE_PROMPT_REASON)
+        );
+        let (json_out, code) = pre_tool_use_stdout(&response);
+        assert_eq!(code, 0);
+        let json_out = json_out.unwrap();
+        assert_eq!(json_out["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert_eq!(
+            json_out["hookSpecificOutput"]["permissionDecisionReason"],
+            CODEX_NO_NATIVE_PROMPT_REASON
+        );
+        let record = sole_audit_record(dir.path());
+        assert_eq!(record["event"], "denied");
+        assert_eq!(
+            record["decided_by"],
+            "codex_ask_fail_closed:always_ask:intrinsic"
+        );
+    }
+
+    #[test]
+    fn promptless_daemon_ask_converts_to_audited_deny() {
+        // itr#559: a daemon-resolved Ask reaching a headless spawn would go
+        // out as Claude-shaped `"ask"` JSON and block silently — it must
+        // convert to a message-bearing deny plus an audit record.
+        let input = serde_json::Value::Null;
+        let id = Some("use-9".to_string());
+        let dir = tempfile::tempdir().unwrap();
+        let ask = HookResponse::new(
+            Decision::Ask,
+            HookEventType::PreToolUse,
+            AgentType::ClaudeCode,
+        );
+        let ctx = defer_ctx(
+            "Bash",
+            &input,
+            &id,
+            HookEventType::PreToolUse,
+            AgentType::ClaudeCode,
+        );
+        let converted =
+            convert_promptless_daemon_ask(dir.path(), &PromptSurface::ManagedHeadless, ask, &ctx);
+        assert_eq!(converted.decision, Decision::Deny);
+        assert!(converted.message.as_deref().unwrap().contains("HEADLESS"));
+        let record = sole_audit_record(dir.path());
+        assert_eq!(record["event"], "denied");
+        assert_eq!(record["decided_by"], "headless_no_prompt:daemon_ask");
+
+        // Interactive Claude Ask passes through untouched — the native prompt
+        // is the correct destination; nothing is audited here.
+        let dir = tempfile::tempdir().unwrap();
+        let ask = HookResponse::new(
+            Decision::Ask,
+            HookEventType::PreToolUse,
+            AgentType::ClaudeCode,
+        );
+        let passed =
+            convert_promptless_daemon_ask(dir.path(), &PromptSurface::Interactive, ask, &ctx);
+        assert_eq!(passed.decision, Decision::Ask);
+        assert!(!dir.path().join("events.jsonl").exists());
+
+        // Interactive Codex PreToolUse keeps its itr#366 attribution and the
+        // exact formatter reason.
+        let dir = tempfile::tempdir().unwrap();
+        let ask = HookResponse::new(Decision::Ask, HookEventType::PreToolUse, AgentType::Codex);
+        let ctx_codex = defer_ctx(
+            "Bash",
+            &input,
+            &id,
+            HookEventType::PreToolUse,
+            AgentType::Codex,
+        );
+        let converted =
+            convert_promptless_daemon_ask(dir.path(), &PromptSurface::Interactive, ask, &ctx_codex);
+        assert_eq!(converted.decision, Decision::Deny);
+        assert_eq!(
+            converted.message.as_deref(),
+            Some(CODEX_NO_NATIVE_PROMPT_REASON)
+        );
+        let record = sole_audit_record(dir.path());
+        assert_eq!(record["decided_by"], "codex_ask_fail_closed:daemon_ask");
+
+        // Non-Ask daemon resolutions are never touched.
+        let dir = tempfile::tempdir().unwrap();
+        let deny = HookResponse::new(
+            Decision::Deny,
+            HookEventType::PreToolUse,
+            AgentType::ClaudeCode,
+        );
+        let passed =
+            convert_promptless_daemon_ask(dir.path(), &PromptSurface::ManagedHeadless, deny, &ctx);
+        assert_eq!(passed.decision, Decision::Deny);
+        assert!(!dir.path().join("events.jsonl").exists());
+    }
+
+    #[test]
+    fn promptless_conversion_is_scoped_to_prompt_shaped_events() {
+        // Review fix (itr#559): on block-shaped events an Ask has always been
+        // an inert exit-0 pass-through; converting it to a Deny would INVERT
+        // semantics (Stop-deny = `{"decision":"block"}` = keep working;
+        // UserPromptSubmit-deny blocks the spawn's own initial prompt). Both
+        // promptless resolvers convert ONLY prompt-consuming asks.
+        let input = serde_json::Value::Null;
+        let id: Option<String> = None;
+
+        // Daemon-ask conversion: prompt-shaped Elicitation converts...
+        let dir = tempfile::tempdir().unwrap();
+        let ask = HookResponse::new(
+            Decision::Ask,
+            HookEventType::Elicitation,
+            AgentType::ClaudeCode,
+        );
+        let ctx = defer_ctx(
+            "Elicitation",
+            &input,
+            &id,
+            HookEventType::Elicitation,
+            AgentType::ClaudeCode,
+        );
+        let converted =
+            convert_promptless_daemon_ask(dir.path(), &PromptSurface::ManagedHeadless, ask, &ctx);
+        assert_eq!(converted.decision, Decision::Deny);
+        assert_eq!(
+            sole_audit_record(dir.path())["decided_by"],
+            "headless_no_prompt:daemon_ask"
+        );
+
+        // ...while Stop / UserPromptSubmit asks pass through unchanged and
+        // unaudited on a promptless surface.
+        for event in [HookEventType::Stop, HookEventType::UserPromptSubmit] {
+            let dir = tempfile::tempdir().unwrap();
+            let ask = HookResponse::new(Decision::Ask, event, AgentType::ClaudeCode);
+            let ctx = defer_ctx("Stop", &input, &id, event, AgentType::ClaudeCode);
+            let passed = convert_promptless_daemon_ask(
+                dir.path(),
+                &PromptSurface::ManagedHeadless,
+                ask,
+                &ctx,
+            );
+            assert_eq!(
+                passed.decision,
+                Decision::Ask,
+                "{event:?} Ask must pass through"
+            );
+            assert!(passed.message.is_none());
+            assert!(!dir.path().join("events.jsonl").exists());
+        }
+
+        // Always-defer guard: an operator `always_ask` entry naming a
+        // block-shaped event keeps the pre-itr#559 defer (Ask + "deferred"
+        // audit) even on a promptless surface.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = defer_ctx(
+            "Stop",
+            &input,
+            &id,
+            HookEventType::Stop,
+            AgentType::ClaudeCode,
+        );
+        let response = resolve_always_defer(
+            dir.path(),
+            &PromptSurface::ManagedHeadless,
+            &DeferClass::Operator,
+            &ctx,
+        );
+        assert_eq!(response.decision, Decision::Ask);
+        let record = sole_audit_record(dir.path());
+        assert_eq!(record["event"], "deferred");
+        assert_eq!(record["decided_by"], "always_ask:operator");
     }
 
     #[test]

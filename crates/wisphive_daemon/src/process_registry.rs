@@ -2243,6 +2243,20 @@ fn build_agent_command(
     cmd.current_dir(&req.project);
     cmd.env("WISPHIVE_AGENT_ID", agent_id);
     cmd.env("WISPHIVE_AGENT_TYPE", req.agent_type.to_string());
+    // itr#559: name the prompt surface for the child's wisphive-hook. Managed
+    // spawns run headless (`claude -p` / `codex exec`, stdio nulled below) —
+    // there is NO native prompt for an always-defer `ask` to land on, so the
+    // hook resolves intrinsic interactive tools (AskUserQuestion /
+    // ExitPlanMode / ...) as a deterministic audited deny instead of an `ask`
+    // that blocks silently (ADR-0002 amendment 3). This env var is the seam
+    // for future ATTENDED managed surfaces (the itr#564 Chat spike, whose
+    // native gate is the Wisphive Inbox): such a surface must set a DIFFERENT
+    // recognized value here — never simply drop the variable, because the
+    // hook treats a `WISPHIVE_AGENT_ID`-without-marker child as headless (a
+    // pre-marker daemon's spawn) and an unrecognized value as fail-closed.
+    // The literal must stay in sync with `PROMPT_SURFACE_ENV` /
+    // `classify_prompt_surface` in `wisphive_hook`.
+    cmd.env("WISPHIVE_PROMPT_SURFACE", "headless");
     // Managed children must not inherit the daemon's terminal input. Any
     // interactive bytes would bypass the reviewed SpawnAgent request.
     cmd.stdin(Stdio::null());
@@ -3394,6 +3408,38 @@ mod tests {
             &build_agent_command(&default_mode, "agent-test", uuid::Uuid::nil()).unwrap(),
         );
         assert!(!argv.iter().any(|arg| arg == "--permission-mode"));
+    }
+
+    #[test]
+    fn managed_spawns_declare_the_headless_prompt_surface() {
+        // itr#559: both providers' managed children run headless (stdio
+        // nulled) — the child's wisphive-hook needs the surface named so an
+        // always-defer tool resolves a deterministic audited deny instead of
+        // emitting an `ask` with no native prompt to land on (ADR-0002
+        // amendment 3). WISPHIVE_PROMPT_SURFACE is also the seam: a future
+        // ATTENDED managed surface (itr#564 Chat/Inbox) must set a different
+        // recognized value, never drop the variable.
+        let proj = tempfile::tempdir().unwrap();
+        for mut req in [claude_req(proj.path()), codex_req(proj.path())] {
+            validate_spawn_request(&mut req).unwrap();
+            let cmd = build_agent_command(&req, "agent-surface", uuid::Uuid::nil()).unwrap();
+            let env: HashMap<_, _> = cmd
+                .as_std()
+                .get_envs()
+                .filter_map(|(key, value)| Some((key.to_os_string(), value?.to_os_string())))
+                .collect();
+            assert_eq!(
+                env.get(std::ffi::OsStr::new("WISPHIVE_PROMPT_SURFACE"))
+                    .and_then(|value| value.to_str()),
+                Some("headless"),
+                "a managed {:?} spawn must declare its promptless surface",
+                req.agent_type
+            );
+            assert!(
+                env.contains_key(std::ffi::OsStr::new("WISPHIVE_AGENT_ID")),
+                "the managed-origin marker must still be set alongside the surface"
+            );
+        }
     }
 
     #[test]

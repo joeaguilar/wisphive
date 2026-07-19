@@ -53,7 +53,11 @@ _Last reviewed: 2026-07-05_
   This includes `claude -p`.
 - **Headless / spawned agent** — An agent **Wisphive** launches via the process registry
   (`wisphive agent start`), running inside a Wisphive-owned **PTY**. Wisphive owns its lifecycle
-  and byte stream.
+  and byte stream. Managed spawns export `WISPHIVE_PROMPT_SURFACE=headless` to their child: no
+  **native prompt** exists on this surface, so **always-defer** tools resolve as a deterministic
+  audited deny instead of an `ask` that would block silently (ADR-0002 amendment 3, itr#559). A
+  future *attended* managed surface (itr#564 Chat/Inbox) declares a different marker value —
+  that env var is the routing seam.
 - **`claude -p`** — Claude Code's non-interactive / "print" mode. Fires `PreToolUse` hooks
   identically to interactive — **even under `--permission-mode bypassPermissions`** (bypass skips
   Claude's *native* prompts, not hooks). So `-p` tool calls are gated like any other. It has **no
@@ -94,11 +98,18 @@ session has *only* the conversation transcript. Both are bulk-exfiltration surfa
   it before it runs. The core verb of the product.
 - **Decision** — The outcome: `Approve`, `Deny`, or `Ask`. Also the `wisphive_protocol` type.
 - **Ask / defer** — Return the call to the **agent's native prompt** instead of resolving it in
-  Wisphive. Deferred calls never reach the daemon queue.
+  Wisphive. Deferred calls never reach the daemon queue. `ask` **presumes a native prompt
+  exists**: on a promptless origin (a managed **headless** spawn — any provider/event — or
+  Codex's `PreToolUse` path, itr#366) it is not a defer but a silent failure, so the hook
+  resolves it as a deterministic audited deny instead — predicate `native_prompt_exists` in
+  `wisphive_hook` (ADR-0002 amendment 3, itr#559).
 - **Always-defer / always-ask** — The classification that runs **first**, before any level check
   (ADR-0002, itr#380). `DEFAULT_ALWAYS_ASK` (`AskUserQuestion`, `EnterPlanMode`, `ExitPlanMode`,
   `Elicitation`) defers **unconditionally** — no posture or override un-defers it (since `0530ef1`).
   Operator-added `always_ask` tools are releasable by the **dangerous** posture or `always_ask_remove`.
+  Unconditional defer applies **where a native prompt exists**; on promptless origins the same
+  classification fails closed with `decided_by: always_ask:headless_no_prompt:*` (ADR-0002
+  amendment 3, itr#559).
 - **Auto-approve level** — Tiered posture in `config.json`: `off` / `read` / `write` / `execute` /
   `all`. Resolves **in the hook**, never touching the daemon. Plus per-tool `auto_approve_add` /
   `auto_approve_remove` and content-aware `tool_rules`.
