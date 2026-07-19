@@ -53,3 +53,14 @@ NEXT: claim 602/L1 (#567) lane A · claim 603/L1 (#560) lane B.
 - LEARNED: worktrees can spawn STALE (pre-L1 base observed) — lanes now verify base commit at start; daemon reply-shapes are shared with CLI (device_id-keyed splits only); read-path can silently undo a write-path guarantee.
 - WATCH ⚠ OPERATOR BRIEF: evidence seat dissented "rescope" in 2 consecutive councils — pattern claim: premises under-specify terrain (write-side verified, read-side assumed). Options: (1) DEFAULT — continue with B-A9 end-to-end gating absorbed into every remaining link review (cost: ~1 extra reviewer dimension per link); (2) freeze + rescope 603 into a successor chain with an end-to-end-audit premise (cost: council + re-formation overhead, same code lands). Default executes on silence.
 - NEXT: land 603/L2 after rework → claim 607 · land 602/L2 on its report → chain 602 terminal.
+
+## Pulse — 2026-07-18 (chain 602 SEALED · 588 admitted)
+
+`WALK · landed 4/11 · burn n/a · lanes 2/2`
+
+- LANDED: 603#L2 itr#562 → 8b260e3 (unknown provider = loud bare-exit refusal, audited). 602#L2 itr#565 → 20b0ad7 (success-path silence cured: AgentSpawned producer + Spawned Processes UI; real-exec e2e proof).
+- CHAIN 602 SEALED COMPLETE: reported symptom resolved (refusals loud + success visible). 2 councils, 2 reworks, 0 quarantines. Honest residue: #608 (HIGH — dropdown-only project picker, the PO-hint match, dissent-flagged), #609 TUI parity, #610 preflight hint, #611 pidfile flake, #606 dup-id visibility.
+- MOVED: chain 588 (session survival plan A) ADMITTED to lane A — #590 (persist respawn spec) claimed, walking. 603/L2.5 (#607 audit read layer) built + under review.
+- LEARNED (B-A9 residue map from #607): retention archiver discards agent_type for ALL rows; ingest writer emits invalid JSON for special-char labels; missing agent_type silently defaults to claude_code; .ok()? silent-drop pattern persists for other columns; web parse was all-or-nothing per message. Tickets at #607 landing.
+- WATCH: operator brief stands (evidence-seat rescope pattern; default = seal-and-continue executed). 603 remaining: 607 review → land → #559 → #568 → #561; 5-landed-links council fires at next 603 landing.
+- NEXT: tally #607 review → land → claim #559 (lane B) · walk #590 (lane A).
