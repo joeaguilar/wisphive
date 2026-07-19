@@ -277,6 +277,15 @@ pub enum ClientMessage {
     #[serde(rename = "term_reorder")]
     TermReorder { id: Uuid, sort_order: i64 },
 
+    /// Pin or unpin a terminal session as an "important session" (itr#589).
+    /// The daemon persists the flag on the `terminal_sessions` row and
+    /// broadcasts the updated session list so all clients converge. Dormant
+    /// until itr#591: nothing consumes the flag yet — pinned sessions become
+    /// respawn-on-restart candidates there; unpinned sessions keep today's
+    /// orphan-on-restart behavior.
+    #[serde(rename = "term_set_pinned")]
+    TermSetPinned { id: Uuid, pinned: bool },
+
     /// Mark the originating web device as freshly reauthenticated, resetting
     /// its sudo-mode TTL. Emitted by `wisphive_web::post_auth_reauth` after
     /// a successful password re-entry; the daemon reads `device_id` from the
@@ -1574,6 +1583,7 @@ mod tests {
             sort_order: 0,
             created_by: None,
             replay_acl: Vec::new(),
+            pinned: false,
         }
     }
 
@@ -1661,6 +1671,55 @@ mod tests {
             decode::<ClientMessage>(&legacy).unwrap(),
             ClientMessage::TermClose { id: decoded } if decoded == id
         ));
+    }
+
+    /// itr#589: the pin toggle round-trips both states and uses the
+    /// `term_set_pinned` tag, matching the term-command naming convention.
+    #[test]
+    fn round_trip_term_set_pinned() {
+        let id = uuid::Uuid::new_v4();
+        for pinned in [true, false] {
+            let msg = ClientMessage::TermSetPinned { id, pinned };
+            let encoded = encode(&msg).unwrap();
+            assert!(encoded.contains("\"type\":\"term_set_pinned\""));
+            match decode::<ClientMessage>(&encoded).unwrap() {
+                ClientMessage::TermSetPinned {
+                    id: did,
+                    pinned: dp,
+                } => {
+                    assert_eq!(did, id);
+                    assert_eq!(dp, pinned);
+                }
+                _ => panic!("unexpected variant"),
+            }
+        }
+    }
+
+    /// itr#589: `pinned` is additive on `TerminalSessionMeta` — a legacy
+    /// frame without the field decodes with `pinned: false`, and a pinned
+    /// meta round-trips true.
+    #[test]
+    fn terminal_meta_pinned_is_additive() {
+        let mut meta = sample_meta();
+        meta.pinned = true;
+        let encoded = encode(&ServerMessage::TermCreated(meta)).unwrap();
+        match decode::<ServerMessage>(&encoded).unwrap() {
+            ServerMessage::TermCreated(m) => assert!(m.pinned),
+            _ => panic!("unexpected variant"),
+        }
+
+        // Legacy frame: no `pinned` key at all (internally tagged — the meta
+        // fields sit beside `type` at the top level).
+        let legacy_meta = sample_meta();
+        let mut value: serde_json::Value =
+            serde_json::from_str(&encode(&ServerMessage::TermCreated(legacy_meta)).unwrap())
+                .unwrap();
+        let obj = value.as_object_mut().expect("top-level object");
+        assert!(obj.remove("pinned").is_some(), "pinned serialized");
+        match decode::<ServerMessage>(&value.to_string()).unwrap() {
+            ServerMessage::TermCreated(m) => assert!(!m.pinned),
+            _ => panic!("unexpected variant"),
+        }
     }
 
     #[test]

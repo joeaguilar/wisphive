@@ -65,6 +65,8 @@ interface MountOverrides {
   onAttach?: (id: string) => void;
   onDetach?: (id: string) => void;
   onReplay?: (id: string, fromSeq?: number) => void;
+  onSetPinned?: (id: string, pinned: boolean) => void;
+  terminals?: TerminalSessionMeta[];
   registerHandler?: (
     id: string,
     handler: TerminalOutputHandler,
@@ -79,11 +81,12 @@ function mountTerminals(overrides: MountOverrides = {}) {
   const onAttach = overrides.onAttach ?? vi.fn();
   const onDetach = overrides.onDetach ?? vi.fn();
   const onReplay = overrides.onReplay ?? vi.fn();
+  const onSetPinned = overrides.onSetPinned ?? vi.fn();
   const registerHandler = overrides.registerHandler ?? vi.fn(() => () => {});
   const backgroundRef = createRef<HTMLElement>();
   const terminalsView = (
     <Terminals
-      terminals={[session]}
+      terminals={overrides.terminals ?? [session]}
       queue={[]}
       projects={[]}
       onRefresh={() => {}}
@@ -97,6 +100,7 @@ function mountTerminals(overrides: MountOverrides = {}) {
       onResize={() => {}}
       onSetGroup={() => {}}
       onReorder={() => {}}
+      onSetPinned={onSetPinned}
       onApprove={() => {}}
       onDeny={() => {}}
       onJumpToQueue={() => {}}
@@ -118,7 +122,7 @@ function mountTerminals(overrides: MountOverrides = {}) {
     </div>
   ) : terminalsView;
   const utils = render(overrides.strict ? <StrictMode>{view}</StrictMode> : view);
-  return { ...utils, onAttach, onDetach, onReplay, registerHandler };
+  return { ...utils, onAttach, onDetach, onReplay, onSetPinned, registerHandler };
 }
 
 beforeEach(() => {
@@ -449,5 +453,38 @@ describe("Terminals stream lifecycle (itr#375)", () => {
     unmount();
 
     expect(onDetach).not.toHaveBeenCalled();
+  });
+});
+
+describe("Terminals session pinning (itr#589)", () => {
+  it("pins an unpinned session without selecting it", () => {
+    const { onSetPinned, onAttach } = mountTerminals();
+
+    fireEvent.click(screen.getByRole("button", { name: `Pin session ${session.label}` }));
+
+    expect(onSetPinned).toHaveBeenCalledWith(session.id, true);
+    // The toggle is row-scoped: it must not open/attach the session.
+    expect(onAttach).not.toHaveBeenCalled();
+  });
+
+  it("unpins a pinned session and shows the pinned indicator", () => {
+    const pinnedSession: TerminalSessionMeta = { ...session, pinned: true };
+    const { container, onSetPinned } = mountTerminals({ terminals: [pinnedSession] });
+
+    // Indicator renders for pinned rows (full text, no truncation).
+    const indicator = container.querySelector(".term-pinned")!;
+    expect(indicator.textContent).toContain("pinned");
+
+    fireEvent.click(screen.getByRole("button", { name: `Unpin session ${session.label}` }));
+    expect(onSetPinned).toHaveBeenCalledWith(session.id, false);
+  });
+
+  it("offers the pin toggle on non-running (orphaned) sessions too", () => {
+    const orphanedSession: TerminalSessionMeta = { ...session, status: "orphaned" };
+    const { container, onSetPinned } = mountTerminals({ terminals: [orphanedSession] });
+
+    expect(container.querySelector(".term-pinned")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: `Pin session ${session.label}` }));
+    expect(onSetPinned).toHaveBeenCalledWith(session.id, true);
   });
 });

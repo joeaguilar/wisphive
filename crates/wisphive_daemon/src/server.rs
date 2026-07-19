@@ -1380,6 +1380,7 @@ async fn dispatch_command(
         | ClientMessage::TermList
         | ClientMessage::TermSetGroup { .. }
         | ClientMessage::TermReorder { .. }
+        | ClientMessage::TermSetPinned { .. }
         | ClientMessage::TermReplay { .. } => {
             handle_terminal_command(writer, ctx, device_id, msg, term_attachments, conn_tx).await?;
         }
@@ -3237,6 +3238,33 @@ async fn handle_terminal_command(
                         &ServerMessage::TermError {
                             id: Some(id),
                             message: format!("term reorder failed: {e}"),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+        ClientMessage::TermSetPinned { id, pinned } => {
+            // Pin toggle (itr#589): persist + broadcast the refreshed session
+            // list so every client converges, exactly like TermSetGroup /
+            // TermReorder. Same auth path as all terminal commands: local TUI
+            // or bridge-authenticated web device (`device_id` stamped by the
+            // web bridge). Dormant flag — nothing consumes it until itr#591.
+            info!(?device_id, %id, pinned, "term set pinned");
+            match ctx.terminal_manager.set_pinned(id, pinned).await {
+                Ok(()) => {
+                    if let Ok(sessions) = ctx.terminal_manager.list_all().await {
+                        let _ = ctx
+                            .tui_tx
+                            .send(ServerMessage::TermListResponse { sessions });
+                    }
+                }
+                Err(e) => {
+                    write_msg(
+                        writer,
+                        &ServerMessage::TermError {
+                            id: Some(id),
+                            message: format!("term set pinned failed: {e}"),
                         },
                     )
                     .await?;

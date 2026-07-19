@@ -20,6 +20,11 @@ interface TerminalsProps {
   onResize: (id: string, cols: number, rows: number) => void;
   onSetGroup: (id: string, group?: string) => void;
   onReorder: (id: string, sortOrder: number) => void;
+  /** Pin/unpin an "important session" (itr#589): pinned sessions are
+   * respawn-on-restart candidates (consumed by itr#591; dormant until then).
+   * Same daemon auth path as onClose/onSetGroup — the ws bridge stamps the
+   * authenticated device id on every terminal command. */
+  onSetPinned: (id: string, pinned: boolean) => void;
   onApprove: (id: string, opts?: { additional_context?: string; always_allow?: boolean }) => void;
   onDeny: (id: string, message?: string) => void;
   onJumpToQueue: () => void;
@@ -57,7 +62,7 @@ interface DragPayload {
 export function Terminals(props: TerminalsProps) {
   const {
     terminals, queue, projects, onRefresh, onRefreshProjects, onCreate, onAttach, onDetach,
-    onClose, onReplay, onInput, onResize, onSetGroup, onReorder,
+    onClose, onReplay, onInput, onResize, onSetGroup, onReorder, onSetPinned,
     onApprove, onDeny, onJumpToQueue, focusSessionId, onFocusHandled, backgroundRef, registerHandler,
   } = props;
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -564,6 +569,7 @@ export function Terminals(props: TerminalsProps) {
                           onAttach={() => handleSelect(t, false)}
                           onClose={() => onClose(t.id)}
                           onReplay={() => handleSelect(t, true)}
+                          onTogglePin={() => onSetPinned(t.id, !t.pinned)}
                         />
                       ))}
                     </div>
@@ -599,6 +605,7 @@ export function Terminals(props: TerminalsProps) {
                       dragHinted={false}
                       onClick={() => handleSelect(t, true)}
                       onReplay={() => handleSelect(t, true)}
+                      onTogglePin={() => onSetPinned(t.id, !t.pinned)}
                     />
                   ))}
                 </div>
@@ -632,6 +639,7 @@ export function Terminals(props: TerminalsProps) {
                       dragHinted={false}
                       onClick={() => handleSelect(t, true)}
                       onReplay={() => handleSelect(t, true)}
+                      onTogglePin={() => onSetPinned(t.id, !t.pinned)}
                     />
                   ))}
                 </div>
@@ -718,16 +726,19 @@ interface SidebarItemProps {
   onAttach?: () => void;
   onClose?: () => void;
   onReplay: () => void;
+  /** Toggle the "important session" pin (itr#589). */
+  onTogglePin: () => void;
 }
 
 function SidebarItem(p: SidebarItemProps) {
-  const { t, selected, pending, draggable, dragHinted, onClick, onDragStart, onDragEnd, onDragOver, onAttach, onClose, onReplay } = p;
+  const { t, selected, pending, draggable, dragHinted, onClick, onDragStart, onDragEnd, onDragOver, onAttach, onClose, onReplay, onTogglePin } = p;
   const classes = [
     "terminals-sidebar-item",
     selected ? "selected" : "",
     pending > 0 ? "has-pending" : "",
     dragHinted ? "drop-hint" : "",
   ].filter(Boolean).join(" ");
+  const sessionName = t.label ?? "(no label)";
   return (
     <div
       className={classes}
@@ -739,7 +750,12 @@ function SidebarItem(p: SidebarItemProps) {
     >
       <div className="row">
         {draggable && <span className="drag-handle" title="Drag to reorder" aria-hidden="true">⋮⋮</span>}
-        <strong>{t.label ?? "(no label)"}</strong>
+        <strong>{sessionName}</strong>
+        {t.pinned && (
+          <span className="term-pinned" title="Marked important">
+            ★ pinned
+          </span>
+        )}
         <span className={`term-status term-status-${t.status}`}>{t.status}</span>
         {pending > 0 && (
           <span className="pending-badge" title={`${pending} pending approval${pending === 1 ? "" : "s"}`}>
@@ -759,6 +775,13 @@ function SidebarItem(p: SidebarItemProps) {
           </>
         )}
         <button onClick={(e) => { e.stopPropagation(); onReplay(); }}>Replay</button>
+        <button
+          aria-label={`${t.pinned ? "Unpin" : "Pin"} session ${sessionName}`}
+          title={t.pinned ? "Unmark" : "Mark as an important session"}
+          onClick={(e) => { e.stopPropagation(); onTogglePin(); }}
+        >
+          {t.pinned ? "Unpin" : "Pin"}
+        </button>
       </div>
     </div>
   );

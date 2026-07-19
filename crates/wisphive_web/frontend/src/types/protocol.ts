@@ -188,6 +188,10 @@ export interface TerminalSessionMeta {
   created_by?: string;
   /** Resolver labels explicitly allowed to replay this session. */
   replay_acl?: string[];
+  /** User-marked "important session" flag (itr#589): a pinned session is a
+   * respawn-on-restart candidate (consumed by itr#591; dormant until then).
+   * Absent on legacy frames — treat as unpinned. */
+  pinned?: boolean;
 }
 
 // Server → Client messages
@@ -856,6 +860,7 @@ function parseTerminalSessionMeta(value: unknown, path: string): TerminalSession
     sort_order: readField(session, "sort_order", readI64Safe, path),
     created_by: readOptionalField(session, "created_by", readString, path),
     replay_acl: readOptionalField(session, "replay_acl", arrayOf(readString), path),
+    pinned: readOptionalField(session, "pinned", readBoolean, path) ?? false,
   };
 }
 
@@ -1183,7 +1188,8 @@ export type ClientMessage =
   | { type: "term_list" }
   | { type: "term_replay"; id: string; from_seq?: number; speed?: number }
   | { type: "term_set_group"; id: string; group?: string }
-  | { type: "term_reorder"; id: string; sort_order: number };
+  | { type: "term_reorder"; id: string; sort_order: number }
+  | { type: "term_set_pinned"; id: string; pinned: boolean };
 
 /** Outbound wire shape: a ClientMessage optionally carrying the
  * `ClientCommand` envelope's `correlation_id` (wire.rs). One-shot commands

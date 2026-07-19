@@ -157,6 +157,16 @@ impl StateDb {
             "TEXT NOT NULL DEFAULT '[]'",
         )
         .await?;
+        // Pin / keep-alive flag (itr#589): user-marked "important sessions"
+        // become respawn-on-restart candidates (consumed by itr#591; dormant
+        // until then). Legacy rows default to unpinned.
+        try_add_column(
+            &self.pool,
+            "terminal_sessions",
+            "pinned",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        .await?;
 
         // Per-event stream: raw input/output/resize bytes for replay.
         sqlx::query(

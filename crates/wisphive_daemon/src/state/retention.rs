@@ -289,6 +289,7 @@ mod tests {
             sort_order: 0,
             created_by: None,
             replay_acl: Vec::new(),
+            pinned: false,
         }
     }
 

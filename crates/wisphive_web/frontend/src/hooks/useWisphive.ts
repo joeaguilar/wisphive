@@ -1065,6 +1065,16 @@ export function useWisphive() {
     [send],
   );
 
+  // Pin/unpin an "important session" (itr#589): the daemon persists the flag
+  // and broadcasts the refreshed term_list, so `terminals` converges via the
+  // normal term_list_response path.
+  const termSetPinned = useCallback(
+    (id: string, pinned: boolean) => {
+      send({ type: "term_set_pinned", id, pinned });
+    },
+    [send],
+  );
+
   const registerTerminalHandler = useCallback(
     (id: string, handler: TerminalOutputHandler, options?: TerminalHandlerOptions) => {
       const registration: TerminalHandlerRegistration = {
@@ -1114,6 +1124,7 @@ export function useWisphive() {
     termReplay,
     termSetGroup,
     termReorder,
+    termSetPinned,
     registerTerminalHandler,
   };
 }

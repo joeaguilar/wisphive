@@ -173,6 +173,7 @@ type TerminalSessionRow = (
     i64,
     Option<String>,
     Option<String>,
+    i64,
 );
 
 fn hydrate_terminal_session(row: TerminalSessionRow) -> Option<TerminalSessionMeta> {
@@ -192,6 +193,7 @@ fn hydrate_terminal_session(row: TerminalSessionRow) -> Option<TerminalSessionMe
         sort_order,
         created_by,
         replay_acl_json,
+        pinned,
     ) = row;
 
     let Ok(id) = uuid::Uuid::parse_str(&id) else {
@@ -228,6 +230,7 @@ fn hydrate_terminal_session(row: TerminalSessionRow) -> Option<TerminalSessionMe
         sort_order,
         created_by,
         replay_acl,
+        pinned: pinned != 0,
     })
 }
 
@@ -248,8 +251,8 @@ impl StateDb {
         let replay_acl_json = serde_json::to_string(&meta.replay_acl)?;
         let env_json = env.map(serde_json::to_string).transpose()?;
         sqlx::query(
-            "INSERT INTO terminal_sessions (id, label, command, args, cwd, env_json, cols, rows, started_at, ended_at, exit_code, status, group_name, sort_order, created_by, replay_acl)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO terminal_sessions (id, label, command, args, cwd, env_json, cols, rows, started_at, ended_at, exit_code, status, group_name, sort_order, created_by, replay_acl, pinned)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(meta.id.to_string())
         .bind(&meta.label)
@@ -267,6 +270,7 @@ impl StateDb {
         .bind(meta.sort_order)
         .bind(meta.created_by.as_deref())
         .bind(replay_acl_json)
+        .bind(i64::from(meta.pinned))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -286,6 +290,19 @@ impl StateDb {
     pub async fn set_terminal_sort_order(&self, id: uuid::Uuid, sort_order: i64) -> Result<()> {
         sqlx::query("UPDATE terminal_sessions SET sort_order = ? WHERE id = ?")
             .bind(sort_order)
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Pin or unpin a session as an "important session" (itr#589). The flag
+    /// marks the row as a respawn-on-restart candidate for itr#591's
+    /// reconcile-on-start; it is dormant until then and never affects the
+    /// startup orphan sweep today.
+    pub async fn set_terminal_pinned(&self, id: uuid::Uuid, pinned: bool) -> Result<()> {
+        sqlx::query("UPDATE terminal_sessions SET pinned = ? WHERE id = ?")
+            .bind(i64::from(pinned))
             .bind(id.to_string())
             .execute(&self.pool)
             .await?;
@@ -318,7 +335,7 @@ impl StateDb {
     /// `started_at` DESC. The client is responsible for sectioning by status.
     pub async fn list_terminal_sessions(&self) -> Result<Vec<TerminalSessionMeta>> {
         let rows: Vec<TerminalSessionRow> = sqlx::query_as(
-            "SELECT id, label, command, args, cwd, cols, rows, started_at, ended_at, exit_code, status, group_name, sort_order, created_by, replay_acl
+            "SELECT id, label, command, args, cwd, cols, rows, started_at, ended_at, exit_code, status, group_name, sort_order, created_by, replay_acl, pinned
              FROM terminal_sessions
              ORDER BY sort_order ASC, started_at DESC
              LIMIT 500",
@@ -341,7 +358,7 @@ impl StateDb {
         id: uuid::Uuid,
     ) -> Result<Option<TerminalSessionMeta>> {
         let row: Option<TerminalSessionRow> = sqlx::query_as(
-            "SELECT id, label, command, args, cwd, cols, rows, started_at, ended_at, exit_code, status, group_name, sort_order, created_by, replay_acl
+            "SELECT id, label, command, args, cwd, cols, rows, started_at, ended_at, exit_code, status, group_name, sort_order, created_by, replay_acl, pinned
              FROM terminal_sessions
              WHERE id = ?
              LIMIT 1",
@@ -524,6 +541,7 @@ mod tests {
             sort_order: 0,
             created_by: None,
             replay_acl: Vec::new(),
+            pinned: false,
         }
     }
 
@@ -678,6 +696,66 @@ mod tests {
         let after = db.list_terminal_sessions().await.unwrap();
         let found = after.iter().find(|m| m.id == ids[0]).unwrap();
         assert_eq!(found.group_name, None);
+    }
+
+    /// itr#589 AC#1 PIN: the pin flag persists in SQLite and round-trips
+    /// through both the single-row and list read paths; toggling off
+    /// restores the unpinned default.
+    #[tokio::test]
+    async fn terminal_pinned_flag_persists_and_toggles() {
+        let db = test_db().await;
+        let id = uuid::Uuid::new_v4();
+        db.create_terminal_session(&make_term_meta(id), None)
+            .await
+            .unwrap();
+
+        // Default: unpinned.
+        let got = db.get_terminal_session(id).await.unwrap().unwrap();
+        assert!(!got.pinned);
+
+        db.set_terminal_pinned(id, true).await.unwrap();
+        let got = db.get_terminal_session(id).await.unwrap().unwrap();
+        assert!(got.pinned);
+        let listed = db.list_terminal_sessions().await.unwrap();
+        assert!(listed.iter().find(|m| m.id == id).unwrap().pinned);
+
+        db.set_terminal_pinned(id, false).await.unwrap();
+        let got = db.get_terminal_session(id).await.unwrap().unwrap();
+        assert!(!got.pinned);
+
+        // A meta created already-pinned persists the flag at insert.
+        let pinned_id = uuid::Uuid::new_v4();
+        let mut meta = make_term_meta(pinned_id);
+        meta.pinned = true;
+        db.create_terminal_session(&meta, None).await.unwrap();
+        let got = db.get_terminal_session(pinned_id).await.unwrap().unwrap();
+        assert!(got.pinned);
+    }
+
+    /// itr#589 AC#2 PIN (dormancy): pinning does NOT exempt a session from
+    /// the startup orphan sweep — nothing consumes the flag until itr#591
+    /// flips respawn behavior. The flag itself survives the sweep.
+    #[tokio::test]
+    async fn pinned_sessions_still_orphaned_on_startup_sweep() {
+        let db = test_db().await;
+        let id = uuid::Uuid::new_v4();
+        db.create_terminal_session(&make_term_meta(id), None)
+            .await
+            .unwrap();
+        db.set_terminal_pinned(id, true).await.unwrap();
+
+        db.mark_running_terminals_orphaned().await.unwrap();
+
+        let got = db.get_terminal_session(id).await.unwrap().unwrap();
+        assert_eq!(
+            got.status,
+            TerminalStatus::Orphaned,
+            "pin must stay dormant: the itr#589 link changes flag+UI only"
+        );
+        assert!(
+            got.pinned,
+            "the flag survives the sweep for itr#591 to read"
+        );
     }
 
     #[tokio::test]

@@ -2018,6 +2018,14 @@ kbd {
 
 .terminals-sidebar-item:hover .drag-handle { opacity: 0.8; }
 
+/* "★ pinned" important-session indicator on a sidebar row (itr#589) —
+   muted and small, matching the neighboring row indicators. */
+.term-pinned {
+  color: var(--text-dim);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
 .pending-badge {
   background: var(--cyan);
   color: var(--bg);

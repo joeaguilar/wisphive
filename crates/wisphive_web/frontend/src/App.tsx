@@ -67,7 +67,7 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
     connected, queue, agents, managedAgents, projects, worktrees, burnTouches, hookStatus, hookErrors, auditDecisions, endedAgentIds, history, agentTimeline, sessionTimeline, sessions, terminals,
     pendingReauth, diskAlerts, configAlerts, errors, spawn, approve, deny, dismissReauth, retryPendingApprove, dismissError,
     spawnAgent, clearSpawnStatus, queryProjects, queryManagedAgents, queryWorktrees, queryBurn, installHooks, queryProjectHookStatus, queryHistory, queryAgentTimeline, querySessionTimeline, searchHistory, querySessions,
-    termList, termCreate, termAttach, termDetach, termInput, termResize, termClose, termReplay, termSetGroup, termReorder, registerTerminalHandler,
+    termList, termCreate, termAttach, termDetach, termInput, termResize, termClose, termReplay, termSetGroup, termReorder, termSetPinned, registerTerminalHandler,
   } = useWisphive();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [view, setView] = useState<View>("inbox");
@@ -371,6 +371,7 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
             onResize={termResize}
             onSetGroup={termSetGroup}
             onReorder={termReorder}
+            onSetPinned={termSetPinned}
             onApprove={(id, opts) => approve(id, opts)}
             onDeny={(id, msg) => deny(id, msg)}
             onJumpToQueue={() => setView("queue")}

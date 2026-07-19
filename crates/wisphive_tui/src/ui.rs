@@ -103,7 +103,12 @@ fn draw_terminal_list_view(frame: &mut Frame, app: &App) {
                 wisphive_protocol::TerminalStatus::Orphaned => Color::Yellow,
             };
             let status = format!("{}", t.status);
+            // Pin marker (itr#589): pinned sessions are respawn-on-restart
+            // candidates (consumed by itr#591). Single-width glyph so row
+            // columns stay aligned.
+            let pin = if t.pinned { "*" } else { " " };
             let line = Line::from(vec![
+                Span::styled(format!("{pin} "), Style::default().fg(Color::Yellow)),
                 Span::styled(
                     format!("{:<10} ", status),
                     Style::default().fg(status_color),
@@ -155,6 +160,8 @@ fn draw_terminal_list_view(frame: &mut Frame, app: &App) {
         Span::raw(" replay  "),
         Span::styled("[d]", Style::default().fg(Color::Yellow)),
         Span::raw(" close  "),
+        Span::styled("[p]", Style::default().fg(Color::Yellow)),
+        Span::raw(" pin  "),
         Span::styled("[j/k]", Style::default().fg(Color::Yellow)),
         Span::raw(" move  "),
         Span::styled("[q/Esc]", Style::default().fg(Color::Yellow)),

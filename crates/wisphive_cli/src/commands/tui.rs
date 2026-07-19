@@ -330,6 +330,10 @@ async fn run_loop(
                             tracing::info!(%id, "closing terminal session");
                             conn.send(&ClientMessage::TermClose { id }).await?;
                         }
+                        InputAction::TermSetPinned { id, pinned } => {
+                            tracing::info!(%id, pinned, "toggling terminal session pin");
+                            conn.send(&ClientMessage::TermSetPinned { id, pinned }).await?;
+                        }
                         InputAction::TermInput { id, bytes } => {
                             use base64::Engine as _;
                             let data = base64::engine::general_purpose::STANDARD.encode(&bytes);

@@ -666,7 +666,9 @@ fn status_bar_terminal_list() {
     expect_bar_tokens(
         "terminal list",
         &bar,
-        &["[n]", "[P]", "[Enter]", "[r]", "[d]", "[j/k]", "[q/Esc]"],
+        &[
+            "[n]", "[P]", "[Enter]", "[r]", "[d]", "[p]", "[j/k]", "[q/Esc]",
+        ],
     );
 }
 

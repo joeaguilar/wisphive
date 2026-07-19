@@ -239,6 +239,7 @@ impl TerminalSessionManager {
             sort_order,
             created_by,
             replay_acl: Vec::new(),
+            pinned: false,
         };
         // Persist the restorable respawn spec (itr#590): command/args/cwd
         // live on the meta row; the client-requested env overrides are
@@ -454,6 +455,19 @@ impl TerminalSessionManager {
         let sessions = self.sessions.lock().await;
         if let Some(sess) = sessions.get(&id) {
             sess.meta.lock().await.sort_order = order;
+        }
+        Ok(())
+    }
+
+    /// Pin or unpin a session as an "important session" (itr#589). Persists
+    /// to SQLite and mirrors to the live meta, matching `set_group` /
+    /// `set_sort_order`. Dormant until itr#591 consumes the flag — pinning
+    /// changes no spawn/teardown/orphan behavior in this manager.
+    pub async fn set_pinned(&self, id: Uuid, pinned: bool) -> Result<()> {
+        self.state_db.set_terminal_pinned(id, pinned).await?;
+        let sessions = self.sessions.lock().await;
+        if let Some(sess) = sessions.get(&id) {
+            sess.meta.lock().await.pinned = pinned;
         }
         Ok(())
     }

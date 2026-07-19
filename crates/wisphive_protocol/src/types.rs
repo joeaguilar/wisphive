@@ -856,6 +856,13 @@ pub struct TerminalSessionMeta {
     /// here. Empty on legacy/default sessions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub replay_acl: Vec<String>,
+    /// User-marked "important session" flag (itr#589): a pinned session is a
+    /// candidate for respawn-on-restart (itr#591 consumes it). Dormant until
+    /// then — pinning changes no runtime behavior today; unpinned sessions
+    /// keep the orphan-on-restart behavior. Additive: legacy peers omit the
+    /// field and it defaults to `false`.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 /// Content-aware rule for a specific tool.

@@ -70,6 +70,10 @@ pub enum InputAction {
     TermDetach { id: uuid::Uuid },
     /// Close a terminal session.
     TermClose { id: uuid::Uuid },
+    /// Pin/unpin a terminal session as an "important session" (itr#589):
+    /// pinned sessions become respawn-on-restart candidates (dormant until
+    /// itr#591 consumes the flag).
+    TermSetPinned { id: uuid::Uuid, pinned: bool },
     /// Forward raw input bytes to a PTY.
     TermInput { id: uuid::Uuid, bytes: Vec<u8> },
     /// Start replaying a terminal session.
@@ -1583,6 +1587,55 @@ mod tests {
         }
     }
 
+    /// itr#589: `p` in the terminal list toggles the selected session's pin
+    /// flag — pinned→unpin, unpinned→pin — and no-ops on an empty list.
+    #[test]
+    fn terminal_list_p_toggles_pin_on_selected_session() {
+        let meta = wisphive_protocol::TerminalSessionMeta {
+            id: uuid::Uuid::new_v4(),
+            label: Some("main".into()),
+            command: "/bin/sh".into(),
+            args: Vec::new(),
+            cwd: "/tmp".into(),
+            cols: 80,
+            rows: 24,
+            started_at: chrono::Utc::now(),
+            ended_at: None,
+            exit_code: None,
+            status: wisphive_protocol::TerminalStatus::Running,
+            group_name: None,
+            sort_order: 0,
+            created_by: None,
+            replay_acl: Vec::new(),
+            pinned: false,
+        };
+        let mut app = App::new();
+        app.view_mode = ViewMode::TerminalList;
+        app.terminals = vec![meta.clone()];
+        app.terminals_index = 0;
+
+        let press_p = Event::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        match handle_event(&mut app, press_p.clone()) {
+            InputAction::TermSetPinned { id, pinned } => {
+                assert_eq!(id, meta.id);
+                assert!(pinned, "unpinned session must toggle to pinned");
+            }
+            _ => panic!("expected TermSetPinned"),
+        }
+
+        app.terminals[0].pinned = true;
+        match handle_event(&mut app, press_p.clone()) {
+            InputAction::TermSetPinned { id, pinned } => {
+                assert_eq!(id, meta.id);
+                assert!(!pinned, "pinned session must toggle to unpinned");
+            }
+            _ => panic!("expected TermSetPinned"),
+        }
+
+        app.terminals.clear();
+        assert!(matches!(handle_event(&mut app, press_p), InputAction::None));
+    }
+
     #[test]
     fn bracket_keys_navigate_pending_decision_details() {
         let mut app = App::new();
@@ -1708,6 +1761,19 @@ fn handle_terminal_list_input(app: &mut App, key: KeyEvent) -> InputAction {
         KeyCode::Char('d') => {
             if let Some(meta) = app.selected_terminal() {
                 InputAction::TermClose { id: meta.id }
+            } else {
+                InputAction::None
+            }
+        }
+        // Toggle the pin ("important session") flag on the selected session
+        // (itr#589). The daemon persists it and broadcasts the refreshed
+        // list, so the row updates when the TermListResponse arrives.
+        KeyCode::Char('p') => {
+            if let Some(meta) = app.selected_terminal() {
+                InputAction::TermSetPinned {
+                    id: meta.id,
+                    pinned: !meta.pinned,
+                }
             } else {
                 InputAction::None
             }

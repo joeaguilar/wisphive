@@ -1042,6 +1042,7 @@ fn terminal_meta(
         sort_order: 0,
         created_by: created_by.map(str::to_string),
         replay_acl: replay_acl.into_iter().map(str::to_string).collect(),
+        pinned: false,
     }
 }
 
@@ -1111,6 +1112,61 @@ async fn wait_for_web_audit_event(
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("missing web_audit event {event} for terminal session {session_id}");
+}
+
+/// itr#589 end-to-end: a client's `term_set_pinned` persists the flag in
+/// SQLite and broadcasts a refreshed `term_list_response` carrying it, so
+/// every connected client converges; toggling off restores the default.
+#[tokio::test]
+async fn term_set_pinned_persists_and_broadcasts_updated_meta() {
+    let (_tmp, config) = temp_config_without_notifications();
+    let socket_path = config.socket_path.clone();
+    let db_path = config.db_path.clone();
+    let shutdown_tx = start_server(config).await;
+
+    let session_id = seed_terminal_history(&db_path, None, Vec::new(), Vec::new()).await;
+
+    let (mut tui_lines, mut tui_writer) = connect_as_tui(&socket_path).await;
+    // A second connected client must converge via the broadcast alone.
+    let (mut observer_lines, _observer_writer) = connect_as_tui(&socket_path).await;
+
+    for pinned in [true, false] {
+        tui_writer
+            .write_all(
+                encode(&ClientMessage::TermSetPinned {
+                    id: session_id,
+                    pinned,
+                })
+                .unwrap()
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        for lines in [&mut tui_lines, &mut observer_lines] {
+            let msg = next_tui_msg(lines, |m| {
+                matches!(m, ServerMessage::TermListResponse { .. })
+            })
+            .await;
+            let ServerMessage::TermListResponse { sessions } = msg else {
+                unreachable!()
+            };
+            let session = sessions
+                .iter()
+                .find(|s| s.id == session_id)
+                .expect("pinned session present in broadcast list");
+            assert_eq!(session.pinned, pinned, "broadcast meta carries the flag");
+        }
+
+        // The flag is durable, not just broadcast: read it back from SQLite.
+        let db = wisphive_daemon::state::StateDb::open_client(&db_path.to_string_lossy())
+            .await
+            .unwrap();
+        let row = db.get_terminal_session(session_id).await.unwrap().unwrap();
+        assert_eq!(row.pinned, pinned, "flag persisted in terminal_sessions");
+    }
+
+    let _ = shutdown_tx.send(true);
 }
 
 #[tokio::test]
