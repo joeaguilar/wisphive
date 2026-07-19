@@ -52,3 +52,6 @@ Reviewer: conforms=TRUE, oracle_adequate=TRUE, B-A4/B-A8/B-A9 all SUPPORTS — n
 
 ## L3/decision — 2026-07-19T03:00:32Z (LANDED)
 Rework #1 verified: prompt_shaped_event scoping on BOTH promptless resolvers (incl. the flagged half-step on resolve_always_defer's operator-class path — ACCEPTED: same class, same premise, reviewer's finding text covers it); escape-hatch sentences; binary-spawn env test headless_marker_denies_intrinsic_defer_with_audit. Patch applied CLEAN on d787fab. Gate land-603-L3 EXIT 0 (53s). CLAUDE.md always-defer promptless caveat folded at landing. pidfile flake third occurrence noted on #611 already.
+
+## L4/decision — 2026-07-19T03:00:45Z
+Claimed itr#568 (lane B) on HEAD 9c1c82e. Registry/reaper territory (server.rs reaper region + registry.rs — regions untouched by other lanes). Next 603 landing = 5th chain link → 5-landed-links council fires at L5 (#561) landing per premise.

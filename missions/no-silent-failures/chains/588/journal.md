@@ -27,3 +27,6 @@ Reviewer: conforms=TRUE, oracle_adequate=TRUE, C-A1/C-A3 SUPPORTS — no council
 
 ## L2/decision — 2026-07-19T02:56:59Z (LANDED)
 Rework #1 verified (neutral tooltips, .term-pinned rule via var(--text-dim), no test churn needed). Patch applied CLEAN on 641895d. Gate land-588-L2 EXIT 0 (workspace + eslint + vitest).
+
+## L3/decision — 2026-07-19T02:57:12Z
+Claimed itr#591 (lane A) on HEAD d787fab — chain TERMINAL link. Claim context: handoff notes (a)-(e) on the issue + Terminals e2e coverage hole. User-visible: reconcile goes LIVE here; full e2e at landing.

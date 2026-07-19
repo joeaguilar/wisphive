@@ -75,3 +75,13 @@ NEXT: claim 602/L1 (#567) lane A · claim 603/L1 (#560) lane B.
 - LEARNED: read-side tolerance can silently MUTATE (backslash-escape labels) — writer fix #612 is the real close; dormancy-by-pub-API holds but nothing prevents an accidental early consumer.
 - WATCH: 603 chain-landed count = 3; the 5-link council fires at #561's landing. Remaining: #559 (in gate) → #568 → #561 · 588: #589 → #591 (terminal, e2e).
 - NEXT: tally #559 report → review → land · #589 report → review → land.
+
+## Pulse — 2026-07-18 (9 landed)
+
+`WALK · landed 9/11 · burn n/a · lanes 2/2`
+
+- LANDED: 588#L2 itr#589 → d787fab (pin flag persisted + TUI/web toggles, honest neutral wording, dormant until #591). 603#L3 itr#559 → 9c1c82e (headless intrinsic asks: silent block → loud audited deny with escape hatch; interactive contract pinned unchanged; Chat seam documented; plan-mode KEEP ratified).
+- MOVED: 588/L3 (#591 reconcile-on-start, chain TERMINAL, e2e-mandated incl. first-ever Terminals spec) walking lane A. 603/L4 (#568 false-disconnect reaping) walking lane B.
+- LEARNED: reviewer sweep proved the headless markers leak into no interactive path; block-shaped-event Deny inversion caught pre-land (Stop-deny = keep working); Terminals view had zero e2e coverage repo-wide.
+- WATCH: 603's 5-landed-links council fires at #561's landing (next after #568). Then both chains terminal → closure oracles.
+- NEXT: #568 report → review → land → claim #561 (5-link council) · #591 report → review → land → seal 588 → closure.
