@@ -21,3 +21,12 @@ __pycache__/
 
 # Transient Playwright-MCP browser output (console logs, screenshots)
 .playwright-mcp/
+
+# SQLite sidecars for the itr tracker DB
+.itr.db-*
+
+# Stray root npm lockfile (frontend lockfile lives in crates/wisphive_web/frontend)
+/package-lock.json
+
+# Symlink into the external skills repo
+.claude/workflows
