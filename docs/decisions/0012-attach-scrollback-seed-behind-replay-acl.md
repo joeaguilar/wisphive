@@ -187,3 +187,35 @@ attachment handles; and no terminal payload bytes leak into logs or replay-audit
 **Silent denial.** This ADR documents that an unauthorized attach silently degrades to a screen-only
 catchup. ADR-0013 later asserted that denials "remain audited," which contradicts this. That
 contradiction is real and is resolved in favour of auditing — see ADR-0013 Correction 1 and itr#629.
+
+## Correction 2 (2026-07-19): the restated invariant is STILL conditional
+
+`dc63cad` (itr#626) fixed the original drop/duplicate interleavings via producer-side atomicity, and
+Correction 1's RESOLVED block claims the invariant now holds. A second independent review found that
+claim is **still overbroad**. Recorded rather than edited, for the same reason as before.
+
+**1. `seq >= N` frames can still be dropped — receiver overflow (itr#626, reopened).** `attach_with`
+subscribes, then leaves the receiver **undrained** across the 500 ms persistence wait, the seed
+query, the catchup build, and its awaited delivery. The forwarder only begins receiving after
+`attach_with` returns. The broadcast ring holds 256 frames of up to 4096 bytes, so ~>1 MiB of output
+during that window yields `Lagged`, and the server responds by telling the client to re-attach and
+terminating the forwarder. **A subscription existing is not the same as delivery being exactly
+once.** The invariant holds only in the absence of receiver lag.
+
+**2. The seed's completeness rests on a watermark that is not contiguous (itr#633).** A failed insert
+batch is discarded, and a later successful batch advances the watermark via `fetch_max` — so it marks
+*latest persisted*, not *contiguously persisted*, while the seed logic consumes it as the latter.
+
+**3. The timeout path degrades silently (itr#632)**, and the wait runs *before* the ACL decision, so
+a stalled batcher taxes even attaches that will be denied.
+
+**Wording fix:** the invariant's "every `seq < N` frame has bytes in the snapshot" is literally
+false for **input** frames, which are never parser content. It should read "every *output* frame".
+
+**Also noted:** the preservation rules ("never assign a seq or mutate the parser outside the lock")
+are documented but **not type-enforced** — `next_seq()` does not require a parser guard — so
+correctness rests on module discipline rather than the compiler. Worth making structural.
+
+**Standing lesson for this ADR:** three rounds of stated invariants have now each been narrower in
+practice than in prose. Future edits should state the *conditions* under which a guarantee holds
+rather than asserting it unconditionally.
