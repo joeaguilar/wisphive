@@ -395,7 +395,7 @@ mod tests {
         let mut meta = make_term_meta(id);
         meta.ended_at = Some(chrono::Utc::now() - chrono::Duration::days(60));
         meta.status = TerminalStatus::Exited;
-        db.create_terminal_session(&meta).await.unwrap();
+        db.create_terminal_session(&meta, None).await.unwrap();
 
         let events: Vec<_> = (0..5u64)
             .map(|seq| {
@@ -460,7 +460,7 @@ mod tests {
 
         // A still-running session (ended_at = None) must never be pruned.
         let meta = make_term_meta(id);
-        db.create_terminal_session(&meta).await.unwrap();
+        db.create_terminal_session(&meta, None).await.unwrap();
         let events: Vec<_> = (0..3u64)
             .map(|seq| {
                 (

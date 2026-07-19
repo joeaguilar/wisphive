@@ -34,7 +34,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 use wisphive_protocol::{ServerMessage, TerminalDirection, TerminalSessionMeta, TerminalStatus};
 
-use crate::state::StateDb;
+use crate::state::{StateDb, TerminalEnvSpec};
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
@@ -240,7 +240,16 @@ impl TerminalSessionManager {
             created_by,
             replay_acl: Vec::new(),
         };
-        self.state_db.create_terminal_session(&meta).await?;
+        // Persist the restorable respawn spec (itr#590): command/args/cwd
+        // live on the meta row; the client-requested env overrides are
+        // redaction-classified into `env_json` (see `TerminalEnvSpec` for
+        // the secret-handling semantics). The daemon-inherited environment
+        // is deliberately NOT captured — a reconciling daemon re-inherits
+        // current values at respawn.
+        let env_spec = env.as_ref().and_then(TerminalEnvSpec::from_requested_env);
+        self.state_db
+            .create_terminal_session(&meta, env_spec.as_ref())
+            .await?;
 
         let session = Arc::new(TerminalSession {
             id,
@@ -791,5 +800,101 @@ mod tests {
                 .is_err()
         );
         assert!(manager.resize(meta.id, 100, 30).await.is_err());
+    }
+
+    /// itr#590 AC#3 PIN: a respawn driven purely from the stored spec lands
+    /// in the same cwd with the same command; non-secret env is reproduced
+    /// verbatim; secret env is re-sourced from the (simulated) current daemon
+    /// environment — never replayed stale, never persisted cleartext.
+    #[tokio::test]
+    async fn respawn_from_stored_spec_reproduces_cwd_command_and_env() {
+        let state_db = Arc::new(StateDb::open(":memory:").await.expect("open test db"));
+        let (tui_tx, _) = broadcast::channel(16);
+        let manager = Arc::new(TerminalSessionManager::new(state_db.clone(), tui_tx));
+
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let cwd_path = cwd.path().canonicalize().expect("canonicalize cwd");
+        let script = "printf 'CWD=%s M=%s K=%s READY' \"$(pwd -P)\" \"$MY_MARKER\" \"$MY_API_KEY\"; read line";
+        let env: HashMap<String, String> = [
+            ("MY_MARKER".to_string(), "mv1".to_string()),
+            ("MY_API_KEY".to_string(), "sk-stale12345678".to_string()),
+        ]
+        .into();
+
+        let original = manager
+            .create(
+                Some("respawn-src".into()),
+                Some("/bin/sh".into()),
+                Some(vec!["-c".into(), script.into()]),
+                Some(cwd_path.clone()),
+                200,
+                50,
+                Some(env),
+                Some("test".into()),
+            )
+            .await
+            .expect("create original session");
+        wait_for_ready(&manager, original.id).await;
+        manager.close(original.id).await.expect("close original");
+        wait_for_persisted_exit(&state_db, original.id).await;
+
+        // Read back the stored spec — this is all itr#591's reconciler will
+        // have after a daemon restart.
+        let spec = state_db
+            .get_terminal_respawn_spec(original.id)
+            .await
+            .expect("read respawn spec")
+            .expect("respawn spec exists");
+        assert_eq!(spec.command, "/bin/sh");
+        assert_eq!(spec.cwd, cwd_path);
+        let env_spec = spec.env.expect("env spec persisted");
+        assert!(
+            env_spec.set.values().all(|v| !v.contains("sk-stale")),
+            "secret value persisted cleartext in the stored spec"
+        );
+        assert!(env_spec.inherit_names.contains(&"MY_API_KEY".to_string()));
+
+        // Materialize against a simulated *current* daemon environment that
+        // carries a rotated secret: inherit-current, not replay-stale.
+        let daemon_env: HashMap<String, String> =
+            [("MY_API_KEY".to_string(), "sk-fresh87654321".to_string())].into();
+        let respawn_env = env_spec.materialize(&daemon_env);
+
+        let respawned = manager
+            .create(
+                Some("respawn-dst".into()),
+                Some(spec.command),
+                Some(spec.args),
+                Some(spec.cwd),
+                200,
+                50,
+                Some(respawn_env),
+                Some("test".into()),
+            )
+            .await
+            .expect("respawn from stored spec");
+        wait_for_ready(&manager, respawned.id).await;
+
+        let session = manager.get(respawned.id).await.expect("respawned live");
+        let screen = String::from_utf8_lossy(&session.catchup_snapshot()).to_string();
+        let expected_cwd = format!("CWD={}", cwd_path.display());
+        assert!(
+            screen.contains(&expected_cwd),
+            "respawn landed in the wrong cwd: {screen}"
+        );
+        assert!(
+            screen.contains("M=mv1"),
+            "non-secret env not reproduced verbatim: {screen}"
+        );
+        assert!(
+            screen.contains("K=sk-fresh87654321"),
+            "secret env not re-sourced from the daemon environment: {screen}"
+        );
+        assert!(
+            !screen.contains("sk-stale"),
+            "stale secret was replayed into the respawn: {screen}"
+        );
+
+        manager.close(respawned.id).await.expect("close respawned");
     }
 }

@@ -1055,7 +1055,7 @@ async fn seed_terminal_history(
         .await
         .unwrap();
     let id = uuid::Uuid::new_v4();
-    db.create_terminal_session(&terminal_meta(id, created_by, replay_acl))
+    db.create_terminal_session(&terminal_meta(id, created_by, replay_acl), None)
         .await
         .unwrap();
     let rows: Vec<_> = payloads
