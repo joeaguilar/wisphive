@@ -20,6 +20,7 @@
 //! cross-referencing approvals with the terminal they came from.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,6 +38,11 @@ use wisphive_protocol::{ServerMessage, TerminalDirection, TerminalSessionMeta, T
 use crate::state::{StateDb, TerminalEnvSpec};
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+/// Test-only pause hook invoked at the top of `ingest_output` with the frame
+/// bytes (itr#626 interleaving tests).
+#[cfg(test)]
+type IngestGapHook = Box<dyn Fn(&[u8]) + Send>;
 
 /// Maximum PTY dimensions accepted. vt100 allocates per-cell so very large
 /// terminals burn memory; wisphive rejects anything past this bound.
@@ -75,6 +81,13 @@ pub struct TerminalSession {
     master: std::sync::Mutex<Box<dyn MasterPty + Send>>,
     /// vt100 screen state, updated by the reader thread. Snapshot source for
     /// catchup when new clients attach.
+    ///
+    /// itr#626: this mutex is ALSO the sequence-assignment lock. Every
+    /// `next_seq()` call for a live session happens while holding it (output:
+    /// `ingest_output`; input/resize: their command handlers), so under the
+    /// lock the parser's content and the seq counter are always mutually
+    /// consistent — which is what lets `attach_with` capture the boundary,
+    /// the snapshot, and the broadcast subscription atomically.
     parser: std::sync::Mutex<vt100::Parser>,
     /// Broadcast fanout for live viewers. Lag drops for laggard receivers;
     /// they are expected to re-attach and pick up a fresh catchup snapshot.
@@ -97,6 +110,22 @@ pub struct TerminalSession {
     /// daemon's startup sweep captures it as a respawn candidate ("running
     /// at shutdown" candidacy). Never set outside daemon teardown.
     preserve_status_on_shutdown: std::sync::atomic::AtomicBool,
+    /// `seq + 1` of the newest OUTPUT frame ingested by the reader (0 =
+    /// none this epoch). Written inside the parser/seq critical section, so
+    /// an attach reading it under the same lock learns exactly which output
+    /// frames its scrollback seed must cover (itr#626).
+    output_high_water: AtomicU64,
+    /// `seq + 1` of the newest OUTPUT frame the db batcher has successfully
+    /// persisted (0 = none this epoch). Shared with `run_db_batcher`; the
+    /// attach seam waits (bounded) until this reaches the high-water mark
+    /// captured at the boundary so the seed read cannot miss output that has
+    /// already scrolled off the screen snapshot (itr#626).
+    output_persisted: Arc<AtomicU64>,
+    /// Test-only pause point inside `ingest_output`, used by the itr#626
+    /// race tests to hold the reader at a chosen interleaving while an
+    /// attach runs. Always `None` outside tests.
+    #[cfg(test)]
+    ingest_gap_hook: std::sync::Mutex<Option<IngestGapHook>>,
 }
 
 impl TerminalSession {
@@ -105,8 +134,10 @@ impl TerminalSession {
         self.seq.fetch_add(1, Ordering::AcqRel)
     }
 
-    /// Read the sequence counter without incrementing. Used by new viewers
-    /// to filter out any stale frames their broadcast receiver may re-deliver.
+    /// Read the sequence counter without incrementing. Only meaningful as an
+    /// attach boundary when read under the parser/seq lock (see
+    /// `attach_with`, itr#626); viewers use the captured value to filter out
+    /// stale frames their broadcast receiver may re-deliver.
     pub fn seq_load(&self) -> u64 {
         self.seq.load(Ordering::Acquire)
     }
@@ -121,6 +152,128 @@ impl TerminalSession {
     pub fn catchup_snapshot(&self) -> Vec<u8> {
         let parser = self.parser.lock().expect("parser poisoned");
         parser.screen().contents_formatted()
+    }
+
+    #[cfg(test)]
+    fn set_ingest_gap_hook(&self, hook: IngestGapHook) {
+        *self.ingest_gap_hook.lock().expect("gap hook poisoned") = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn run_ingest_gap_hook(&self, bytes: &[u8]) {
+        if let Some(hook) = self
+            .ingest_gap_hook
+            .lock()
+            .expect("gap hook poisoned")
+            .as_ref()
+        {
+            hook(bytes);
+        }
+    }
+
+    /// Ingest one output frame from the PTY reader: update the vt100 parser,
+    /// assign a sequence number, and broadcast to live viewers. Returns the
+    /// frame for persistence enqueueing.
+    ///
+    /// itr#626: the vt100 update and the sequence assignment form ONE
+    /// critical section under the parser lock. Pre-fix they were separate
+    /// steps, so an attach could snapshot a parser that already contained a
+    /// frame whose seq had not been assigned yet — the frame then arrived
+    /// live with `seq >= next_seq` and rendered twice.
+    fn ingest_output(&self, bytes: Bytes) -> Arc<TermFrame> {
+        #[cfg(test)]
+        self.run_ingest_gap_hook(&bytes);
+        let (seq, ts_us) = {
+            let mut parser = self.parser.lock().expect("parser poisoned");
+            parser.process(&bytes);
+            let seq = self.next_seq();
+            self.output_high_water.store(seq + 1, Ordering::Release);
+            (seq, chrono::Utc::now().timestamp_micros())
+        };
+        let frame = Arc::new(TermFrame {
+            seq,
+            ts_us,
+            direction: TerminalDirection::Output,
+            bytes,
+        });
+        // Broadcast to live viewers (drops for slow receivers). The send
+        // happens after the critical section, so any receiver subscribed
+        // under the lock (attach_with) with boundary N is guaranteed to see
+        // every frame assigned seq >= N.
+        let _ = self.bcast.send(frame.clone());
+        frame
+    }
+
+    /// Perform the attach seam: capture the sequence boundary, read the
+    /// (already ACL-decided) scrollback seed via `read_seed`, deliver the
+    /// catchup via `deliver`, and return the live receiver plus the boundary
+    /// the forwarder must filter against.
+    ///
+    /// itr#626 exactly-once invariant: the boundary `N`, the parser
+    /// snapshot, and the broadcast subscription are captured in ONE critical
+    /// section under the parser/seq lock, with no awaits inside. Because
+    /// every seq assignment also happens under that lock:
+    ///
+    /// - every frame with `seq < N` already has its bytes in the snapshot
+    ///   (and, for output, is covered by the seed read below); if the
+    ///   receiver still sees such a frame, the forwarder's `seq < N` filter
+    ///   drops it — never rendered twice;
+    /// - every frame with `seq >= N` is assigned (and therefore broadcast)
+    ///   strictly after the subscription exists — never dropped.
+    ///
+    /// The persistence wait between the critical section and the seed read
+    /// closes the remaining scrollback gap: output below `N` still sitting
+    /// in the db batcher would otherwise be invisible to the seed query and
+    /// absent from this attachment's scrollback once it scrolls off screen.
+    pub async fn attach_with<SF, DF, E>(
+        &self,
+        read_seed: impl FnOnce(u64) -> SF,
+        deliver: impl FnOnce(ServerMessage) -> DF,
+    ) -> Result<(broadcast::Receiver<Arc<TermFrame>>, u64), E>
+    where
+        SF: Future<Output = Vec<u8>>,
+        DF: Future<Output = Result<(), E>>,
+    {
+        let (next_seq, snapshot, rx, settle_target) = {
+            let parser = self.parser.lock().expect("parser poisoned");
+            let next_seq = self.seq_load();
+            let snapshot = parser.screen().contents_formatted();
+            let rx = self.bcast.subscribe();
+            let settle_target = self.output_high_water.load(Ordering::Acquire);
+            (next_seq, snapshot, rx, settle_target)
+        };
+        self.await_output_persisted(settle_target, Duration::from_millis(500))
+            .await;
+        let seed = read_seed(next_seq).await;
+        let catchup = catchup_message(self, next_seq, &snapshot, &seed);
+        deliver(catchup).await?;
+        Ok((rx, next_seq))
+    }
+
+    /// Bounded wait for the db batcher to persist every output frame below
+    /// `target` (a high-water mark: `seq + 1`). On timeout the attach
+    /// degrades loudly to whatever is persisted — the screen repaint stays
+    /// authoritative for anything still on screen.
+    async fn await_output_persisted(&self, target: u64, max_wait: Duration) {
+        if target == 0 || self.output_persisted.load(Ordering::Acquire) >= target {
+            return;
+        }
+        let deadline = tokio::time::Instant::now() + max_wait;
+        loop {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            if self.output_persisted.load(Ordering::Acquire) >= target {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                warn!(
+                    session_id = %self.id,
+                    target,
+                    persisted = self.output_persisted.load(Ordering::Acquire),
+                    "attach seed persistence catch-up timed out; seeding what is persisted"
+                );
+                return;
+            }
+        }
     }
 }
 
@@ -239,6 +392,10 @@ impl TerminalSessionManager {
             killer: std::sync::Mutex::new(Some(spawned.killer)),
             ended: std::sync::atomic::AtomicBool::new(false),
             preserve_status_on_shutdown: std::sync::atomic::AtomicBool::new(false),
+            output_high_water: AtomicU64::new(0),
+            output_persisted: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            ingest_gap_hook: std::sync::Mutex::new(None),
         });
 
         self.sessions.lock().await.insert(id, session.clone());
@@ -248,7 +405,12 @@ impl TerminalSessionManager {
         spawn_reader_thread(session.clone(), spawned.reader, db_tx.clone());
 
         // DB batcher: drains frames into SQLite in small transactional batches.
-        tokio::spawn(run_db_batcher(id, db_rx, self.state_db.clone()));
+        tokio::spawn(run_db_batcher(
+            id,
+            db_rx,
+            self.state_db.clone(),
+            session.output_persisted.clone(),
+        ));
 
         // Waiter: whenever the reader exits or the child dies, persist the
         // final status and broadcast TermEnded to all TUIs.
@@ -274,8 +436,13 @@ impl TerminalSessionManager {
             .await
             .ok_or_else(|| anyhow!("terminal session {id} not found"))?;
 
-        // Log the input event for faithful replay.
-        let seq = session.next_seq();
+        // Log the input event for faithful replay. The seq assignment takes
+        // the parser lock (the sequence-assignment lock, itr#626) so that an
+        // attach boundary cleanly partitions ALL frames, not just output.
+        let seq = {
+            let _seq_lock = session.parser.lock().expect("parser poisoned");
+            session.next_seq()
+        };
         let ts_us = chrono::Utc::now().timestamp_micros();
         let frame = TermFrame {
             seq,
@@ -328,10 +495,15 @@ impl TerminalSessionManager {
                 })
                 .map_err(|e| anyhow!("pty resize failed: {e}"))?;
         }
-        {
+        // The screen-state change and the seq assignment share one critical
+        // section (the sequence-assignment lock, itr#626): an attach snapshot
+        // either sees the resized screen with the resize frame below its
+        // boundary, or neither.
+        let seq = {
             let mut parser = session.parser.lock().expect("parser poisoned");
             parser.set_size(rows, cols);
-        }
+            session.next_seq()
+        };
         {
             let mut meta = session.meta.lock().await;
             meta.cols = cols;
@@ -339,7 +511,6 @@ impl TerminalSessionManager {
         }
 
         // Log as a resize event.
-        let seq = session.next_seq();
         let ts_us = chrono::Utc::now().timestamp_micros();
         let payload = format!("{cols},{rows}").into_bytes();
         let frame = TermFrame {
@@ -602,6 +773,10 @@ impl TerminalSessionManager {
             killer: std::sync::Mutex::new(Some(killer)),
             ended: std::sync::atomic::AtomicBool::new(false),
             preserve_status_on_shutdown: std::sync::atomic::AtomicBool::new(false),
+            output_high_water: AtomicU64::new(0),
+            output_persisted: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            ingest_gap_hook: std::sync::Mutex::new(None),
         });
 
         // Record the banner as a real (daemon-origin) output event so the
@@ -630,7 +805,12 @@ impl TerminalSessionManager {
 
         self.sessions.lock().await.insert(id, session.clone());
         spawn_reader_thread(session.clone(), spawned.reader, db_tx.clone());
-        tokio::spawn(run_db_batcher(id, db_rx, self.state_db.clone()));
+        tokio::spawn(run_db_batcher(
+            id,
+            db_rx,
+            self.state_db.clone(),
+            session.output_persisted.clone(),
+        ));
         tokio::spawn(run_waiter(
             session.clone(),
             self.state_db.clone(),
@@ -780,21 +960,7 @@ fn spawn_reader_thread(
                     }
                     Ok(n) => {
                         let bytes = Bytes::copy_from_slice(&buf[..n]);
-                        // Feed the vt100 parser so catchup snapshots stay current.
-                        {
-                            let mut parser = session.parser.lock().expect("parser poisoned");
-                            parser.process(&bytes);
-                        }
-                        let seq = session.next_seq();
-                        let ts_us = chrono::Utc::now().timestamp_micros();
-                        let frame = Arc::new(TermFrame {
-                            seq,
-                            ts_us,
-                            direction: TerminalDirection::Output,
-                            bytes,
-                        });
-                        // Broadcast to live viewers (drops for slow receivers).
-                        let _ = session.bcast.send(frame.clone());
+                        let frame = session.ingest_output(bytes);
                         // Enqueue for DB batcher. If the queue fills, a
                         // blocking_send back-pressures the reader — correct:
                         // stalling briefly beats losing audit data.
@@ -824,11 +990,31 @@ fn spawn_reader_thread(
 }
 
 /// Drain frames from the in-memory channel into SQLite in bounded batches.
+///
+/// `output_persisted` is the session's persistence watermark (itr#626):
+/// after each successful batch insert it advances to `seq + 1` of the newest
+/// output frame in the batch, letting the attach seam wait for the seed's
+/// backing rows instead of silently seeding a stale tail. Failed inserts do
+/// not advance it — an attach then degrades loudly after its bounded wait.
 async fn run_db_batcher(
     session_id: Uuid,
     mut rx: mpsc::Receiver<TermFrame>,
     state_db: Arc<StateDb>,
+    output_persisted: Arc<AtomicU64>,
 ) {
+    fn note_persisted(
+        pending: &[(Uuid, u64, i64, TerminalDirection, Vec<u8>)],
+        watermark: &AtomicU64,
+    ) {
+        if let Some(max) = pending
+            .iter()
+            .filter(|row| matches!(row.3, TerminalDirection::Output))
+            .map(|row| row.1)
+            .max()
+        {
+            watermark.fetch_max(max + 1, Ordering::AcqRel);
+        }
+    }
     let mut pending: Vec<(Uuid, u64, i64, TerminalDirection, Vec<u8>)> = Vec::with_capacity(128);
     loop {
         // Drain until we have enough for a batch or 50 ms pass.
@@ -853,10 +1039,14 @@ async fn run_db_batcher(
                     }
                     None => {
                         // Sender dropped; flush whatever's left and exit.
-                        if !pending.is_empty()
-                            && let Err(e) = state_db.insert_terminal_events_batch(&pending).await {
-                                warn!(session_id = %session_id, "final batch insert failed: {e}");
+                        if !pending.is_empty() {
+                            match state_db.insert_terminal_events_batch(&pending).await {
+                                Ok(()) => note_persisted(&pending, &output_persisted),
+                                Err(e) => {
+                                    warn!(session_id = %session_id, "final batch insert failed: {e}");
+                                }
                             }
+                        }
                         return;
                     }
                 }
@@ -866,10 +1056,13 @@ async fn run_db_batcher(
             }
         }
 
-        if !pending.is_empty()
-            && let Err(e) = state_db.insert_terminal_events_batch(&pending).await
-        {
-            warn!(session_id = %session_id, "batch insert failed: {e}");
+        if !pending.is_empty() {
+            match state_db.insert_terminal_events_batch(&pending).await {
+                Ok(()) => note_persisted(&pending, &output_persisted),
+                Err(e) => {
+                    warn!(session_id = %session_id, "batch insert failed: {e}");
+                }
+            }
         }
         pending.clear();
     }
@@ -973,10 +1166,13 @@ pub const ATTACH_SCROLLBACK_SEED_MAX_BYTES: usize = 256 * 1024;
 
 /// Build a `TermCatchup` message from a vt100 snapshot.
 ///
-/// `scrollback_seed` (itr#624) is prepended raw: the client resets its
-/// emulator and replays these historical output bytes, which rebuilds real
-/// scrollback client-side, before the authoritative screen repaint. The
-/// snapshot's vt100 `contents_formatted()` prefix is `ESC[H ESC[J` (home +
+/// `snapshot` is the screen repaint captured by `attach_with` inside its
+/// boundary critical section (itr#626) — never re-snapshotted here, or the
+/// repaint would drift ahead of the `next_seq` boundary. `scrollback_seed`
+/// (itr#624) is prepended raw: the client resets its emulator and replays
+/// these historical output bytes, which rebuilds real scrollback
+/// client-side, before the authoritative screen repaint. The snapshot's
+/// vt100 `contents_formatted()` prefix is `ESC[H ESC[J` (home +
 /// erase-below), which never touches the emulator's scrollback, so the seam
 /// cannot duplicate or wipe the seeded history. Pass an empty seed for the
 /// legacy screen-only catchup (unauthorized requesters keep exactly the old
@@ -985,10 +1181,11 @@ pub const ATTACH_SCROLLBACK_SEED_MAX_BYTES: usize = 256 * 1024;
 pub fn catchup_message(
     session: &TerminalSession,
     next_seq: u64,
+    snapshot: &[u8],
     scrollback_seed: &[u8],
 ) -> ServerMessage {
     let mut screen = scrollback_seed.to_vec();
-    screen.extend_from_slice(&session.catchup_snapshot());
+    screen.extend_from_slice(snapshot);
     // cols/rows are tracked in the parser but we read them off meta for
     // simplicity; they are updated on resize.
     let meta = session
@@ -1087,8 +1284,9 @@ mod tests {
         wait_for_ready(&manager, meta.id).await;
         let session = manager.get(meta.id).await.expect("session live");
 
-        let plain = catchup_message(&session, 7, &[]);
-        let seeded = catchup_message(&session, 7, b"HISTORY\r\n");
+        let snapshot = session.catchup_snapshot();
+        let plain = catchup_message(&session, 7, &snapshot, &[]);
+        let seeded = catchup_message(&session, 7, &snapshot, b"HISTORY\r\n");
         let (plain_screen, seeded_screen) = match (plain, seeded) {
             (
                 ServerMessage::TermCatchup {
@@ -1127,6 +1325,403 @@ mod tests {
             "screen repaint should carry the home+erase-below prefix"
         );
         manager.close(meta.id).await.expect("close session");
+    }
+
+    /// Extract every `L-<n>` marker from a byte stream, in order. Markers are
+    /// plain text, so this works on raw frames and on the ANSI-bearing screen
+    /// repaint alike (vt100 renders a plain-text row's characters
+    /// contiguously).
+    fn stream_tokens(bytes: &[u8]) -> Vec<usize> {
+        let text = String::from_utf8_lossy(bytes);
+        let mut tokens = Vec::new();
+        let mut rest = text.as_ref();
+        while let Some(pos) = rest.find("L-") {
+            rest = &rest[pos + 2..];
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !digits.is_empty() {
+                tokens.push(digits.parse::<usize>().expect("token digits"));
+                rest = &rest[digits.len()..];
+            }
+        }
+        tokens
+    }
+
+    fn count_occurrences(hay: &[u8], needle: &str) -> usize {
+        String::from_utf8_lossy(hay).matches(needle).count()
+    }
+
+    fn decode_catchup_screen(msg: ServerMessage) -> Vec<u8> {
+        match msg {
+            ServerMessage::TermCatchup { screen, .. } => {
+                B64.decode(screen).expect("catchup screen base64")
+            }
+            other => panic!("expected TermCatchup, got {other:?}"),
+        }
+    }
+
+    /// itr#626 DROP window, deterministic: a frame produced while the attach
+    /// is delivering its catchup (after the sequence boundary was captured)
+    /// must still reach the attachment exactly once. Pre-fix, the frame was
+    /// broadcast before the attach subscribed AND excluded from the snapshot
+    /// and seed — delivered zero times.
+    ///
+    /// Determinism: the injection happens inside the `deliver` closure — by
+    /// construction after the boundary capture and before `attach_with`
+    /// returns — and the closure only returns once the injected frame is
+    /// PERSISTED. The reader broadcasts before enqueueing for persistence,
+    /// so a persisted marker proves the broadcast already happened.
+    #[tokio::test]
+    async fn frame_arriving_during_catchup_delivery_is_delivered_exactly_once() {
+        let state_db = Arc::new(StateDb::open(":memory:").await.expect("open test db"));
+        let (tui_tx, _) = broadcast::channel(16);
+        let manager = Arc::new(TerminalSessionManager::new(state_db.clone(), tui_tx));
+        let meta = manager
+            .create(
+                Some("itr626-drop".into()),
+                Some("/bin/sh".into()),
+                Some(vec![
+                    "-c".into(),
+                    "printf READY; while read l; do printf 'OUT-%s\\r\\n' \"$l\"; done".into(),
+                ]),
+                None,
+                80,
+                24,
+                None,
+                Some("test".into()),
+            )
+            .await
+            .expect("create session");
+        wait_for_ready(&manager, meta.id).await;
+        let session = manager.get(meta.id).await.expect("session live");
+
+        let catchup_slot: Arc<std::sync::Mutex<Option<ServerMessage>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let slot = catchup_slot.clone();
+        let inj_manager = manager.clone();
+        let inj_db = state_db.clone();
+        let sess_id = meta.id;
+        let (mut rx, next_seq) = session
+            .attach_with(
+                |_n| async { Vec::new() },
+                move |catchup| async move {
+                    inj_manager
+                        .write_input(sess_id, b"42\n".to_vec())
+                        .await
+                        .expect("inject input");
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            let tail = inj_db
+                                .tail_terminal_output(sess_id, 1 << 20, None)
+                                .await
+                                .expect("tail read");
+                            if count_occurrences(&tail, "OUT-42") > 0 {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("injected frame never persisted");
+                    *slot.lock().unwrap() = Some(catchup);
+                    Ok::<(), anyhow::Error>(())
+                },
+            )
+            .await
+            .expect("attach");
+
+        // Sentinel injected AFTER attach returned: guaranteed to arrive on
+        // the live stream under any implementation, so draining until it
+        // shows up is deterministic.
+        manager
+            .write_input(meta.id, b"done\n".to_vec())
+            .await
+            .expect("sentinel input");
+
+        let mut live = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let frame = rx.recv().await.expect("broadcast closed");
+                if frame.seq < next_seq {
+                    // The live forwarder's filter semantics.
+                    continue;
+                }
+                if matches!(frame.direction, TerminalDirection::Output) {
+                    live.extend_from_slice(&frame.bytes);
+                    if count_occurrences(&live, "OUT-done") > 0 {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("sentinel never arrived on the live stream");
+
+        let catchup_screen = decode_catchup_screen(
+            catchup_slot
+                .lock()
+                .unwrap()
+                .take()
+                .expect("catchup delivered"),
+        );
+        let total =
+            count_occurrences(&catchup_screen, "OUT-42") + count_occurrences(&live, "OUT-42");
+        // Close BEFORE asserting: a panicking assert would otherwise leave
+        // the PTY child alive and the waiter's spawn_blocking wait pinned,
+        // hanging runtime teardown.
+        manager.close(meta.id).await.ok();
+        assert_eq!(
+            total, 1,
+            "a frame produced while the attach catchup was being delivered must reach \
+             the attachment exactly once (0 = dropped, itr#626 DROP; 2 = duplicated)"
+        );
+    }
+
+    /// itr#626 DUPLICATE window, deterministic: the reader ingest and a full
+    /// attach are interleaved at the ingest pause hook. Pre-fix the hook sat
+    /// in the gap between the vt100 update and the sequence assignment, so
+    /// the attach snapshot already contained the frame's bytes while the
+    /// frame was then also assigned `seq >= next_seq` and delivered live —
+    /// the same bytes twice. The fix collapses that gap into one critical
+    /// section shared with the attach boundary capture, so the same schedule
+    /// (reader paused at ingest while an attach completes) now lands the
+    /// frame wholly on the live side.
+    #[tokio::test]
+    async fn attach_overlapping_reader_ingest_delivers_exactly_once() {
+        let state_db = Arc::new(StateDb::open(":memory:").await.expect("open test db"));
+        let (tui_tx, _) = broadcast::channel(16);
+        let manager = Arc::new(TerminalSessionManager::new(state_db.clone(), tui_tx));
+        let meta = manager
+            .create(
+                Some("itr626-dup".into()),
+                Some("/bin/sh".into()),
+                Some(vec!["-c".into(), "printf READY; read line".into()]),
+                None,
+                80,
+                24,
+                None,
+                Some("test".into()),
+            )
+            .await
+            .expect("create session");
+        wait_for_ready(&manager, meta.id).await;
+        let session = manager.get(meta.id).await.expect("session live");
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        session.set_ingest_gap_hook(Box::new(move |bytes| {
+            // Pause ONLY the marker frame: any straggling real PTY output
+            // (e.g. the READY frame's ingest completing late) must pass
+            // through untouched or it would consume the release token.
+            if !bytes.windows(b"GAPMARK".len()).any(|w| w == b"GAPMARK") {
+                return;
+            }
+            let _ = entered_tx.send(());
+            // Ignore errors so the hook degrades to a no-op once the test's
+            // release sender is gone.
+            let _ = release_rx.lock().unwrap().recv();
+        }));
+
+        let ingest_session = session.clone();
+        let ingest = std::thread::spawn(move || {
+            ingest_session.ingest_output(Bytes::from_static(b"GAPMARK\r\n"))
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("ingest never reached the pause hook");
+
+        let catchup_slot: Arc<std::sync::Mutex<Option<ServerMessage>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let slot = catchup_slot.clone();
+        let (mut rx, next_seq) = session
+            .attach_with(
+                |_n| async { Vec::new() },
+                move |catchup| async move {
+                    *slot.lock().unwrap() = Some(catchup);
+                    Ok::<(), anyhow::Error>(())
+                },
+            )
+            .await
+            .expect("attach");
+
+        release_tx.send(()).expect("release ingest");
+        let frame = ingest.join().expect("ingest thread");
+
+        // The ingested frame is the only broadcast after our subscribe
+        // completed (the shell is blocked on `read line`), so one bounded
+        // recv drains everything relevant.
+        let mut live = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while count_occurrences(&live, "GAPMARK") == 0 && tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                Ok(Ok(f)) => {
+                    if f.seq >= next_seq && matches!(f.direction, TerminalDirection::Output) {
+                        live.extend_from_slice(&f.bytes);
+                    }
+                }
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+
+        let catchup_screen = decode_catchup_screen(
+            catchup_slot
+                .lock()
+                .unwrap()
+                .take()
+                .expect("catchup delivered"),
+        );
+        let total =
+            count_occurrences(&catchup_screen, "GAPMARK") + count_occurrences(&live, "GAPMARK");
+        // Close BEFORE asserting (see the DROP test for why).
+        manager.close(meta.id).await.ok();
+        assert_eq!(
+            total, 1,
+            "a frame whose ingest overlaps an attach must reach the attachment exactly \
+             once (2 = duplicated via snapshot + live, itr#626 DUPLICATE; 0 = dropped); \
+             ingested frame seq {} vs boundary {}",
+            frame.seq, next_seq
+        );
+    }
+
+    /// itr#626 acceptance: attach WHILE output is streaming and assert the
+    /// attachment reconstructs EXACTLY the produced stream — every produced
+    /// line exactly once, in order, across seed + screen repaint + live
+    /// frames. Verified at the emulator level (a client vt100 with deep
+    /// scrollback) because the catchup repaint is by design a re-rendering
+    /// of bytes the seed also carries, not a byte-for-byte relay.
+    #[tokio::test]
+    async fn attach_mid_stream_reconstructs_exactly_the_produced_stream() {
+        const LINES: usize = 200;
+        let state_db = Arc::new(StateDb::open(":memory:").await.expect("open test db"));
+        let (tui_tx, _) = broadcast::channel(16);
+        let manager = Arc::new(TerminalSessionManager::new(state_db.clone(), tui_tx));
+        let script = format!(
+            "printf READY; read go; i=0; while [ \"$i\" -lt {LINES} ]; do echo \"L-$i\"; \
+             i=$((i+1)); sleep 0.01; done; echo STREAM-DONE; read fin"
+        );
+        let meta = manager
+            .create(
+                Some("itr626-stream".into()),
+                Some("/bin/sh".into()),
+                Some(vec!["-c".into(), script]),
+                None,
+                80,
+                24,
+                None,
+                Some("test".into()),
+            )
+            .await
+            .expect("create session");
+        wait_for_ready(&manager, meta.id).await;
+        let session = manager.get(meta.id).await.expect("session live");
+        manager
+            .write_input(meta.id, b"go\n".to_vec())
+            .await
+            .expect("start stream");
+
+        // Attach genuinely mid-stream: wait until a chunk of the burst has
+        // already been produced (and partly scrolled off the 24-row screen).
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if count_occurrences(&session.catchup_snapshot(), "L-3") > 0 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("stream never reached mid-point");
+
+        let catchup_slot: Arc<std::sync::Mutex<Option<ServerMessage>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let slot = catchup_slot.clone();
+        let seed_db = state_db.clone();
+        let sess_id = meta.id;
+        let seed_slot: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seed_out = seed_slot.clone();
+        let (mut rx, next_seq) = session
+            .attach_with(
+                move |n| async move {
+                    let seed = seed_db
+                        .tail_terminal_output(sess_id, ATTACH_SCROLLBACK_SEED_MAX_BYTES, Some(n))
+                        .await
+                        .expect("seed read");
+                    *seed_out.lock().unwrap() = seed.clone();
+                    seed
+                },
+                move |catchup| async move {
+                    *slot.lock().unwrap() = Some(catchup);
+                    Ok::<(), anyhow::Error>(())
+                },
+            )
+            .await
+            .expect("attach");
+
+        // Collect the accepted live output stream (the forwarder's filter
+        // semantics) until the terminator arrives.
+        let mut live = Vec::new();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let frame = rx.recv().await.expect("broadcast closed");
+                if frame.seq < next_seq {
+                    continue;
+                }
+                if matches!(frame.direction, TerminalDirection::Output) {
+                    live.extend_from_slice(&frame.bytes);
+                    if count_occurrences(&live, "STREAM-DONE") > 0 {
+                        return;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("stream end never arrived on the live stream");
+
+        let seed = seed_slot.lock().unwrap().clone();
+        let repaint = decode_catchup_screen(
+            catchup_slot
+                .lock()
+                .unwrap()
+                .take()
+                .expect("catchup delivered"),
+        );
+        // Close BEFORE asserting (see the DROP test for why).
+        manager.close(meta.id).await.ok();
+
+        // The attachment's byte stream is seed || live (the repaint that sits
+        // between them is by design a re-RENDERING of the seed's tail — the
+        // home+erase-below repaint replaces exactly the screen lines the seed
+        // just drew, so it never duplicates content at the emulator level).
+        // Concatenating seed and live heals a line split at the seam.
+        let mut stream = seed.clone();
+        stream.extend_from_slice(&live);
+        let tokens = stream_tokens(&stream);
+        let expected: Vec<usize> = (0..LINES).collect();
+        assert_eq!(
+            tokens, expected,
+            "the attachment must deliver every produced line exactly once, in order, \
+             across seed + live — a missing line is an itr#626 gap, a repeated line \
+             is an itr#626 duplicate (boundary seq {next_seq})"
+        );
+        assert_eq!(
+            count_occurrences(&stream, "STREAM-DONE"),
+            1,
+            "stream terminator must appear exactly once"
+        );
+        // Scrollback-gap guard: everything the repaint shows must also be in
+        // the seed — a screen line absent from the seed means output below the
+        // boundary was skipped by the seed read (persisted too late), i.e. the
+        // "vanishes once it scrolls off" degradation of itr#626. A partially
+        // rendered final line can parse as an earlier (lower) token, which the
+        // subset check still covers.
+        let seed_tokens = stream_tokens(&seed);
+        for t in stream_tokens(&repaint) {
+            assert!(
+                seed_tokens.contains(&t),
+                "repaint shows L-{t} but the scrollback seed does not contain it — \
+                 the line would vanish from scrollback (itr#626 gap; boundary {next_seq})"
+            );
+        }
     }
 
     #[tokio::test]

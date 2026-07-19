@@ -3214,11 +3214,6 @@ async fn handle_terminal_command(
             let session = ctx.terminal_manager.get(id).await;
             match session {
                 Some(session) => {
-                    // Snapshot the current screen BEFORE subscribing so
-                    // the seq counter we capture matches what we'll see
-                    // on the receiver.
-                    let next_seq = session.seq_load();
-
                     // itr#624: an attach catchup used to carry only the
                     // current vt100 screen, so after any page refresh /
                     // re-attach the web xterm had NO scrollback — wheel and
@@ -3231,6 +3226,13 @@ async fn handle_terminal_command(
                     // the legacy screen-only catchup (attach itself still
                     // succeeds). Bounded to frames below `next_seq` so the
                     // live forwarder can't re-deliver seeded bytes.
+                    //
+                    // itr#626: the sequence boundary, the parser snapshot,
+                    // and the live subscription must be established
+                    // atomically or frames can be both dropped and
+                    // duplicated at the seam — `attach_with` owns that
+                    // critical section; this arm only supplies the
+                    // ACL-decided seed read and the catchup delivery.
                     let requester = resolver_label(&device_id);
                     let mut meta = match ctx.state_db.get_terminal_session(id).await {
                         Ok(meta) => meta,
@@ -3243,41 +3245,47 @@ async fn handle_terminal_command(
                         meta = Some(session.meta.lock().await.clone());
                     }
                     let access = evaluate_replay_access(meta.as_ref(), &requester);
-                    let seed = if access.allowed() {
-                        match ctx
-                            .state_db
-                            .tail_terminal_output(
-                                id,
-                                crate::terminal::ATTACH_SCROLLBACK_SEED_MAX_BYTES,
-                                Some(next_seq),
-                            )
-                            .await
-                        {
-                            Ok(tail) => {
-                                if access.non_authored() {
-                                    info!(
-                                        %id,
-                                        requester = %sanitize_for_log(&requester),
-                                        author = ?access.author.as_deref().map(sanitize_for_log),
-                                        "attach scrollback seed served via replay ACL grant"
-                                    );
+                    let seed_allowed = access.allowed();
+                    let seed_non_authored = access.non_authored();
+                    let seed_author = access.author.clone();
+                    let seed_db = ctx.state_db.clone();
+                    let seed_requester = requester.clone();
+                    let (mut rx, next_seq) = session
+                        .attach_with(
+                            move |next_seq| async move {
+                                if !seed_allowed {
+                                    return Vec::new();
                                 }
-                                tail
-                            }
-                            Err(e) => {
-                                // Best-effort: degrade to the legacy
-                                // screen-only catchup, but loudly.
-                                warn!(%id, "attach scrollback seed read failed; catching up screen-only: {e}");
-                                Vec::new()
-                            }
-                        }
-                    } else {
-                        Vec::new()
-                    };
-                    let catchup = crate::terminal::catchup_message(&session, next_seq, &seed);
-                    write_msg(writer, &catchup).await?;
-
-                    let mut rx = session.subscribe();
+                                match seed_db
+                                    .tail_terminal_output(
+                                        id,
+                                        crate::terminal::ATTACH_SCROLLBACK_SEED_MAX_BYTES,
+                                        Some(next_seq),
+                                    )
+                                    .await
+                                {
+                                    Ok(tail) => {
+                                        if seed_non_authored {
+                                            info!(
+                                                %id,
+                                                requester = %sanitize_for_log(&seed_requester),
+                                                author = ?seed_author.as_deref().map(sanitize_for_log),
+                                                "attach scrollback seed served via replay ACL grant"
+                                            );
+                                        }
+                                        tail
+                                    }
+                                    Err(e) => {
+                                        // Best-effort: degrade to the legacy
+                                        // screen-only catchup, but loudly.
+                                        warn!(%id, "attach scrollback seed read failed; catching up screen-only: {e}");
+                                        Vec::new()
+                                    }
+                                }
+                            },
+                            move |catchup| async move { write_msg(writer, &catchup).await },
+                        )
+                        .await?;
                     let sess_id = session.id;
                     let tx = conn_tx.clone();
                     let handle = tokio::spawn(async move {

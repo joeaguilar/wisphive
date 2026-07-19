@@ -45,14 +45,22 @@ Mechanics:
 - **Bound:** `ATTACH_SCROLLBACK_SEED_MAX_BYTES = 256 KiB`, trimmed
   oldest-first — the same budget as the itr#591 respawn seed. Full,
   unbounded history remains exclusively behind the audited `TermReplay`.
-- **Seam (live):** the seed query takes an **exclusive `before_seq` upper
-  bound** at the `next_seq` captured for the catchup, so a frame can arrive
-  either in the seed or from the live forwarder, never both (no duplicated
-  output at the seam; a not-yet-persisted frame below `next_seq` is at worst
-  absent from *scrollback* — the screen repaint stays authoritative).
-  > **⚠ CORRECTED — this invariant is NOT achieved as implemented. See
-  > [Correction 1](#correction-1-2026-07-19-two-invariants-above-are-not-achieved-as-implemented)
-  > and itr#626. Output can be both dropped and duplicated at this seam.**
+- **Seam (live):** exactly-once at the seam is established **atomically**
+  (itr#626 fix; see Correction 1 for the original, falsified mechanism). The
+  session's parser mutex doubles as the *sequence-assignment lock*: every
+  `next_seq()` for a live session is taken under it, and the reader's vt100
+  update + seq assignment form one critical section. `TerminalSession::
+  attach_with` captures the boundary `N`, the screen snapshot, the broadcast
+  subscription, and the output high-water mark in ONE critical section under
+  that same lock (no awaits inside). Hence: a frame with `seq < N` already
+  has its bytes in the snapshot and is dropped by the forwarder's `seq < N`
+  filter if its broadcast is still seen; a frame with `seq >= N` is assigned
+  — and therefore broadcast — strictly after the subscription exists. The
+  seed query keeps the **exclusive `before_seq = N` bound**, and the attach
+  first waits (bounded, 500 ms) for the db batcher's persistence watermark to
+  reach the boundary's high-water mark, so the seed covers every output frame
+  below `N` (within the seed budget); on timeout it degrades loudly and the
+  screen repaint stays authoritative.
 - **Seam (repaint):** the vt100 screen snapshot that follows the seed
   self-prefixes `ESC[H ESC[J` (home + erase-below), which cannot scroll
   content into or wipe the client's freshly seeded scrollback.
@@ -88,7 +96,11 @@ Mechanics:
 - Catchup messages grow (up to ~340 KiB base64 JSON) for seeded attaches.
 - Future work touching attach, replay ACLs, or catchup format must preserve:
   the ACL gate on the seed, the output-only invariant, the `before_seq`
-  exclusivity, and the erase-below-only repaint.
+  exclusivity, the erase-below-only repaint, and (itr#626) the atomicity of
+  boundary + snapshot + subscription under the sequence-assignment lock —
+  in particular, never assign a seq or mutate the parser for a live session
+  outside that lock, and never re-snapshot the screen after the boundary
+  critical section.
 
 ## Alternatives considered
 
@@ -108,13 +120,14 @@ Mechanics:
 ## Links
 
 - Code: `crates/wisphive_daemon/src/server.rs` (`TermAttach` arm),
-  `crates/wisphive_daemon/src/terminal.rs` (`catchup_message`,
-  `ATTACH_SCROLLBACK_SEED_MAX_BYTES`),
+  `crates/wisphive_daemon/src/terminal.rs` (`attach_with`, `ingest_output`,
+  `catchup_message`, `ATTACH_SCROLLBACK_SEED_MAX_BYTES`),
   `crates/wisphive_daemon/src/state/terminals.rs` (`tail_terminal_output`)
 - Tests: `crates/wisphive_web/frontend/e2e/touch-scroll.spec.ts`,
-  `crates/wisphive_web/frontend/e2e/desktop-wheel.spec.ts`
+  `crates/wisphive_web/frontend/e2e/desktop-wheel.spec.ts`; itr#626 seam
+  tests in `crates/wisphive_daemon/src/terminal.rs`
 - itr: #624 (root cause + fix), #284 (mechanism delivered), #479 (coverage),
-  #623 (remaining grant-path work)
+  #623 (remaining grant-path work), #626 (seam atomicity fix)
 - Commit: e3d29b9
 
 ## Correction 1 (2026-07-19): two invariants above are NOT achieved as implemented
@@ -136,6 +149,24 @@ the producer updates the parser *before* assigning a sequence and broadcasting, 
 lets the snapshot already contain a frame that is then also delivered live — **duplicated**. A
 correct fix must establish the subscription and the snapshot atomically with respect to the sequence
 boundary (e.g. subscribe first, then snapshot, then de-duplicate by `seq`).
+
+> **RESOLVED (2026-07-19, itr#626).** The seam is now atomic; the Decision's "Seam (live)" bullet
+> above restates the invariant as implemented. Mechanism: the parser mutex became the
+> sequence-assignment lock (reader ingest fuses vt100 update + seq assignment in one critical
+> section; input/resize assignments take the same lock), and `TerminalSession::attach_with` captures
+> boundary + snapshot + subscription + output high-water mark in one critical section under it —
+> neither Codex shape alone sufficed: subscribe-first (+ `seq` de-dup) fixes the drop but cannot see
+> that a snapshot already contains a frame whose seq is not yet assigned, so the duplicate needed
+> the fused producer-side critical section as well. A bounded (500 ms) wait for the batcher's
+> persistence watermark before the seed read closes the residual scrollback gap ("not-yet-persisted
+> frame scrolled off screen vanishes from the attachment"). Proven by deterministic red→green
+> reproductions of both interleavings plus a mid-stream exactly-once acceptance test in
+> `crates/wisphive_daemon/src/terminal.rs` (`frame_arriving_during_catchup_delivery_is_delivered_
+> exactly_once`, `attach_overlapping_reader_ingest_delivers_exactly_once`,
+> `attach_mid_stream_reconstructs_exactly_the_produced_stream`). Frames below the boundary that the
+> seed's byte/row budget trims remain out of scope here (bounded seed by design; full history stays
+> behind `TermReplay`), as do itr#627 (ANSI split at the seed boundary) and itr#630 (budget
+> semantics).
 
 **2. The `ESC[H ESC[J` repaint is only authoritative from a neutral parser state (itr#627).**
 The sequence itself is sound, but the seed is trimmed at **frame** boundaries, and frames are
