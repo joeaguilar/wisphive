@@ -106,3 +106,14 @@ NEXT: claim 602/L1 (#567) lane A · claim 603/L1 (#560) lane B.
 - CHAIN 588 SEALED COMPLETE: "my pinned sessions come back after a daemon restart" delivered as a live shell with scrollback + honesty banner. Epic stays open for plan B/C. 3/3 links landed, every review caught something real pre-land (cleartext leak class, command fabrication).
 - MOVED: 603/L5 (#561 process-group stop — mission's final link) walking lane B.
 - NEXT: #561 report → review (mandated terrain re-count) → land → 603 terminal → closure oracles + debrief.
+
+## Closure — 2026-07-19
+
+`CLOSED · COMPLETE · 12 links landed (11 planned + 1 ratified extension) · 3/3 chains sealed`
+
+- ORACLES vs integrated main 25432ff: oracle-rust 46.6s ✓ · oracle-frontend 7.9s ✓ · oracle-e2e 129.9s ✓ (19/19).
+- LANDED (final): 603#L5 itr#561 → 25432ff (process-group stop ladder, confirmed-whole-tree-gone; asymmetric-tree test mutation-proven; terrain re-count 9/9 clean — the mission's first fully-correct map). #563 closed duplicate.
+- CHAINS: 602 sealed+epic closed · 603 sealed+epic closed · 588 plan-A slice sealed, epic open for plan B/C.
+- FLAG-FLIP: nothing to flip — user-visible work went live at terminal links; 603's enforcement changes activate at the operator's ./install.sh (two post-install items added to docs/smoke/CHECKLIST.md).
+- DEBRIEF: missions/no-silent-failures/debrief.md · HANDOFF: docs/handoff/2026-07-19-no-silent-failures-mission.md.
+- REGISTERED FOR PO: B-A10 (stop outcomes reply-only, unaudited) rides itr#620 — ratify or reverse.

@@ -174,6 +174,32 @@ Copy this block into the appropriate phase section:
 
 ---
 
+## Mission no-silent-failures — post-install verification (added 2026-07-19; park until the operator runs ./install.sh)
+
+All mission code was verified against isolated temp HOMEs and `./target/release` binaries per the
+standing rule; these items burn down the residue that only the operator's real install can prove.
+
+### Pinned terminal session survives a real daemon restart (source: itr#589/#590/#591, commit 0378792)
+- **Steps:** After installing the new binaries (`./install.sh`, operator-only): `wisphive term new`
+  a session, run something with visible output, pin it (TUI `p` or web star), then
+  `wisphive daemon stop && wisphive daemon start`. Attach to the session.
+- **Expected:** The session is Running again (starred), shows pre-restart scrollback with the
+  process-loss honesty banner, and accepts live typing. An unpinned control session shows as
+  orphaned/killed, not respawned. `web_audit` (sqlite3 -readonly) carries `terminal_respawn`
+  outcome rows.
+- **Evidence:** _subjective note + `wisphive term list` before/after_
+- [ ] Verified — signed off: _______
+
+### Stopping an agent kills its whole process tree (source: itr#561, commit 25432ff)
+- **Steps:** After install: start a managed agent that launches a long-running tool subprocess
+  (e.g. a build), `wisphive agent stop <id>`, then `pgrep -g <pgid>` / check for surviving
+  grandchildren.
+- **Expected:** The stop takes ≤ ~4 s, reports success, and the entire tree is gone — no orphaned
+  build/npm processes. A stop that cannot confirm whole-tree death reports a loud error naming
+  the pgid instead of claiming success.
+- **Evidence:** _shell transcript_
+- [ ] Verified — signed off: _______
+
 ## Signed off
 
 ### Chrome desktop LocalLAN passkey happy path — real Touch ID (source: itr#315)
