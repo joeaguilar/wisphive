@@ -71,10 +71,54 @@
 - **#510/#511 routing:** fable-5 with codex cross-review per PO direction.
 
 ## Outcomes
-<!-- Populated by /sprint-review after /blitz runs. -->
+
+**Goal achievement:** yes
+**Reviewed:** 2026-07-18
+**Stories:** 19/19 closed, 0 quarantined, 0 open (100% completion)
+
+| ID | Title | Status | Notes |
+|----|-------|--------|-------|
+| itr#510 | Align Claude hook timeout with daemon timeout | closed | 3 rounds (fable→sol/ultra); bug moved registry→install layer between passes |
+| itr#511 | Audit Codex managed spawn vs hook inventory | closed | 4 rounds (fable×2, sol×2, opus); spawned ADR-track #528; **first detonation of the research-gate class** |
+| itr#512–520 | sprint-4 review debt (Tier A remainder) | closed | #513/#516/#517 each needed 1 escalation redo (all opus-CLOSE) |
+| itr#56,134,135,139,263,292,338,450 | Tier B C1 backlog | closed | #56 needed 1 escalation (hint clipped off-screen); #134 pre-wave (already done by #123) |
+
+**Untracked changes (in git diff, not tied to a sprint-5 story):**
+- #134 closed pre-wave without executor spend — correctly logged, not scope creep.
+- Follow-ups #525–532 filed *during* the run (flake harness, dispatch_command test, ADR-track #528, etc.) — all now closed; NOT epic members by design.
 
 ## Demo
-<!-- Populated by /sprint-review. -->
+
+Reviewed 2026-07-18. Per PO: 17 low-risk mechanical stories batch-accepted; #510/#511 deep-dived. **All 19 accepted — 0 rejected, 0 conditional.**
+
+| ID | PO Decision | Notes |
+|----|-------------|-------|
+| #512–520, #56, #134, #135, #139, #263, #292, #338, #450 (17) | accepted (batch) | closed, cross-reviewed to CLOSE, behavior-preserving |
+| #510 | accepted | "system working as designed" — cross-review caught every blocker |
+| #511 | accepted | same; the 4-round cost is the retro subject, not a rejection |
+
+**Bugs surfaced during demo:** none (code). The demo surfaced a **process** finding, not a defect — see Retro.
 
 ## Retro
-<!-- Populated by /sprint-review. -->
+
+**Triggered by:** interventions recorded (#510/#511 escalation ladders; wave-1 `just verify` socket-test flake). This retro went deep by PO direction — it became a data-backed process investigation.
+
+### Plan vs. actual
+- 100% completion, but 6/19 stories (32%) needed an escalation redo — every one caught by the cross-model review gate, never self-caught. The gate earns its cost; it operates *after* the spend.
+- #511 alone = 4 rounds / +4543 lines to close one review-debt ticket. Cost-per-close, not close-rate, is the waste.
+
+### Friction log (data-verified this session)
+- **The review-debt circle is real and measured.** Sprint-5 was 58% cleanup of sprint-4's review output (9 `sprint-4-followup` + 2 `review-followup`); sprint-3 spawned 20 follow-ups and was itself 57% prior-review debt. Each sprint's review generates 8–20 follow-ups that become the majority of the next.
+- **#511 root cause:** reverse-engineered OpenAI Codex's hook/config resolution across 4 rounds while the Apache-2.0 source sat unread at `inspiration/codex`. Cross-sprint audit proved this is a **first detonation**, not a recurring pattern (sprint-3 #502 and sprint-4 #303 read dependency source correctly).
+- **Process retro items don't stick:** sprint-4's #521 ("stop guessing file ownership") failed to prevent sprint-5's own planner mis-guessing ownership on #516/#263/#513. A prose action item aimed at a future planner's memory rots within one sprint.
+
+### Process improvements — EXECUTED, not filed (the loop-engineering reframe)
+This retro produced the doctrine that a loop must contain a step that improves the loop, and in the agentic world **Retro executes that improvement inline (e2e-dry-run gated), never slices it into a future sprint** — because backlog is the queue that de-prioritized process work and rotted #521.
+- **Design captured:** `docs/plan-agentic-discovery-and-retro-enforcement.md` (canonical; byte-identical copy in `AI_Projects/skills/docs/`). Produced by a Fable↔Codex debate, PO-adjudicated. Discovery gates (A–F) + Retro-executed enforcement (§4) + process e2e dry-run gate (§5).
+- **Build authorized as the highest-priority work → itr#601** (SOLO AGENT ONLY, not a sprint — the loop machinery must be built in one coherent context; the features that later flow *through* it sprint normally).
+- **#511 done-right → itr#600** (verify the audit against `inspiration/codex` source; re-scope #528).
+
+### Agent-specific learnings
+- Assertions must be data-backed: "this happens all the time" was disproven by the sprint-history audit (→ memory `feedback_no_claims_without_data`).
+- The retro→action-item loop is itself the highest-leverage target; §4 replaces "file a follow-up" with "build + dry-run-verify inline."
+- This retro is the first working example of its own doctrine — the loop-improvement step surfaced an improvement neither PO nor agent could have specified beforehand.
