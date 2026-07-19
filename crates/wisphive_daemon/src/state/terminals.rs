@@ -587,17 +587,30 @@ impl StateDb {
     /// unauthenticated-to-attach catchup screen, and the full input+output
     /// history stays behind the ACL-gated, audited `term replay` path
     /// (itr#98).
-    pub async fn tail_terminal_output(&self, id: uuid::Uuid, max_bytes: usize) -> Result<Vec<u8>> {
+    /// `before_seq` (exclusive) bounds the tail to already-broadcast frames:
+    /// the attach-time scrollback seed (itr#624) captures `next_seq` first and
+    /// must not include frames the live forwarder will also deliver, or the
+    /// seam would render duplicated output. `None` means unbounded (respawn).
+    pub async fn tail_terminal_output(
+        &self,
+        id: uuid::Uuid,
+        max_bytes: usize,
+        before_seq: Option<u64>,
+    ) -> Result<Vec<u8>> {
         // Newest rows first, bounded (output frames are chunked at ~4 KiB by
         // the PTY reader, so 512 rows comfortably covers any sane byte cap);
         // reassembled oldest-first below.
+        let bound = before_seq
+            .map(|s| i64::try_from(s).unwrap_or(i64::MAX))
+            .unwrap_or(i64::MAX);
         let rows: Vec<(i64, Vec<u8>)> = sqlx::query_as(
             "SELECT seq, payload FROM terminal_events
-             WHERE session_id = ? AND direction = 'output'
+             WHERE session_id = ? AND direction = 'output' AND seq < ?
              ORDER BY seq DESC
              LIMIT 512",
         )
         .bind(id.to_string())
+        .bind(bound)
         .fetch_all(&self.pool)
         .await?;
         let mut total = 0usize;
@@ -971,7 +984,10 @@ mod tests {
 
         assert_eq!(db.max_terminal_event_seq(id).await.unwrap(), None);
         assert!(
-            db.tail_terminal_output(id, 1024).await.unwrap().is_empty(),
+            db.tail_terminal_output(id, 1024, None)
+                .await
+                .unwrap()
+                .is_empty(),
             "no history yields an empty seed"
         );
 
@@ -993,14 +1009,14 @@ mod tests {
 
         assert_eq!(db.max_terminal_event_seq(id).await.unwrap(), Some(5));
 
-        let full = db.tail_terminal_output(id, 1024).await.unwrap();
+        let full = db.tail_terminal_output(id, 1024, None).await.unwrap();
         assert_eq!(full, b"old-old-middle-newest".to_vec());
 
         // Byte cap trims the OLDEST frames first; input/resize bytes are
         // never present regardless of the cap.
-        let capped = db.tail_terminal_output(id, 13).await.unwrap();
+        let capped = db.tail_terminal_output(id, 13, None).await.unwrap();
         assert_eq!(capped, b"middle-newest".to_vec());
-        let tiny = db.tail_terminal_output(id, 1).await.unwrap();
+        let tiny = db.tail_terminal_output(id, 1, None).await.unwrap();
         assert_eq!(
             tiny,
             b"newest".to_vec(),
@@ -1012,6 +1028,17 @@ mod tests {
                 "input bytes leaked into the respawn seed"
             );
         }
+
+        // itr#624: `before_seq` (exclusive) bounds the attach-time scrollback
+        // seed to frames already broadcast — frames at or above the captured
+        // `next_seq` will be re-delivered live and must not be seeded twice.
+        let bounded = db.tail_terminal_output(id, 1024, Some(5)).await.unwrap();
+        assert_eq!(bounded, b"old-old-middle-".to_vec());
+        let none_below = db.tail_terminal_output(id, 1024, Some(1)).await.unwrap();
+        assert!(
+            none_below.is_empty(),
+            "a bound below the oldest frame yields an empty seed"
+        );
     }
 
     #[tokio::test]

@@ -551,7 +551,7 @@ impl TerminalSessionManager {
             // LOUDLY (itr#591 rework: the silence was the bug).
             let tail = match self
                 .state_db
-                .tail_terminal_output(id, RESPAWN_SEED_MAX_BYTES)
+                .tail_terminal_output(id, RESPAWN_SEED_MAX_BYTES, None)
                 .await
             {
                 Ok(tail) => tail,
@@ -966,9 +966,29 @@ pub fn frame_to_chunk(id: Uuid, frame: &TermFrame) -> ServerMessage {
     }
 }
 
+/// Byte cap for the scrollback seed an attach catchup prepends for requesters
+/// that pass the replay ACL (itr#624). Same budget as the respawn seed: the
+/// tail of persisted output-direction rows, oldest trimmed first.
+pub const ATTACH_SCROLLBACK_SEED_MAX_BYTES: usize = 256 * 1024;
+
 /// Build a `TermCatchup` message from a vt100 snapshot.
-pub fn catchup_message(session: &TerminalSession, next_seq: u64) -> ServerMessage {
-    let screen = session.catchup_snapshot();
+///
+/// `scrollback_seed` (itr#624) is prepended raw: the client resets its
+/// emulator and replays these historical output bytes, which rebuilds real
+/// scrollback client-side, before the authoritative screen repaint. The
+/// snapshot's vt100 `contents_formatted()` prefix is `ESC[H ESC[J` (home +
+/// erase-below), which never touches the emulator's scrollback, so the seam
+/// cannot duplicate or wipe the seeded history. Pass an empty seed for the
+/// legacy screen-only catchup (unauthorized requesters keep exactly the old
+/// behavior — scrollback disclosure is replay-class and stays behind the
+/// itr#98 ACL).
+pub fn catchup_message(
+    session: &TerminalSession,
+    next_seq: u64,
+    scrollback_seed: &[u8],
+) -> ServerMessage {
+    let mut screen = scrollback_seed.to_vec();
+    screen.extend_from_slice(&session.catchup_snapshot());
     // cols/rows are tracked in the parser but we read them off meta for
     // simplicity; they are updated on resize.
     let meta = session
@@ -1041,6 +1061,72 @@ mod tests {
         })
         .await
         .expect("ended terminal session was not removed from live map");
+    }
+
+    /// itr#624: a seeded catchup carries the scrollback seed BYTES first,
+    /// then the authoritative screen repaint; an empty seed reproduces the
+    /// legacy screen-only catchup exactly.
+    #[tokio::test]
+    async fn catchup_message_prepends_scrollback_seed_before_screen() {
+        let state_db = Arc::new(StateDb::open(":memory:").await.expect("open test db"));
+        let (tui_tx, _) = broadcast::channel(16);
+        let manager = Arc::new(TerminalSessionManager::new(state_db.clone(), tui_tx));
+        let meta = manager
+            .create(
+                Some("catchup-seed".into()),
+                Some("/bin/sh".into()),
+                Some(vec!["-c".into(), "printf READY; read line".into()]),
+                None,
+                80,
+                24,
+                None,
+                None,
+            )
+            .await
+            .expect("create session");
+        wait_for_ready(&manager, meta.id).await;
+        let session = manager.get(meta.id).await.expect("session live");
+
+        let plain = catchup_message(&session, 7, &[]);
+        let seeded = catchup_message(&session, 7, b"HISTORY\r\n");
+        let (plain_screen, seeded_screen) = match (plain, seeded) {
+            (
+                ServerMessage::TermCatchup {
+                    screen: p,
+                    next_seq: p_seq,
+                    ..
+                },
+                ServerMessage::TermCatchup {
+                    screen: s,
+                    next_seq: s_seq,
+                    ..
+                },
+            ) => {
+                assert_eq!(p_seq, 7);
+                assert_eq!(s_seq, 7);
+                (B64.decode(p).unwrap(), B64.decode(s).unwrap())
+            }
+            other => panic!("expected TermCatchup pair, got {other:?}"),
+        };
+        assert!(
+            seeded_screen.starts_with(b"HISTORY\r\n"),
+            "seed bytes must replay before the screen repaint"
+        );
+        assert_eq!(
+            &seeded_screen[b"HISTORY\r\n".len()..],
+            plain_screen.as_slice(),
+            "after the seed, the seeded catchup is byte-identical to the legacy screen-only catchup"
+        );
+        // The repaint that follows the seed must home + erase-below — never
+        // an ED2/ED3 that could disturb the client's freshly seeded
+        // scrollback (vt100's ClearScreen is ESC[H ESC[J).
+        assert!(
+            plain_screen
+                .windows(b"\x1b[H\x1b[J".len())
+                .any(|w| w == b"\x1b[H\x1b[J"),
+            "screen repaint should carry the home+erase-below prefix"
+        );
+        manager.close(meta.id).await.expect("close session");
     }
 
     #[tokio::test]
@@ -1251,7 +1337,10 @@ mod tests {
         // the DB, not the live parser).
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let tail = state_db.tail_terminal_output(id, 65536).await.unwrap();
+                let tail = state_db
+                    .tail_terminal_output(id, 65536, None)
+                    .await
+                    .unwrap();
                 if tail.windows(5).any(|w| w == b"READY") {
                     return;
                 }

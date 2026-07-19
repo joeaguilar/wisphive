@@ -191,4 +191,23 @@ describe("TerminalView touch-to-scroll (itr#445)", () => {
     expect(mount).not.toBeNull();
     expect(mount!.style.touchAction).toBe("pinch-zoom");
   });
+
+  it("does NOT expose the __wisphiveTerm test handle without the named opt-in (itr#624)", () => {
+    // The Terminal object is a write channel into a live PTY (term.input /
+    // term.paste), so the e2e observability handle must stay absent unless
+    // the test-only localStorage flag is set before mount.
+    localStorage.removeItem("wisphive-term-test-handle");
+    mountView();
+    expect((window as unknown as Record<string, unknown>).__wisphiveTerm).toBeUndefined();
+  });
+
+  it("exposes the __wisphiveTerm handle when the test-only flag opts in (itr#479/#624)", () => {
+    localStorage.setItem("wisphive-term-test-handle", "1");
+    try {
+      mountView();
+      expect((window as unknown as Record<string, unknown>).__wisphiveTerm).toBeDefined();
+    } finally {
+      localStorage.removeItem("wisphive-term-test-handle");
+    }
+  });
 });

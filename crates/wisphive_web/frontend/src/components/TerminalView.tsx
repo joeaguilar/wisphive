@@ -47,6 +47,27 @@ export function TerminalView({ session, replayMode, onInput, onResize, registerH
 
     termRef.current = term;
     fitRef.current = fit;
+    // e2e observability (itr#479/#624): the Playwright touch-scroll suite
+    // must assert REAL buffer movement (`buffer.active.viewportY`) — never a
+    // mocked scroll call, which is exactly how the itr#624 regression shipped
+    // green. The handle is a NAMED OPT-IN, absent by default: the Terminal
+    // object is a write channel into a live PTY (`term.input()`/`paste()`),
+    // so exposing it unconditionally would widen the XSS blast radius from
+    // "read the page" toward "type into every open shell". The Playwright
+    // suite sets the flag via addInitScript before load. Not `import.meta
+    // .env.DEV`-gated because e2e deliberately exercises the production
+    // embedded build — the tests must run against exactly what ships.
+    const w = window as unknown as Record<string, unknown>;
+    const termHandleOptIn = ((): boolean => {
+      try {
+        return window.localStorage.getItem("wisphive-term-test-handle") === "1";
+      } catch {
+        return false;
+      }
+    })();
+    if (termHandleOptIn) {
+      w.__wisphiveTerm = term;
+    }
 
     // Flex layout isn't guaranteed to be settled in the same tick as mount.
     // Fit once synchronously so we have a best-effort size, then again in rAF
@@ -183,6 +204,9 @@ export function TerminalView({ session, replayMode, onInput, onResize, registerH
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
+      if (w.__wisphiveTerm === term) {
+        delete w.__wisphiveTerm;
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session.id, replayMode]);

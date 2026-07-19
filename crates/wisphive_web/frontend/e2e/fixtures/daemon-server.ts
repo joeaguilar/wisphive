@@ -297,7 +297,11 @@ export async function startWisphiveDaemonServer(): Promise<WisphiveDaemonServer>
     },
     stop: async () => {
       await stopDaemonProc(proc)
-      await rm(home, { recursive: true, force: true })
+      // A PTY child spawned as `$SHELL -l` (zsh) can still be flushing
+      // `.zsh_sessions` into the temp HOME while its process group dies,
+      // racing the recursive delete into ENOTEMPTY. Retry briefly — the
+      // teardown must not fail an otherwise-green spec.
+      await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 })
     },
   }
 }
