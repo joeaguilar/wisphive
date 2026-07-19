@@ -3,11 +3,11 @@ import type {
   AgentInfo,
   ArtifactTouch,
   AuditDecision,
-  ClientMessage,
   ConfigAlertKind,
   DecisionRequest,
   DiskAlertKind,
   HistoryEntry,
+  OutboundCommand,
   ProjectHookStatus,
   ProjectSummary,
   SessionSummary,
@@ -64,6 +64,68 @@ export interface WisphiveState {
   /** Currently-active config trust / policy-widening alerts, one per kind.
    * A `config_alert` with `active:false` clears its kind. */
   configAlerts: ConfigAlert[];
+  /** Surfaced errors (itr#567): every daemon `error` / `command_error` frame
+   * that no in-flight command claimed, every `term_error`, and every local
+   * send-while-disconnected failure. Rendered by the dismissible ErrorBanner —
+   * never silently console-logged and dropped. Bounded (oldest evicted);
+   * consecutive duplicates collapse into one entry with a count. */
+  errors: UiError[];
+  /** Correlated status of the in-flight (or most recent) spawn_agent submit
+   * (itr#567). `pending` from send until the daemon's direct reply; `queued`
+   * on the `agent_spawn_queued` ack; `refused` on a matching `command_error`
+   * or a local send failure. Null when no spawn is being tracked — cleared by
+   * `clearSpawnStatus` when the modal closes, after which any late correlated
+   * refusal falls through to the error banner instead. */
+  spawn: SpawnStatus | null;
+}
+
+/** One surfaced error row (itr#567). `message` is server/agent-derived
+ * untrusted display data — render as inert text only. */
+export interface UiError {
+  /** Client-assigned monotonic id — the dismiss key. */
+  id: number;
+  /** Which boundary produced it: a daemon `error`/`command_error` frame, a
+   * daemon `term_error` frame, or a client-side failure (WS not open). */
+  source: "daemon" | "terminal" | "client";
+  message: string;
+  /** ISO timestamp of local receipt. */
+  at: string;
+  /** Consecutive-duplicate collapse count (≥1). */
+  count: number;
+}
+
+export type SpawnStatus =
+  | { phase: "pending"; correlationId: string }
+  | { phase: "queued"; correlationId: string; decisionId: string }
+  | { phase: "refused"; correlationId: string; message: string };
+
+/** Cap on retained error rows — enough to scroll back through a burst without
+ * letting a reconnect loop grow state unboundedly. */
+const MAX_ERRORS = 20;
+
+/** Append an error row: collapse an immediate duplicate (same source+message)
+ * into the previous row's count, otherwise push a new row and evict the
+ * oldest past MAX_ERRORS. Pure — safe inside a React state updater. */
+function appendError(
+  errors: UiError[],
+  source: UiError["source"],
+  message: string,
+  at: string,
+): UiError[] {
+  const last = errors[errors.length - 1];
+  if (last && last.source === source && last.message === message) {
+    return [...errors.slice(0, -1), { ...last, count: last.count + 1, at }];
+  }
+  const next = [...errors, { id: last ? last.id + 1 : 1, source, message, at, count: 1 }];
+  return next.length > MAX_ERRORS ? next.slice(next.length - MAX_ERRORS) : next;
+}
+
+function newSpawnCorrelationId(): string {
+  const uuid =
+    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.floor(Math.random() * 1_000_000_000)}`;
+  return `spawn-${uuid}`;
 }
 
 export interface DiskAlert {
@@ -184,6 +246,8 @@ export function useWisphive() {
     pendingReauth: null,
     diskAlerts: [],
     configAlerts: [],
+    errors: [],
+    spawn: null,
   });
 
   // Keep document side effects out of state updaters. React may invoke a
@@ -285,6 +349,19 @@ export function useWisphive() {
       if (msg.type === "decision_resolved") {
         approveStashRef.current.delete(msg.id);
       }
+
+      // Error frames stay observable in devtools, but the authoritative
+      // surface is now the banner / spawn modal state below (itr#567) —
+      // logging happens once here at the validated message boundary, never
+      // inside the (re-runnable) state updater.
+      if (msg.type === "error" || msg.type === "command_error") {
+        console.error("Daemon error:", msg.message);
+      } else if (msg.type === "term_error") {
+        console.warn("Terminal error:", msg.message);
+      }
+      // Timestamp errors at the boundary too: Date.now() inside an updater
+      // would make it impure across StrictMode double-invocations.
+      const receivedAt = new Date().toISOString();
 
       setState((prev) => {
         switch (msg.type) {
@@ -419,8 +496,54 @@ export function useWisphive() {
             return prev;
 
           case "error":
-            console.error("Daemon error:", msg.message);
+            // Uncorrelated daemon error → dismissible banner (itr#567). The
+            // daemon's message text is operator-facing and already good.
+            return { ...prev, errors: appendError(prev.errors, "daemon", msg.message, receivedAt) };
+
+          case "command_error": {
+            // Correlated failure: if it answers the spawn submit we are
+            // tracking, surface it in the spawn modal instead of the banner.
+            // Anything else (modal already closed and cleared, or a future
+            // correlated command we don't track) falls through to the banner
+            // so no daemon error is ever dropped.
+            if (
+              prev.spawn &&
+              prev.spawn.phase !== "refused" &&
+              msg.correlation_id === prev.spawn.correlationId
+            ) {
+              return {
+                ...prev,
+                spawn: {
+                  phase: "refused",
+                  correlationId: prev.spawn.correlationId,
+                  message: msg.message,
+                },
+              };
+            }
+            return { ...prev, errors: appendError(prev.errors, "daemon", msg.message, receivedAt) };
+          }
+
+          case "agent_spawn_queued": {
+            // Positive confirmation for the spawn submit we are tracking
+            // (itr#567): the daemon accepted it and queued the approval
+            // decision. The queue row itself arrives via the normal
+            // `new_decision` broadcast — this only advances the modal state.
+            if (
+              prev.spawn &&
+              prev.spawn.phase === "pending" &&
+              msg.correlation_id === prev.spawn.correlationId
+            ) {
+              return {
+                ...prev,
+                spawn: {
+                  phase: "queued",
+                  correlationId: prev.spawn.correlationId,
+                  decisionId: msg.decision.id,
+                },
+              };
+            }
             return prev;
+          }
 
           case "term_created": {
             const meta = msg.session;
@@ -445,8 +568,12 @@ export function useWisphive() {
             return prev;
 
           case "term_error":
-            console.warn("Terminal error:", msg.message);
-            return prev;
+            // Terminal-session errors were previously console-only (itr#567);
+            // route them to the same dismissible banner.
+            return {
+              ...prev,
+              errors: appendError(prev.errors, "terminal", msg.message, receivedAt),
+            };
 
           case "web_reauth_required":
             // Display the newest gate in the single modal. The complete
@@ -614,10 +741,29 @@ export function useWisphive() {
     });
   }, [connect]);
 
-  const send = useCallback((msg: ClientMessage) => {
+  /** Send one command to the daemon. Returns whether it was actually written.
+   * A send while the socket is not OPEN used to be a silent no-op (itr#567 —
+   * the root of "the button does nothing"); it now surfaces a client-side
+   * banner error unless the caller opts out because it renders the failure
+   * itself (`quiet`, e.g. the spawn modal). */
+  const send = useCallback((msg: OutboundCommand, opts?: { quiet?: boolean }): boolean => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify(msg));
+      return true;
     }
+    if (!opts?.quiet) {
+      const at = new Date().toISOString();
+      setState((prev) => ({
+        ...prev,
+        errors: appendError(
+          prev.errors,
+          "client",
+          `Not connected to the daemon — "${msg.type}" was not sent.`,
+          at,
+        ),
+      }));
+    }
+    return false;
   }, []);
 
   const approve = useCallback(
@@ -770,12 +916,43 @@ export function useWisphive() {
     [send],
   );
 
+  /** Submit a spawn and start tracking its correlated outcome (itr#567). The
+   * outbound command carries a fresh `correlation_id` (preserved by the web
+   * bridge into the ClientCommand envelope) so the daemon's direct reply —
+   * `agent_spawn_queued` or `command_error` — resolves `state.spawn` for the
+   * modal. A send while disconnected refuses immediately instead of
+   * pretending the click worked; `quiet` because the modal renders it. */
   const spawnAgent = useCallback(
     (req: SpawnAgentRequest) => {
-      send({ type: "spawn_agent", ...req });
+      const correlationId = newSpawnCorrelationId();
+      const sent = send(
+        { type: "spawn_agent", ...req, correlation_id: correlationId },
+        { quiet: true },
+      );
+      setState((prev) => ({
+        ...prev,
+        spawn: sent
+          ? { phase: "pending", correlationId }
+          : {
+              phase: "refused",
+              correlationId,
+              message: "Not connected to the daemon — the spawn request was not sent.",
+            },
+      }));
     },
     [send],
   );
+
+  /** Stop tracking the current spawn submit (modal closed). Any late
+   * correlated refusal then falls through to the error banner. */
+  const clearSpawnStatus = useCallback(() => {
+    setState((prev) => (prev.spawn ? { ...prev, spawn: null } : prev));
+  }, []);
+
+  /** Dismiss one surfaced error row by id. */
+  const dismissError = useCallback((id: number) => {
+    setState((prev) => ({ ...prev, errors: prev.errors.filter((e) => e.id !== id) }));
+  }, []);
 
   // ── Terminal session actions ───────────────────────────────────
   const termList = useCallback(() => {
@@ -883,6 +1060,8 @@ export function useWisphive() {
     queryProjectHookStatus,
     searchHistory,
     spawnAgent,
+    clearSpawnStatus,
+    dismissError,
     termList,
     termCreate,
     termAttach,

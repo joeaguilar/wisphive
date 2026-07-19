@@ -1360,7 +1360,7 @@ async fn dispatch_command(
         | ClientMessage::ListAgents
         | ClientMessage::StopAgent { .. }
         | ClientMessage::ReimportEvents => {
-            handle_agent_command(writer, ctx, correlation_id, msg, conn_tx).await?;
+            handle_agent_command(writer, ctx, device_id, correlation_id, msg, conn_tx).await?;
         }
         ClientMessage::QueryHistory { .. }
         | ClientMessage::SearchHistory(_)
@@ -2274,8 +2274,15 @@ async fn finalize_spawn_abandonment(
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 enum SpawnRunError {
-    #[error("agent spawn denied by human reviewer")]
-    Denied,
+    /// The decision resolved as Deny. Carries the resolving `RichDecision`'s
+    /// message so the operator-visible error names the TRUE cause (itr#567):
+    /// approval expiry and persistence fail-closed both resolve as Deny with
+    /// their own messages ("SpawnAgent approval expired", "SpawnAgent
+    /// approval could not be recorded; launch refused") — before this they
+    /// all surfaced as "denied by human reviewer". Audit attribution
+    /// (`decided_by`) was always correct and is unchanged.
+    #[error("{0}")]
+    Denied(String),
     #[error("agent spawn was deferred; explicit approval is required")]
     Deferred,
     #[error("approval channel closed; refusing managed-agent spawn")]
@@ -2313,7 +2320,11 @@ where
                 .await
                 .map_err(|e| SpawnRunError::Action(e.to_string()))
         }
-        Decision::Deny => Err(SpawnRunError::Denied),
+        Decision::Deny => {
+            Err(SpawnRunError::Denied(rich.message.unwrap_or_else(|| {
+                "agent spawn denied by human reviewer".to_string()
+            })))
+        }
         Decision::Ask => Err(SpawnRunError::Deferred),
     }
 }
@@ -2367,6 +2378,33 @@ fn stop_agent_reply(
     }
 }
 
+/// Build the error reply for a refused or failed SpawnAgent (itr#567).
+///
+/// The split is keyed on **web origin** (`device_id` present), NOT on
+/// `correlation_id`: the ws bridge forces an authenticated `device_id` onto
+/// every browser frame, while the CLI and TUI never set one — but the CLI
+/// DOES stamp a correlation UUID on its commands, and its reply loop
+/// (`wisphive agent start`, crates/wisphive_cli/src/commands/agent.rs) only
+/// understands the legacy bare [`ServerMessage::Error`]. Keying on
+/// correlation would therefore hang a refused CLI spawn forever on a frame
+/// it skips. Web-origin callers get a [`ServerMessage::CommandError`] with
+/// their correlation id (when supplied) echoed so the SPA's spawn modal can
+/// bind the refusal to the exact submit; everyone else keeps the exact
+/// legacy `Error` shape they have always received.
+fn spawn_error_reply(
+    message: String,
+    correlation_id: Option<String>,
+    device_id: Option<&wisphive_protocol::DeviceId>,
+) -> ServerMessage {
+    match device_id {
+        Some(_) => ServerMessage::CommandError {
+            message,
+            correlation_id,
+        },
+        None => ServerMessage::Error { message },
+    }
+}
+
 /// Dispatch agent-process commands: spawn, list, stop, and event re-import.
 ///
 /// A spawn is deliberately asynchronous relative to this connection: the
@@ -2376,6 +2414,7 @@ fn stop_agent_reply(
 async fn handle_agent_command(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     ctx: &ConnectionContext,
+    device_id: Option<wisphive_protocol::DeviceId>,
     correlation_id: Option<String>,
     msg: ClientMessage,
     conn_tx: &tokio::sync::mpsc::Sender<ServerMessage>,
@@ -2388,9 +2427,11 @@ async fn handle_agent_command(
             if let Err(e) = ensure_spawn_mode_active(&ctx.home_dir) {
                 write_msg(
                     writer,
-                    &ServerMessage::Error {
-                        message: format!("failed to queue agent spawn: {e}"),
-                    },
+                    &spawn_error_reply(
+                        format!("failed to queue agent spawn: {e}"),
+                        correlation_id,
+                        device_id.as_ref(),
+                    ),
                 )
                 .await?;
                 return Ok(());
@@ -2408,9 +2449,11 @@ async fn handle_agent_command(
                 );
                 write_msg(
                     writer,
-                    &ServerMessage::Error {
-                        message: format!("invalid agent spawn request: {e}"),
-                    },
+                    &spawn_error_reply(
+                        format!("invalid agent spawn request: {e}"),
+                        correlation_id,
+                        device_id.as_ref(),
+                    ),
                 )
                 .await?;
                 return Ok(());
@@ -2422,9 +2465,11 @@ async fn handle_agent_command(
                     Err(e) => {
                         write_msg(
                             writer,
-                            &ServerMessage::Error {
-                                message: format!("failed to queue agent spawn: {e}"),
-                            },
+                            &spawn_error_reply(
+                                format!("failed to queue agent spawn: {e}"),
+                                correlation_id,
+                                device_id.as_ref(),
+                            ),
                         )
                         .await?;
                         return Ok(());
@@ -2464,6 +2509,11 @@ async fn handle_agent_command(
             let queue = ctx.queue.clone();
             let home_dir = ctx.home_dir.clone();
             let response_tx = conn_tx.clone();
+            // Carried into the worker so post-review failures (deny, expiry,
+            // gate refusals, persistence fail-closed) stay bound to the
+            // originating command for web-origin callers (itr#567).
+            let worker_correlation_id = correlation_id;
+            let worker_device_id = device_id;
             tokio::spawn(async move {
                 let expiry_state = state_db.clone();
                 let expiry_queue = queue.clone();
@@ -2526,12 +2576,14 @@ async fn handle_agent_command(
                                 ),
                             }
                         }
-                        SpawnRunError::Denied | SpawnRunError::Deferred => {}
+                        SpawnRunError::Denied(_) | SpawnRunError::Deferred => {}
                     }
                     if response_tx
-                        .send(ServerMessage::Error {
-                            message: format!("failed to spawn agent: {e}"),
-                        })
+                        .send(spawn_error_reply(
+                            format!("failed to spawn agent: {e}"),
+                            worker_correlation_id,
+                            worker_device_id.as_ref(),
+                        ))
                         .await
                         .is_err()
                     {
@@ -3706,7 +3758,10 @@ mod tests {
         .await
         .expect_err("deny must fail closed");
 
-        assert_eq!(err, SpawnRunError::Denied);
+        assert_eq!(
+            err,
+            SpawnRunError::Denied("agent spawn denied by human reviewer".into())
+        );
         assert!(!action_called.load(Ordering::SeqCst));
     }
 
@@ -3934,7 +3989,9 @@ mod tests {
         })
         .await
         .unwrap_err();
-        assert_eq!(err, SpawnRunError::Denied);
+        // The fail-closed message travels to the originating client (itr#567):
+        // an expiry must not masquerade as a human deny.
+        assert_eq!(err, SpawnRunError::Denied("expired".into()));
 
         assert_eq!(queue.lock().await.count_tool("SpawnAgent"), 0);
         assert_eq!(db.pending_count().await.unwrap(), 0);
@@ -5260,6 +5317,59 @@ mod tests {
                 assert!(message.contains("no managed agent with id: agent-3"));
             }
             other => panic!("failed stop must reply Error, got {other:?}"),
+        }
+    }
+
+    /// itr#567 contract: the CommandError/legacy-Error split is keyed on WEB
+    /// ORIGIN (`device_id` present), never on `correlation_id`. The CLI
+    /// always stamps a correlation UUID but its reply loop only understands
+    /// the bare `Error` — keying on correlation would hang a refused
+    /// `wisphive agent start` forever on a frame it skips.
+    #[test]
+    fn spawn_refusal_reply_is_legacy_error_unless_web_origin() {
+        use wisphive_protocol::{DeviceId, ServerMessage};
+
+        // CLI shape: correlation id present, NO device id → legacy Error.
+        match super::spawn_error_reply(
+            "invalid agent spawn request: prompt must not be empty".into(),
+            Some("cli-corr-1".into()),
+            None,
+        ) {
+            ServerMessage::Error { message } => {
+                assert_eq!(
+                    message,
+                    "invalid agent spawn request: prompt must not be empty"
+                );
+            }
+            other => panic!("a non-web spawn refusal must reply legacy Error, got {other:?}"),
+        }
+
+        // Web shape: authenticated device id (forced by ws_bridge) →
+        // CommandError with the browser's correlation id echoed.
+        let device = DeviceId("dev-1".into());
+        match super::spawn_error_reply(
+            "failed to spawn agent: denied".into(),
+            Some("spawn-corr-1".into()),
+            Some(&device),
+        ) {
+            ServerMessage::CommandError {
+                message,
+                correlation_id,
+            } => {
+                assert_eq!(message, "failed to spawn agent: denied");
+                assert_eq!(correlation_id.as_deref(), Some("spawn-corr-1"));
+            }
+            other => panic!("a web spawn refusal must reply CommandError, got {other:?}"),
+        }
+
+        // Web caller without a correlation id still gets the typed frame the
+        // SPA parses; it simply cannot be bound to a specific submit.
+        match super::spawn_error_reply("failed to spawn agent: denied".into(), None, Some(&device))
+        {
+            ServerMessage::CommandError { correlation_id, .. } => {
+                assert!(correlation_id.is_none());
+            }
+            other => panic!("a web spawn refusal must reply CommandError, got {other:?}"),
         }
     }
 

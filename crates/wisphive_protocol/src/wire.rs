@@ -452,6 +452,22 @@ pub enum ServerMessage {
         correlation_id: Option<String>,
     },
 
+    /// Typed direct error reply to a failed client command, sent to
+    /// **web-origin** callers (their [`ClientCommand`] envelope carries an
+    /// authenticated `device_id`, forced by the ws bridge) so the SPA can
+    /// bind a refusal to the exact command it sent via the echoed
+    /// `correlation_id` (itr#567). Non-web callers (CLI/TUI, which never set
+    /// a device id) keep receiving the legacy bare [`ServerMessage::Error`]:
+    /// their reply loops predate this variant, and the CLI in particular
+    /// always stamps a correlation id, so the split MUST key on origin, not
+    /// correlation (see `wisphive_daemon::server::spawn_error_reply`).
+    #[serde(rename = "command_error")]
+    CommandError {
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        correlation_id: Option<String>,
+    },
+
     /// Response to QueryHistory request.
     #[serde(rename = "history_response")]
     HistoryResponse {
@@ -885,6 +901,29 @@ mod tests {
         match decoded {
             ServerMessage::Overloaded { message } => {
                 assert_eq!(message, "daemon connection capacity reached; retry later");
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    /// itr#567: the correlated error reply round-trips with its correlation id
+    /// and serializes under the `command_error` tag.
+    #[test]
+    fn round_trip_command_error() {
+        let msg = ServerMessage::CommandError {
+            message: "failed to queue agent spawn: refused".into(),
+            correlation_id: Some("spawn-corr-1".into()),
+        };
+        let encoded = encode(&msg).unwrap();
+        assert!(encoded.contains("\"type\":\"command_error\""));
+        let decoded: ServerMessage = decode(&encoded).unwrap();
+        match decoded {
+            ServerMessage::CommandError {
+                message,
+                correlation_id,
+            } => {
+                assert_eq!(message, "failed to queue agent spawn: refused");
+                assert_eq!(correlation_id.as_deref(), Some("spawn-corr-1"));
             }
             _ => panic!("unexpected variant"),
         }

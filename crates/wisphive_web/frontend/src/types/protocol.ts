@@ -197,6 +197,14 @@ export type ServerMessage =
   // from older daemons validate cleanly rather than logging as wire drift.
   | { type: "agent_spawned"; agent: ManagedAgent }
   | { type: "agent_exited"; agent_id: string; exit_code?: number }
+  // Correlated direct ack that a spawn was queued for approval (itr#567).
+  // Sent only to the originating connection when its `spawn_agent` carried a
+  // `correlation_id`; the broadcast `new_decision` still populates the queue.
+  | { type: "agent_spawn_queued"; decision: DecisionRequest; correlation_id?: string }
+  // Typed direct error reply sent to web-origin (device-attributed) callers
+  // (itr#567) — e.g. a spawn refusal bound via `correlation_id` to the exact
+  // submit the modal is waiting on. Legacy CLI/TUI clients receive `error`.
+  | { type: "command_error"; message: string; correlation_id?: string }
   | { type: "agent_list"; agents: ManagedAgent[] }
   | { type: "agents_snapshot"; agents: AgentInfo[] }
   | { type: "history_response"; entries: HistoryEntry[]; request_id?: string }
@@ -397,6 +405,18 @@ export function parseServerMessage(data: string): ServerMessage {
         type,
         agent_id: readField(message, "agent_id", readString, "message"),
         exit_code: readOptionalField(message, "exit_code", readI32, "message"),
+      };
+    case "agent_spawn_queued":
+      return {
+        type,
+        decision: readField(message, "decision", parseDecisionRequest, "message"),
+        correlation_id: readOptionalField(message, "correlation_id", readString, "message"),
+      };
+    case "command_error":
+      return {
+        type,
+        message: readField(message, "message", readString, "message"),
+        correlation_id: readOptionalField(message, "correlation_id", readString, "message"),
       };
     case "agent_list":
       return {
@@ -1128,3 +1148,10 @@ export type ClientMessage =
   | { type: "term_replay"; id: string; from_seq?: number; speed?: number }
   | { type: "term_set_group"; id: string; group?: string }
   | { type: "term_reorder"; id: string; sort_order: number };
+
+/** Outbound wire shape: a ClientMessage optionally carrying the
+ * `ClientCommand` envelope's `correlation_id` (wire.rs). One-shot commands
+ * set it so the daemon's direct reply (`agent_spawn_queued` /
+ * `command_error`) can be bound back to the exact submit (itr#567). The web
+ * bridge preserves it while stamping `device_id` server-side. */
+export type OutboundCommand = ClientMessage & { correlation_id?: string };

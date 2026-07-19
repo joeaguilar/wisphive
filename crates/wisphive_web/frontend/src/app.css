@@ -2358,6 +2358,93 @@ kbd {
   }
 }
 
+/* Surfaced daemon/terminal/client errors (itr#567) — dismissible rows, red
+ * because each one is a command that did NOT do what the operator asked. */
+.error-banner {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  margin-bottom: var(--space-md);
+}
+
+.error-alert {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-sm);
+  padding: 8px 12px;
+  border: 1px solid var(--red);
+  border-radius: 4px;
+  color: var(--red);
+  background: rgba(244, 67, 54, 0.08);
+  font-size: var(--font-sm);
+}
+
+.error-alert-icon,
+.error-alert-label {
+  flex-shrink: 0;
+}
+
+.error-alert-label {
+  font-weight: 600;
+}
+
+.error-alert-message {
+  color: var(--text);
+  /* Daemon messages can be long (multi-hook Codex refusals name every hook);
+   * wrap rather than clip — never truncate the one thing the operator needs. */
+  overflow-wrap: anywhere;
+  flex: 1;
+}
+
+.error-alert-count {
+  flex-shrink: 0;
+  font-weight: 600;
+}
+
+.error-alert-dismiss {
+  flex-shrink: 0;
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: var(--red);
+  cursor: pointer;
+  font-size: var(--font-sm);
+  padding: 0 2px;
+  line-height: 1;
+}
+
+.error-alert-dismiss:hover {
+  color: var(--text);
+}
+
+@media (max-width: 480px) {
+  .error-alert {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .error-alert-message {
+    flex-basis: 100%;
+  }
+}
+
+/* Correlated spawn-submit status inside the SpawnModal (itr#567). */
+.spawn-status {
+  padding: 8px 12px;
+  border-radius: 4px;
+  font-size: var(--font-sm);
+  border: 1px solid var(--green);
+  color: var(--green);
+  background: rgba(76, 175, 80, 0.08);
+  overflow-wrap: anywhere;
+}
+
+.spawn-status-refused {
+  border-color: var(--red);
+  color: var(--red);
+  background: rgba(244, 67, 54, 0.08);
+}
+
 .login-setup {
   display: flex;
   flex-direction: column;

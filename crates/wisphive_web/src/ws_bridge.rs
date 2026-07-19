@@ -141,6 +141,19 @@ pub async fn bridge(ws: WebSocket, socket_path: &Path, device: AuthedDevice) -> 
                                 len = text.len(),
                                 "dropping malformed browser message"
                             );
+                            // Tell the browser its frame was dropped (itr#567)
+                            // instead of leaving it waiting on a reply that
+                            // will never arrive; the SPA surfaces this in its
+                            // error banner. A send failure means the browser
+                            // is gone — end the bridge like any other write
+                            // failure.
+                            if ws_tx
+                                .send(Message::Text(malformed_payload_error(text.len()).into()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
                             continue;
                         };
                         debug!(
@@ -170,15 +183,41 @@ pub async fn bridge(ws: WebSocket, socket_path: &Path, device: AuthedDevice) -> 
 /// Re-serialize a browser-origin ClientMessage inside a ClientCommand
 /// envelope tagged with the authenticated device id.
 ///
-/// Returns `None` if the payload doesn't parse as a ClientMessage — we
+/// Returns `None` if the payload doesn't parse as a ClientCommand — we
 /// refuse to forward raw bytes because a compromised browser tab could
 /// otherwise emit decisions that look as if they came from a different
 /// device. Going through typed decode guarantees the envelope we emit to
-/// the daemon always has `device_id = Some(caller)`.
+/// the daemon always has `device_id = Some(caller)`: any device id the
+/// browser embedded is overwritten with the authenticated one.
+///
+/// A browser-supplied `correlation_id` is preserved (itr#567): it is an
+/// opaque echo token scoped to this same connection — the daemon stamps it
+/// back onto direct replies (`agent_spawn_queued`, `command_error`) so the
+/// SPA can bind an ack or refusal to the exact command it sent. It carries
+/// no authority, so forwarding it verbatim is safe.
 fn rewrap_with_device(raw: &str, device: &AuthedDevice) -> Option<String> {
-    let body: ClientMessage = wisphive_protocol::decode(raw).ok()?;
-    let command = ClientCommand::from(body).with_device_id(device.id.clone());
+    let mut command: ClientCommand = wisphive_protocol::decode(raw).ok()?;
+    command.device_id = Some(device.id.clone());
     wisphive_protocol::encode(&command).ok()
+}
+
+/// Build the single-frame wire error the bridge sends back to the browser
+/// when its payload failed to decode (itr#567). Without this the drop is
+/// warn!-only server-side and the browser waits forever for a reply that
+/// will never come. The raw payload is deliberately NOT echoed back — it is
+/// attacker-influenced and possibly huge; the byte length is enough for the
+/// operator to correlate with the server log.
+fn malformed_payload_error(len: usize) -> String {
+    let frame = ServerMessage::Error {
+        message: format!(
+            "The daemon bridge dropped a malformed message from this browser ({len} bytes): it did not decode as a Wisphive client command. This is a bug or a stale web client — reload the page."
+        ),
+    };
+    // encode() appends the newline framing used on the Unix socket; the
+    // WebSocket is message-framed, so serialize without it.
+    serde_json::to_string(&frame).unwrap_or_else(|_| {
+        r#"{"type":"error","message":"malformed browser message dropped"}"#.to_string()
+    })
 }
 
 #[cfg(test)]
@@ -219,6 +258,52 @@ mod tests {
     fn rewrap_rejects_garbage() {
         assert!(rewrap_with_device("not json at all", &authed("d")).is_none());
         assert!(rewrap_with_device(r#"{"type":"not_a_variant"}"#, &authed("d")).is_none());
+    }
+
+    // ---- itr#567: browser-supplied correlation ids survive the rewrap ----
+
+    #[test]
+    fn rewrap_preserves_browser_correlation_id() {
+        let spawn = r#"{"type":"spawn_agent","project":"/proj","prompt":"do it","correlation_id":"spawn-corr-9"}"#;
+        let wrapped = rewrap_with_device(spawn, &authed("dev-1")).unwrap();
+        let decoded: ClientCommand = wisphive_protocol::decode(&wrapped).unwrap();
+        assert_eq!(decoded.correlation_id.as_deref(), Some("spawn-corr-9"));
+        // Device attribution still comes from the authenticated middleware,
+        // never the payload.
+        assert_eq!(
+            decoded.device_id.as_ref().map(|d| d.0.as_str()),
+            Some("dev-1")
+        );
+    }
+
+    #[test]
+    fn rewrap_without_correlation_id_stays_uncorrelated() {
+        let approve = r#"{"type":"approve","id":"00000000-0000-0000-0000-000000000000","always_allow":false}"#;
+        let wrapped = rewrap_with_device(approve, &authed("dev-1")).unwrap();
+        assert!(!wrapped.contains("correlation_id"));
+        let decoded: ClientCommand = wisphive_protocol::decode(&wrapped).unwrap();
+        assert!(decoded.correlation_id.is_none());
+    }
+
+    // ---- itr#567: a dropped browser frame is answered with a wire error ----
+
+    #[test]
+    fn malformed_payload_error_is_a_decodable_error_frame() {
+        let frame = malformed_payload_error(42);
+        assert!(
+            !frame.ends_with('\n'),
+            "WebSocket frames are not newline-framed"
+        );
+        let decoded: ServerMessage = wisphive_protocol::decode(&frame).unwrap();
+        match decoded {
+            ServerMessage::Error { message } => {
+                assert!(
+                    message.contains("42 bytes"),
+                    "must carry the length: {message}"
+                );
+            }
+            other => panic!("expected Error frame, got {other:?}"),
+        }
     }
 
     // ---- itr#83: capped daemon line length ----

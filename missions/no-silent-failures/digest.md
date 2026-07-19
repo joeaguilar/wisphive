@@ -31,3 +31,14 @@
 **Excluded:** #601 (solo-agent-only), plan-B/C survival, herdr UX, ADR-0009 spikes, program phases (successor candidates).
 
 NEXT: claim 602/L1 (#567) lane A · claim 603/L1 (#560) lane B.
+
+## Pulse — 2026-07-18 (1st land)
+
+`WALK · landed 1/10 · burn n/a · lanes 2/2`
+
+- LANDED: 603#L1 itr#560 → fd2d3f9 (hook fails closed+audited on live daemon rejection; typed Overloaded; ADR-0001 amended; mutation-proofed audit test). Review: conforms, B-A1/A2/A8 supports, 2 SHOULD-FIX reworked once.
+- MOVED: 603/L2 (#562) claimed, lane B walking. 602/L1 (#567) built (full gate + 16/16 e2e green), in adversarial review.
+- LEARNED: version-skew now denies loudly (throttle carve-out documented); wire.rs enum = cross-lane shared surface (both lanes added variants); fresh worktrees need dist/ copied for rust-embed.
+- FILED: #604 two-stage admission (reserved interactive floor), #605 shed-storm latched alert, #606 dup-id operator visibility.
+- WATCH: 602/L1 review verdict pending — X-A1 wire.rs adjacency will be tested when 602's patch applies on top of fd2d3f9.
+- NEXT: land 602/L1 on green review → admit 602/L2 (#565 diagnosis).

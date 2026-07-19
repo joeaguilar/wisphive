@@ -23,6 +23,7 @@ import { Login } from "./components/Login";
 import { SudoModal } from "./components/SudoModal";
 import { DiskAlertBanner } from "./components/DiskAlertBanner";
 import { ConfigAlertBanner } from "./components/ConfigAlertBanner";
+import { ErrorBanner } from "./components/ErrorBanner";
 import "./app.css";
 
 type View = "inbox" | "board" | "queue" | "history" | "sessions" | "projects" | "worktrees" | "burn" | "agents" | "config" | "terminals";
@@ -64,8 +65,8 @@ function App() {
 function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
   const {
     connected, queue, agents, projects, worktrees, burnTouches, hookStatus, hookErrors, auditDecisions, endedAgentIds, history, agentTimeline, sessionTimeline, sessions, terminals,
-    pendingReauth, diskAlerts, configAlerts, approve, deny, dismissReauth, retryPendingApprove,
-    spawnAgent, queryProjects, queryWorktrees, queryBurn, installHooks, queryProjectHookStatus, queryHistory, queryAgentTimeline, querySessionTimeline, searchHistory, querySessions,
+    pendingReauth, diskAlerts, configAlerts, errors, spawn, approve, deny, dismissReauth, retryPendingApprove, dismissError,
+    spawnAgent, clearSpawnStatus, queryProjects, queryWorktrees, queryBurn, installHooks, queryProjectHookStatus, queryHistory, queryAgentTimeline, querySessionTimeline, searchHistory, querySessions,
     termList, termCreate, termAttach, termDetach, termInput, termResize, termClose, termReplay, termSetGroup, termReorder, registerTerminalHandler,
   } = useWisphive();
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -149,7 +150,7 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
     },
     onBack: () => {
       if (showHelp) { setShowHelp(false); return; }
-      if (showSpawn) { setShowSpawn(false); return; }
+      if (showSpawn) { setShowSpawn(false); setSpawnDefaultProject(undefined); clearSpawnStatus(); return; }
       if (selectedId) { setSelectedId(null); return; }
       if (agentDrilldown) { setAgentDrilldown(null); return; }
       if (sessionAgent) { setSessionAgent(null); return; }
@@ -171,7 +172,7 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
     onViewBurn: () => setView("burn"),
     onSpawn: () => setShowSpawn(true),
     onHelp: () => setShowHelp((v) => !v),
-  }), [handleNext, handlePrev, selectedId, view, navList, approve, deny, showHelp, showSpawn, agentDrilldown, sessionAgent]);
+  }), [handleNext, handlePrev, selectedId, view, navList, approve, deny, showHelp, showSpawn, agentDrilldown, sessionAgent, clearSpawnStatus]);
 
   useKeyboard(keyActions);
 
@@ -244,6 +245,7 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
       <main className="content">
         <DiskAlertBanner alerts={diskAlerts} />
         <ConfigAlertBanner alerts={configAlerts} />
+        <ErrorBanner errors={errors} onDismiss={dismissError} />
         {view === "inbox" && (
           <Inbox
             items={queue}
@@ -408,8 +410,9 @@ function AuthedApp({ onLogout }: { onLogout: () => Promise<void> }) {
         <SpawnModal
           projects={projects.map((p) => p.project)}
           defaultProject={spawnDefaultProject}
-          onSpawn={(req) => { spawnAgent(req); setShowSpawn(false); setSpawnDefaultProject(undefined); }}
-          onClose={() => { setShowSpawn(false); setSpawnDefaultProject(undefined); }}
+          status={spawn}
+          onSpawn={(req) => spawnAgent(req)}
+          onClose={() => { setShowSpawn(false); setSpawnDefaultProject(undefined); clearSpawnStatus(); }}
         />
       )}
 

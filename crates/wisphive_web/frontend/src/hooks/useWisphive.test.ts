@@ -897,3 +897,182 @@ describe("useWisphive approve-stash tool-name cross-check (itr#275)", () => {
     expect(latest().sentMessages().filter((m) => m.type === "approve")).toHaveLength(0);
   });
 });
+
+describe("useWisphive error surfacing and spawn correlation (itr#567)", () => {
+  beforeEach(() => {
+    MockWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", MockWebSocket as unknown as typeof WebSocket);
+    localStorage.setItem("wisphive-web-token", "test-token");
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  async function mountOpen() {
+    const view = renderHook(() => useWisphive());
+    await waitFor(() => expect(MockWebSocket.instances.length).toBeGreaterThan(0));
+    act(() => latest().open());
+    return view;
+  }
+
+  it("routes a daemon error frame into dismissible errors state, not just the console", async () => {
+    const { result } = await mountOpen();
+    act(() => latest().emit({ type: "error", message: "reimport failed: disk on fire" }));
+
+    expect(result.current.errors).toHaveLength(1);
+    expect(result.current.errors[0]).toMatchObject({
+      source: "daemon",
+      message: "reimport failed: disk on fire",
+      count: 1,
+    });
+
+    act(() => result.current.dismissError(result.current.errors[0].id));
+    expect(result.current.errors).toHaveLength(0);
+  });
+
+  it("appends exactly one row per error frame under StrictMode double-invocation", async () => {
+    const view = renderHook(() => useWisphive(), { wrapper: StrictMode });
+    await waitFor(() => expect(MockWebSocket.instances.length).toBeGreaterThan(0));
+    act(() => latest().open());
+
+    act(() => latest().emit({ type: "error", message: "boom" }));
+    expect(view.result.current.errors).toHaveLength(1);
+    expect(view.result.current.errors[0].count).toBe(1);
+  });
+
+  it("collapses consecutive duplicate errors into one row with a count", async () => {
+    const { result } = await mountOpen();
+    act(() => {
+      latest().emit({ type: "error", message: "same failure" });
+      latest().emit({ type: "error", message: "same failure" });
+      latest().emit({ type: "error", message: "different failure" });
+    });
+    expect(result.current.errors).toHaveLength(2);
+    expect(result.current.errors[0]).toMatchObject({ message: "same failure", count: 2 });
+    expect(result.current.errors[1]).toMatchObject({ message: "different failure", count: 1 });
+  });
+
+  it("routes term_error into errors state with the terminal source", async () => {
+    const { result } = await mountOpen();
+    act(() =>
+      latest().emit({ type: "term_error", id: TERMINAL_ID, message: "session not found" }),
+    );
+    expect(result.current.errors).toHaveLength(1);
+    expect(result.current.errors[0]).toMatchObject({
+      source: "terminal",
+      message: "session not found",
+    });
+  });
+
+  it("spawnAgent stamps a correlation_id and agent_spawn_queued advances it to queued", async () => {
+    const { result } = await mountOpen();
+    act(() => result.current.spawnAgent({ project: "/proj", prompt: "do it" }));
+
+    const sent = latest().sentMessages().find((m) => m.type === "spawn_agent");
+    expect(sent).toBeDefined();
+    expect(typeof sent?.correlation_id).toBe("string");
+    expect(result.current.spawn).toMatchObject({ phase: "pending" });
+
+    act(() =>
+      latest().emit({
+        type: "agent_spawn_queued",
+        decision: decisionRequest({ id: VALID_REQUEST_ID, tool_name: "SpawnAgent" }),
+        correlation_id: sent?.correlation_id,
+      }),
+    );
+    expect(result.current.spawn).toEqual({
+      phase: "queued",
+      correlationId: sent?.correlation_id,
+      decisionId: VALID_REQUEST_ID,
+    });
+    // Positive ack is not an error — the banner stays empty.
+    expect(result.current.errors).toHaveLength(0);
+  });
+
+  it("a command_error matching the pending spawn refuses it in the modal, not the banner", async () => {
+    const { result } = await mountOpen();
+    act(() => result.current.spawnAgent({ project: "/nope", prompt: "do it" }));
+    const sent = latest().sentMessages().find((m) => m.type === "spawn_agent");
+
+    act(() =>
+      latest().emit({
+        type: "command_error",
+        message: "invalid agent spawn request: project does not exist",
+        correlation_id: sent?.correlation_id,
+      }),
+    );
+    expect(result.current.spawn).toEqual({
+      phase: "refused",
+      correlationId: sent?.correlation_id,
+      message: "invalid agent spawn request: project does not exist",
+    });
+    expect(result.current.errors).toHaveLength(0);
+  });
+
+  it("a command_error with an unmatched correlation falls through to the banner", async () => {
+    const { result } = await mountOpen();
+    act(() =>
+      latest().emit({
+        type: "command_error",
+        message: "failed to spawn agent: denied",
+        correlation_id: "spawn-somebody-else",
+      }),
+    );
+    expect(result.current.spawn).toBeNull();
+    expect(result.current.errors).toHaveLength(1);
+    expect(result.current.errors[0]).toMatchObject({
+      source: "daemon",
+      message: "failed to spawn agent: denied",
+    });
+  });
+
+  it("clearSpawnStatus stops tracking so a late correlated refusal reaches the banner", async () => {
+    const { result } = await mountOpen();
+    act(() => result.current.spawnAgent({ project: "/proj", prompt: "go" }));
+    const sent = latest().sentMessages().find((m) => m.type === "spawn_agent");
+
+    act(() => result.current.clearSpawnStatus());
+    expect(result.current.spawn).toBeNull();
+
+    act(() =>
+      latest().emit({
+        type: "command_error",
+        message: "failed to spawn agent: agent spawn denied by human reviewer",
+        correlation_id: sent?.correlation_id,
+      }),
+    );
+    expect(result.current.errors).toHaveLength(1);
+    expect(result.current.errors[0].message).toContain("denied by human reviewer");
+  });
+
+  it("a send while disconnected surfaces a client error instead of a silent no-op", async () => {
+    const { result } = renderHook(() => useWisphive());
+    await waitFor(() => expect(MockWebSocket.instances.length).toBeGreaterThan(0));
+    // Socket never opened (readyState CONNECTING) — the old code dropped this
+    // approve on the floor.
+    act(() => result.current.approve(REQUEST_ID));
+    expect(latest().sent).toHaveLength(0);
+    expect(result.current.errors).toHaveLength(1);
+    expect(result.current.errors[0]).toMatchObject({ source: "client" });
+    expect(result.current.errors[0].message).toContain('"approve" was not sent');
+  });
+
+  it("spawnAgent while disconnected refuses immediately in the modal without a banner row", async () => {
+    const { result } = renderHook(() => useWisphive());
+    await waitFor(() => expect(MockWebSocket.instances.length).toBeGreaterThan(0));
+    act(() => result.current.spawnAgent({ project: "/proj", prompt: "go" }));
+    expect(latest().sent).toHaveLength(0);
+    expect(result.current.spawn).toMatchObject({
+      phase: "refused",
+      message: "Not connected to the daemon — the spawn request was not sent.",
+    });
+    // The modal renders this refusal; no duplicate banner entry.
+    expect(result.current.errors).toHaveLength(0);
+  });
+});

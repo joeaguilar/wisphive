@@ -1,9 +1,18 @@
 import { useEffect, useRef, useState } from "react";
 import { Modal } from "./Modal";
+import type { SpawnStatus } from "../hooks/useWisphive";
+
+/** How long a submit may sit unanswered before the modal stops claiming
+ * progress (itr#567). The daemon replies to spawn_agent synchronously
+ * (queued ack or refusal) well within this. */
+const PENDING_TIMEOUT_MS = 10_000;
 
 interface SpawnModalProps {
   projects: string[];
   defaultProject?: string;
+  /** Correlated status of the submit (useWisphive `state.spawn`, itr#567):
+   * null before the first submit, then pending → queued | refused. */
+  status: SpawnStatus | null;
   onSpawn: (req: {
     agent_type?: "claude_code" | "codex";
     project: string;
@@ -15,21 +24,42 @@ interface SpawnModalProps {
   onClose: () => void;
 }
 
-export function SpawnModal({ projects, defaultProject, onSpawn, onClose }: SpawnModalProps) {
+export function SpawnModal({ projects, defaultProject, status, onSpawn, onClose }: SpawnModalProps) {
   const [agentType, setAgentType] = useState<"claude_code" | "codex">("claude_code");
   const [project, setProject] = useState(defaultProject || "");
   const [prompt, setPrompt] = useState("");
   const [model, setModel] = useState("");
   const [reasoning, setReasoning] = useState("");
   const [maxTurns, setMaxTurns] = useState("");
+  // The correlation id of a submit whose pending wait expired. Deriving
+  // `timedOut` from a match against the CURRENT submit means a fresh submit
+  // (new correlation id) implicitly clears the stale flag — no synchronous
+  // setState-in-effect needed.
+  const [timedOutFor, setTimedOutFor] = useState<string | null>(null);
   const promptRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     promptRef.current?.focus();
   }, []);
 
+  // Never spin forever on a reply that is not coming: if the daemon has not
+  // answered this submit (keyed by its correlation id) within the timeout,
+  // stop claiming progress and let the operator retry. A late queued/refused
+  // reply still lands — the phase change re-runs this effect and re-renders.
+  const phase = status?.phase ?? null;
+  const correlationId = status?.correlationId ?? null;
+  useEffect(() => {
+    if (phase !== "pending" || correlationId === null) return;
+    const timer = setTimeout(() => setTimedOutFor(correlationId), PENDING_TIMEOUT_MS);
+    return () => clearTimeout(timer);
+  }, [phase, correlationId]);
+
+  const timedOut = phase === "pending" && timedOutFor === correlationId;
+  const pending = phase === "pending" && !timedOut;
+  const queued = phase === "queued";
+
   const handleSubmit = () => {
-    if (!project.trim() || !prompt.trim()) return;
+    if (!project.trim() || !prompt.trim() || pending || queued) return;
     onSpawn({
       agent_type: agentType,
       project: project.trim(),
@@ -103,10 +133,38 @@ export function SpawnModal({ projects, defaultProject, onSpawn, onClose }: Spawn
           </label>
         </div>
 
+        {queued && (
+          <div className="spawn-status spawn-status-queued" role="status">
+            Spawn queued for approval — review and approve it from the Inbox.
+          </div>
+        )}
+        {status?.phase === "refused" && (
+          // Daemon-authored refusal text: untrusted display data, rendered as
+          // an inert text node. The message names the exact refusal cause
+          // (mode off, invalid request, hook gate, deny, expiry, …).
+          <div className="spawn-status spawn-status-refused" role="alert">
+            {status.message}
+          </div>
+        )}
+        {phase === "pending" && timedOut && (
+          <div className="spawn-status spawn-status-refused" role="alert">
+            No response from the daemon after {PENDING_TIMEOUT_MS / 1000}s — the spawn has not
+            been confirmed. Check the connection and try again.
+          </div>
+        )}
+
         <div className="modal-actions">
-          <button className="btn-approve" onClick={handleSubmit} disabled={!project.trim() || !prompt.trim()}>
-            Spawn
-          </button>
+          {queued ? (
+            <button className="btn-approve" onClick={onClose}>Close</button>
+          ) : (
+            <button
+              className="btn-approve"
+              onClick={handleSubmit}
+              disabled={!project.trim() || !prompt.trim() || pending}
+            >
+              {pending ? "Spawning…" : phase === "refused" || timedOut ? "Retry Spawn" : "Spawn"}
+            </button>
+          )}
           <button className="btn-cancel" onClick={onClose}>Cancel</button>
         </div>
       </div>
