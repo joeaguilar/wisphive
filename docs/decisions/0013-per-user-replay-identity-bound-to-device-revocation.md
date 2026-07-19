@@ -63,6 +63,10 @@ its access to all history, including sessions it created itself.
 `replay_acl` is retained for genuinely foreign principals. Denials remain audited, and must surface
 as actionable UI naming the remedy — never a raw `terminal replay denied` string.
 
+> **⚠ CORRECTED — "denials remain audited" describes the `TermReplay` path only. The `TermAttach`
+> path denies **silently and without an audit row**, which is the common case. See Correction 1
+> below and itr#629.**
+
 **See Amendment 1 below** — authorization additionally requires *recent* authentication when
 crossing into a session the device is not already attached to. Revocation alone is reactive; the
 step-up requirement is the proactive half of this decision and is not optional.
@@ -196,3 +200,27 @@ new audited event class and a notification source.
 - itr: #623 (implementation), #624 (the defect that exposed it), #284 (attach scrollback epic)
 - ADR: ADR-0012 (attach seed gated by this ACL), ADR-0008 (same-uid tamper evidence, not
   tamper-proofing)
+
+## Correction 1 (2026-07-19): the "denials remain audited" claim was false as written
+
+An independent review (Codex `gpt-5.6-sol`) found that this ADR asserted a property the shipped code
+does not have. The **decision** is unaffected; the factual claim was wrong and is corrected here
+rather than silently edited.
+
+**What is actually true.** The ACL *is* correctly evaluated before any history is read, on every
+path examined — that part held up. But only the `TermReplay` path audits the request
+(`server.rs:3529`). The `TermAttach` path returns an empty seed (`server.rs:3245`) with **no durable
+audit row and no user-visible explanation**. ADR-0012 documents that silent degradation explicitly,
+so this ADR's blanket "denials remain audited" stood in direct contradiction to an ADR accepted the
+same day.
+
+**How it is resolved.** In favour of auditing. `TermAttach` is the *common* way an operator meets
+this boundary — far more common than an explicit replay — so leaving it silent is what made a
+permission decision read as "the scroll wheel is broken on web." Implementation is required by
+itr#629: a denied or downgraded attach must emit an audit row equivalent to the replay path and
+surface as actionable UI. Until that lands, ADR-0012's documented silent-attach behaviour is what
+the code does, and this ADR's requirement is aspirational.
+
+**Why this is recorded rather than fixed in place.** Two ADRs accepted hours apart disagreed about
+observable behaviour, and neither matched the code. That is exactly the failure mode the ADR
+convention exists to prevent, and the reasoning history is more useful than a clean-looking document.

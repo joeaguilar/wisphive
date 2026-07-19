@@ -50,9 +50,15 @@ Mechanics:
   either in the seed or from the live forwarder, never both (no duplicated
   output at the seam; a not-yet-persisted frame below `next_seq` is at worst
   absent from *scrollback* — the screen repaint stays authoritative).
+  > **⚠ CORRECTED — this invariant is NOT achieved as implemented. See
+  > [Correction 1](#correction-1-2026-07-19-two-invariants-above-are-not-achieved-as-implemented)
+  > and itr#626. Output can be both dropped and duplicated at this seam.**
 - **Seam (repaint):** the vt100 screen snapshot that follows the seed
   self-prefixes `ESC[H ESC[J` (home + erase-below), which cannot scroll
   content into or wipe the client's freshly seeded scrollback.
+  > **⚠ CORRECTED — holds only from a neutral parser state, which the seed
+  > does not guarantee. See [Correction 1](#correction-1-2026-07-19-two-invariants-above-are-not-achieved-as-implemented)
+  > and itr#627.**
 - **Direction:** output-direction rows only — the itr#591 security invariant
   (input-direction bytes, e.g. no-echo passwords, are never seeded).
 
@@ -110,3 +116,43 @@ Mechanics:
 - itr: #624 (root cause + fix), #284 (mechanism delivered), #479 (coverage),
   #623 (remaining grant-path work)
 - Commit: e3d29b9
+
+## Correction 1 (2026-07-19): two invariants above are NOT achieved as implemented
+
+An independent review (Codex `gpt-5.6-sol`) of the implementing commit `e3d29b9`, run hours after
+this ADR was accepted, falsified two of the guarantees stated above. The **decision** stands — seed
+the attach catchup, gate it behind the replay ACL, bound it, output-direction only. What was wrong
+was the claim that the chosen mechanism *delivers* certain properties. Recorded here rather than
+quietly edited, because an ADR that asserts a safety property the code does not have is worse than
+no ADR at all.
+
+**1. "Either in the seed or from the live forwarder, never both" is false (itr#626).**
+The exclusive `before_seq` bound separates *persisted seed rows* from *live frames*, but it does not
+make the parser snapshot, the sequence boundary, and the broadcast subscription **atomic**. The
+`TermAttach` arm captures `next_seq`, then performs several awaited DB operations and writes the
+catchup, and only subscribes afterwards. In that window a frame can be broadcast with no receiver
+attached and excluded from the seed by `seq < N` — **dropped from both paths**. Conversely, because
+the producer updates the parser *before* assigning a sequence and broadcasting, a preemption there
+lets the snapshot already contain a frame that is then also delivered live — **duplicated**. A
+correct fix must establish the subscription and the snapshot atomically with respect to the sequence
+boundary (e.g. subscribe first, then snapshot, then de-duplicate by `seq`).
+
+**2. The `ESC[H ESC[J` repaint is only authoritative from a neutral parser state (itr#627).**
+The sequence itself is sound, but the seed is trimmed at **frame** boundaries, and frames are
+arbitrary ~4096-byte PTY reads — not ANSI boundaries. A seed ending inside an OSC/DCS string (whose
+terminator lives in an excluded frame) leaves the client parser mid-string, so the repaint bytes are
+consumed as *payload* rather than executed. The missing invariant is that the seed guarantees a
+neutral parser state before the repaint.
+
+**Also corrected:** the `ATTACH_SCROLLBACK_SEED_MAX_BYTES = 256 KiB` bound is enforced by a
+**512-row prefetch** trimmed afterwards, so it is neither a reliable 256 KiB tail (many small frames
+yield far less) nor a strict cap (the newest frame is admitted even when it alone exceeds the
+budget) — itr#630.
+
+**What the review confirmed as sound:** seed bytes are read only *after* the ACL decision; the SQL
+bound is correctly exclusive and output-direction-only; two simultaneous attaches do not share
+attachment handles; and no terminal payload bytes leak into logs or replay-audit detail.
+
+**Silent denial.** This ADR documents that an unauthorized attach silently degrades to a screen-only
+catchup. ADR-0013 later asserted that denials "remain audited," which contradicts this. That
+contradiction is real and is resolved in favour of auditing — see ADR-0013 Correction 1 and itr#629.
