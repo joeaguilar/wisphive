@@ -15,3 +15,6 @@ Reviewer: conforms=FALSE (1 MUST-FIX, empirically confirmed), oracle_adequate=FA
 
 ## L1/decision — 2026-07-19T02:27:56Z (LANDED)
 Rework #1 verified: three-probe union (key-rule first via redact_value one-entry-object probe), corpus differential test (5 confirmed leak cases + 2 empty-value pins all NAME-ONLY, benign controls verbatim), malformed-env_json degradation test. Patch applied CLEAN on d484e59. Gate land-588-L1 EXIT 0.
+
+## L2/decision — 2026-07-19T02:27:58Z
+Claimed itr#589 (lane A) on HEAD 2a85eae. Full-stack link (wire + TUI + web + persistence). House rules bound into brief: TUI keybinding in status bar; mobile-responsive CSS; pin toggle = control-plane write affordance — the worktree strip read-only rule (itr#401) applies to the STRIP, terminals view already has write affordances. Dormant rule: pin flag persists + UI toggles, but nothing consumes pinned until #591 — inherently dark.

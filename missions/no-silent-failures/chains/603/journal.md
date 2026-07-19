@@ -40,3 +40,6 @@ Link agent report in, gate green (gatr itr607-verify + vitest/eslint/tsc). Agent
 
 ## L2.5/review+decision — 2026-07-19T02:06:19Z (LANDED)
 Reviewer: conforms=TRUE, oracle_adequate=TRUE, B-A9 SUPPORTS (conditional on residues filed — now filed: #612 ingest writer, #613 archive drop, #614 missing-field default, #615 clippy drift), B-A8 neutral. Untagged serde proven sound both directions; escape coverage exceeds DoD (all Cc+DEL+C1; Cf bidi = NOTE on #614-adjacent polish); old-client skew non-catastrophic (close note carries: retroactive visibility requires daemon restart onto new binary). Workaround honestly bridged: quote-strip fallback now points at filed #612. Patch applied CLEAN; gate land-603-L25 EXIT 0. No contradicts — no council. Chain-603 landed links = 3 (5-link council fires at L5).
+
+## L3/decision — 2026-07-19T02:06:21Z
+Claimed itr#559 (lane B) on HEAD d484e59. AC1 (probe) pre-satisfied in-repo. Binding scope note 217: fix must be POSTURE-AWARE — prompt-existence predicate; unattended headless => deterministic fail-closed with reason + audit; leave explicit seam for Chat surface (#564) to route intrinsic asks to the Inbox. AC6 decision (plan-mode spawns) to be made and recorded.

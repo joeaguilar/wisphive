@@ -64,3 +64,14 @@ NEXT: claim 602/L1 (#567) lane A · claim 603/L1 (#560) lane B.
 - LEARNED (B-A9 residue map from #607): retention archiver discards agent_type for ALL rows; ingest writer emits invalid JSON for special-char labels; missing agent_type silently defaults to claude_code; .ok()? silent-drop pattern persists for other columns; web parse was all-or-nothing per message. Tickets at #607 landing.
 - WATCH: operator brief stands (evidence-seat rescope pattern; default = seal-and-continue executed). 603 remaining: 607 review → land → #559 → #568 → #561; 5-landed-links council fires at next 603 landing.
 - NEXT: tally #607 review → land → claim #559 (lane B) · walk #590 (lane A).
+
+## Pulse — 2026-07-18 (6 landed)
+
+`WALK · landed 6/11 · burn n/a · lanes 2/2`
+
+- LANDED: 603#L2.5 itr#607 → d484e59 (audit read layer tolerant — wisphive audit sees unrecognized-provider refusals, retroactively). 588#L1 itr#590 → 2a85eae (respawn spec persisted redaction-safe; reviewer caught a cleartext leak class pre-land — key-rule probe + differential corpus now pin it).
+- MOVED: 588/L2 (#589 pin flag) claimed, lane A walking. 603/L3 (#559 posture-aware headless defer) build done, gate rerun executing.
+- FILED: #612 ingest invalid-JSON writer (high), #613 archive agent_type drop, #614 missing-field misattribution, #615 clippy --all-targets toolchain drift.
+- LEARNED: read-side tolerance can silently MUTATE (backslash-escape labels) — writer fix #612 is the real close; dormancy-by-pub-API holds but nothing prevents an accidental early consumer.
+- WATCH: 603 chain-landed count = 3; the 5-link council fires at #561's landing. Remaining: #559 (in gate) → #568 → #561 · 588: #589 → #591 (terminal, e2e).
+- NEXT: tally #559 report → review → land · #589 report → review → land.
