@@ -42,6 +42,14 @@ export interface WisphiveDaemonServer {
   process: ChildProcessWithoutNullStreams
   /** Combined stdout+stderr captured so far — attach on failure. */
   output(): string
+  /**
+   * Gracefully stop the daemon (SIGTERM → its shutdown path runs) and boot a
+   * FRESH daemon process on the SAME home + SAME port. The restart-survival
+   * harness for itr#591: state under `<home>/.wisphive` persists, the web
+   * origin (and the browser's localStorage token) stays valid, and the new
+   * daemon's reconcile-on-start runs against the previous run's SQLite rows.
+   */
+  restart(): Promise<void>
   /** SIGTERM (then SIGKILL) the daemon and delete the temp state dir. */
   stop(): Promise<void>
 }
@@ -122,38 +130,16 @@ async function writeStub(binDir: string, name: string): Promise<void> {
   await chmod(p, 0o755)
 }
 
-export async function startWisphiveDaemonServer(): Promise<WisphiveDaemonServer> {
-  const bin = resolveBinary()
+/** One daemon process lifecycle (a fixture may boot several via restart). */
+interface DaemonProc {
+  child: ChildProcessWithoutNullStreams
+  tracked: ReturnType<typeof track>
+  output: () => string
+  exited: () => boolean
+  waitExit: (ms: number) => Promise<boolean>
+}
 
-  const home = await mkdtemp(path.join(os.tmpdir(), 'wisphive-e2e-daemon-'))
-  // Belt-and-braces: never proceed if the isolated dir somehow resolves to
-  // (or inside) the real home — a live wisphive daemon owns ~/.wisphive.
-  const realHome = path.resolve(os.homedir())
-  const isolated = path.resolve(home)
-  if (isolated === realHome || isolated.startsWith(realHome + path.sep)) {
-    throw new Error(`refusing to run e2e against the real HOME: ${home}`)
-  }
-  await mkdir(path.join(home, '.wisphive'), { recursive: true, mode: 0o700 })
-
-  // Secure-mode file: the daemon re-validates mode per hook DecisionRequest
-  // (crates/wisphive_daemon/src/server.rs `hook_decision_mode_denial`, main
-  // commit b6a1551) and denies before enqueue unless `<home>/.wisphive/mode`
-  // is a 0600 regular file reading `active` inside the 0700 state dir. A
-  // real hook only ever sends a DecisionRequest when mode is active, so the
-  // fixture daemon must start in that state or every injected decision is
-  // denied without ever reaching the queue.
-  const modePath = path.join(home, '.wisphive', 'mode')
-  await writeFile(modePath, 'active')
-  await chmod(modePath, 0o600)
-
-  // Notification no-op stubs, first on PATH.
-  const binDir = path.join(home, 'stub-bin')
-  await mkdir(binDir, { recursive: true })
-  await writeStub(binDir, 'terminal-notifier')
-  await writeStub(binDir, 'osascript')
-  await writeStub(binDir, 'notify-send')
-
-  const port = await allocateEphemeralPort()
+function spawnDaemon(bin: string, home: string, binDir: string, port: number): DaemonProc {
   const args = [
     'daemon',
     'start',
@@ -189,41 +175,95 @@ export async function startWisphiveDaemonServer(): Promise<WisphiveDaemonServer>
       resolve()
     })
   })
-
   const waitExit = async (ms: number): Promise<boolean> =>
     Promise.race([exitPromise.then(() => true), sleep(ms).then(() => false)])
 
-  const cleanup = async () => {
-    untrack(tracked)
-    await rm(home, { recursive: true, force: true })
-  }
+  return { child, tracked, output: () => output, exited: () => exited, waitExit }
+}
 
-  const socketPath = path.join(home, '.wisphive', 'wisphive.sock')
-
-  // Ready = web listener answering AND the daemon's Unix socket bound (the
-  // embedded web server is spawned before Server::new binds the socket, so
-  // the two are racing — hook fixtures need the socket, not just the web UI).
+/**
+ * Ready = web listener answering AND the daemon's Unix socket bound (the
+ * embedded web server is spawned before Server::new binds the socket, so
+ * the two are racing — hook fixtures need the socket, not just the web UI).
+ * On failure the process is killed and untracked before throwing.
+ */
+async function waitDaemonReady(proc: DaemonProc, port: number, socketPath: string): Promise<void> {
   const readyTimeoutMs = 30_000
   const deadline = Date.now() + readyTimeoutMs
   try {
     for (;;) {
-      if (exited) {
+      if (proc.exited()) {
         throw new Error(
-          `wisphive daemon start exited before becoming ready (args: ${args.join(' ')}).\n--- output ---\n${output}`,
+          `wisphive daemon start exited before becoming ready (port ${port}).\n--- output ---\n${proc.output()}`,
         )
       }
-      if ((await probeReady(port)) && existsSync(socketPath)) break
+      if ((await probeReady(port)) && existsSync(socketPath)) return
       if (Date.now() > deadline) {
         throw new Error(
-          `wisphive daemon start not ready after ${readyTimeoutMs}ms on port ${port}.\n--- output ---\n${output}`,
+          `wisphive daemon start not ready after ${readyTimeoutMs}ms on port ${port}.\n--- output ---\n${proc.output()}`,
         )
       }
       await sleep(150)
     }
   } catch (err) {
-    if (!exited) killGroup(child, 'SIGKILL')
-    await waitExit(5_000)
-    await cleanup()
+    if (!proc.exited()) killGroup(proc.child, 'SIGKILL')
+    await proc.waitExit(5_000)
+    untrack(proc.tracked)
+    throw err
+  }
+}
+
+/** SIGTERM (escalating to SIGKILL) one daemon process and untrack it. */
+async function stopDaemonProc(proc: DaemonProc): Promise<void> {
+  if (!proc.exited()) {
+    killGroup(proc.child, 'SIGTERM')
+    if (!(await proc.waitExit(5_000))) {
+      killGroup(proc.child, 'SIGKILL')
+      await proc.waitExit(5_000)
+    }
+  }
+  untrack(proc.tracked)
+}
+
+export async function startWisphiveDaemonServer(): Promise<WisphiveDaemonServer> {
+  const bin = resolveBinary()
+
+  const home = await mkdtemp(path.join(os.tmpdir(), 'wisphive-e2e-daemon-'))
+  // Belt-and-braces: never proceed if the isolated dir somehow resolves to
+  // (or inside) the real home — a live wisphive daemon owns ~/.wisphive.
+  const realHome = path.resolve(os.homedir())
+  const isolated = path.resolve(home)
+  if (isolated === realHome || isolated.startsWith(realHome + path.sep)) {
+    throw new Error(`refusing to run e2e against the real HOME: ${home}`)
+  }
+  await mkdir(path.join(home, '.wisphive'), { recursive: true, mode: 0o700 })
+
+  // Secure-mode file: the daemon re-validates mode per hook DecisionRequest
+  // (crates/wisphive_daemon/src/server.rs `hook_decision_mode_denial`, main
+  // commit b6a1551) and denies before enqueue unless `<home>/.wisphive/mode`
+  // is a 0600 regular file reading `active` inside the 0700 state dir. A
+  // real hook only ever sends a DecisionRequest when mode is active, so the
+  // fixture daemon must start in that state or every injected decision is
+  // denied without ever reaching the queue.
+  const modePath = path.join(home, '.wisphive', 'mode')
+  await writeFile(modePath, 'active')
+  await chmod(modePath, 0o600)
+
+  // Notification no-op stubs, first on PATH.
+  const binDir = path.join(home, 'stub-bin')
+  await mkdir(binDir, { recursive: true })
+  await writeStub(binDir, 'terminal-notifier')
+  await writeStub(binDir, 'osascript')
+  await writeStub(binDir, 'notify-send')
+
+  const port = await allocateEphemeralPort()
+  const socketPath = path.join(home, '.wisphive', 'wisphive.sock')
+
+  let proc = spawnDaemon(bin, home, binDir, port)
+  try {
+    await waitDaemonReady(proc, port, socketPath)
+  } catch (err) {
+    await rm(home, { recursive: true, force: true })
     throw err
   }
 
@@ -232,17 +272,32 @@ export async function startWisphiveDaemonServer(): Promise<WisphiveDaemonServer>
     port,
     home,
     socketPath,
-    process: child,
-    output: () => output,
-    stop: async () => {
-      if (!exited) {
-        killGroup(child, 'SIGTERM')
-        if (!(await waitExit(5_000))) {
-          killGroup(child, 'SIGKILL')
-          await waitExit(5_000)
+    get process() {
+      return proc.child
+    },
+    output: () => proc.output(),
+    restart: async () => {
+      await stopDaemonProc(proc)
+      // Same home + SAME port so the browser origin (and its localStorage
+      // token) survives the restart. Rebinding the port immediately after
+      // the old listener closed can transiently fail; retry briefly.
+      let lastErr: unknown
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const next = spawnDaemon(bin, home, binDir, port)
+        try {
+          await waitDaemonReady(next, port, socketPath)
+          proc = next
+          return
+        } catch (err) {
+          lastErr = err
+          await sleep(500)
         }
       }
-      await cleanup()
+      throw lastErr
+    },
+    stop: async () => {
+      await stopDaemonProc(proc)
+      await rm(home, { recursive: true, force: true })
     },
   }
 }

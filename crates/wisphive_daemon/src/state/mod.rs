@@ -98,6 +98,13 @@ fn rotate_if_large(path: &std::path::Path, max_bytes: u64) {
 #[derive(Clone)]
 pub struct StateDb {
     pool: SqlitePool,
+    /// Pinned sessions that were still `running` when [`Self::open`] swept
+    /// the terminal table — the respawn candidates for itr#591's
+    /// reconcile-on-start. Captured atomically by the sweep's
+    /// `UPDATE .. RETURNING`, consumed once by
+    /// [`Self::take_respawn_candidates`] in `Server::new`. Always empty for
+    /// [`Self::open_client`] handles (the CLI never reconciles).
+    respawn_candidates: std::sync::Arc<std::sync::Mutex<Vec<uuid::Uuid>>>,
 }
 
 impl StateDb {
@@ -109,15 +116,32 @@ impl StateDb {
         // Any terminal session still marked running at daemon startup
         // belongs to a prior daemon instance whose PTY is gone. Mark
         // orphaned so replay still works but clients know the live stream
-        // is unreachable.
+        // is unreachable. PINNED rows swept here are captured as respawn
+        // candidates (itr#591) for `Server::new` to resurrect.
         //
         // CRITICAL — this MUST NOT run from non-daemon processes: a live
         // daemon's running PTYs would all get flipped to orphaned and the
         // daemon would continue writing events to rows the DB now considers
         // ended. That's why the CLI uses `open_client` below.
-        db.mark_running_terminals_orphaned().await?;
+        let candidates = db.mark_running_terminals_orphaned().await?;
+        *db.respawn_candidates
+            .lock()
+            .expect("respawn candidates poisoned") = candidates;
         info!("state database ready at {}", path);
         Ok(db)
+    }
+
+    /// Take (and clear) the pinned-session respawn candidates captured by
+    /// this handle's [`Self::open`] sweep. One-shot by design: the reconcile
+    /// pass in `Server::new` is the only consumer, and a candidate must
+    /// never be respawned twice.
+    pub fn take_respawn_candidates(&self) -> Vec<uuid::Uuid> {
+        std::mem::take(
+            &mut *self
+                .respawn_candidates
+                .lock()
+                .expect("respawn candidates poisoned"),
+        )
     }
 
     /// Open (or create) the database for a read/write client that is NOT
@@ -159,7 +183,10 @@ impl StateDb {
             .journal_mode(SqliteJournalMode::Wal);
         let pool = SqlitePool::connect_with(opts).await?;
 
-        let db = Self { pool };
+        let db = Self {
+            pool,
+            respawn_candidates: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
         db.migrate().await?;
         if let Some(location) = secure_location {
             let path = location.database_path().to_owned();

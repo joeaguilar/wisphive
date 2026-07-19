@@ -298,6 +298,7 @@ describe("Terminals deferred deep-link focus (itr#437 / itr#449)", () => {
         onResize={() => {}}
         onSetGroup={() => {}}
         onReorder={() => {}}
+        onSetPinned={() => {}}
         onApprove={() => {}}
         onDeny={() => {}}
         onJumpToQueue={() => {}}

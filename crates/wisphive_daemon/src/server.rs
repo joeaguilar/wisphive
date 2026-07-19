@@ -229,6 +229,69 @@ impl Server {
             tui_tx.clone(),
         ));
 
+        // Reconcile-on-start (itr#591): the StateDb::open sweep just orphaned
+        // every terminal row still marked `running` and captured the PINNED
+        // ones as respawn candidates — i.e. sessions that were running when
+        // the previous daemon went down (crash) or entered graceful shutdown
+        // (`shutdown_all` preserves pinned rows as `running`). Pinned rows
+        // that were ALREADY orphaned/exited beforehand are stale and never
+        // qualify. Respawn is best-effort per session: a failure (deleted
+        // cwd, missing binary) leaves that row orphaned, is logged + audited,
+        // and never blocks daemon startup. Each outcome lands in `web_audit`
+        // as `terminal_respawn` (pinning has execution consequences now —
+        // the trail must show what actually ran), and one refreshed
+        // TermListResponse is broadcast so early-connecting TUI/web clients
+        // converge on the revived sessions.
+        let candidates = state_db.take_respawn_candidates();
+        let mut respawned = 0usize;
+        for id in candidates {
+            let outcome = terminal_manager.respawn_session(id).await;
+            let detail = match &outcome {
+                Ok((meta, notes)) => {
+                    let mut d = serde_json::json!({
+                        "session_id": id,
+                        "outcome": "respawned",
+                        "command": meta.command,
+                        "cwd": meta.cwd.display().to_string(),
+                    });
+                    // Best-effort degradations (malformed env_json, seed
+                    // read failure) — the respawn proceeded, but the trail
+                    // must say it was not full-fidelity.
+                    if !notes.is_empty() {
+                        d["notes"] = serde_json::json!(notes);
+                    }
+                    d.to_string()
+                }
+                Err(e) => serde_json::json!({
+                    "session_id": id,
+                    "outcome": "failed",
+                    "error": e.to_string(),
+                })
+                .to_string(),
+            };
+            if let Err(e) = state_db
+                .append_web_audit("terminal_respawn", None, None, Some(&detail))
+                .await
+            {
+                warn!("failed to audit terminal respawn: {e}");
+            }
+            match outcome {
+                Ok(_) => respawned += 1,
+                Err(e) => {
+                    warn!(session_id = %id, "pinned terminal respawn failed; session stays orphaned: {e}");
+                }
+            }
+        }
+        if respawned > 0 {
+            info!(
+                respawned,
+                "respawned pinned terminal sessions after restart"
+            );
+            if let Ok(sessions) = terminal_manager.list_all().await {
+                let _ = tui_tx.send(ServerMessage::TermListResponse { sessions });
+            }
+        }
+
         Ok(Self {
             config,
             queue,
@@ -3315,10 +3378,32 @@ async fn handle_terminal_command(
             // list so every client converges, exactly like TermSetGroup /
             // TermReorder. Same auth path as all terminal commands: local TUI
             // or bridge-authenticated web device (`device_id` stamped by the
-            // web bridge). Dormant flag — nothing consumes it until itr#591.
+            // web bridge). Since itr#591 the flag has EXECUTION consequences
+            // (a pinned session respawns its stored command on the next
+            // daemon start), so every successful toggle is stamped into
+            // `web_audit` like `terminal_replay` — who pinned what, when.
             info!(?device_id, %id, pinned, "term set pinned");
             match ctx.terminal_manager.set_pinned(id, pinned).await {
                 Ok(()) => {
+                    let dev_id: Option<String> = device_id.as_ref().map(|d| d.0.clone());
+                    let detail = serde_json::json!({
+                        "session_id": id,
+                        "pinned": pinned,
+                        "requester": resolver_label(&device_id),
+                    })
+                    .to_string();
+                    if let Err(e) = ctx
+                        .state_db
+                        .append_web_audit(
+                            "terminal_set_pinned",
+                            dev_id.as_deref(),
+                            None,
+                            Some(&detail),
+                        )
+                        .await
+                    {
+                        warn!("failed to audit terminal pin toggle: {e}");
+                    }
                     if let Ok(sessions) = ctx.terminal_manager.list_all().await {
                         let _ = ctx
                             .tui_tx
@@ -4355,6 +4440,299 @@ mod tests {
             history[0].decided_by.as_deref(),
             Some("daemon_restart:failopen")
         );
+    }
+
+    /// itr#591 AC: the full reconcile-on-start path across a real graceful
+    /// daemon-restart cycle (the common planned-restart shape). A PINNED
+    /// running session comes back live under the same id in the next
+    /// Server — saved cwd/command, scrollback seeded, honesty banner,
+    /// `WISPHIVE_TERMINAL_SESSION_ID` re-injected (hook-gate
+    /// cross-reference) — while an unpinned session and a STALE pinned
+    /// orphan (already orphaned before this restart) stay orphaned. Each
+    /// respawn is audited as `terminal_respawn`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_respawns_pinned_sessions_and_leaves_the_rest_orphaned() {
+        use crate::DaemonConfig;
+        use wisphive_protocol::{TerminalSessionMeta, TerminalStatus};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+
+        let s1 = super::Server::new(DaemonConfig::new(home.clone()))
+            .await
+            .unwrap();
+
+        // Pinned: prints a marker + its own session id, then blocks.
+        let script =
+            "printf 'MARKER-PIN sid=%s READY' \"$WISPHIVE_TERMINAL_SESSION_ID\"; read line";
+        let pinned = s1
+            .terminal_manager
+            .create(
+                Some("pinned".into()),
+                Some("/bin/sh".into()),
+                Some(vec!["-c".into(), script.into()]),
+                None,
+                120,
+                40,
+                None,
+                Some("test".into()),
+            )
+            .await
+            .unwrap();
+        let unpinned = s1
+            .terminal_manager
+            .create(
+                Some("unpinned".into()),
+                Some("/bin/sh".into()),
+                Some(vec!["-c".into(), "printf READY; read line".into()]),
+                None,
+                80,
+                24,
+                None,
+                Some("test".into()),
+            )
+            .await
+            .unwrap();
+
+        // The respawn seed reads the DB — wait for the marker to persist.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let tail = s1
+                    .state_db
+                    .tail_terminal_output(pinned.id, 65536)
+                    .await
+                    .unwrap();
+                if tail.windows(5).any(|w| w == b"READY") {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("pinned marker output was not persisted");
+        s1.terminal_manager
+            .set_pinned(pinned.id, true)
+            .await
+            .unwrap();
+
+        // Stale candidate: pinned but ALREADY orphaned before this restart
+        // (left over from an earlier lifecycle) — must NOT respawn.
+        let stale_id = uuid::Uuid::new_v4();
+        let stale = TerminalSessionMeta {
+            id: stale_id,
+            label: Some("stale".into()),
+            command: "/bin/sh".into(),
+            args: vec![],
+            cwd: std::path::PathBuf::from("/tmp"),
+            cols: 80,
+            rows: 24,
+            started_at: chrono::Utc::now(),
+            ended_at: Some(chrono::Utc::now()),
+            exit_code: None,
+            status: TerminalStatus::Orphaned,
+            group_name: None,
+            sort_order: 0,
+            created_by: None,
+            replay_acl: Vec::new(),
+            pinned: true,
+        };
+        s1.state_db
+            .create_terminal_session(&stale, None)
+            .await
+            .unwrap();
+
+        // Graceful shutdown: children killed, pinned row preserved `running`.
+        s1.terminal_manager.shutdown_all().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let u = s1
+                    .state_db
+                    .get_terminal_session(unpinned.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if u.status != TerminalStatus::Running
+                    && s1.terminal_manager.get(pinned.id).await.is_none()
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shutdown teardown did not settle");
+        drop(s1);
+
+        // ── Restart ──────────────────────────────────────────────
+        let s2 = super::Server::new(DaemonConfig::new(home.clone()))
+            .await
+            .unwrap();
+
+        // Pinned: live + attachable in the new daemon, row resurrected.
+        let session = s2
+            .terminal_manager
+            .get(pinned.id)
+            .await
+            .expect("pinned session must be live after restart");
+        let row = s2
+            .state_db
+            .get_terminal_session(pinned.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, TerminalStatus::Running);
+        assert!(row.pinned, "pin is sticky across the restart");
+
+        // Screen: seeded prior scrollback + banner + the FRESH child's print
+        // carrying the SAME session id (gate cross-reference env).
+        let sid_needle = format!("sid={}", pinned.id);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let screen = String::from_utf8_lossy(&session.catchup_snapshot()).to_string();
+                if screen.matches("MARKER-PIN").count() >= 2 {
+                    assert!(
+                        screen.contains("pinned session respawned"),
+                        "honesty banner missing: {screen}"
+                    );
+                    assert_eq!(
+                        screen.matches(&sid_needle).count(),
+                        2,
+                        "respawned child must re-inject the session id: {screen}"
+                    );
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("respawned session never showed seeded scrollback + fresh output");
+
+        // Unpinned: orphaned, not live. Stale pinned orphan: untouched.
+        assert!(s2.terminal_manager.get(unpinned.id).await.is_none());
+        let u = s2
+            .state_db
+            .get_terminal_session(unpinned.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(u.status, TerminalStatus::Running);
+        assert!(s2.terminal_manager.get(stale_id).await.is_none());
+        let st = s2
+            .state_db
+            .get_terminal_session(stale_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            st.status,
+            TerminalStatus::Orphaned,
+            "a pinned row already orphaned before the restart must not respawn"
+        );
+
+        // The respawn is observable in the audit trail.
+        let audit = s2.state_db.list_web_audit(50).await.unwrap();
+        let respawn_rows: Vec<_> = audit
+            .iter()
+            .filter(|r| r.event == "terminal_respawn")
+            .collect();
+        assert_eq!(respawn_rows.len(), 1, "exactly one candidate respawned");
+        let detail = respawn_rows[0].detail.as_deref().unwrap_or_default();
+        assert!(detail.contains(&pinned.id.to_string()), "{detail}");
+        assert!(detail.contains("\"outcome\":\"respawned\""), "{detail}");
+
+        s2.terminal_manager.shutdown_all().await;
+    }
+
+    /// itr#591 rework MUST-FIX: a corrupt persisted respawn spec must fail
+    /// LOUD, never fabricate a command. With garbage in the `args` column,
+    /// the reconcile must audit a `terminal_respawn` row with
+    /// `outcome=failed` naming the corruption, spawn NO PTY (an empty argv
+    /// would turn `/bin/sh -c 'cmd'` into a bare interactive `/bin/sh` and
+    /// call it a success), and leave the session orphaned with its pin
+    /// sticky so the operator can repair and restart again.
+    #[tokio::test]
+    async fn restart_audits_failed_respawn_on_corrupt_args_and_keeps_session_orphaned_pinned() {
+        use crate::DaemonConfig;
+        use wisphive_protocol::{TerminalSessionMeta, TerminalStatus};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+
+        // Previous lifecycle: a pinned session whose row was preserved as
+        // `running` (the graceful-shutdown shape) but whose stored args blob
+        // is corrupt.
+        let s1 = super::Server::new(DaemonConfig::new(home.clone()))
+            .await
+            .unwrap();
+        let id = uuid::Uuid::new_v4();
+        let meta = TerminalSessionMeta {
+            id,
+            label: Some("corrupt-spec".into()),
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), "echo should-never-run".into()],
+            cwd: std::path::PathBuf::from("/tmp"),
+            cols: 80,
+            rows: 24,
+            started_at: chrono::Utc::now(),
+            ended_at: None,
+            exit_code: None,
+            status: TerminalStatus::Running,
+            group_name: None,
+            sort_order: 0,
+            created_by: None,
+            replay_acl: Vec::new(),
+            pinned: true,
+        };
+        s1.state_db
+            .create_terminal_session(&meta, None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE terminal_sessions SET args = ? WHERE id = ?")
+            .bind("{definitely not an argv")
+            .bind(id.to_string())
+            .execute(s1.state_db.pool())
+            .await
+            .unwrap();
+        drop(s1);
+
+        // Restart: the sweep captures the pinned candidate; the reconcile's
+        // respawn attempt must refuse the corrupt spec.
+        let s2 = super::Server::new(DaemonConfig::new(home.clone()))
+            .await
+            .unwrap();
+
+        // No PTY was spawned for it.
+        assert!(
+            s2.terminal_manager.get(id).await.is_none(),
+            "a corrupt spec must never produce a live PTY"
+        );
+
+        // The row stays orphaned AND pinned (sticky pin: repair + retry).
+        let row = s2.state_db.get_terminal_session(id).await.unwrap().unwrap();
+        assert_eq!(row.status, TerminalStatus::Orphaned);
+        assert!(row.pinned, "pin must stay sticky on a failed respawn");
+
+        // Audited as outcome=failed, with a reason naming the corruption.
+        let audit = s2.state_db.list_web_audit(50).await.unwrap();
+        let respawn_row = audit
+            .iter()
+            .filter(|r| r.event == "terminal_respawn")
+            .find(|r| {
+                r.detail
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(&id.to_string())
+            })
+            .expect("failed respawn must land in the audit trail");
+        let detail = respawn_row.detail.as_deref().unwrap_or_default();
+        assert!(detail.contains("\"outcome\":\"failed\""), "{detail}");
+        assert!(
+            detail.contains("malformed args_json"),
+            "failure reason must name the corruption: {detail}"
+        );
+
+        s2.terminal_manager.shutdown_all().await;
     }
 
     #[tokio::test]

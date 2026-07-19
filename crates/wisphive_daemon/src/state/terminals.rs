@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use wisphive_protocol::redact::{REDACTED, redact_text, redact_value};
 use wisphive_protocol::{TerminalDirection, TerminalSessionMeta, TerminalStatus};
@@ -155,6 +155,11 @@ pub struct TerminalRespawnSpec {
     pub args: Vec<String>,
     pub cwd: std::path::PathBuf,
     pub env: Option<TerminalEnvSpec>,
+    /// True when `env_json` was present but unparsable: `env` degraded to
+    /// `None` (the respawn proceeds with daemon-inherited env only) and the
+    /// caller should surface the degradation in its audit detail. Always
+    /// false for a NULL `env_json` (legacy rows / no overrides requested).
+    pub env_degraded: bool,
 }
 
 type TerminalSessionRow = (
@@ -297,9 +302,10 @@ impl StateDb {
     }
 
     /// Pin or unpin a session as an "important session" (itr#589). The flag
-    /// marks the row as a respawn-on-restart candidate for itr#591's
-    /// reconcile-on-start; it is dormant until then and never affects the
-    /// startup orphan sweep today.
+    /// has execution consequences since itr#591: graceful shutdown preserves
+    /// a pinned session's row as `running`, and the startup sweep
+    /// ([`Self::mark_running_terminals_orphaned`]) captures pinned `running`
+    /// rows as respawn candidates for reconcile-on-start.
     pub async fn set_terminal_pinned(&self, id: uuid::Uuid, pinned: bool) -> Result<()> {
         sqlx::query("UPDATE terminal_sessions SET pinned = ? WHERE id = ?")
             .bind(i64::from(pinned))
@@ -372,9 +378,14 @@ impl StateDb {
     /// Read back the restorable spawn spec for a session (itr#590).
     ///
     /// `command`/`args`/`cwd` are returned exactly as stored (non-negotiable
-    /// respawn fidelity); a NULL or unparsable `env_json` degrades to
-    /// `env: None` rather than failing the whole spec — env is best-effort,
-    /// the respawn itself must never be blocked by it.
+    /// respawn fidelity) — a corrupt `args` blob is a hard `Err`, never a
+    /// fabricated empty argv: defaulting would respawn e.g.
+    /// `/bin/sh -c 'my-server'` as a bare interactive `/bin/sh` and audit it
+    /// as a success (itr#591 rework MUST-FIX). A NULL or unparsable
+    /// `env_json` still degrades to `env: None` (flagged via
+    /// [`TerminalRespawnSpec::env_degraded`]) rather than failing the whole
+    /// spec — env is best-effort, the respawn itself must never be blocked
+    /// by it.
     pub async fn get_terminal_respawn_spec(
         &self,
         id: uuid::Uuid,
@@ -388,16 +399,26 @@ impl StateDb {
         .bind(id.to_string())
         .fetch_optional(&self.pool)
         .await?;
-        Ok(
-            row.map(|(command, args_json, cwd, env_json)| TerminalRespawnSpec {
-                command,
-                args: serde_json::from_str(&args_json).unwrap_or_default(),
-                cwd: std::path::PathBuf::from(cwd),
-                env: env_json
-                    .as_deref()
-                    .and_then(|json| serde_json::from_str::<TerminalEnvSpec>(json).ok()),
-            }),
-        )
+        let Some((command, args_json, cwd, env_json)) = row else {
+            return Ok(None);
+        };
+        let args: Vec<String> = serde_json::from_str(&args_json).map_err(|e| {
+            anyhow!(
+                "malformed args_json in the stored respawn spec for terminal session {id} \
+                 (refusing to fabricate an argv): {e}"
+            )
+        })?;
+        let env = env_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<TerminalEnvSpec>(json).ok());
+        let env_degraded = env_json.is_some() && env.is_none();
+        Ok(Some(TerminalRespawnSpec {
+            command,
+            args,
+            cwd: std::path::PathBuf::from(cwd),
+            env,
+            env_degraded,
+        }))
     }
 
     /// Grant one resolver label explicit replay access to a session.
@@ -485,18 +506,116 @@ impl StateDb {
         Ok(out)
     }
 
-    /// Mark any sessions still flagged 'running' as orphaned. Called on daemon
-    /// startup — a running session across a restart has no live PTY behind it.
-    pub async fn mark_running_terminals_orphaned(&self) -> Result<()> {
-        sqlx::query(
+    /// Mark any sessions still flagged 'running' as orphaned, returning the
+    /// ids of the PINNED rows swept — the respawn candidates for itr#591's
+    /// reconcile-on-start. Called on daemon startup — a running session
+    /// across a restart has no live PTY behind it.
+    ///
+    /// Candidacy (itr#591): "pinned AND running at shutdown". A row is still
+    /// `running` at this point in exactly two cases — the previous daemon
+    /// crashed, or its graceful shutdown deliberately preserved the row
+    /// (`shutdown_all` skips the end-persist for pinned sessions). A pinned
+    /// row that is *already* orphaned/exited/killed is a STALE candidate from
+    /// an earlier lifecycle (or a session that died on its own): pinning it
+    /// marks it important but never resurrects it, so it is not returned.
+    /// The capture and the sweep are one atomic UPDATE .. RETURNING — there
+    /// is no window in which a candidate can be missed or double-counted.
+    ///
+    /// Every swept row (pinned or not) is truthfully `orphaned` after this
+    /// call; a successful respawn flips its row back to `running` via
+    /// [`Self::resurrect_terminal_session`], and a failed respawn leaves it
+    /// orphaned.
+    pub async fn mark_running_terminals_orphaned(&self) -> Result<Vec<uuid::Uuid>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
             "UPDATE terminal_sessions
              SET status = 'orphaned', ended_at = COALESCE(ended_at, ?)
-             WHERE status = 'running'",
+             WHERE status = 'running'
+             RETURNING id, pinned",
         )
         .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|(_, pinned)| *pinned != 0)
+            .filter_map(|(id, _)| uuid::Uuid::parse_str(&id).ok())
+            .collect())
+    }
+
+    /// Flip a swept (orphaned) session back to `running` after a successful
+    /// respawn (itr#591). Clears the sweep's `ended_at` stamp and any stale
+    /// exit code; the original `started_at` is preserved — the row is the
+    /// same logical session, resurrected with a fresh child process.
+    pub async fn resurrect_terminal_session(&self, id: uuid::Uuid) -> Result<()> {
+        sqlx::query(
+            "UPDATE terminal_sessions
+             SET status = 'running', ended_at = NULL, exit_code = NULL
+             WHERE id = ?",
+        )
+        .bind(id.to_string())
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Highest event sequence number recorded for a session, or `None` when
+    /// no events exist. A respawn (itr#591) continues the stream at max+1 so
+    /// the `INSERT OR IGNORE` de-dup on `(session_id, seq)` can never
+    /// silently drop the new epoch's audit bytes onto old seq numbers.
+    pub async fn max_terminal_event_seq(&self, id: uuid::Uuid) -> Result<Option<u64>> {
+        let row: (Option<i64>,) =
+            sqlx::query_as("SELECT MAX(seq) FROM terminal_events WHERE session_id = ?")
+                .bind(id.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(row.0.map(|s| s as u64))
+    }
+
+    /// The trailing OUTPUT bytes of a session's recorded history, capped at
+    /// `max_bytes` (trimmed from the front, oldest first). Used by itr#591's
+    /// respawn to seed the new epoch's vt100 screen with the prior scrollback
+    /// (herdr's screen-history-replay path).
+    ///
+    /// SECURITY INVARIANT: output direction ONLY — input-direction rows
+    /// (typed sudo passwords, pasted keys) are never part of the seed.
+    /// Honest limit: PTY *echo* of typed input IS output-direction bytes, so
+    /// echoed input can still appear in the seed — the guarantee is
+    /// "input-direction rows never seeded", not "typed secrets can never
+    /// appear" (no-echo input like a sudo password stays excluded). The
+    /// seed's final-screen exposure therefore equals what a live attacher
+    /// already saw on screen; the seed surfaces through the same
+    /// unauthenticated-to-attach catchup screen, and the full input+output
+    /// history stays behind the ACL-gated, audited `term replay` path
+    /// (itr#98).
+    pub async fn tail_terminal_output(&self, id: uuid::Uuid, max_bytes: usize) -> Result<Vec<u8>> {
+        // Newest rows first, bounded (output frames are chunked at ~4 KiB by
+        // the PTY reader, so 512 rows comfortably covers any sane byte cap);
+        // reassembled oldest-first below.
+        let rows: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+            "SELECT seq, payload FROM terminal_events
+             WHERE session_id = ? AND direction = 'output'
+             ORDER BY seq DESC
+             LIMIT 512",
+        )
+        .bind(id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        let mut total = 0usize;
+        let mut kept: Vec<Vec<u8>> = Vec::new();
+        for (_seq, payload) in rows {
+            // Always admit the newest frame even if it alone exceeds the cap;
+            // stop before admitting an older frame that would overflow it.
+            if !kept.is_empty() && total + payload.len() > max_bytes {
+                break;
+            }
+            total += payload.len();
+            kept.push(payload);
+            if total >= max_bytes {
+                break;
+            }
+        }
+        kept.reverse();
+        Ok(kept.concat())
     }
 
     /// Delete terminal events older than the retention cutoff for sessions
@@ -732,9 +851,10 @@ mod tests {
         assert!(got.pinned);
     }
 
-    /// itr#589 AC#2 PIN (dormancy): pinning does NOT exempt a session from
-    /// the startup orphan sweep — nothing consumes the flag until itr#591
-    /// flips respawn behavior. The flag itself survives the sweep.
+    /// itr#589 AC#2, superseded by itr#591: the startup sweep still orphans
+    /// pinned rows at the DB level (truthful — no PTY exists at sweep time),
+    /// but now RETURNS them as respawn candidates. The flag itself survives
+    /// the sweep (sticky pin: the user unpins when done).
     #[tokio::test]
     async fn pinned_sessions_still_orphaned_on_startup_sweep() {
         let db = test_db().await;
@@ -744,18 +864,154 @@ mod tests {
             .unwrap();
         db.set_terminal_pinned(id, true).await.unwrap();
 
-        db.mark_running_terminals_orphaned().await.unwrap();
+        let candidates = db.mark_running_terminals_orphaned().await.unwrap();
+        assert_eq!(
+            candidates,
+            vec![id],
+            "a pinned running row is a respawn candidate (itr#591)"
+        );
 
         let got = db.get_terminal_session(id).await.unwrap().unwrap();
         assert_eq!(
             got.status,
             TerminalStatus::Orphaned,
-            "pin must stay dormant: the itr#589 link changes flag+UI only"
+            "the sweep stays truthful: no PTY exists until the respawn lands"
         );
         assert!(
             got.pinned,
-            "the flag survives the sweep for itr#591 to read"
+            "the flag survives the sweep for the reconciler to honor"
         );
+    }
+
+    /// itr#591 AC candidacy PIN: only pinned rows still `running` at sweep
+    /// time qualify. Unpinned running rows sweep silently; pinned rows
+    /// already orphaned (stale, from an earlier lifecycle) or exited (died
+    /// on their own) are marked important but never resurrected.
+    #[tokio::test]
+    async fn sweep_candidacy_is_pinned_and_running_only() {
+        let db = test_db().await;
+
+        let fresh_pinned = uuid::Uuid::new_v4();
+        db.create_terminal_session(&make_term_meta(fresh_pinned), None)
+            .await
+            .unwrap();
+        db.set_terminal_pinned(fresh_pinned, true).await.unwrap();
+
+        let running_unpinned = uuid::Uuid::new_v4();
+        db.create_terminal_session(&make_term_meta(running_unpinned), None)
+            .await
+            .unwrap();
+
+        // Stale: pinned but already orphaned before this startup.
+        let stale_pinned = uuid::Uuid::new_v4();
+        let mut stale = make_term_meta(stale_pinned);
+        stale.status = TerminalStatus::Orphaned;
+        stale.pinned = true;
+        db.create_terminal_session(&stale, None).await.unwrap();
+
+        // Exited on its own: pinning marks it important, not resurrectable.
+        let exited_pinned = uuid::Uuid::new_v4();
+        db.create_terminal_session(&make_term_meta(exited_pinned), None)
+            .await
+            .unwrap();
+        db.set_terminal_pinned(exited_pinned, true).await.unwrap();
+        db.end_terminal_session(exited_pinned, Some(0), TerminalStatus::Exited)
+            .await
+            .unwrap();
+
+        let candidates = db.mark_running_terminals_orphaned().await.unwrap();
+        assert_eq!(candidates, vec![fresh_pinned]);
+
+        // A second sweep returns nothing — the fresh candidate is orphaned
+        // now, i.e. stale for any later lifecycle unless resurrected.
+        let again = db.mark_running_terminals_orphaned().await.unwrap();
+        assert!(again.is_empty(), "swept candidates must not re-qualify");
+    }
+
+    /// itr#591 PIN: resurrect flips a swept row back to running, clearing the
+    /// sweep's ended_at/exit_code stamps and preserving pin + started_at.
+    #[tokio::test]
+    async fn resurrect_restores_running_and_clears_end_fields() {
+        let db = test_db().await;
+        let id = uuid::Uuid::new_v4();
+        let meta = make_term_meta(id);
+        db.create_terminal_session(&meta, None).await.unwrap();
+        db.set_terminal_pinned(id, true).await.unwrap();
+        db.mark_running_terminals_orphaned().await.unwrap();
+
+        db.resurrect_terminal_session(id).await.unwrap();
+
+        let got = db.get_terminal_session(id).await.unwrap().unwrap();
+        assert_eq!(got.status, TerminalStatus::Running);
+        assert!(got.ended_at.is_none(), "sweep's ended_at stamp cleared");
+        assert!(got.exit_code.is_none());
+        assert!(got.pinned, "pin is sticky across resurrect");
+        assert_eq!(
+            got.started_at.timestamp(),
+            meta.started_at.timestamp(),
+            "same logical session: started_at preserved"
+        );
+    }
+
+    /// itr#591 PIN: seq continuation + output-only scrollback seed. The tail
+    /// never contains input-direction bytes (the no-echo typed secret below
+    /// models a sudo password), trims oldest-first at the byte cap, and
+    /// max_terminal_event_seq points past the recorded stream. Honest
+    /// caveat: PTY echo of typed input arrives as OUTPUT-direction bytes and
+    /// therefore CAN appear in the seed — the pinned guarantee is
+    /// "input-direction rows never seeded", not "typed secrets can never
+    /// appear" (see `tail_terminal_output`).
+    #[tokio::test]
+    async fn max_seq_and_output_tail_for_respawn_seed() {
+        let db = test_db().await;
+        let id = uuid::Uuid::new_v4();
+        db.create_terminal_session(&make_term_meta(id), None)
+            .await
+            .unwrap();
+
+        assert_eq!(db.max_terminal_event_seq(id).await.unwrap(), None);
+        assert!(
+            db.tail_terminal_output(id, 1024).await.unwrap().is_empty(),
+            "no history yields an empty seed"
+        );
+
+        db.insert_terminal_events_batch(&[
+            (id, 1, 100, TerminalDirection::Output, b"old-old-".to_vec()),
+            (
+                id,
+                2,
+                200,
+                TerminalDirection::Input,
+                b"hunter2-typed-secret".to_vec(),
+            ),
+            (id, 3, 300, TerminalDirection::Output, b"middle-".to_vec()),
+            (id, 4, 400, TerminalDirection::Resize, b"80,24".to_vec()),
+            (id, 5, 500, TerminalDirection::Output, b"newest".to_vec()),
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(db.max_terminal_event_seq(id).await.unwrap(), Some(5));
+
+        let full = db.tail_terminal_output(id, 1024).await.unwrap();
+        assert_eq!(full, b"old-old-middle-newest".to_vec());
+
+        // Byte cap trims the OLDEST frames first; input/resize bytes are
+        // never present regardless of the cap.
+        let capped = db.tail_terminal_output(id, 13).await.unwrap();
+        assert_eq!(capped, b"middle-newest".to_vec());
+        let tiny = db.tail_terminal_output(id, 1).await.unwrap();
+        assert_eq!(
+            tiny,
+            b"newest".to_vec(),
+            "the newest frame is always admitted even past the cap"
+        );
+        for seed in [&full, &capped, &tiny] {
+            assert!(
+                !String::from_utf8_lossy(seed).contains("hunter2"),
+                "input bytes leaked into the respawn seed"
+            );
+        }
     }
 
     #[tokio::test]
@@ -766,7 +1022,11 @@ mod tests {
             .await
             .unwrap();
         // Directly invoke the sweeper (also runs inside StateDb::open).
-        db.mark_running_terminals_orphaned().await.unwrap();
+        let candidates = db.mark_running_terminals_orphaned().await.unwrap();
+        assert!(
+            candidates.is_empty(),
+            "unpinned rows are swept but never respawn candidates"
+        );
         let got = db.get_terminal_session(id).await.unwrap().unwrap();
         assert_eq!(got.status, TerminalStatus::Orphaned);
         assert!(got.ended_at.is_some());
@@ -926,6 +1186,37 @@ mod tests {
         assert_eq!(spec.args, vec!["-c".to_string(), "echo hi".into()]);
         assert_eq!(spec.cwd, std::path::PathBuf::from("/tmp"));
         assert_eq!(spec.env, None, "malformed env_json must degrade to None");
+        assert!(
+            spec.env_degraded,
+            "the degradation must be flagged for the respawn audit detail"
+        );
+    }
+
+    /// itr#591 rework MUST-FIX PIN: a corrupt `args` blob fails the spec
+    /// read LOUDLY — never a fabricated empty argv, which would respawn
+    /// `/bin/sh -c 'cmd'` as a bare interactive `/bin/sh` and audit it as a
+    /// success. (Contrast with `env_json`, which degrades best-effort.)
+    #[tokio::test]
+    async fn respawn_spec_fails_loud_on_malformed_args_json() {
+        let db = test_db().await;
+        let id = uuid::Uuid::new_v4();
+        db.create_terminal_session(&make_term_meta(id), None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE terminal_sessions SET args = ? WHERE id = ?")
+            .bind("{not an argv")
+            .bind(id.to_string())
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let err = db.get_terminal_respawn_spec(id).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("malformed args_json"), "{msg}");
+        assert!(
+            msg.contains(&id.to_string()),
+            "error must name the session: {msg}"
+        );
     }
 
     /// itr#590 AC#2 PIN: a secret-bearing env value NEVER lands in the DB in
@@ -1012,6 +1303,10 @@ mod tests {
         let got = db.get_terminal_respawn_spec(legacy).await.unwrap().unwrap();
         assert_eq!(got.command, "/bin/sh");
         assert_eq!(got.env, None);
+        assert!(
+            !got.env_degraded,
+            "NULL env_json is legacy-clean, not degraded"
+        );
 
         // Unknown id → None.
         assert!(

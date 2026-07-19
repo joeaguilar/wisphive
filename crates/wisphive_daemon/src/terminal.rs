@@ -47,6 +47,12 @@ const MAX_ROWS: u16 = 200;
 /// single client can't hold up the broadcast with a multi-megabyte write.
 const CHUNK_BYTES: usize = 4096;
 
+/// Byte cap for the scrollback seed a respawned session replays into its new
+/// vt100 screen (itr#591, herdr's screen-history-replay path uses 8 KiB; we
+/// afford more because the seed only ever renders as one final screen).
+/// Trimmed oldest-first; see `StateDb::tail_terminal_output`.
+const RESPAWN_SEED_MAX_BYTES: usize = 256 * 1024;
+
 /// A single event from a terminal's live stream.
 #[derive(Debug, Clone)]
 pub struct TermFrame {
@@ -85,6 +91,12 @@ pub struct TerminalSession {
     /// Drop-guard flag: once true, the reader thread is expected to have
     /// exited and no further events will be produced.
     ended: std::sync::atomic::AtomicBool,
+    /// Graceful-shutdown preserve flag (itr#591): set by `shutdown_all` for
+    /// PINNED sessions before their child is killed. The waiter then skips
+    /// the end-persist, leaving the SQLite row `running` so the next
+    /// daemon's startup sweep captures it as a respawn candidate ("running
+    /// at shutdown" candidacy). Never set outside daemon teardown.
+    preserve_status_on_shutdown: std::sync::atomic::AtomicBool,
 }
 
 impl TerminalSession {
@@ -171,45 +183,8 @@ impl TerminalSessionManager {
 
         let id = Uuid::new_v4();
 
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .context("openpty failed")?;
-
-        let mut builder = CommandBuilder::new(&cmd_str);
-        for arg in &cmd_args {
-            builder.arg(arg);
-        }
-        builder.cwd(&cwd_path);
-        builder.env("WISPHIVE_TERMINAL_SESSION_ID", id.to_string());
-        builder.env("TERM", "xterm-256color");
-        if let Some(ref extra) = env {
-            for (k, v) in extra {
-                builder.env(k, v);
-            }
-        }
-
-        let child = pair
-            .slave
-            .spawn_command(builder)
-            .context("spawn_command failed")?;
-        // Clone a killer up-front — this handle survives the waiter task
-        // taking ownership of `child`, so shutdown can still kill the PTY
-        // process regardless of where the waiter is in its state machine.
-        let killer = child.clone_killer();
-        // The slave must be dropped so the master sees EOF when the child closes.
-        drop(pair.slave);
-
-        let writer = pair.master.take_writer().context("take_writer failed")?;
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .context("try_clone_reader failed")?;
+        let spawned =
+            spawn_pty_child(id, &cmd_str, &cmd_args, &cwd_path, env.as_ref(), cols, rows)?;
 
         // Scrollback=0: we rely on vt100 for the current screen only; full
         // replay goes through SQLite. Keeping scrollback out of memory bounds
@@ -255,21 +230,22 @@ impl TerminalSessionManager {
         let session = Arc::new(TerminalSession {
             id,
             meta: Mutex::new(meta.clone()),
-            writer: std::sync::Mutex::new(writer),
-            master: std::sync::Mutex::new(pair.master),
+            writer: std::sync::Mutex::new(spawned.writer),
+            master: std::sync::Mutex::new(spawned.master),
             parser: std::sync::Mutex::new(parser),
             bcast: bcast_tx.clone(),
             seq: AtomicU64::new(0),
-            child: std::sync::Mutex::new(Some(child)),
-            killer: std::sync::Mutex::new(Some(killer)),
+            child: std::sync::Mutex::new(Some(spawned.child)),
+            killer: std::sync::Mutex::new(Some(spawned.killer)),
             ended: std::sync::atomic::AtomicBool::new(false),
+            preserve_status_on_shutdown: std::sync::atomic::AtomicBool::new(false),
         });
 
         self.sessions.lock().await.insert(id, session.clone());
 
         // Reader thread: portable_pty's reader is blocking, so we drive it
         // from a dedicated OS thread instead of a tokio task.
-        spawn_reader_thread(session.clone(), reader, db_tx.clone());
+        spawn_reader_thread(session.clone(), spawned.reader, db_tx.clone());
 
         // DB batcher: drains frames into SQLite in small transactional batches.
         tokio::spawn(run_db_batcher(id, db_rx, self.state_db.clone()));
@@ -461,8 +437,11 @@ impl TerminalSessionManager {
 
     /// Pin or unpin a session as an "important session" (itr#589). Persists
     /// to SQLite and mirrors to the live meta, matching `set_group` /
-    /// `set_sort_order`. Dormant until itr#591 consumes the flag — pinning
-    /// changes no spawn/teardown/orphan behavior in this manager.
+    /// `set_sort_order`. The flag has execution consequences since itr#591:
+    /// [`Self::shutdown_all`] reads it to preserve a pinned session's row as
+    /// `running` through graceful shutdown, making it a respawn candidate
+    /// for the next daemon's reconcile-on-start
+    /// ([`Self::respawn_session`]).
     pub async fn set_pinned(&self, id: Uuid, pinned: bool) -> Result<()> {
         self.state_db.set_terminal_pinned(id, pinned).await?;
         let sessions = self.sessions.lock().await;
@@ -472,8 +451,210 @@ impl TerminalSessionManager {
         Ok(())
     }
 
+    /// Respawn a pinned, orphaned session in place (itr#591
+    /// reconcile-on-start). The session keeps its id and SQLite row: the
+    /// stored respawn spec (itr#590) supplies command/args/cwd exactly and
+    /// env best-effort (verbatim non-secret overrides; secret NAMES
+    /// re-sourced from the daemon's CURRENT environment via
+    /// `TerminalEnvSpec::materialize` — inherit-current, never
+    /// replay-stale). The new epoch's vt100 screen is seeded from the
+    /// recorded OUTPUT byte-history (never input bytes), a daemon-origin
+    /// banner marks the restart honestly in both the screen and the audit
+    /// stream, and the event seq continues past the previous epoch so
+    /// `INSERT OR IGNORE` can never drop new audit bytes.
+    ///
+    /// Gate re-entry is by construction: the child goes through the same
+    /// [`spawn_pty_child`] path as `create` — a fresh subprocess with
+    /// `WISPHIVE_TERMINAL_SESSION_ID` set, whose tool calls route through
+    /// `wisphive-hook` exactly like any fresh terminal. Nothing here can
+    /// widen approvals or bypass the hook.
+    ///
+    /// Errors leave the row orphaned (and kill the child if one was already
+    /// spawned) — respawn is best-effort and must never wedge daemon
+    /// startup. A corrupt stored args blob is one of those errors
+    /// (`get_terminal_respawn_spec` refuses to fabricate an argv), so the
+    /// reconcile audits it as a FAILED respawn and the pin stays sticky.
+    ///
+    /// On success returns the revived meta plus best-effort degradation
+    /// notes ("env degraded: …", "seed unavailable: …") for the caller's
+    /// `terminal_respawn` audit detail — the respawn proceeded, but not at
+    /// full fidelity, and that must never be silent.
+    pub async fn respawn_session(
+        self: &Arc<Self>,
+        id: Uuid,
+    ) -> Result<(TerminalSessionMeta, Vec<String>)> {
+        if self.sessions.lock().await.contains_key(&id) {
+            return Err(anyhow!("terminal session {id} is already live"));
+        }
+        let mut meta = self
+            .state_db
+            .get_terminal_session(id)
+            .await?
+            .ok_or_else(|| anyhow!("terminal session {id} not found"))?;
+        if meta.status != TerminalStatus::Orphaned {
+            return Err(anyhow!(
+                "respawn requires an orphaned session (status: {})",
+                meta.status
+            ));
+        }
+        if !meta.pinned {
+            return Err(anyhow!("respawn requires a pinned session"));
+        }
+        let spec = self
+            .state_db
+            .get_terminal_respawn_spec(id)
+            .await?
+            .ok_or_else(|| anyhow!("no respawn spec for terminal session {id}"))?;
+
+        let mut notes: Vec<String> = Vec::new();
+        if spec.env_degraded {
+            warn!(
+                session_id = %id,
+                "respawn env overrides unreadable (malformed env_json); \
+                 spawning with daemon-inherited env only"
+            );
+            notes.push("env degraded: malformed env_json".to_string());
+        }
+
+        // Env per the itr#590 stored semantics (chain handoff item f).
+        let daemon_env: HashMap<String, String> = std::env::vars().collect();
+        let env = spec.env.as_ref().map(|e| e.materialize(&daemon_env));
+
+        let spawned = spawn_pty_child(
+            id,
+            &spec.command,
+            &spec.args,
+            &spec.cwd,
+            env.as_ref(),
+            meta.cols,
+            meta.rows,
+        )?;
+        let mut killer = spawned.killer;
+
+        // Everything DB-flavored below must not leak the fresh child on
+        // failure: kill it and bail, leaving the row orphaned.
+        let prepared: Result<(u64, vt100::Parser, Vec<u8>)> = async {
+            // Continue the audit stream where the previous epoch stopped.
+            let base_seq = self
+                .state_db
+                .max_terminal_event_seq(id)
+                .await?
+                .map_or(0, |s| s + 1);
+
+            // Seed the new screen with the prior scrollback (output-only;
+            // see tail_terminal_output for the security invariant) plus the
+            // honesty banner: a respawned session is never misrepresented
+            // as the same live process.
+            let mut parser = vt100::Parser::new(meta.rows, meta.cols, 0);
+            // Seed is best-effort: a DB read failure degrades to an
+            // unseeded screen (banner only), never a failed respawn — but
+            // LOUDLY (itr#591 rework: the silence was the bug).
+            let tail = match self
+                .state_db
+                .tail_terminal_output(id, RESPAWN_SEED_MAX_BYTES)
+                .await
+            {
+                Ok(tail) => tail,
+                Err(e) => {
+                    warn!(
+                        session_id = %id,
+                        "respawn scrollback seed read failed; seeding banner only: {e}"
+                    );
+                    notes.push(format!("seed unavailable: {e}"));
+                    Vec::new()
+                }
+            };
+            parser.process(&tail);
+            let banner = respawn_banner();
+            parser.process(&banner);
+
+            // Resurrect the row BEFORE the waiter can run: if the fresh
+            // child exits instantly, the waiter's end-persist must land
+            // after (and override) the `running` flip, never the reverse.
+            self.state_db.resurrect_terminal_session(id).await?;
+            Ok((base_seq, parser, banner))
+        }
+        .await;
+        let (base_seq, parser, banner) = match prepared {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = killer.kill();
+                return Err(e);
+            }
+        };
+
+        meta.status = TerminalStatus::Running;
+        meta.ended_at = None;
+        meta.exit_code = None;
+
+        let (bcast_tx, _) = broadcast::channel::<Arc<TermFrame>>(256);
+        let (db_tx, db_rx) = mpsc::channel::<TermFrame>(1024);
+
+        let session = Arc::new(TerminalSession {
+            id,
+            meta: Mutex::new(meta.clone()),
+            writer: std::sync::Mutex::new(spawned.writer),
+            master: std::sync::Mutex::new(spawned.master),
+            parser: std::sync::Mutex::new(parser),
+            bcast: bcast_tx,
+            seq: AtomicU64::new(base_seq),
+            child: std::sync::Mutex::new(Some(spawned.child)),
+            killer: std::sync::Mutex::new(Some(killer)),
+            ended: std::sync::atomic::AtomicBool::new(false),
+            preserve_status_on_shutdown: std::sync::atomic::AtomicBool::new(false),
+        });
+
+        // Record the banner as a real (daemon-origin) output event so the
+        // replayed audit history carries the restart marker too.
+        let banner_seq = session.next_seq();
+        let ts_us = chrono::Utc::now().timestamp_micros();
+        let _ = session.bcast.send(Arc::new(TermFrame {
+            seq: banner_seq,
+            ts_us,
+            direction: TerminalDirection::Output,
+            bytes: Bytes::copy_from_slice(&banner),
+        }));
+        if let Err(e) = self
+            .state_db
+            .insert_terminal_events_batch(&[(
+                id,
+                banner_seq,
+                ts_us,
+                TerminalDirection::Output,
+                banner,
+            )])
+            .await
+        {
+            warn!(session_id = %id, "respawn banner event persist failed: {e}");
+        }
+
+        self.sessions.lock().await.insert(id, session.clone());
+        spawn_reader_thread(session.clone(), spawned.reader, db_tx.clone());
+        tokio::spawn(run_db_batcher(id, db_rx, self.state_db.clone()));
+        tokio::spawn(run_waiter(
+            session.clone(),
+            self.state_db.clone(),
+            self.tui_tx.clone(),
+            self.sessions_handle(),
+        ));
+
+        info!(
+            session_id = %id,
+            command = %meta.command,
+            cwd = %meta.cwd.display(),
+            "pinned terminal session respawned after daemon restart"
+        );
+        Ok((meta, notes))
+    }
+
     /// Graceful shutdown: kill every running session's child and mark it as
-    /// Killed in SQLite. Invoked from `Server::run` on shutdown signal.
+    /// Killed in SQLite — except PINNED sessions, whose SQLite row keeps its
+    /// `running` status (via the waiter-side preserve flag) so the next
+    /// daemon's startup sweep captures them as respawn candidates (itr#591,
+    /// "running at shutdown" candidacy). The pinned CHILD is still killed:
+    /// Plan A never keeps a live process across a restart — the master fd
+    /// dies with this daemon regardless. Invoked from `Server::run` on
+    /// shutdown signal.
     ///
     /// Uses the clone-killer handle rather than `Child::kill`, because the
     /// waiter task typically owns the `Child` by the time shutdown runs and
@@ -485,11 +666,100 @@ impl TerminalSessionManager {
             map.values().cloned().collect()
         };
         for session in sessions {
+            if session.meta.lock().await.pinned {
+                session
+                    .preserve_status_on_shutdown
+                    .store(true, Ordering::Release);
+            }
             if let Some(mut k) = session.killer.lock().expect("killer poisoned").take() {
                 let _ = k.kill();
             }
         }
     }
+}
+
+/// Everything the PTY layer hands back for one spawned child. Shared by
+/// [`TerminalSessionManager::create`] (fresh session) and
+/// [`TerminalSessionManager::respawn_session`] (itr#591 reconcile) so a
+/// respawned child goes through EXACTLY the same spawn path — same
+/// `WISPHIVE_TERMINAL_SESSION_ID` / `TERM` injection, same cwd handling —
+/// and therefore re-enters the wisphive-hook gate like any fresh terminal
+/// child. Keep every env/argv decision inside [`spawn_pty_child`]; a
+/// respawn-only divergence here would be a gate-bypass hazard.
+struct SpawnedPty {
+    master: Box<dyn MasterPty + Send>,
+    writer: Box<dyn std::io::Write + Send>,
+    reader: Box<dyn std::io::Read + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+}
+
+/// Open a PTY and spawn `command` into it. See [`SpawnedPty`] for why this
+/// is the single spawn path for both fresh and respawned sessions.
+fn spawn_pty_child(
+    id: Uuid,
+    command: &str,
+    args: &[String],
+    cwd: &std::path::Path,
+    env: Option<&HashMap<String, String>>,
+    cols: u16,
+    rows: u16,
+) -> Result<SpawnedPty> {
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .context("openpty failed")?;
+
+    let mut builder = CommandBuilder::new(command);
+    for arg in args {
+        builder.arg(arg);
+    }
+    builder.cwd(cwd);
+    builder.env("WISPHIVE_TERMINAL_SESSION_ID", id.to_string());
+    builder.env("TERM", "xterm-256color");
+    if let Some(extra) = env {
+        for (k, v) in extra {
+            builder.env(k, v);
+        }
+    }
+
+    let child = pair
+        .slave
+        .spawn_command(builder)
+        .context("spawn_command failed")?;
+    // Clone a killer up-front — this handle survives the waiter task
+    // taking ownership of `child`, so shutdown can still kill the PTY
+    // process regardless of where the waiter is in its state machine.
+    let killer = child.clone_killer();
+    // The slave must be dropped so the master sees EOF when the child closes.
+    drop(pair.slave);
+
+    let writer = pair.master.take_writer().context("take_writer failed")?;
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .context("try_clone_reader failed")?;
+
+    Ok(SpawnedPty {
+        master: pair.master,
+        writer,
+        reader,
+        child,
+        killer,
+    })
+}
+
+/// The daemon-origin restart marker written into a respawned session's
+/// screen and audit stream. Honesty affordance from the research doc: the
+/// session "comes back", the PROCESS does not — say so where the user looks.
+fn respawn_banner() -> Vec<u8> {
+    b"\r\n\x1b[7m wisphive: daemon restarted \xe2\x80\x94 pinned session respawned; scrollback above is replayed history, the process below is a new instance \x1b[0m\r\n"
+        .to_vec()
 }
 
 /// Spawn a blocking OS thread that drives the PTY master reader.
@@ -624,6 +894,27 @@ async fn run_waiter(
         .await
         .ok()
         .and_then(|r| r.ok());
+
+    // Graceful daemon shutdown of a PINNED session (itr#591): `shutdown_all`
+    // set the preserve flag before killing the child, so skip the
+    // end-persist — the SQLite row stays `running` and the next startup's
+    // sweep captures it as a respawn candidate. Skip the TermEnded broadcast
+    // too (the daemon is going down; a "session ended" toast would misstate
+    // what the restart is about to undo). If the child exited on its own
+    // BEFORE shutdown set the flag, this path is not taken and the honest
+    // Exited status persists — pinning never resurrects a session that died
+    // by itself.
+    if session
+        .preserve_status_on_shutdown
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        manager.sessions.lock().await.remove(&id);
+        info!(
+            session_id = %id,
+            "pinned terminal child stopped for daemon shutdown; row preserved as running for respawn"
+        );
+        return;
+    }
 
     // Translate portable_pty::ExitStatus to (code, TerminalStatus)
     let (exit_code, status) = match wait_result {
@@ -814,6 +1105,313 @@ mod tests {
                 .is_err()
         );
         assert!(manager.resize(meta.id, 100, 30).await.is_err());
+    }
+
+    async fn wait_for_snapshot_count(
+        manager: &TerminalSessionManager,
+        id: Uuid,
+        needle: &[u8],
+        want: usize,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(session) = manager.get(id).await {
+                    let snap = session.catchup_snapshot();
+                    let count = snap.windows(needle.len()).filter(|w| *w == needle).count();
+                    if count >= want {
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "screen never showed {} occurrences of {:?}",
+                want,
+                String::from_utf8_lossy(needle)
+            )
+        });
+    }
+
+    /// itr#591 AC PIN: graceful shutdown preserves a PINNED session's row as
+    /// `running` (the respawn-candidacy marker) while an unpinned session is
+    /// ended honestly. Both children are killed either way — Plan A never
+    /// keeps a live process across a restart.
+    #[tokio::test]
+    async fn shutdown_all_preserves_pinned_rows_as_running() {
+        let state_db = Arc::new(StateDb::open(":memory:").await.expect("open test db"));
+        let (tui_tx, _) = broadcast::channel(16);
+        let manager = Arc::new(TerminalSessionManager::new(state_db.clone(), tui_tx));
+
+        let blocker = vec!["-c".to_string(), "printf READY; read line".to_string()];
+        let pinned = manager
+            .create(
+                Some("pinned".into()),
+                Some("/bin/sh".into()),
+                Some(blocker.clone()),
+                None,
+                80,
+                24,
+                None,
+                Some("test".into()),
+            )
+            .await
+            .expect("create pinned session");
+        wait_for_ready(&manager, pinned.id).await;
+        manager.set_pinned(pinned.id, true).await.unwrap();
+
+        let unpinned = manager
+            .create(
+                Some("unpinned".into()),
+                Some("/bin/sh".into()),
+                Some(blocker),
+                None,
+                80,
+                24,
+                None,
+                Some("test".into()),
+            )
+            .await
+            .expect("create unpinned session");
+        wait_for_ready(&manager, unpinned.id).await;
+
+        manager.shutdown_all().await;
+        wait_for_session_removal(&manager, pinned.id).await;
+        wait_for_session_removal(&manager, unpinned.id).await;
+
+        let p = state_db
+            .get_terminal_session(pinned.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            p.status,
+            TerminalStatus::Running,
+            "pinned row must stay `running` at shutdown — the itr#591 candidacy marker"
+        );
+        assert!(p.ended_at.is_none());
+
+        let u = state_db
+            .get_terminal_session(unpinned.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            u.status,
+            TerminalStatus::Running,
+            "unpinned sessions end honestly at shutdown"
+        );
+
+        // The preserved row is exactly what the next startup sweep captures.
+        let candidates = state_db.mark_running_terminals_orphaned().await.unwrap();
+        assert_eq!(candidates, vec![pinned.id]);
+    }
+
+    /// itr#591 AC PIN: the full resurrect path. After a (simulated) restart,
+    /// `respawn_session` brings a pinned orphan back live under the SAME id:
+    /// saved cwd/command, prior scrollback seeded into the new screen, the
+    /// honesty banner present, the audit seq stream continued without
+    /// clobbering the old epoch, and `WISPHIVE_TERMINAL_SESSION_ID`
+    /// re-injected into the fresh child (the hook's session cross-reference —
+    /// the respawned child re-enters the gate like any fresh terminal).
+    #[tokio::test]
+    async fn respawn_session_revives_pinned_orphan_with_seeded_scrollback() {
+        let state_db = Arc::new(StateDb::open(":memory:").await.expect("open test db"));
+        let (tui_tx, _) = broadcast::channel(16);
+        let manager = Arc::new(TerminalSessionManager::new(
+            state_db.clone(),
+            tui_tx.clone(),
+        ));
+
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let cwd_path = cwd.path().canonicalize().expect("canonicalize cwd");
+        // Prints a marker + its own session id, then blocks (stays running).
+        let script = "printf 'MARKER-ALPHA sid=%s cwd=%s READY' \"$WISPHIVE_TERMINAL_SESSION_ID\" \"$(pwd -P)\"; read line";
+
+        let meta = manager
+            .create(
+                Some("pinned-src".into()),
+                Some("/bin/sh".into()),
+                Some(vec!["-c".into(), script.into()]),
+                Some(cwd_path.clone()),
+                200,
+                50,
+                None,
+                Some("test".into()),
+            )
+            .await
+            .expect("create session");
+        let id = meta.id;
+        wait_for_ready(&manager, id).await;
+        manager.set_pinned(id, true).await.unwrap();
+
+        // Wait until the marker output is PERSISTED (the respawn seed reads
+        // the DB, not the live parser).
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let tail = state_db.tail_terminal_output(id, 65536).await.unwrap();
+                if tail.windows(5).any(|w| w == b"READY") {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("marker output was not persisted");
+        let old_max_seq = state_db
+            .max_terminal_event_seq(id)
+            .await
+            .unwrap()
+            .expect("events recorded");
+        let old_epoch_rows = state_db.replay_terminal_events(id, None).await.unwrap();
+
+        // Simulated graceful restart: shutdown kills the child but preserves
+        // the pinned row as `running` (also reaps the child's blocking
+        // `wait()` — a child left alive would wedge the test runtime's
+        // drop). Then the next daemon's StateDb::open sweep runs; a fresh
+        // manager models the fresh daemon process.
+        manager.shutdown_all().await;
+        wait_for_session_removal(&manager, id).await;
+        let candidates = state_db.mark_running_terminals_orphaned().await.unwrap();
+        assert_eq!(candidates, vec![id]);
+        let manager2 = Arc::new(TerminalSessionManager::new(state_db.clone(), tui_tx));
+
+        let (revived, notes) = manager2
+            .respawn_session(id)
+            .await
+            .expect("respawn pinned orphan");
+        assert_eq!(revived.id, id, "same logical session, same id");
+        assert_eq!(revived.status, TerminalStatus::Running);
+        assert!(revived.pinned, "pin is sticky across the respawn");
+        assert!(
+            notes.is_empty(),
+            "a healthy respawn carries no degradation notes: {notes:?}"
+        );
+
+        // DB row resurrected.
+        let row = state_db.get_terminal_session(id).await.unwrap().unwrap();
+        assert_eq!(row.status, TerminalStatus::Running);
+        assert!(row.ended_at.is_none());
+
+        // Live + attachable in the new manager.
+        let session = manager2.get(id).await.expect("respawned session live");
+
+        // Screen: seeded old scrollback AND the fresh child's new print —
+        // the marker appears twice, the banner once, and the fresh child
+        // echoes the SAME session id (env re-injection) and the SAME cwd.
+        wait_for_snapshot_count(&manager2, id, b"MARKER-ALPHA", 2).await;
+        let screen = String::from_utf8_lossy(&session.catchup_snapshot()).to_string();
+        assert!(
+            screen.contains("pinned session respawned"),
+            "honesty banner missing from the seeded screen: {screen}"
+        );
+        let sid_needle = format!("sid={id}");
+        assert_eq!(
+            screen.matches(&sid_needle).count(),
+            2,
+            "fresh child must carry WISPHIVE_TERMINAL_SESSION_ID={id}: {screen}"
+        );
+        let cwd_needle = format!("cwd={}", cwd_path.display());
+        assert_eq!(
+            screen.matches(&cwd_needle).count(),
+            2,
+            "respawn landed in the wrong cwd: {screen}"
+        );
+
+        // Audit stream: old epoch untouched, new epoch strictly after it.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let max = state_db.max_terminal_event_seq(id).await.unwrap().unwrap();
+                if max > old_max_seq {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("new epoch events were not recorded");
+        let all_rows = state_db.replay_terminal_events(id, None).await.unwrap();
+        assert_eq!(
+            &all_rows[..old_epoch_rows.len()],
+            &old_epoch_rows[..],
+            "respawn must never rewrite or drop the previous epoch's audit rows"
+        );
+        let banner_row = all_rows
+            .iter()
+            .find(|(seq, ..)| *seq == old_max_seq + 1)
+            .expect("banner recorded at the epoch boundary");
+        assert!(
+            String::from_utf8_lossy(&banner_row.3).contains("respawned"),
+            "epoch boundary event must be the daemon-origin banner"
+        );
+
+        manager2.close(id).await.expect("close respawned");
+    }
+
+    /// itr#591 candidacy negatives: respawn refuses sessions that are live,
+    /// unpinned, or ended on their own — only a pinned orphan qualifies.
+    #[tokio::test]
+    async fn respawn_session_rejects_non_candidates() {
+        let state_db = Arc::new(StateDb::open(":memory:").await.expect("open test db"));
+        let (tui_tx, _) = broadcast::channel(16);
+        let manager = Arc::new(TerminalSessionManager::new(state_db.clone(), tui_tx));
+
+        // Live session (still running in this manager): refused.
+        let live = manager
+            .create(
+                Some("live".into()),
+                Some("/bin/sh".into()),
+                Some(vec!["-c".into(), "printf READY; read line".into()]),
+                None,
+                80,
+                24,
+                None,
+                Some("test".into()),
+            )
+            .await
+            .unwrap();
+        wait_for_ready(&manager, live.id).await;
+        manager.set_pinned(live.id, true).await.unwrap();
+        let err = manager.respawn_session(live.id).await.unwrap_err();
+        assert!(err.to_string().contains("already live"), "{err}");
+
+        // Unpinned orphan: refused.
+        let unpinned = uuid::Uuid::new_v4();
+        let mut m = TerminalSessionMeta {
+            id: unpinned,
+            label: None,
+            command: "/bin/sh".into(),
+            args: vec![],
+            cwd: std::path::PathBuf::from("/tmp"),
+            cols: 80,
+            rows: 24,
+            started_at: chrono::Utc::now(),
+            ended_at: None,
+            exit_code: None,
+            status: TerminalStatus::Orphaned,
+            group_name: None,
+            sort_order: 0,
+            created_by: None,
+            replay_acl: Vec::new(),
+            pinned: false,
+        };
+        state_db.create_terminal_session(&m, None).await.unwrap();
+        let err = manager.respawn_session(unpinned).await.unwrap_err();
+        assert!(err.to_string().contains("pinned"), "{err}");
+
+        // Pinned but exited on its own: refused (pin marks importance, it
+        // does not resurrect the dead).
+        let exited = uuid::Uuid::new_v4();
+        m.id = exited;
+        m.status = TerminalStatus::Exited;
+        m.pinned = true;
+        state_db.create_terminal_session(&m, None).await.unwrap();
+        let err = manager.respawn_session(exited).await.unwrap_err();
+        assert!(err.to_string().contains("orphaned"), "{err}");
+
+        manager.close(live.id).await.unwrap();
     }
 
     /// itr#590 AC#3 PIN: a respawn driven purely from the stored spec lands

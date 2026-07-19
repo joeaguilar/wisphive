@@ -24,12 +24,16 @@ export type AgentTypeLabel = AgentType | (string & {});
  * Consumers that classify sessions (board lanes, burn meter) use this and
  * fall back to their agent-id heuristic; audit surfaces keep the raw label. */
 export function knownAgentType(label: AgentTypeLabel): AgentType | null {
+  // Note: a switch over the literals cannot narrow here — the `string & {}`
+  // member of AgentTypeLabel absorbs literal case comparisons, so `label`
+  // stays un-narrowed in the case arms (tsc error under `tsc -b`). The
+  // explicit cast is sound: the case list IS the closed AgentType set.
   switch (label) {
     case "codex":
     case "claude_code":
     case "red":
     case "local_llm":
-      return label;
+      return label as AgentType;
     default:
       return null;
   }
