@@ -97,3 +97,12 @@ NEXT: claim 602/L1 (#567) lane A · claim 603/L1 (#560) lane B.
 - FILED: #616 (HIGH — tsc sub-gate for verify-frontend + e2e-outside-tsconfig), #617 (respawn log level), #618 (resize dims), #619 (respawn/pin observability residue: web_audit has no read surface, set_pinned refusals unaudited).
 - WATCH: 588/L3 rework must re-run full e2e; #561 is the highest-blast-radius link (destructive-at-runtime failure mode) — council chose the re-count control over halting.
 - NEXT: #591 rework → land → SEAL 588 · #561 report → review (terrain re-count) → land → 603 terminal → closure oracles.
+
+## Pulse — 2026-07-19 (CHAIN 588 SEALED · 11 landed)
+
+`WALK · landed 11/11-planned · burn n/a · lanes 1/2 (603/L5 walking)`
+
+- LANDED: 588#L3 itr#591 → 0378792 (pinned respawn LIVE: e2e-proven with real daemon-restart fixture; malformed spec now fails loud+audited per review MUST-FIX; production-build tsc breaks fixed in-passing).
+- CHAIN 588 SEALED COMPLETE: "my pinned sessions come back after a daemon restart" delivered as a live shell with scrollback + honesty banner. Epic stays open for plan B/C. 3/3 links landed, every review caught something real pre-land (cleartext leak class, command fabrication).
+- MOVED: 603/L5 (#561 process-group stop — mission's final link) walking lane B.
+- NEXT: #561 report → review (mandated terrain re-count) → land → 603 terminal → closure oracles + debrief.
