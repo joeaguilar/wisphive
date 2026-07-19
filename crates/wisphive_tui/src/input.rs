@@ -1567,7 +1567,7 @@ mod tests {
         wisphive_protocol::HistoryEntry {
             id: uuid::Uuid::new_v4(),
             agent_id: "agent-1".into(),
-            agent_type: wisphive_protocol::AgentType::Codex,
+            agent_type: wisphive_protocol::AgentType::Codex.into(),
             project: "/tmp/project".into(),
             tool_name: tool_name.into(),
             tool_input: serde_json::Value::Null,

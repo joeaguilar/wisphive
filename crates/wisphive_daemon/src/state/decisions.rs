@@ -921,6 +921,34 @@ fn audit_kind_from_row(
     }
 }
 
+/// Decode the raw `decision_log.agent_type` column into a label without ever
+/// failing (itr#607). The column normally holds a JSON-encoded string
+/// (`"claude_code"` with quotes), but two writer quirks make a strict
+/// `serde_json` parse lossy:
+///
+/// - itr#562 refusal rows carry `unrecognized:<raw>` where `<raw>` is
+///   arbitrary agent-chosen bytes (clamped to 64 bytes, not sanitized);
+/// - the events.jsonl ingest (`event_ingest::ingest_line`) wraps the free
+///   string in bare quotes without JSON escaping, so embedded quotes,
+///   backslashes, or raw control bytes yield a column value that is not
+///   valid JSON at all.
+///
+/// Strict JSON parse first; on failure strip one surrounding quote pair and
+/// keep the rest verbatim. A row is never dropped for its agent_type — the
+/// pre-itr#607 `.ok()?` here silently vanished exactly the refusal rows that
+/// `wisphive audit --decided-by agent_type:unrecognized` exists to surface.
+pub(super) fn agent_type_label_from_column(raw: &str) -> wisphive_protocol::AgentTypeLabel {
+    let inner = match serde_json::from_str::<String>(raw) {
+        Ok(s) => s,
+        Err(_) => raw
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .unwrap_or(raw)
+            .to_string(),
+    };
+    wisphive_protocol::AgentTypeLabel::from_raw(inner)
+}
+
 /// Convert raw SQL rows to HistoryEntry structs.
 pub(super) fn rows_to_entries(rows: Vec<DecisionLogRow>) -> Vec<wisphive_protocol::HistoryEntry> {
     rows.into_iter()
@@ -945,7 +973,7 @@ pub(super) fn rows_to_entries(rows: Vec<DecisionLogRow>) -> Vec<wisphive_protoco
                 Some(wisphive_protocol::HistoryEntry {
                     id: id.parse().ok()?,
                     agent_id,
-                    agent_type: serde_json::from_str(&agent_type).ok()?,
+                    agent_type: agent_type_label_from_column(&agent_type),
                     project: std::path::PathBuf::from(project),
                     tool_name,
                     tool_input: serde_json::from_str(&tool_input)

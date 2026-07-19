@@ -2740,7 +2740,7 @@ async fn handle_query_command(
                         if !sessions.iter().any(|s| s.agent_id == agent.agent_id) {
                             sessions.push(wisphive_protocol::SessionSummary {
                                 agent_id: agent.agent_id.clone(),
-                                agent_type: agent.agent_type.clone(),
+                                agent_type: agent.agent_type.clone().into(),
                                 project: agent.project.clone(),
                                 first_seen: agent.connected_at,
                                 last_seen: agent.last_seen,

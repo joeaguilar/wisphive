@@ -964,7 +964,7 @@ mod tests {
         let entry = HistoryEntry {
             id: uuid::Uuid::new_v4(),
             agent_id: "cc-1".into(),
-            agent_type: AgentType::ClaudeCode,
+            agent_type: AgentType::ClaudeCode.into(),
             project: PathBuf::from("/proj"),
             tool_name: "Bash".into(),
             tool_input: serde_json::json!({"command": "ls"}),

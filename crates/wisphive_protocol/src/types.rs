@@ -31,6 +31,88 @@ fn default_agent_type() -> AgentType {
     AgentType::ClaudeCode
 }
 
+/// Agent-type label at the audit/query read boundary (itr#607).
+///
+/// `decision_log.agent_type` is a free-string column: the hook writes refusal
+/// rows labelled `unrecognized:<raw>` (itr#562) and the events.jsonl ingest
+/// accepts any string. The closed [`AgentType`] enum is deliberately NOT
+/// loosened to absorb these — it protects the daemon spawn/enforcement path,
+/// where an unknown provider must be refused, never defaulted (itr#562). Read
+/// surfaces carry the opposite obligation: an audit row must never be silently
+/// dropped because its label doesn't parse (itr#607 — "audited" means
+/// end-to-end queryable). `Known` keeps the typed variant where it exists;
+/// `Other` preserves the raw label verbatim so audit surfaces can show exactly
+/// what was recorded.
+///
+/// Serialization is `untagged`: `Known` keeps the exact wire encoding
+/// [`AgentType`] always had (e.g. `"claude_code"`), so every
+/// previously-representable value is wire-identical to pre-itr#607 builds, and
+/// unknown labels ride the same string position.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AgentTypeLabel {
+    Known(AgentType),
+    Other(String),
+}
+
+impl AgentTypeLabel {
+    /// Total constructor from a raw label string: the four known snake_case
+    /// names map to `Known`; anything else (e.g. `unrecognized:<raw>`,
+    /// itr#562) is preserved verbatim as `Other`. Never fails — the whole
+    /// point of this type is that no label is unrepresentable.
+    pub fn from_raw(raw: impl Into<String>) -> Self {
+        let raw = raw.into();
+        match raw.as_str() {
+            "codex" => Self::Known(AgentType::Codex),
+            "claude_code" => Self::Known(AgentType::ClaudeCode),
+            "red" => Self::Known(AgentType::Red),
+            "local_llm" => Self::Known(AgentType::LocalLlm),
+            _ => Self::Other(raw),
+        }
+    }
+
+    /// The typed variant, when this label is one of the four known agents.
+    pub fn as_known(&self) -> Option<AgentType> {
+        match self {
+            Self::Known(t) => Some(t.clone()),
+            Self::Other(_) => None,
+        }
+    }
+}
+
+impl From<AgentType> for AgentTypeLabel {
+    fn from(t: AgentType) -> Self {
+        Self::Known(t)
+    }
+}
+
+/// `Display` is a terminal-safe rendering, not a raw accessor: `Other` labels
+/// originate from hostile input (the agent chose the string; itr#562 clamps
+/// but does not sanitize it), so control characters — including a raw ESC that
+/// could smuggle ANSI sequences into a TUI, log line, or `println!` — render
+/// as Rust-style escapes (`\u{1b}`) instead of passing through (itr#607 AC#3).
+/// Surfaces that need the exact bytes must match on `Other` explicitly.
+impl std::fmt::Display for AgentTypeLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::fmt::Write as _;
+        match self {
+            Self::Known(t) => t.fmt(f),
+            Self::Other(raw) => {
+                for ch in raw.chars() {
+                    if ch.is_control() {
+                        for esc in ch.escape_default() {
+                            f.write_char(esc)?;
+                        }
+                    } else {
+                        f.write_char(ch)?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Metadata about a connected agent instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentInfo {
@@ -429,7 +511,11 @@ impl From<Decision> for RichDecision {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub agent_id: String,
-    pub agent_type: AgentType,
+    /// Label, not the closed enum: session aggregates come from
+    /// `decision_log`, whose `agent_type` column can carry labels outside
+    /// [`AgentType`] (e.g. itr#562 `unrecognized:<raw>` refusal rows). A
+    /// session must never vanish for an unparseable label (itr#607).
+    pub agent_type: AgentTypeLabel,
     pub project: PathBuf,
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
@@ -574,7 +660,11 @@ pub struct HistorySearch {
 pub struct HistoryEntry {
     pub id: Uuid,
     pub agent_id: String,
-    pub agent_type: AgentType,
+    /// Label, not the closed enum: history rows come from `decision_log`,
+    /// whose `agent_type` column can carry labels outside [`AgentType`]
+    /// (e.g. itr#562 `unrecognized:<raw>` refusal rows). An audit row must
+    /// never vanish for an unparseable label (itr#607).
+    pub agent_type: AgentTypeLabel,
     pub project: PathBuf,
     pub tool_name: String,
     pub tool_input: serde_json::Value,
@@ -1146,6 +1236,66 @@ mod tests {
         assert_eq!(AgentType::ClaudeCode.to_string(), "claude_code");
         assert_eq!(AgentType::Red.to_string(), "red");
         assert_eq!(AgentType::LocalLlm.to_string(), "local_llm");
+    }
+
+    // ── AgentTypeLabel (itr#607) ───────────────────────────────────────
+
+    #[test]
+    fn agent_type_label_wire_compatible_with_agent_type() {
+        // Known variants keep the exact pre-itr#607 wire encoding.
+        for (variant, expected_json) in [
+            (AgentType::Codex, "\"codex\""),
+            (AgentType::ClaudeCode, "\"claude_code\""),
+            (AgentType::Red, "\"red\""),
+            (AgentType::LocalLlm, "\"local_llm\""),
+        ] {
+            let label = AgentTypeLabel::from(variant.clone());
+            assert_eq!(serde_json::to_string(&label).unwrap(), expected_json);
+            let back: AgentTypeLabel = serde_json::from_str(expected_json).unwrap();
+            assert_eq!(back, AgentTypeLabel::Known(variant));
+        }
+        // Unknown labels round-trip verbatim in the same string position.
+        let raw = "\"unrecognized:ghost-provider\"";
+        let label: AgentTypeLabel = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            label,
+            AgentTypeLabel::Other("unrecognized:ghost-provider".into())
+        );
+        assert_eq!(serde_json::to_string(&label).unwrap(), raw);
+    }
+
+    #[test]
+    fn agent_type_label_from_raw_is_total() {
+        assert_eq!(
+            AgentTypeLabel::from_raw("claude_code"),
+            AgentTypeLabel::Known(AgentType::ClaudeCode)
+        );
+        assert_eq!(
+            AgentTypeLabel::from_raw("codex"),
+            AgentTypeLabel::Known(AgentType::Codex)
+        );
+        assert_eq!(
+            AgentTypeLabel::from_raw("unrecognized:x"),
+            AgentTypeLabel::Other("unrecognized:x".into())
+        );
+        assert_eq!(
+            AgentTypeLabel::from_raw(""),
+            AgentTypeLabel::Other(String::new())
+        );
+    }
+
+    #[test]
+    fn agent_type_label_display_escapes_control_chars() {
+        // AC#3: a raw ESC must never reach a terminal via Display.
+        let label = AgentTypeLabel::Other("unrecognized:\u{1b}[31mevil\u{7}".into());
+        assert_eq!(label.to_string(), "unrecognized:\\u{1b}[31mevil\\u{7}");
+        // Known variants are unaffected.
+        assert_eq!(AgentTypeLabel::Known(AgentType::Codex).to_string(), "codex");
+        // Non-control unicode passes through untouched.
+        assert_eq!(
+            AgentTypeLabel::Other("unrecognized:界😀".into()).to_string(),
+            "unrecognized:界😀"
+        );
     }
 
     // ── HookEventType ──────────────────────────────────────────────────

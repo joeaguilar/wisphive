@@ -5,6 +5,7 @@ import type {
   DecisionRequest,
   SessionSummary,
 } from "../types/protocol";
+import { knownAgentType } from "../types/protocol";
 import { deferredKey } from "./queueUtils";
 
 // ── Liveness constants (spec §5.2, itr#400) ─────────────────────────
@@ -178,7 +179,12 @@ export function deriveBoard(inputs: BoardInputs): BoardModel {
   for (const session of sessions) {
     const draft = draftFor(drafts, session.agent_id);
     draft.project = draft.project ?? session.project;
-    draft.agentType = draft.agentType ?? session.agent_type;
+    // Session labels come from decision_log and can sit outside the closed
+    // enum (itr#562 refusal rows / itr#607); the lane badge is a
+    // classification, so narrow to a known type here and let the agent-id
+    // heuristic fall back for unknown labels. Audit surfaces keep the raw
+    // label; the session itself must never vanish.
+    draft.agentType = draft.agentType ?? knownAgentType(session.agent_type);
     noteActivity(draft, session.last_seen, null);
     draft.isLive = draft.isLive || session.is_live;
     draft.sessionPendingCount = Math.max(draft.sessionPendingCount, session.pending_count);

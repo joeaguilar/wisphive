@@ -186,7 +186,7 @@ mod fixtures {
         app.session_timeline = vec![HistoryEntry {
             id: Uuid::from_u128(6),
             agent_id: "codex-unicode".into(),
-            agent_type: AgentType::Codex,
+            agent_type: AgentType::Codex.into(),
             project: PathBuf::from("/tmp/wisphive-demo"),
             tool_name: "Bash".into(),
             tool_input: serde_json::json!({

@@ -10,6 +10,31 @@ export type JsonValue =
 
 export type AgentType = "codex" | "claude_code" | "red" | "local_llm";
 
+/** Agent-type label at the audit/query read boundary (itr#607): decision_log
+ * rows can carry labels outside the closed AgentType set — e.g. the itr#562
+ * `unrecognized:<raw>` refusal rows, where `<raw>` is arbitrary agent-chosen
+ * text. Known values still narrow via `knownAgentType`, but unknown labels
+ * are preserved instead of failing the parse: before itr#607 one such row
+ * threw inside `parseServerMessage` and dropped the ENTIRE history/sessions
+ * message. `string & {}` keeps AgentType literal hints in editors while
+ * accepting any string. */
+export type AgentTypeLabel = AgentType | (string & {});
+
+/** Narrow a query-boundary label to the closed AgentType set, or null.
+ * Consumers that classify sessions (board lanes, burn meter) use this and
+ * fall back to their agent-id heuristic; audit surfaces keep the raw label. */
+export function knownAgentType(label: AgentTypeLabel): AgentType | null {
+  switch (label) {
+    case "codex":
+    case "claude_code":
+    case "red":
+    case "local_llm":
+      return label;
+    default:
+      return null;
+  }
+}
+
 export type HookEventType =
   | "PreToolUse"
   | "PostToolUse"
@@ -66,7 +91,7 @@ export interface PermissionRule {
 export interface HistoryEntry {
   id: string;
   agent_id: string;
-  agent_type: AgentType;
+  agent_type: AgentTypeLabel;
   project: string;
   tool_name: string;
   tool_input: JsonValue;
@@ -130,7 +155,7 @@ export interface ManagedAgent {
 
 export interface SessionSummary {
   agent_id: string;
-  agent_type: AgentType;
+  agent_type: AgentTypeLabel;
   project: string;
   first_seen: string;
   last_seen: string;
@@ -656,7 +681,7 @@ function parseHistoryEntry(value: unknown, path: string): HistoryEntry {
   return {
     id: readField(entry, "id", readUuid, path),
     agent_id: readField(entry, "agent_id", readString, path),
-    agent_type: readField(entry, "agent_type", readAgentType, path),
+    agent_type: readField(entry, "agent_type", readAgentTypeLabel, path),
     project: readField(entry, "project", readString, path),
     tool_name: readField(entry, "tool_name", readString, path),
     tool_input: readField(entry, "tool_input", readJsonValue, path),
@@ -729,7 +754,7 @@ function parseSessionSummary(value: unknown, path: string): SessionSummary {
   const session = readObject(value, path);
   return {
     agent_id: readField(session, "agent_id", readString, path),
-    agent_type: readField(session, "agent_type", readAgentType, path),
+    agent_type: readField(session, "agent_type", readAgentTypeLabel, path),
     project: readField(session, "project", readString, path),
     first_seen: readField(session, "first_seen", readRfc3339, path),
     last_seen: readField(session, "last_seen", readRfc3339, path),
@@ -892,6 +917,16 @@ function readAgentType(value: unknown, path: string): AgentType {
     default:
       return invalid(path, "known AgentType value");
   }
+}
+
+/** Tolerant variant for decision_log-backed rows (HistoryEntry /
+ * SessionSummary, itr#607): any string is a valid label — an audit row must
+ * never be dropped (nor its whole message thrown away) because its
+ * agent_type is outside the closed enum (itr#562 refusal rows). Live-agent
+ * shapes (AgentInfo, ManagedAgent, DecisionRequest) keep strict
+ * `readAgentType`: the daemon only ever emits the closed set there. */
+function readAgentTypeLabel(value: unknown, path: string): AgentTypeLabel {
+  return readString(value, path);
 }
 
 function readHookEventType(value: unknown, path: string): HookEventType {

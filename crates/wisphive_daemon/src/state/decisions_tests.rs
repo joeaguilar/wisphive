@@ -284,7 +284,10 @@ async fn approved_spawn_audit_uses_complete_reviewed_request() {
     assert_eq!(db.pending_count().await.unwrap(), 0);
     let history = db.query_history(None, 10).await.unwrap();
     assert_eq!(history.len(), 1);
-    assert_eq!(history[0].agent_type, wisphive_protocol::AgentType::Codex);
+    assert_eq!(
+        history[0].agent_type,
+        wisphive_protocol::AgentType::Codex.into()
+    );
     assert_eq!(history[0].project, std::path::PathBuf::from("/reviewed"));
     assert_eq!(history[0].tool_input["prompt"], "reviewed prompt");
     assert_eq!(history[0].decision, Decision::Approve);
@@ -1259,4 +1262,162 @@ async fn terminal_session_id_persists_through_decision_log() {
     let history = db.query_history(Some("cc-1"), 10).await.unwrap();
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].terminal_session_id, Some(term_id));
+}
+
+// ════════════════════════════════════════════════════════════
+// Non-enum agent_type visibility (itr#607)
+// ════════════════════════════════════════════════════════════
+
+/// Insert an itr#562-shaped refusal row (agent_type outside the closed enum)
+/// the way the events.jsonl ingest stores it.
+async fn log_unrecognized_refusal(db: &StateDb, agent_id: &str, agent_type_column: &str) {
+    db.log_auto_approved(&AutoApprovedEntry {
+        agent_id,
+        agent_type: agent_type_column,
+        project: "/proj",
+        tool_name: "Bash",
+        tool_input: r#"{"command":"ls"}"#,
+        timestamp: "2026-07-18T00:00:00Z",
+        tool_use_id: Some(&format!("{agent_id}-refusal")),
+        hook_event_name: Some("PreToolUse"),
+        decision: "deny",
+        decided_by: Some("agent_type:unrecognized"),
+        config_hash: Some("abc123"),
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn query_history_retains_unrecognized_agent_type_rows() {
+    // AC#1/AC#4: a decision_log row whose agent_type is not one of the 4 enum
+    // variants must appear in query_history instead of silently vanishing.
+    let db = test_db().await;
+    log_unrecognized_refusal(&db, "mystery-1", "\"unrecognized:x\"").await;
+
+    let history = db.query_history(None, 10).await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(
+        history[0].agent_type,
+        wisphive_protocol::AgentTypeLabel::Other("unrecognized:x".into())
+    );
+    assert_eq!(
+        history[0].decided_by.as_deref(),
+        Some("agent_type:unrecognized")
+    );
+}
+
+#[tokio::test]
+async fn search_history_decided_by_filter_returns_refusal_rows() {
+    // AC#2 (unit-level): `wisphive audit --decided-by agent_type:unrecognized`
+    // goes through search_history with a decided_by substring filter — the
+    // refusal rows must come back.
+    let db = test_db().await;
+    log_unrecognized_refusal(&db, "mystery-1", "\"unrecognized:x\"").await;
+    // A normal row that must NOT match the filter.
+    let req = make_request("Edit", "cc-1", "/proj");
+    db.persist_pending(&req).await.unwrap();
+    db.resolve_pending(req.id, Decision::Approve).await.unwrap();
+
+    let search = wisphive_protocol::HistorySearch {
+        decided_by: Some("agent_type:unrecognized".into()),
+        ..Default::default()
+    };
+    let results = db.search_history(&search).await.unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].agent_id, "mystery-1");
+    assert_eq!(
+        results[0].agent_type,
+        wisphive_protocol::AgentTypeLabel::Other("unrecognized:x".into())
+    );
+}
+
+#[tokio::test]
+async fn query_history_tolerates_malformed_agent_type_column() {
+    // The events.jsonl ingest wraps agent_type in bare quotes without JSON
+    // escaping (event_ingest::ingest_line), so an itr#562 raw value carrying
+    // control bytes or quotes produces a column that is not valid JSON.
+    // Those rows must still be visible, label preserved verbatim.
+    let db = test_db().await;
+    let raw_value = "unrecognized:\u{1b}[31mevil\"q";
+    let column = format!("\"{raw_value}\""); // naive ingest quoting
+    log_unrecognized_refusal(&db, "mystery-esc", &column).await;
+
+    let history = db.query_history(None, 10).await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(
+        history[0].agent_type,
+        wisphive_protocol::AgentTypeLabel::Other(raw_value.into())
+    );
+    // AC#3: the Display path escapes the raw ESC before any terminal surface.
+    assert_eq!(
+        history[0].agent_type.to_string(),
+        "unrecognized:\\u{1b}[31mevil\"q"
+    );
+}
+
+#[tokio::test]
+async fn ingest_line_refusal_round_trips_to_query_history() {
+    // Council addendum (b): an events.jsonl record with a non-enum agent_type
+    // — the exact shape the rotation re-ingest (itr#336) replays through
+    // ingest_line — lands in decision_log and stays queryable.
+    let db = test_db().await;
+    let event = serde_json::json!({
+        "event": "denied",
+        "agent_id": "mystery-rot",
+        "agent_type": "unrecognized:ghost-provider",
+        "project": "/proj",
+        "tool_name": "Bash",
+        "tool_input": {"command": "ls"},
+        "timestamp": "2026-07-18T00:00:00Z",
+        "tool_use_id": "rot-1",
+        "hook_event_name": "PreToolUse",
+        "decided_by": "agent_type:unrecognized",
+        "config_hash": "abc123",
+    });
+    crate::event_ingest::ingest_line(&event.to_string(), &db)
+        .await
+        .unwrap();
+
+    let history = db.query_history(None, 10).await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(
+        history[0].agent_type,
+        wisphive_protocol::AgentTypeLabel::Other("unrecognized:ghost-provider".into())
+    );
+    assert_eq!(history[0].decision, Decision::Deny);
+}
+
+#[test]
+fn agent_type_label_from_column_shapes() {
+    use wisphive_protocol::{AgentType, AgentTypeLabel};
+    // Well-formed JSON, known variant.
+    assert_eq!(
+        agent_type_label_from_column("\"claude_code\""),
+        AgentTypeLabel::Known(AgentType::ClaudeCode)
+    );
+    // Well-formed JSON, unknown label.
+    assert_eq!(
+        agent_type_label_from_column("\"unrecognized:x\""),
+        AgentTypeLabel::Other("unrecognized:x".into())
+    );
+    // Malformed: naive quoting around an embedded quote (invalid JSON).
+    assert_eq!(
+        agent_type_label_from_column("\"unrecognized:a\"b\""),
+        AgentTypeLabel::Other("unrecognized:a\"b".into())
+    );
+    // Malformed: raw control byte inside the JSON string (invalid JSON).
+    assert_eq!(
+        agent_type_label_from_column("\"unrecognized:\u{1b}x\""),
+        AgentTypeLabel::Other("unrecognized:\u{1b}x".into())
+    );
+    // Degenerate: no quotes at all — kept verbatim, mapped if known.
+    assert_eq!(
+        agent_type_label_from_column("codex"),
+        AgentTypeLabel::Known(AgentType::Codex)
+    );
+    assert_eq!(
+        agent_type_label_from_column(""),
+        AgentTypeLabel::Other(String::new())
+    );
 }

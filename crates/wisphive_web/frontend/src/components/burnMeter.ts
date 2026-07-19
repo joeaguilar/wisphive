@@ -5,6 +5,7 @@ import type {
   JsonValue,
   SessionSummary,
 } from "../types/protocol";
+import { knownAgentType } from "../types/protocol";
 
 // ── Burn-meter constants (spec §5.4, itr#402) ───────────────────────
 //
@@ -281,7 +282,9 @@ export function deriveBurn(inputs: BurnInputs): BurnModel {
   for (const session of sessions) {
     const draft = drafts.get(session.agent_id);
     if (!draft) continue;
-    draft.agentType = draft.agentType ?? session.agent_type;
+    // Narrow query-boundary labels (itr#607): unknown agent_type labels
+    // (itr#562 refusal rows) fall through to the agent-id heuristic below.
+    draft.agentType = draft.agentType ?? knownAgentType(session.agent_type);
     draft.project = draft.project ?? session.project;
   }
 

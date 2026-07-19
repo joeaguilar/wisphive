@@ -37,7 +37,10 @@ impl StateDb {
                 )| {
                     Some(wisphive_protocol::SessionSummary {
                         agent_id,
-                        agent_type: serde_json::from_str(&agent_type).ok()?,
+                        // Tolerant label mapping (itr#607): a session whose
+                        // rows carry a non-enum agent_type (itr#562 refusals)
+                        // must not vanish from the aggregate.
+                        agent_type: super::decisions::agent_type_label_from_column(&agent_type),
                         project: std::path::PathBuf::from(project),
                         first_seen: chrono::DateTime::parse_from_rfc3339(&first_seen)
                             .ok()?
@@ -201,6 +204,46 @@ mod tests {
         assert_eq!(s2.total_calls, 1);
         assert_eq!(s2.approved, 0);
         assert_eq!(s2.denied, 1);
+    }
+
+    #[tokio::test]
+    async fn query_sessions_retains_unrecognized_agent_type_aggregate() {
+        // itr#607 AC#4: a session whose rows carry a non-enum agent_type
+        // (itr#562 refusal rows) must appear in the aggregates instead of
+        // silently vanishing.
+        let db = test_db().await;
+        db.log_auto_approved(&AutoApprovedEntry {
+            agent_id: "mystery-1",
+            agent_type: "\"unrecognized:x\"",
+            project: "/proj",
+            tool_name: "Bash",
+            tool_input: r#"{"command":"ls"}"#,
+            timestamp: "2026-07-18T00:00:00Z",
+            tool_use_id: Some("mystery-refusal-1"),
+            hook_event_name: Some("PreToolUse"),
+            decision: "deny",
+            decided_by: Some("agent_type:unrecognized"),
+            config_hash: None,
+        })
+        .await
+        .unwrap();
+        // A normal session alongside it.
+        let r = make_request("Bash", "cc-1", "/muse");
+        db.persist_pending(&r).await.unwrap();
+        db.resolve_pending(r.id, Decision::Approve).await.unwrap();
+
+        let sessions = db.query_sessions().await.unwrap();
+        assert_eq!(sessions.len(), 2, "unknown-label session must not vanish");
+        let mystery = sessions
+            .iter()
+            .find(|s| s.agent_id == "mystery-1")
+            .expect("refusal session present");
+        assert_eq!(
+            mystery.agent_type,
+            wisphive_protocol::AgentTypeLabel::Other("unrecognized:x".into())
+        );
+        assert_eq!(mystery.total_calls, 1);
+        assert_eq!(mystery.denied, 1);
     }
 
     // ════════════════════════════════════════════════════════════
