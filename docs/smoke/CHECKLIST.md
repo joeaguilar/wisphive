@@ -226,7 +226,7 @@ standing rule; these items burn down the residue that only the operator's real i
   orphaned/killed, not respawned. `web_audit` (sqlite3 -readonly) carries `terminal_respawn`
   outcome rows.
 - **Evidence:** _subjective note + `wisphive term list` before/after_
-- [ ] Verified — signed off: _______
+- [√] Verified — signed off: josef
 
 ### Stopping an agent kills its whole process tree (source: itr#561, commit 25432ff)
 - **Steps:** After install: start a managed agent that launches a long-running tool subprocess
@@ -236,7 +236,7 @@ standing rule; these items burn down the residue that only the operator's real i
   build/npm processes. A stop that cannot confirm whole-tree death reports a loud error naming
   the pgid instead of claiming success.
 - **Evidence:** _shell transcript_
-- [ ] Verified — signed off: _______
+- [√] Verified — signed off: josef
 
 ## Signed off
 
