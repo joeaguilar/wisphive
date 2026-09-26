@@ -140,6 +140,14 @@ def canonical(rec: dict, resolved: set[int] = frozenset()) -> str:
     return json.dumps(rec, sort_keys=True)
 
 
+def stale_edges(index: dict[int, dict], resolved: set[int]) -> int:
+    """Blocker edges whose blocker is resolved: inert, pruned on import."""
+    return sum(
+        1 for rec in index.values()
+        for b in (rec.get("blocked_by") or []) if b in resolved
+    )
+
+
 def diff(committed: dict[int, dict], live: dict[int, dict]):
     added = sorted(set(live) - set(committed))
     removed = sorted(set(committed) - set(live))
@@ -149,6 +157,17 @@ def diff(committed: dict[int, dict], live: dict[int, dict]):
         if canonical(committed[i], res_c) != canonical(live[i], res_l)
     )
     return added, removed, changed
+
+
+def stale_edge_note(live: dict[int, dict]) -> None:
+    """Say out loud what the compare ignored, so pending pruning is visible."""
+    n = stale_edges(live, resolved_ids(live))
+    if n:
+        print(
+            f"NOTE: ignored {n} blocker edge(s) whose blocker is done/wontfix — "
+            "a restore drops them (itr prunes such edges on import, as on close); "
+            "`itr doctor --fix` clears them from the live database"
+        )
 
 
 # ── modes ─────────────────────────────────────────────────────────────────
@@ -237,8 +256,10 @@ def check(root: Path, snapshot: Path, strict: bool) -> int:
     added, removed, changed = diff(committed, live)
     if not (added or removed or changed):
         print(f"PASS: {rel} matches the itr database ({len(live)} issues)")
+        stale_edge_note(live)
         return 0
     print(f"DRIFT: {rel} is stale vs the itr database — regenerate it (--write) and commit it")
+    stale_edge_note(live)
     if added:
         print(f"  added in db, missing from snapshot ({len(added)}): {added[:20]}")
     if removed:
