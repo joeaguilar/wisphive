@@ -25,6 +25,15 @@ __pycache__/
 # SQLite sidecars for the itr tracker DB
 .itr.db-*
 
+# Regenerated e2e evidence under campaign/ and sprint/: screenshots and run
+# logs that `just e2e` overwrites in place on every run (timestamps + temp
+# paths churn, nothing else). Working copies stay on disk; the reviewed
+# snapshots remain in git history. Hand-written .txt artifacts stay tracked.
+campaign/**/*.png
+sprint/**/*.png
+campaign/**/*-e2e.txt
+sprint/**/*-e2e.txt
+
 # Stray root npm lockfile (frontend lockfile lives in crates/wisphive_web/frontend)
 /package-lock.json
 

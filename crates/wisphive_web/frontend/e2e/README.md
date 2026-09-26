@@ -70,6 +70,10 @@ green. Run `just e2e` after such changes. This has bitten us repeatedly:
 ## Evidence
 
 Specs that back an itr close write screenshots to
-`sprint/<sprint>/blitz/evidence/` and attach them to the Playwright report.
+`sprint/<sprint>/blitz/evidence/` (campaign specs: `campaign/<campaign>/artifacts/`)
+and attach them to the Playwright report. Those screenshots and the `*-e2e.txt`
+run logs are **gitignored**: every run overwrites them in place, so they are
+working evidence on disk, not tracked files. The reviewed snapshots that backed
+each close remain in git history.
 Prefer asserting the **real effect** (a socket resolution settling, a file on
 disk) over a UI label alone.
