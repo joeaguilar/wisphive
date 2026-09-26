@@ -51,7 +51,19 @@ npm run lint      # ESLint
 
 ## Issue Tracking
 
-This project uses `itr` for local issue tracking. See the `.itr.db` file (gitignored) for current issues.
+This project uses `itr` for issue tracking. The live database is `.itr.db`
+(SQLite, gitignored). Its git-visible form is the tracked snapshot
+`.itr/issues.jsonl`: `itr export` output, one JSON line per issue bundling the
+issue with its notes, audit events, blockers and relations, sorted by id.
+
+- **Fresh clone:** `just itr-restore` rebuilds `.itr.db` from the snapshot. Issue
+  ids are preserved, so every `itr#NNN` reference in the docs and commits resolves.
+- **After changing the tracker:** `just itr-snapshot` regenerates the snapshot;
+  commit it with the work. `just docs-lint` fails while it is stale.
+- **One writer at a time:** issue ids are sequential integers, so two clones filing
+  issues concurrently mint the same id. Pull and `just itr-restore` before filing,
+  `just itr-snapshot` and push after. `itr-restore` replaces colliding ids from the
+  snapshot; it is a pull, not a merge.
 
 ## Architecture
 

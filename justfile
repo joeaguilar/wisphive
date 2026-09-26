@@ -29,9 +29,30 @@ clippy:
 fmt:
     cargo fmt --all
 
-# Lint the docs/ROADMAP.md <-> itr <-> crates seam (deterministic drift check)
+# Also fails when the tracked tracker snapshot (.itr/issues.jsonl) is stale vs .itr.db.
+# Lint the docs/ROADMAP.md <-> itr <-> crates seam + tracker snapshot freshness
 docs-lint:
     python3 scripts/roadmap_sync_check.py
+    python3 scripts/itr_snapshot_check.py
+
+# The snapshot is the tracker's diffable, git-visible form (the SQLite file stays
+# gitignored). Run it after any tracker change and commit it with the work.
+# Regenerate the tracked itr snapshot (.itr/issues.jsonl) from the local .itr.db
+itr-snapshot:
+    python3 scripts/itr_snapshot_check.py --write
+
+# Surrogate note/event/relation row ids are ignored, so a freshly restored clone
+# passes; issue ids and every other field must match.
+# Fail if .itr/issues.jsonl is stale vs .itr.db
+itr-snapshot-check:
+    python3 scripts/itr_snapshot_check.py
+
+# On an existing DB this REPLACES issues whose ids collide with the snapshot —
+# it is a pull, not a merge: never run it over unexported local tracker changes.
+# Rebuild the local .itr.db from .itr/issues.jsonl (fresh-clone bootstrap)
+itr-restore:
+    test -f .itr.db || itr init
+    itr import --file .itr/issues.jsonl
 
 # Start the daemon in the foreground
 daemon:

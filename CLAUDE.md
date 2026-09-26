@@ -31,6 +31,9 @@ cargo fmt --all                  # Format
 just redteam                     # Red-team invariant suites vs RELEASE binaries in isolated HOMEs (decision-plane + upgrade-safety, epic #533)
 just verify                      # Full verify gate suite via gatr (fmt --check, clippy, tests, frontend lint+vitest, e2e)
 just e2e                         # Playwright e2e smoke suite (isolated temp HOME — never touches ~/.wisphive)
+just docs-lint                   # ROADMAP <-> itr <-> crates drift check + tracker snapshot freshness (.itr/issues.jsonl vs .itr.db)
+just itr-snapshot                # Regenerate .itr/issues.jsonl, the tracked diffable form of the gitignored .itr.db — run after tracker changes, commit with the work
+just itr-restore                 # Fresh clone: rebuild .itr.db from .itr/issues.jsonl (issue ids preserved; REPLACES colliding ids — a pull, not a merge)
 ```
 
 `just verify` is the close-with-evidence gate: it runs every sub-gate under its own gatr tag (`verify-fmt`, `verify-clippy`, `verify-rust`, `verify-frontend`, `verify-e2e`), fails fast on the first red gate, and `gatr last` / `gatr errors` reproduce each tag's result afterward. TUI snapshot tests run inside `verify-rust` (`cargo test --workspace`).
