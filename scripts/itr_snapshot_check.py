@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""itr_snapshot_check.py — keep `.itr/issues.jsonl` in lockstep with `.itr.db`.
+"""itr_snapshot_check.py — keep `.itr/issues.jsonl` in lockstep with the itr database.
 
 `.itr.db` (SQLite, gitignored) is the live issue tracker. `.itr/issues.jsonl`
 is its tracked, git-visible form: `itr export` output, one JSON line per issue
@@ -9,18 +9,28 @@ sorted by issue id and byte-deterministic for an unchanged database.
 Modes
   (default)   compare `itr export` against the snapshot; exit 1 on drift.
   --write     regenerate the snapshot atomically from `itr export`.
+  --restore   rebuild the database from the snapshot (fresh-clone bootstrap).
+              Imports into whatever database itr resolves (walk-up from the
+              repo root, or ITR_DB_PATH); runs `itr init` first when none
+              exists. Existing issues whose ids collide are REPLACED by the
+              snapshot: this is a pull, not a merge.
   --strict    exit 1 (instead of 0) when the check has to SKIP.
+  --root DIR  repo root holding `.itr/issues.jsonl` (default: the git
+              toplevel of this script's location, else its parent's parent).
 
 Exit codes: 0 PASS / SKIP (itr not runnable, no database, no snapshot yet),
-1 DRIFT (or SKIP under --strict), 2 could not produce a snapshot in --write.
+1 DRIFT (or SKIP under --strict), 2 could not produce or restore a snapshot.
 
 Why the compare normalizes: `itr import` preserves ISSUE ids (every `itr#NNN`
 reference in the docs stays valid) but assigns fresh surrogate row ids to
-notes, audit events and relations. A clone that ran `just itr-restore`
+notes, audit events and relations. A clone that restored from the snapshot
 therefore exports the same content with different `id` fields on those rows.
 The check strips those surrogate ids and sorts the rows before comparing, so
 a freshly restored clone is not reported as drift while any real change —
 issue fields, note text, event history, blockers, relations — still is.
+
+Requires itr >= 3.3.1 (two-pass import that restores forward references,
+events and relations). Older importers abort on forward references.
 """
 
 from __future__ import annotations
@@ -32,29 +42,51 @@ import sys
 import tempfile
 from pathlib import Path
 
-REPO_DIR = Path(__file__).resolve().parent.parent
-SNAPSHOT = REPO_DIR / ".itr" / "issues.jsonl"
 SURROGATE_ID_LISTS = ("notes", "events", "relations")
+
+
+# ── repo root ─────────────────────────────────────────────────────────────
+
+
+def default_root() -> Path:
+    here = Path(__file__).resolve().parent
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(here), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return Path(proc.stdout.strip())
+    except FileNotFoundError:
+        pass
+    return here.parent
 
 
 # ── itr access ────────────────────────────────────────────────────────────
 
 
-def run_export() -> str | None:
-    """`itr export` in the repo root, or None when itr cannot run here."""
+def itr(root: Path, *args: str) -> subprocess.CompletedProcess | None:
+    """Run itr in the repo root (walk-up + ITR_DB_PATH apply); None if absent."""
     try:
-        proc = subprocess.run(
-            ["itr", "export", "--export-format", "jsonl"],
-            cwd=REPO_DIR,
-            capture_output=True,
-            text=True,
-        )
+        return subprocess.run(["itr", *args], cwd=root, capture_output=True, text=True)
     except FileNotFoundError:
+        return None
+
+
+def run_export(root: Path) -> str | None:
+    proc = itr(root, "export", "--export-format", "jsonl")
+    if proc is None:
         return None
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr)
         return None
     return proc.stdout
+
+
+def db_available(root: Path) -> bool:
+    proc = itr(root, "stats", "-q")
+    return proc is not None and proc.returncode == 0
 
 
 # ── normalization ─────────────────────────────────────────────────────────
@@ -100,57 +132,91 @@ def diff(committed: dict[int, dict], live: dict[int, dict]):
 # ── modes ─────────────────────────────────────────────────────────────────
 
 
-def write_snapshot() -> int:
-    text = run_export()
+def write_snapshot(root: Path, snapshot: Path) -> int:
+    rel = snapshot.relative_to(root)
+    text = run_export(root)
     if text is None:
-        print("ERROR: `itr export` did not run — snapshot left untouched")
+        print(f"ERROR: `itr export` did not run — {rel} left untouched")
         return 2
     try:
         index = parse(text)
     except (ValueError, KeyError, json.JSONDecodeError) as exc:
-        print(f"ERROR: export is not valid issue JSONL ({exc}) — snapshot left untouched")
+        print(f"ERROR: export is not valid issue JSONL ({exc}) — {rel} left untouched")
         return 2
     if not index:
-        print("ERROR: export contained no issues — refusing to write an empty snapshot")
+        print(f"ERROR: export contained no issues — refusing to write an empty {rel}")
         return 2
-    SNAPSHOT.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=SNAPSHOT.parent, prefix=".issues.", suffix=".jsonl.tmp")
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=snapshot.parent, prefix=".issues.", suffix=".jsonl.tmp")
     try:
         with os.fdopen(fd, "w") as fh:
             fh.write(text)
-        os.replace(tmp, SNAPSHOT)
+        os.replace(tmp, snapshot)
     except BaseException:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
-    rel = SNAPSHOT.relative_to(REPO_DIR)
     print(f"WROTE: {rel} ({len(index)} issues)")
     return 0
 
 
-def check(strict: bool) -> int:
-    rel = SNAPSHOT.relative_to(REPO_DIR)
+def restore(root: Path, snapshot: Path) -> int:
+    rel = snapshot.relative_to(root)
+    if not snapshot.exists():
+        print(f"ERROR: {rel} does not exist — nothing to restore from")
+        return 2
+    if itr(root, "--version") is None:
+        print("ERROR: itr is not installed")
+        return 2
+    if not db_available(root):
+        override = os.environ.get("ITR_DB_PATH")
+        init_args = ["--db", override, "init"] if override else ["init"]
+        proc = itr(root, *init_args)
+        if proc is None or proc.returncode != 0:
+            print(f"ERROR: `itr {' '.join(init_args)}` failed:\n{(proc.stderr if proc else '').strip()}")
+            return 2
+        print((proc.stdout or "").strip() or "INIT: created a new database")
+    proc = itr(root, "import", "--file", str(snapshot))
+    if proc is None or proc.returncode != 0:
+        print(f"ERROR: `itr import` failed:\n{(proc.stderr if proc else '').strip()}")
+        return 2
+    for stream in (proc.stderr, proc.stdout):
+        for line in (stream or "").splitlines():
+            if line.startswith(("IMPORT:", "REVIEW:")):
+                print(line)
+    rc = check(root, snapshot, strict=True)
+    if rc != 0:
+        print(
+            "NOTE: --restore replaces issues whose ids are in the snapshot and never "
+            "deletes local-only issues, so the database still differs. Export them "
+            "with --write (so they reach the snapshot) or remove them by hand."
+        )
+    return rc
+
+
+def check(root: Path, snapshot: Path, strict: bool) -> int:
+    rel = snapshot.relative_to(root)
     skip_rc = 1 if strict else 0
-    if not SNAPSHOT.exists():
-        print(f"SKIP: {rel} does not exist yet — run `just itr-snapshot`")
+    if not snapshot.exists():
+        print(f"SKIP: {rel} does not exist yet — run the --write mode")
         return skip_rc
-    text = run_export()
+    text = run_export(root)
     if text is None:
-        print("SKIP: itr not runnable here (not installed, or no .itr.db)")
+        print("SKIP: itr not runnable here (not installed, or no database found)")
         return skip_rc
     try:
         live = parse(text)
-        committed = parse(SNAPSHOT.read_text())
+        committed = parse(snapshot.read_text())
     except (ValueError, KeyError, json.JSONDecodeError) as exc:
         print(f"DRIFT: could not parse snapshot/export ({exc})")
         return 1
     added, removed, changed = diff(committed, live)
     if not (added or removed or changed):
-        print(f"PASS: {rel} matches .itr.db ({len(live)} issues)")
+        print(f"PASS: {rel} matches the itr database ({len(live)} issues)")
         return 0
-    print(f"DRIFT: {rel} is stale vs .itr.db — run `just itr-snapshot` and commit it")
+    print(f"DRIFT: {rel} is stale vs the itr database — regenerate it (--write) and commit it")
     if added:
         print(f"  added in db, missing from snapshot ({len(added)}): {added[:20]}")
     if removed:
@@ -161,14 +227,37 @@ def check(strict: bool) -> int:
 
 
 def main(argv: list[str]) -> int:
-    args = set(argv[1:])
-    unknown = args - {"--write", "--strict"}
-    if unknown:
-        print(f"usage: {Path(argv[0]).name} [--write] [--strict]  (unknown: {sorted(unknown)})")
+    args = argv[1:]
+    root: Path | None = None
+    flags: set[str] = set()
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--root":
+            if i + 1 >= len(args):
+                print("usage: --root needs a directory")
+                return 2
+            root = Path(args[i + 1]).resolve()
+            i += 2
+            continue
+        if a.startswith("--root="):
+            root = Path(a.split("=", 1)[1]).resolve()
+        elif a in {"--write", "--restore", "--strict"}:
+            flags.add(a)
+        else:
+            print(f"usage: {Path(argv[0]).name} [--write | --restore] [--strict] [--root DIR]  (unknown: {a})")
+            return 2
+        i += 1
+    if "--write" in flags and "--restore" in flags:
+        print("usage: --write and --restore are mutually exclusive")
         return 2
-    if "--write" in args:
-        return write_snapshot()
-    return check(strict="--strict" in args)
+    root = root or default_root()
+    snapshot = root / ".itr" / "issues.jsonl"
+    if "--write" in flags:
+        return write_snapshot(root, snapshot)
+    if "--restore" in flags:
+        return restore(root, snapshot)
+    return check(root, snapshot, strict="--strict" in flags)
 
 
 if __name__ == "__main__":

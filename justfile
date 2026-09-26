@@ -48,11 +48,11 @@ itr-snapshot-check:
     python3 scripts/itr_snapshot_check.py
 
 # On an existing DB this REPLACES issues whose ids collide with the snapshot —
-# it is a pull, not a merge: never run it over unexported local tracker changes.
+# it is a pull, not a merge. Local-only issues survive (it exits 1 and says so):
+# export them with `just itr-snapshot` or remove them by hand.
 # Rebuild the local .itr.db from .itr/issues.jsonl (fresh-clone bootstrap)
 itr-restore:
-    test -f .itr.db || itr init
-    itr import --file .itr/issues.jsonl
+    python3 scripts/itr_snapshot_check.py --restore
 
 # Start the daemon in the foreground
 daemon:
