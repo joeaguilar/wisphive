@@ -29,6 +29,13 @@ The check strips those surrogate ids and sorts the rows before comparing, so
 a freshly restored clone is not reported as drift while any real change —
 issue fields, note text, event history, blockers, relations — still is.
 
+Second normalization: `itr import` drops blocker edges whose blocker issue is
+done/wontfix ("a resolved issue no longer blocks anything, as on close"), the
+same pruning `itr close` performs. A database that still carries such stale
+edges exports them, but a clone restored from that export does not. The check
+therefore ignores a `blocked_by` entry whenever the blocker is resolved on that
+side; an edge from an open blocker is always compared.
+
 Requires itr >= 3.3.1 (two-pass import that restores forward references,
 events and relations). Older importers abort on forward references.
 """
@@ -107,24 +114,39 @@ def parse(text: str) -> dict[int, dict]:
     return index
 
 
-def canonical(rec: dict) -> str:
-    """Bundle with surrogate row ids removed and row lists order-insensitive."""
+RESOLVED_STATUSES = {"done", "wontfix"}
+
+
+def resolved_ids(index: dict[int, dict]) -> set[int]:
+    """Issue ids whose blocker edges itr prunes on close and on import."""
+    return {
+        i for i, rec in index.items()
+        if rec["issue"].get("status") in RESOLVED_STATUSES
+    }
+
+
+def canonical(rec: dict, resolved: set[int] = frozenset()) -> str:
+    """Bundle with surrogate row ids removed, row lists order-insensitive, and
+    blocker edges from resolved issues dropped (itr prunes those on import)."""
     rec = json.loads(json.dumps(rec))  # deep copy
     for key in SURROGATE_ID_LISTS:
         rows = rec.get(key) or []
         for row in rows:
             row.pop("id", None)
         rec[key] = sorted(rows, key=lambda r: json.dumps(r, sort_keys=True))
-    rec["blocked_by"] = sorted(rec.get("blocked_by") or [])
+    rec["blocked_by"] = sorted(
+        b for b in (rec.get("blocked_by") or []) if b not in resolved
+    )
     return json.dumps(rec, sort_keys=True)
 
 
 def diff(committed: dict[int, dict], live: dict[int, dict]):
     added = sorted(set(live) - set(committed))
     removed = sorted(set(committed) - set(live))
+    res_c, res_l = resolved_ids(committed), resolved_ids(live)
     changed = sorted(
         i for i in committed.keys() & live.keys()
-        if canonical(committed[i]) != canonical(live[i])
+        if canonical(committed[i], res_c) != canonical(live[i], res_l)
     )
     return added, removed, changed
 
